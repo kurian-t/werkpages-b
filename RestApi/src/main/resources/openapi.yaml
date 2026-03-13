@@ -1,0 +1,633 @@
+openapi: 3.0.3
+info:
+  title: RateMyManager API
+  version: 1.0.0
+
+servers:
+  - url: http://localhost:8888
+
+security:
+  - bearerAuth: []
+
+paths:
+  /api/auth/signup:
+    post:
+      operationId: signup
+      summary: Create a new user account
+      tags:
+        - Auth
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SignupRequest'
+      responses:
+        '200':
+          description: User created successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/User'
+        '400':
+          description: Missing or invalid fields
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+
+  /api/auth/signin:
+    post:
+      operationId: signin
+      summary: Authenticate a user and return JWT
+      tags:
+        - Auth
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SigninRequest'
+      responses:
+        '200':
+          description: Authentication successful
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SigninResponse'
+        '401':
+          description: Invalid credentials
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+
+  /api/auth/signout:
+    post:
+      operationId: signout
+      summary: Sign out user (invalidate session)
+      tags:
+        - Auth
+      security: []
+      responses:
+        '200':
+          description: Sign out successful
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SignoutResponse'
+        '401':
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+
+  /api/auth/me:
+    get:
+      operationId: me
+      summary: Get current authenticated user info
+      tags:
+        - Auth
+      security: []
+      responses:
+        '200':
+          description: Returns the current user
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/User'
+        '401':
+          description: Unauthorized (missing/invalid JWT)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+        '404':
+          description: User not found
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+
+  /api/managers:
+    get:
+      operationId: getManagers
+      summary: List managers
+      parameters:
+        - in: query
+          name: limit
+          schema:
+            type: integer
+            default: 20
+        - in: query
+          name: offset
+          schema:
+            type: integer
+            default: 0
+      responses:
+        '200':
+          description: Paginated list of managers
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/ManagerSummary'
+                  limit:
+                    type: integer
+                  offset:
+                    type: integer
+                  total:
+                    type: integer
+
+    post:
+      operationId: createManager
+      summary: Create a new manager
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - name
+                - company
+                - title
+                - image
+                - status
+              properties:
+                name:
+                  type: string
+                company:
+                  type: string
+                title:
+                  type: string
+                image:
+                  type: string
+                bio:
+                  type: string
+                  nullable: true
+                status:
+                  type: string
+                  enum: [active, retired]
+                linkedinUrl:
+                  type: string
+                  nullable: true
+      responses:
+        '201':
+          description: Manager created successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ManagerDetail'
+
+  /api/managers/{id}:
+    get:
+      operationId: getManagerById
+      summary: Get a single manager profile
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: Manager profile
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ManagerDetail'
+        '404':
+          description: Manager not found
+
+    put:
+      operationId: updateManager
+      summary: Update a manager's company and/or title and track career history
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                company:
+                  type: string
+                title:
+                  type: string
+      responses:
+        '200':
+          description: Manager updated successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ManagerDetail'
+        '404':
+          description: Manager not found
+
+  /api/managers/{id}/reviews:
+    get:
+      operationId: getManagerReviews
+      summary: Get all reviews for a manager
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: integer
+        - in: query
+          name: sortBy
+          schema:
+            type: string
+            enum: [recent, helpful, highest, lowest]
+            default: recent
+        - in: query
+          name: limit
+          schema:
+            type: integer
+            default: 50
+        - in: query
+          name: offset
+          schema:
+            type: integer
+            default: 0
+      responses:
+        '200':
+          description: Paginated list of reviews
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/ManagerReview'
+                  total:
+                    type: integer
+                  limit:
+                    type: integer
+                  offset:
+                    type: integer
+
+    post:
+      operationId: createManagerReview
+      summary: Submit a new review for a manager
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ManagerReviewInput'
+      responses:
+        '201':
+          description: Review created successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ManagerReview'
+        '404':
+          description: Manager not found
+
+  /api/managers/{managerId}/reviews/{reviewId}:
+    put:
+      operationId: updateManagerReview
+      summary: Update an existing review
+      parameters:
+        - in: path
+          name: managerId
+          required: true
+          schema:
+            type: integer
+        - in: path
+          name: reviewId
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ManagerReviewUpdate'
+      responses:
+        '200':
+          description: Review updated successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ManagerReviewUpdated'
+        '404':
+          description: Review not found
+
+    delete:
+      operationId: deleteManagerReview
+      summary: Delete a review
+      parameters:
+        - in: path
+          name: managerId
+          required: true
+          schema:
+            type: integer
+        - in: path
+          name: reviewId
+          required: true
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: Review deleted
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  message:
+                    type: string
+                    example: Review deleted
+        '401':
+          description: Unauthorized
+        '404':
+          description: Review not found
+
+components:
+  schemas:
+    ManagerSummary:
+      type: object
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        company:
+          type: string
+        title:
+          type: string
+        image:
+          type: string
+        overallRating:
+          type: number
+        reviews:
+          type: integer
+
+    ManagerDetail:
+      type: object
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        company:
+          type: string
+        title:
+          type: string
+        image:
+          type: string
+        overallRating:
+          type: number
+        reviews:
+          type: integer
+        bio:
+          type: string
+        status:
+          type: string
+          enum: [active, retired]
+        categoryAverages:
+          type: object
+          additionalProperties:
+            type: number
+        linkedinUrl:
+          type: string
+          nullable: true
+        createdAt:
+          type: string
+          format: date-time
+        careerHistory:
+          type: array
+          items:
+            type: object
+            properties:
+              company:
+                type: string
+              title:
+                type: string
+              startDate:
+                type: string
+                format: date-time
+              endDate:
+                type: string
+                format: date-time
+                nullable: true
+
+    ManagerReview:
+      type: object
+      properties:
+        id:
+          type: integer
+        managerId:
+          type: integer
+        author:
+          type: string
+        overallRating:
+          type: number
+          minimum: 0
+          maximum: 5
+        ratings:
+          type: object
+          properties:
+            communication_style: { type: number }
+            perceived_approachability: { type: number }
+            perceived_clarity_of_expectations: { type: number }
+            feedback_style: { type: number }
+            perceived_supportiveness: { type: number }
+            decision_making_style: { type: number }
+            organization_and_planning_style: { type: number }
+            delegation_style: { type: number }
+            perceived_professional_demeanor: { type: number }
+            overall_working_experience: { type: number }
+        managerCompany:
+          type: string
+        managerTitle:
+          type: string
+        text:
+          type: string
+          nullable: true
+        verified:
+          type: boolean
+        helpfulCount:
+          type: integer
+        createdAt:
+          type: string
+          format: date-time
+
+    ManagerReviewInput:
+      type: object
+      required:
+        - author
+        - overallRating
+        - ratings
+        - managerCompany
+        - managerTitle
+      properties:
+        author:
+          type: string
+        overallRating:
+          type: number
+          minimum: 0
+          maximum: 5
+        ratings:
+          $ref: '#/components/schemas/ManagerReview/properties/ratings'
+        managerCompany:
+          type: string
+        managerTitle:
+          type: string
+        text:
+          type: string
+          nullable: true
+
+    ManagerReviewUpdate:
+      type: object
+      required:
+        - overallRating
+        - ratings
+        - managerCompany
+        - managerTitle
+      properties:
+        overallRating:
+          type: number
+        ratings:
+          $ref: '#/components/schemas/ManagerReview/properties/ratings'
+        managerCompany:
+          type: string
+        managerTitle:
+          type: string
+        text:
+          type: string
+          nullable: true
+
+    User:
+      type: object
+      properties:
+        id:
+          type: string
+          description: Auth0 user ID
+        email:
+          type: string
+        username:
+          type: string
+        firstName:
+          type: string
+        lastName:
+          type: string
+        createdAt:
+          type: string
+          format: date-time
+      required:
+        - id
+        - email
+        - username
+        - firstName
+        - lastName
+        - createdAt
+
+    SignupRequest:
+      type: object
+      properties:
+        email:
+          type: string
+        username:
+          type: string
+        firstName:
+          type: string
+        lastName:
+          type: string
+        password:
+          type: string
+      required:
+        - email
+        - username
+        - firstName
+        - lastName
+        - password
+
+    SigninRequest:
+      type: object
+      properties:
+        email:
+          type: string
+        password:
+          type: string
+      required:
+        - email
+        - password
+
+    SigninResponse:
+      type: object
+      properties:
+        token:
+          type: string
+          description: JWT access token
+        user:
+          $ref: '#/components/schemas/User'
+      required:
+        - token
+        - user
+
+    SignoutResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+      required:
+        - success
+
+    ManagerReviewUpdated:
+      allOf:
+        - $ref: '#/components/schemas/ManagerReview'
+        - type: object
+          properties:
+            updatedAt:
+              type: string
+              format: date-time
+
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT

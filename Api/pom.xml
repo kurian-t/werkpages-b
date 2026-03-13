@@ -1,0 +1,59 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+	xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+	xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+	<modelVersion>4.0.0</modelVersion>
+
+	<parent>
+		<groupId>org.ratemymanager</groupId>
+		<artifactId>RateMyManagerBackend</artifactId>
+		<version>1.0-SNAPSHOT</version>
+	</parent>
+
+	<artifactId>Api</artifactId>
+
+	<dependencies>
+ 		<!-- Vert.x Web API Contract (for OpenAPI integration later) -->
+		<dependency>
+			<groupId>io.vertx</groupId>
+			<artifactId>vertx-sql-client</artifactId>
+			<version>${vertx.version}</version>
+		</dependency>
+		<!-- vertx-pg-client (required for connection to postgres) -->
+		<dependency>
+			<groupId>io.vertx</groupId>
+			<artifactId>vertx-pg-client</artifactId>
+			<version>${vertx.version}</version>
+		</dependency>
+        <dependency>
+            <groupId>org.postgresql</groupId>
+            <artifactId>postgresql</artifactId>
+            <version>42.6.0</version> <!-- or latest stable -->
+        </dependency>
+        <!-- Source: https://mvnrepository.com/artifact/org.flywaydb/flyway-core -->
+        <dependency>
+            <groupId>org.flywaydb</groupId>
+            <artifactId>flyway-core</artifactId>
+            <version>12.0.0</version>
+            <scope>compile</scope>
+        </dependency>
+        <dependency>
+		  <groupId>io.vertx</groupId>
+		  <artifactId>vertx-auth-jwt</artifactId>
+		  <version>${vertx.version}</version>
+		</dependency>
+		<!-- Source: https://mvnrepository.com/artifact/com.auth0/java-jwt -->
+		<dependency>
+		    <groupId>com.auth0</groupId>
+		    <artifactId>java-jwt</artifactId>
+		    <version>4.5.0</version>
+		    <scope>compile</scope>
+		</dependency>
+	</dependencies>
+
+	<properties>
+		<maven.compiler.source>21</maven.compiler.source>
+		<maven.compiler.target>21</maven.compiler.target>
+		<project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+	</properties>
+</project>
