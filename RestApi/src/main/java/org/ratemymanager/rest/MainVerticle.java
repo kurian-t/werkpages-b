@@ -51,7 +51,6 @@ public class MainVerticle extends AbstractVerticle {
                     if (routerFactoryAr.succeeded()) {
                         OpenAPI3RouterFactory routerFactory = routerFactoryAr.result();
 
-                        // Manager Handlers
                         ManagersHandler managersHandler = new ManagersHandler(Database.getClient());
                         routerFactory.addHandlerByOperationId("getManagers", managersHandler::handleGetManagers);
                         routerFactory.addHandlerByOperationId("getManagerById", managersHandler::handleGetManagerById);
@@ -60,14 +59,12 @@ public class MainVerticle extends AbstractVerticle {
                         routerFactory.addHandlerByOperationId("createManagerReview", managersHandler::handleCreateManagerReview);
                         routerFactory.addHandlerByOperationId("getManagerReviews", managersHandler::handleGetManagerReviews);
 
-                        // Auth Handlers
                         AuthHandler authHandler = new AuthHandler(Database.getClient(), auth0Domain);
                         routerFactory.addHandlerByOperationId("signup", authHandler::handleSignup);
                         routerFactory.addHandlerByOperationId("signin", authHandler::handleSignin);
                         routerFactory.addHandlerByOperationId("me", authHandler::handleMe);
                         routerFactory.addHandlerByOperationId("signout", authHandler::handleSignout);
 
-                        // JWT authentication security handler
                         routerFactory.addSecurityHandler("bearerAuth", routingContext -> {
                             String authHeader = routingContext.request().getHeader("Authorization");
                             if (authHeader == null || !authHeader.startsWith("Bearer ")) {
@@ -87,17 +84,14 @@ public class MainVerticle extends AbstractVerticle {
                             });
                         });
 
-                        // Create a new router
                         Router apiRouter = routerFactory.getRouter();
                         Router router = Router.router(vertx);
 
-                        // Allowed headers for CORS
                         Set<String> allowedHeaders = new HashSet<>();
                         allowedHeaders.add("Authorization");
                         allowedHeaders.add("Content-Type");
                         allowedHeaders.add("Accept");
 
-                        // Allowed HTTP methods for CORS
                         Set<HttpMethod> allowedMethods = new HashSet<>();
                         allowedMethods.add(HttpMethod.GET);
                         allowedMethods.add(HttpMethod.POST);
@@ -105,30 +99,15 @@ public class MainVerticle extends AbstractVerticle {
                         allowedMethods.add(HttpMethod.DELETE);
                         allowedMethods.add(HttpMethod.OPTIONS);
 
-                        // Apply CORS handler to the API routes
-                        router.route("/api/*").handler(
-                            CorsHandler.create("http://localhost:8080")  // Allow requests from frontend (http://localhost:8080)
+                        router.route().handler(
+                            CorsHandler.create("http://localhost:8080")
                                 .allowedHeaders(allowedHeaders)
                                 .allowedMethods(allowedMethods)
                                 .allowCredentials(true)
                         );
 
-                        // Apply CORS to Swagger UI routes as well
-                        router.route("/swagger/*").handler(routingContext -> {
-                            String origin = routingContext.request().getHeader("Origin");
-                            System.out.println("Request origin: " + origin); // Debugging the origin
-
-                            CorsHandler.create("http://localhost:8080")  // Allow requests from frontend (http://localhost:8080)
-                                .allowedHeaders(allowedHeaders)
-                                .allowedMethods(allowedMethods)
-                                .allowCredentials(true);
-                                
-                        });
-
-                        // Mount API router
                         router.mountSubRouter("/", apiRouter);
 
-                        // Static routes for Swagger UI
                         router.route("/swagger/*")
                             .handler(StaticHandler.create().setCachingEnabled(false).setWebRoot("swagger"));
                         router.route("/swagger/webjars/*")
@@ -138,7 +117,6 @@ public class MainVerticle extends AbstractVerticle {
                         router.get("/openapi.yaml")
                             .handler(ctx -> ctx.response().putHeader("Content-Type", "application/yaml").sendFile("openapi.yaml"));
 
-                        // Start HTTP server
                         vertx.createHttpServer()
                             .requestHandler(router)
                             .listen(8888)
