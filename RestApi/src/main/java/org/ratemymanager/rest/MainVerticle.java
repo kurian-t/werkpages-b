@@ -60,6 +60,9 @@ public class MainVerticle extends AbstractVerticle {
                         routerFactory.addHandlerByOperationId("createManagerReview", managersHandler::handleCreateManagerReview);
                         routerFactory.addHandlerByOperationId("getManagerReviews", managersHandler::handleGetManagerReviews);
                         routerFactory.addHandlerByOperationId("handleUpdateReview", managersHandler::handleUpdateReview);
+                        routerFactory.addHandlerByOperationId("deleteManagerReview", managersHandler::handleDeleteManagerReview);
+                        routerFactory.addHandlerByOperationId("getMyReviews", managersHandler::handleGetMyReviews);
+                        
                         
                         AuthHandler authHandler = new AuthHandler(Database.getClient(), auth0Domain);
                         routerFactory.addHandlerByOperationId("signup", authHandler::handleSignup);

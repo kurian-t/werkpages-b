@@ -127,6 +127,22 @@ paths:
                   error:
                     type: string
 
+  /api/users/me/reviews:
+   get:
+    operationId: getMyReviews
+    summary: Get all reviews written by the authenticated user
+    responses:
+      '200':
+        description: List of reviews with manager info
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                data:
+                  type: array
+                  items:
+                    $ref: '#/components/schemas/ManagerReview'
   /api/managers:
     get:
       operationId: getManagers
