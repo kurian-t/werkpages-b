@@ -5,6 +5,7 @@ import java.time.OffsetDateTime;
 import io.vertx.core.buffer.Buffer;
 import io.vertx.core.json.JsonObject;
 import com.auth0.jwt.JWT;
+import com.auth0.jwt.exceptions.JWTDecodeException;
 import com.auth0.jwt.interfaces.DecodedJWT;
 import io.vertx.ext.web.RoutingContext;
 import io.vertx.ext.web.client.HttpResponse;
@@ -227,11 +228,32 @@ public class AuthHandler {
 
     // ---------------- ME ----------------
     public void handleMe(RoutingContext ctx) {
-        String auth0Id = ctx.user().principal().getString("sub");
+        String authHeader = ctx.request().getHeader("Authorization");
+        if (authHeader == null || !authHeader.startsWith("Bearer ")) {
+            ctx.response()
+               .setStatusCode(401)
+               .putHeader("Content-Type", "application/json")
+               .end(new JsonObject().put("error", "Missing or invalid Authorization header").encode());
+            return;
+        }
 
+        String token = authHeader.substring("Bearer ".length());
+        DecodedJWT decoded;
+        try {
+            decoded = JWT.decode(token);
+        } catch (JWTDecodeException e) {
+            ctx.response()
+               .setStatusCode(401)
+               .putHeader("Content-Type", "application/json")
+               .end(new JsonObject().put("error", "Invalid token").encode());
+            return;
+        }
+
+        String auth0Id = decoded.getClaim("sub").asString();
         if (auth0Id == null) {
             ctx.response()
                .setStatusCode(401)
+               .putHeader("Content-Type", "application/json")
                .end(new JsonObject().put("error", "Unauthorized").encode());
             return;
         }
@@ -247,6 +269,7 @@ public class AuthHandler {
             if (!rows.iterator().hasNext()) {
                 ctx.response()
                    .setStatusCode(404)
+                   .putHeader("Content-Type", "application/json")
                    .end(new JsonObject().put("error", "User not found").encode());
                 return;
             }
@@ -254,19 +277,21 @@ public class AuthHandler {
             Row row = rows.iterator().next();
 
             ctx.response()
+               .setStatusCode(200)
                .putHeader("Content-Type", "application/json")
                .end(new JsonObject()
-                   .put("id", row.getString("auth0_id"))
+                   .put("id", row.getUUID("id").toString())  // internal DB UUID — used for userId filtering
+                   .put("auth0Id", row.getString("auth0_id"))
                    .put("email", row.getString("email"))
                    .put("username", row.getString("username"))
                    .put("firstName", row.getString("first_name"))
                    .put("lastName", row.getString("last_name"))
-                   .put("createdAt", row.getOffsetDateTime("created_at").toString())
+                   .put("createdAt", row.getLocalDateTime("created_at").toString())
                    .encode()
                );
         });
     }
-
+    
     // ---------------- SIGNOUT ----------------
     public void handleSignout(RoutingContext ctx) {
         // JWTs are stateless, just tell client to remove it

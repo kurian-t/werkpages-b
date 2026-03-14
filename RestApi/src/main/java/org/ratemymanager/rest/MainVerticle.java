@@ -54,11 +54,13 @@ public class MainVerticle extends AbstractVerticle {
                         ManagersHandler managersHandler = new ManagersHandler(Database.getClient());
                         routerFactory.addHandlerByOperationId("getManagers", managersHandler::handleGetManagers);
                         routerFactory.addHandlerByOperationId("getManagerById", managersHandler::handleGetManagerById);
+                        routerFactory.addHandlerByOperationId("recalculateManagerStats", managersHandler::handleRecalculateManagerStats);
                         routerFactory.addHandlerByOperationId("createManager", managersHandler::handleCreateManager);
                         routerFactory.addHandlerByOperationId("updateManager", managersHandler::handleUpdateManager);
                         routerFactory.addHandlerByOperationId("createManagerReview", managersHandler::handleCreateManagerReview);
                         routerFactory.addHandlerByOperationId("getManagerReviews", managersHandler::handleGetManagerReviews);
-
+                        routerFactory.addHandlerByOperationId("handleUpdateReview", managersHandler::handleUpdateReview);
+                        
                         AuthHandler authHandler = new AuthHandler(Database.getClient(), auth0Domain);
                         routerFactory.addHandlerByOperationId("signup", authHandler::handleSignup);
                         routerFactory.addHandlerByOperationId("signin", authHandler::handleSignin);

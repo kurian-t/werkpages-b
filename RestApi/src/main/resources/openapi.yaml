@@ -224,7 +224,7 @@ paths:
 
     put:
       operationId: updateManager
-      summary: Update a manager's company and/or title and track career history
+      summary: Update any writeable manager fields and optionally track career history
       parameters:
         - in: path
           name: id
@@ -237,11 +237,34 @@ paths:
           application/json:
             schema:
               type: object
+              minProperties: 1
               properties:
                 company:
                   type: string
                 title:
                   type: string
+                image:
+                  type: string
+                bio:
+                  type: string
+                  nullable: true
+                status:
+                  type: string
+                  enum: [active, retired]
+                linkedinUrl:
+                  type: string
+                  nullable: true
+                overallRating:
+                  type: number
+                  minimum: 0
+                  maximum: 5
+                reviews:
+                  type: integer
+                  minimum: 0
+                categoryAverages:
+                  type: object
+                  additionalProperties:
+                    type: number
       responses:
         '200':
           description: Manager updated successfully
@@ -249,13 +272,61 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ManagerDetail'
+        '400':
+          description: Nothing to update
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
         '404':
           description: Manager not found
+
+  /api/managers/{id}/recalculate:
+    put:
+      operationId: recalculateManagerStats
+      summary: Recalculate and persist a manager's overall_rating, reviews_count, and category_averages from the reviews table
+      tags:
+        - Managers
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: integer
+          description: The manager ID to recalculate stats for
+      responses:
+        '200':
+          description: Manager stats recalculated and updated successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ManagerDetail'
+        '401':
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+        '404':
+          description: Manager not found
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
 
   /api/managers/{id}/reviews:
     get:
       operationId: getManagerReviews
-      summary: Get all reviews for a manager
+      summary: Get all reviews for a manager, optionally filtered by user
       parameters:
         - in: path
           name: id
@@ -278,6 +349,13 @@ paths:
           schema:
             type: integer
             default: 0
+        - in: query
+          name: userId
+          required: false
+          schema:
+            type: string
+            format: uuid
+          description: Optional. When provided, returns only reviews written by this user.
       responses:
         '200':
           description: Paginated list of reviews
@@ -296,6 +374,15 @@ paths:
                     type: integer
                   offset:
                     type: integer
+        '400':
+          description: Invalid userId format
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
 
     post:
       operationId: createManagerReview
@@ -324,7 +411,7 @@ paths:
 
   /api/managers/{managerId}/reviews/{reviewId}:
     put:
-      operationId: updateManagerReview
+      operationId: handleUpdateReview
       summary: Update an existing review
       parameters:
         - in: path
@@ -336,7 +423,8 @@ paths:
           name: reviewId
           required: true
           schema:
-            type: integer
+            type: string
+            format: uuid
       requestBody:
         required: true
         content:
@@ -366,7 +454,8 @@ paths:
           name: reviewId
           required: true
           schema:
-            type: integer
+            type: string
+            format: uuid
       responses:
         '200':
           description: Review deleted
@@ -459,7 +548,8 @@ components:
       type: object
       properties:
         id:
-          type: integer
+          type: string
+          format: uuid
         managerId:
           type: integer
         author:
@@ -500,17 +590,12 @@ components:
       type: object
       required:
         - author
-        - overallRating
         - ratings
         - managerCompany
         - managerTitle
       properties:
         author:
           type: string
-        overallRating:
-          type: number
-          minimum: 0
-          maximum: 5
         ratings:
           $ref: '#/components/schemas/ManagerReview/properties/ratings'
         managerCompany:
@@ -545,6 +630,10 @@ components:
       type: object
       properties:
         id:
+          type: string
+          format: uuid
+          description: Internal database UUID
+        auth0Id:
           type: string
           description: Auth0 user ID
         email:
