@@ -4,9 +4,11 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
 
+import org.ratemymanager.config.SecretsConfig;
 import org.ratemymanager.db.Database;
 import org.ratemymanager.rest.handlers.AuthHandler;
 import org.ratemymanager.rest.handlers.ManagersHandler;
+import org.ratemymanager.rest.handlers.ReportsHandler;
 
 import io.vertx.core.AbstractVerticle;
 import io.vertx.core.Vertx;
@@ -22,7 +24,13 @@ import io.vertx.ext.web.handler.StaticHandler;
 
 public class MainVerticle extends AbstractVerticle {
 
+    // Loaded once at startup from AWS Secrets Manager
+    private static SecretsConfig secrets;
+
     public static void main(String[] args) {
+        // Load secrets BEFORE Vert.x starts — intentionally blocking
+        secrets = SecretsConfig.load();
+
         Vertx vertx = Vertx.vertx();
         vertx.deployVerticle(new MainVerticle());
     }
@@ -30,44 +38,52 @@ public class MainVerticle extends AbstractVerticle {
     @SuppressWarnings("deprecation")
     @Override
     public void start() {
-        String auth0Domain = "ratemymanager.ca.auth0.com";
         WebClient client = WebClient.create(vertx);
-        String jwksUrl = "https://" + auth0Domain + "/.well-known/jwks.json";
+        String jwksUrl = "https://" + secrets.auth0Domain + "/.well-known/jwks.json";
 
         client.getAbs(jwksUrl).send(ar -> {
             if (ar.succeeded()) {
                 JsonObject responseBody = ar.result().bodyAsJsonObject();
 
                 List<JsonObject> keys = responseBody.getJsonArray("keys")
-                        .stream()
-                        .map(obj -> JsonObject.mapFrom(obj))
-                        .toList();
+                    .stream()
+                    .map(obj -> JsonObject.mapFrom(obj))
+                    .toList();
 
                 JWTAuth jwtAuth = JWTAuth.create(vertx, new JWTAuthOptions().setJwks(keys));
 
-                Database.init(vertx);
+                Database.init(vertx, secrets);
 
                 OpenAPI3RouterFactory.create(vertx, "openapi.yaml", routerFactoryAr -> {
                     if (routerFactoryAr.succeeded()) {
                         OpenAPI3RouterFactory routerFactory = routerFactoryAr.result();
 
                         ManagersHandler managersHandler = new ManagersHandler(Database.getClient());
-                        routerFactory.addHandlerByOperationId("getManagers", managersHandler::handleGetManagers);
-                        routerFactory.addHandlerByOperationId("getManagerById", managersHandler::handleGetManagerById);
+                        ReportsHandler reportsHandler   = new ReportsHandler(Database.getClient());
+
+                        routerFactory.addHandlerByOperationId("getManagers",           managersHandler::handleGetManagers);
+                        routerFactory.addHandlerByOperationId("getManagerById",        managersHandler::handleGetManagerById);
                         routerFactory.addHandlerByOperationId("recalculateManagerStats", managersHandler::handleRecalculateManagerStats);
-                        routerFactory.addHandlerByOperationId("createManager", managersHandler::handleCreateManager);
-                        routerFactory.addHandlerByOperationId("updateManager", managersHandler::handleUpdateManager);
-                        routerFactory.addHandlerByOperationId("createManagerReview", managersHandler::handleCreateManagerReview);
-                        routerFactory.addHandlerByOperationId("getManagerReviews", managersHandler::handleGetManagerReviews);
-                        routerFactory.addHandlerByOperationId("handleUpdateReview", managersHandler::handleUpdateReview);
-                        routerFactory.addHandlerByOperationId("deleteManagerReview", managersHandler::handleDeleteManagerReview);
-                        routerFactory.addHandlerByOperationId("getMyReviews", managersHandler::handleGetMyReviews);
-                        
-                        
-                        AuthHandler authHandler = new AuthHandler(Database.getClient(), auth0Domain);
-                        routerFactory.addHandlerByOperationId("signup", authHandler::handleSignup);
-                        routerFactory.addHandlerByOperationId("signin", authHandler::handleSignin);
-                        routerFactory.addHandlerByOperationId("me", authHandler::handleMe);
+                        routerFactory.addHandlerByOperationId("createManager",         managersHandler::handleCreateManager);
+                        routerFactory.addHandlerByOperationId("updateManager",         managersHandler::handleUpdateManager);
+                        routerFactory.addHandlerByOperationId("createManagerReview",   managersHandler::handleCreateManagerReview);
+                        routerFactory.addHandlerByOperationId("getManagerReviews",     managersHandler::handleGetManagerReviews);
+                        routerFactory.addHandlerByOperationId("updateManagerReview",   managersHandler::handleUpdateReview);
+                        routerFactory.addHandlerByOperationId("deleteManagerReview",   managersHandler::handleDeleteManagerReview);
+                        routerFactory.addHandlerByOperationId("getMyReviews",          managersHandler::handleGetMyReviews);
+                        routerFactory.addHandlerByOperationId("reportManager",         reportsHandler::handleReportManager);
+
+                        // Pass secrets into AuthHandler — no more hardcoded credentials
+                        AuthHandler authHandler = new AuthHandler(
+                            Database.getClient(),
+                            secrets.auth0Domain,
+                            secrets.auth0ClientId,
+                            secrets.auth0ClientSecret,
+                            secrets.auth0Audience
+                        );
+                        routerFactory.addHandlerByOperationId("signup",  authHandler::handleSignup);
+                        routerFactory.addHandlerByOperationId("signin",  authHandler::handleSignin);
+                        routerFactory.addHandlerByOperationId("me",      authHandler::handleMe);
                         routerFactory.addHandlerByOperationId("signout", authHandler::handleSignout);
 
                         routerFactory.addSecurityHandler("bearerAuth", routingContext -> {
@@ -76,9 +92,7 @@ public class MainVerticle extends AbstractVerticle {
                                 routingContext.fail(401);
                                 return;
                             }
-
                             String token = authHeader.substring(7);
-
                             jwtAuth.authenticate(new JsonObject().put("token", token), res -> {
                                 if (res.succeeded()) {
                                     routingContext.setUser(res.result());
@@ -90,7 +104,7 @@ public class MainVerticle extends AbstractVerticle {
                         });
 
                         Router apiRouter = routerFactory.getRouter();
-                        Router router = Router.router(vertx);
+                        Router router    = Router.router(vertx);
 
                         Set<String> allowedHeaders = new HashSet<>();
                         allowedHeaders.add("Authorization");
@@ -104,8 +118,9 @@ public class MainVerticle extends AbstractVerticle {
                         allowedMethods.add(HttpMethod.DELETE);
                         allowedMethods.add(HttpMethod.OPTIONS);
 
+                        // CORS — updated to production domain
                         router.route().handler(
-                            CorsHandler.create("http://localhost:8080")
+                            CorsHandler.create("https://ratemymanagers.ca")
                                 .allowedHeaders(allowedHeaders)
                                 .allowedMethods(allowedMethods)
                                 .allowCredentials(true)
@@ -125,14 +140,14 @@ public class MainVerticle extends AbstractVerticle {
                         vertx.createHttpServer()
                             .requestHandler(router)
                             .listen(8888)
-                            .onSuccess(server -> System.out.println("HTTP server started on port 8888"))
-                            .onFailure(err -> System.err.println("Failed to start server: " + err.getMessage()));
+                            .onSuccess(server -> System.out.println("✓ HTTP server started on port 8888"))
+                            .onFailure(err -> System.err.println("✗ Failed to start server: " + err.getMessage()));
                     } else {
-                        System.err.println("Failed to create RouterFactory: " + routerFactoryAr.cause());
+                        System.err.println("✗ Failed to create RouterFactory: " + routerFactoryAr.cause());
                     }
                 });
             } else {
-                System.err.println("Failed to fetch JWKS from Auth0: " + ar.cause());
+                System.err.println("✗ Failed to fetch JWKS from Auth0: " + ar.cause());
             }
         });
     }

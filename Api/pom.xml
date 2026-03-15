@@ -11,9 +11,27 @@
 	</parent>
 
 	<artifactId>Api</artifactId>
-
+	<dependencyManagement>
+		<dependencies>
+			<dependency>
+				<groupId>software.amazon.awssdk</groupId>
+				<artifactId>bom</artifactId>
+				<version>2.25.0</version>
+				<type>pom</type>
+				<scope>import</scope>
+			</dependency>
+		</dependencies>
+	</dependencyManagement>
 	<dependencies>
- 		<!-- Vert.x Web API Contract (for OpenAPI integration later) -->
+		<dependency>
+			<groupId>software.amazon.awssdk</groupId>
+			<artifactId>secretsmanager</artifactId>
+		</dependency>
+		<dependency>
+			<groupId>software.amazon.awssdk</groupId>
+			<artifactId>sts</artifactId>
+		</dependency>
+		<!-- Vert.x Web API Contract (for OpenAPI integration later) -->
 		<dependency>
 			<groupId>io.vertx</groupId>
 			<artifactId>vertx-sql-client</artifactId>
@@ -25,29 +43,29 @@
 			<artifactId>vertx-pg-client</artifactId>
 			<version>${vertx.version}</version>
 		</dependency>
-        <dependency>
-            <groupId>org.postgresql</groupId>
-            <artifactId>postgresql</artifactId>
-            <version>42.6.0</version> <!-- or latest stable -->
-        </dependency>
-        <!-- Source: https://mvnrepository.com/artifact/org.flywaydb/flyway-core -->
-        <dependency>
-            <groupId>org.flywaydb</groupId>
-            <artifactId>flyway-core</artifactId>
-            <version>12.0.0</version>
-            <scope>compile</scope>
-        </dependency>
-        <dependency>
-		  <groupId>io.vertx</groupId>
-		  <artifactId>vertx-auth-jwt</artifactId>
-		  <version>${vertx.version}</version>
+		<dependency>
+			<groupId>org.postgresql</groupId>
+			<artifactId>postgresql</artifactId>
+			<version>42.6.0</version> <!-- or latest stable -->
+		</dependency>
+		<!-- Source: https://mvnrepository.com/artifact/org.flywaydb/flyway-core -->
+		<dependency>
+			<groupId>org.flywaydb</groupId>
+			<artifactId>flyway-core</artifactId>
+			<version>12.0.0</version>
+			<scope>compile</scope>
+		</dependency>
+		<dependency>
+			<groupId>io.vertx</groupId>
+			<artifactId>vertx-auth-jwt</artifactId>
+			<version>${vertx.version}</version>
 		</dependency>
 		<!-- Source: https://mvnrepository.com/artifact/com.auth0/java-jwt -->
 		<dependency>
-		    <groupId>com.auth0</groupId>
-		    <artifactId>java-jwt</artifactId>
-		    <version>4.5.0</version>
-		    <scope>compile</scope>
+			<groupId>com.auth0</groupId>
+			<artifactId>java-jwt</artifactId>
+			<version>4.5.0</version>
+			<scope>compile</scope>
 		</dependency>
 	</dependencies>
 

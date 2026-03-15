@@ -425,6 +425,53 @@ paths:
         '404':
           description: Manager not found
 
+  /api/managers/{id}/report:
+    post:
+      operationId: reportManager
+      summary: Report an inaccurate or incorrect manager profile
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - reason
+              properties:
+                reason:
+                  type: string
+                  enum: [incorrect_person, never_worked_here, duplicate_profile, incorrect_information, other]
+                comment:
+                  type: string
+                  nullable: true
+      responses:
+        '201':
+          description: Report submitted successfully
+        '400':
+          description: Missing or invalid reason
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+        '404':
+          description: Manager not found
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+
   /api/managers/{managerId}/reviews/{reviewId}:
     put:
       operationId: handleUpdateReview

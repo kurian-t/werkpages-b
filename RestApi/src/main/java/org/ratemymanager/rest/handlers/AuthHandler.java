@@ -17,18 +17,19 @@ import io.vertx.sqlclient.Tuple;
 
 
 public class AuthHandler {
-
+    
     private final SqlClient db;
     private final String auth0Domain;
+    private final String clientId;
+    private final String clientSecret;
+    private final String audience;
     
-    private static final String CLIENT_ID = "gN3t4gLhfFo4onk48Xv5uhPNhF6lszpO";
-    private static final String CLIENT_SECRET = "CHhkSpWyV2zPAmu6-NlRsNTbXtk7RPnOMaA7pgUztNfcEcgpFxJjCl2YCFU_LRDX"; //"LZKYJYZKgI7NStVL0ziKmIgbKhIIG9lM44Jb6tFaBrMkJhSPByDNIu_nGyTYs2-z";
-    private static final String AUDIENCE = "https://api.ratemymanager.com/";
-    private static final String GRANT_TYPE = "client_credentials";
-    
-    public AuthHandler(SqlClient db, String auth0Domain) {
-        this.db = db;
-        this.auth0Domain = auth0Domain;
+    public AuthHandler(SqlClient db, String auth0Domain, String clientId, String clientSecret, String audience) {
+        this.db           = db;
+        this.auth0Domain  = auth0Domain;
+        this.clientId     = clientId;
+        this.clientSecret = clientSecret;
+        this.audience     = audience;
     }
     
  // ---------------- SIGNUP ----------------
@@ -54,7 +55,7 @@ public class AuthHandler {
         WebClient client = WebClient.create(ctx.vertx());
 
         JsonObject auth0Payload = new JsonObject()
-            .put("client_id", CLIENT_ID)
+            .put("client_id", this.clientId)
             .put("email", email)
             .put("password", password)
             .put("connection", "Username-Password-Authentication")
@@ -154,9 +155,9 @@ public class AuthHandler {
             .put("username", email)
             .put("password", password)
             .put("connection", "Username-Password-Authentication")
-            .put("audience", AUDIENCE)
-            .put("client_id", CLIENT_ID)
-            .put("client_secret", CLIENT_SECRET);
+            .put("audience", this.audience)
+            .put("client_id", this.clientId)
+            .put("client_secret", this.clientSecret);
 
         // Ensure 'auth0Domain' is the field passed into your constructor
         client.post(443, auth0Domain, "/oauth/token")

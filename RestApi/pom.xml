@@ -1,179 +1,200 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <project xmlns="http://maven.apache.org/POM/4.0.0"
-         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
-         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
-    <modelVersion>4.0.0</modelVersion>
+	xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+	xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+	<modelVersion>4.0.0</modelVersion>
 
-    <parent>
-        <groupId>org.ratemymanager</groupId>
-        <artifactId>RateMyManagerBackend</artifactId>
-        <version>1.0-SNAPSHOT</version>
-    </parent>
+	<parent>
+		<groupId>org.ratemymanager</groupId>
+		<artifactId>RateMyManagerBackend</artifactId>
+		<version>1.0-SNAPSHOT</version>
+	</parent>
 
-    <artifactId>RestApi</artifactId>
-
-    <dependencies>
-        <!-- Vert.x Core -->
-        <dependency>
-            <groupId>io.vertx</groupId>
-            <artifactId>vertx-core</artifactId>
-            <version>${vertx.version}</version>
-        </dependency>
-
-        <!-- Vert.x Web -->
-        <dependency>
-            <groupId>io.vertx</groupId>
-            <artifactId>vertx-web</artifactId>
-            <version>${vertx.version}</version>
-        </dependency>
-
-        <!-- Vert.x Web API Contract (for OpenAPI integration later) -->
-        <dependency>
-            <groupId>io.vertx</groupId>
-            <artifactId>vertx-web-api-contract</artifactId>
-            <version>${vertx.version}</version>
-        </dependency>
-		<dependency>
-		    <groupId>io.vertx</groupId>
-		    <artifactId>vertx-sql-client</artifactId>
-		    <version>${vertx.version}</version> 
-		</dependency>
+	<artifactId>RestApi</artifactId>
+	<dependencyManagement>
+		<dependencies>
 			<dependency>
-		    <groupId>io.vertx</groupId>
-		    <artifactId>vertx-pg-client</artifactId>
-		    <version>${vertx.version}</version> <!-- Use the latest version -->
+				<groupId>software.amazon.awssdk</groupId>
+				<artifactId>bom</artifactId>
+				<version>2.25.0</version>
+				<type>pom</type>
+				<scope>import</scope>
+			</dependency>
+		</dependencies>
+	</dependencyManagement>
+	<dependencies>
+		<dependency>
+			<groupId>software.amazon.awssdk</groupId>
+			<artifactId>secretsmanager</artifactId>
 		</dependency>
 		<dependency>
-		    <groupId>io.vertx</groupId>
-		    <artifactId>vertx-web-client</artifactId>
-		    <version>${vertx.version}</version> <!-- Use the latest version -->
+			<groupId>software.amazon.awssdk</groupId>
+			<artifactId>sts</artifactId>
 		</dependency>
-        <!-- Apache Commons IO (required for OpenAPI3RouterFactory) -->
-        <dependency>
-            <groupId>commons-io</groupId>
-            <artifactId>commons-io</artifactId>
-            <version>2.13.0</version>
-        </dependency>
-        <dependency>
-            <groupId>org.postgresql</groupId>
-            <artifactId>postgresql</artifactId>
-            <version>42.6.0</version>
-        </dependency>
-        <!-- Jackson Datatype for Java 8 Date/Time API -->
-        <dependency>
-            <groupId>com.fasterxml.jackson.datatype</groupId>
-            <artifactId>jackson-datatype-jsr310</artifactId>
-            <version>2.15.2</version>
-        </dependency>
+		<!-- Vert.x Core -->
+		<dependency>
+			<groupId>io.vertx</groupId>
+			<artifactId>vertx-core</artifactId>
+			<version>${vertx.version}</version>
+		</dependency>
 
-        <!-- Jackson Core + Databind -->
-        <dependency>
-            <groupId>com.fasterxml.jackson.core</groupId>
-            <artifactId>jackson-databind</artifactId>
-            <version>2.15.2</version>
-        </dependency>
+		<!-- Vert.x Web -->
+		<dependency>
+			<groupId>io.vertx</groupId>
+			<artifactId>vertx-web</artifactId>
+			<version>${vertx.version}</version>
+		</dependency>
 
-        <!-- Swagger Core for OpenAPI 3 -->
-        <dependency>
-            <groupId>io.swagger.core.v3</groupId>
-            <artifactId>swagger-core</artifactId>
-            <version>2.2.3</version>
-        </dependency>
+		<!-- Vert.x Web API Contract (for OpenAPI integration later) -->
+		<dependency>
+			<groupId>io.vertx</groupId>
+			<artifactId>vertx-web-api-contract</artifactId>
+			<version>${vertx.version}</version>
+		</dependency>
+		<dependency>
+			<groupId>io.vertx</groupId>
+			<artifactId>vertx-sql-client</artifactId>
+			<version>${vertx.version}</version>
+		</dependency>
+		<dependency>
+			<groupId>io.vertx</groupId>
+			<artifactId>vertx-pg-client</artifactId>
+			<version>${vertx.version}</version> <!-- Use the latest version -->
+		</dependency>
+		<dependency>
+			<groupId>io.vertx</groupId>
+			<artifactId>vertx-web-client</artifactId>
+			<version>${vertx.version}</version> <!-- Use the latest version -->
+		</dependency>
+		<!-- Apache Commons IO (required for OpenAPI3RouterFactory) -->
+		<dependency>
+			<groupId>commons-io</groupId>
+			<artifactId>commons-io</artifactId>
+			<version>2.13.0</version>
+		</dependency>
+		<dependency>
+			<groupId>org.postgresql</groupId>
+			<artifactId>postgresql</artifactId>
+			<version>42.6.0</version>
+		</dependency>
+		<!-- Jackson Datatype for Java 8 Date/Time API -->
+		<dependency>
+			<groupId>com.fasterxml.jackson.datatype</groupId>
+			<artifactId>jackson-datatype-jsr310</artifactId>
+			<version>2.15.2</version>
+		</dependency>
 
-        <dependency>
-            <groupId>io.swagger.core.v3</groupId>
-            <artifactId>swagger-models</artifactId>
-            <version>2.2.3</version>
-        </dependency>
+		<!-- Jackson Core + Databind -->
+		<dependency>
+			<groupId>com.fasterxml.jackson.core</groupId>
+			<artifactId>jackson-databind</artifactId>
+			<version>2.15.2</version>
+		</dependency>
 
-        <!-- Swagger UI Webjar -->
-        <dependency>
-            <groupId>org.webjars</groupId>
-            <artifactId>swagger-ui</artifactId>
-            <version>${swagger.version}</version>
-        </dependency>
+		<!-- Swagger Core for OpenAPI 3 -->
+		<dependency>
+			<groupId>io.swagger.core.v3</groupId>
+			<artifactId>swagger-core</artifactId>
+			<version>2.2.3</version>
+		</dependency>
+
+		<dependency>
+			<groupId>io.swagger.core.v3</groupId>
+			<artifactId>swagger-models</artifactId>
+			<version>2.2.3</version>
+		</dependency>
+
+		<!-- Swagger UI Webjar -->
+		<dependency>
+			<groupId>org.webjars</groupId>
+			<artifactId>swagger-ui</artifactId>
+			<version>${swagger.version}</version>
+		</dependency>
 		<!-- Source: https://mvnrepository.com/artifact/com.ongres.scram/client -->
 		<dependency>
-		    <groupId>com.ongres.scram</groupId>
-		    <artifactId>client</artifactId>
-		    <version>2.1</version>
-		    <scope>compile</scope>
+			<groupId>com.ongres.scram</groupId>
+			<artifactId>client</artifactId>
+			<version>2.1</version>
+			<scope>compile</scope>
 		</dependency>
-        <!-- Source: https://mvnrepository.com/artifact/org.flywaydb/flyway-core -->
-        <dependency>
-            <groupId>org.flywaydb</groupId>
-            <artifactId>flyway-core</artifactId>
-            <version>12.0.0</version>
-            <scope>compile</scope>
-        </dependency>
-        <dependency>
-		    <groupId>org.flywaydb</groupId>
-		    <artifactId>flyway-database-postgresql</artifactId>
-		    <version>12.0.0</version>
+		<!-- Source: https://mvnrepository.com/artifact/org.flywaydb/flyway-core -->
+		<dependency>
+			<groupId>org.flywaydb</groupId>
+			<artifactId>flyway-core</artifactId>
+			<version>12.0.0</version>
+			<scope>compile</scope>
 		</dependency>
 		<dependency>
-		  <groupId>io.vertx</groupId>
-		  <artifactId>vertx-auth-jwt</artifactId>
-		  <version>${vertx.version}</version>
+			<groupId>org.flywaydb</groupId>
+			<artifactId>flyway-database-postgresql</artifactId>
+			<version>12.0.0</version>
 		</dependency>
-        <dependency>
-            <groupId>org.ratemymanager</groupId>
-            <artifactId>Api</artifactId>
-            <version>1.0-SNAPSHOT</version>
-            <scope>compile</scope>
-        </dependency>
-    </dependencies>
+		<dependency>
+			<groupId>io.vertx</groupId>
+			<artifactId>vertx-auth-jwt</artifactId>
+			<version>${vertx.version}</version>
+		</dependency>
+		<dependency>
+			<groupId>org.ratemymanager</groupId>
+			<artifactId>Api</artifactId>
+			<version>1.0-SNAPSHOT</version>
+			<scope>compile</scope>
+		</dependency>
+	</dependencies>
 
-    <build>
-        <plugins>
-            <!-- Compiler Plugin -->
-            <plugin>
-                <groupId>org.apache.maven.plugins</groupId>
-                <artifactId>maven-compiler-plugin</artifactId>
-                <version>3.10.1</version>
-                <configuration>
-                    <source>${maven.compiler.source}</source>
-                    <target>${maven.compiler.target}</target>
-                </configuration>
-            </plugin>
-
-            <!-- Shade Plugin for fat JAR -->
+	<build>
+		<plugins>
+			<!-- Compiler Plugin -->
 			<plugin>
-			    <groupId>org.apache.maven.plugins</groupId>
-			    <artifactId>maven-shade-plugin</artifactId>
-			    <version>3.4.1</version>
-			    <executions>
-			        <execution>
-			            <id>shade-restapi</id>
-			            <phase>package</phase>
-			            <goals>
-			                <goal>shade</goal>
-			            </goals>
-			            <configuration>
-			                <shadedArtifactAttached>true</shadedArtifactAttached>
-			                <shadedClassifierName>shaded</shadedClassifierName>
-			                <createDependencyReducedPom>false</createDependencyReducedPom>
-			                <transformers>
-			                    <!-- Merge all META-INF/services files so Flyway discovers PostgreSQL -->
-			                    <transformer implementation="org.apache.maven.plugins.shade.resource.ServicesResourceTransformer"/>
-			                    <!-- Set the main class -->
-			                    <transformer implementation="org.apache.maven.plugins.shade.resource.ManifestResourceTransformer">
-			                        <mainClass>org.ratemymanager.rest.MainVerticle</mainClass>
-			                    </transformer>
-			                </transformers>
-			            </configuration>
-			        </execution>
-			    </executions>
+				<groupId>org.apache.maven.plugins</groupId>
+				<artifactId>maven-compiler-plugin</artifactId>
+				<version>3.10.1</version>
+				<configuration>
+					<source>${maven.compiler.source}</source>
+					<target>${maven.compiler.target}</target>
+				</configuration>
+			</plugin>
+
+			<!-- Shade Plugin for fat JAR -->
+			<plugin>
+				<groupId>org.apache.maven.plugins</groupId>
+				<artifactId>maven-shade-plugin</artifactId>
+				<version>3.4.1</version>
+				<executions>
+					<execution>
+						<id>shade-restapi</id>
+						<phase>package</phase>
+						<goals>
+							<goal>shade</goal>
+						</goals>
+						<configuration>
+							<shadedArtifactAttached>true</shadedArtifactAttached>
+							<shadedClassifierName>shaded</shadedClassifierName>
+							<createDependencyReducedPom>false</createDependencyReducedPom>
+							<transformers>
+								<!-- Merge all META-INF/services files so Flyway
+								discovers PostgreSQL -->
+								<transformer
+									implementation="org.apache.maven.plugins.shade.resource.ServicesResourceTransformer" />
+								<!-- Set the main class -->
+								<transformer
+									implementation="org.apache.maven.plugins.shade.resource.ManifestResourceTransformer">
+									<mainClass>
+										org.ratemymanager.rest.MainVerticle</mainClass>
+								</transformer>
+							</transformers>
+						</configuration>
+					</execution>
+				</executions>
 			</plugin>
 
 
-
-            <!-- Optional: OpenAPI Generator Maven Plugin -->
-            <plugin>
-                <groupId>org.openapitools</groupId>
-                <artifactId>openapi-generator-maven-plugin</artifactId>
-                <version>${openapi.generator.version}</version>
-            </plugin>
-        </plugins>
-    </build>
+			<!-- Optional: OpenAPI Generator Maven Plugin -->
+			<plugin>
+				<groupId>org.openapitools</groupId>
+				<artifactId>openapi-generator-maven-plugin</artifactId>
+				<version>${openapi.generator.version}</version>
+			</plugin>
+		</plugins>
+	</build>
 </project>

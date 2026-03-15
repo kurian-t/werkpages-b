@@ -704,24 +704,24 @@ public class ManagersHandler {
 
             // Read ratings using display-name keys — matches what the frontend sends
             Tuple params = Tuple.of(
-                managerId,
-                userId,
-                author,
-                overallRating,
-                ratings.getDouble("Communication Style"),
-                ratings.getDouble("Perceived Approachability"),
-                ratings.getDouble("Perceived Clarity of Expectations"),
-                ratings.getDouble("Feedback Style"),
-                ratings.getDouble("Perceived Supportiveness"),
-                ratings.getDouble("Decision Making Style"),
-                ratings.getDouble("Organization and Planning Style"),
-                ratings.getDouble("Delegation Style"),
-                ratings.getDouble("Perceived Professional Demeanor"),
-                ratings.getDouble("Overall Working Experience"),
-                managerCompany,
-                managerTitle,
-                text
-            );
+            	    managerId,
+            	    userId,
+            	    author,
+            	    overallRating,
+            	    ratings.getDouble("Communication Style") != null ? ratings.getDouble("Communication Style") : ratings.getDouble("communication_style"),
+            	    ratings.getDouble("Perceived Approachability") != null ? ratings.getDouble("Perceived Approachability") : ratings.getDouble("perceived_approachability"),
+            	    ratings.getDouble("Perceived Clarity of Expectations") != null ? ratings.getDouble("Perceived Clarity of Expectations") : ratings.getDouble("perceived_clarity_of_expectations"),
+            	    ratings.getDouble("Feedback Style") != null ? ratings.getDouble("Feedback Style") : ratings.getDouble("feedback_style"),
+            	    ratings.getDouble("Perceived Supportiveness") != null ? ratings.getDouble("Perceived Supportiveness") : ratings.getDouble("perceived_supportiveness"),
+            	    ratings.getDouble("Decision Making Style") != null ? ratings.getDouble("Decision Making Style") : ratings.getDouble("decision_making_style"),
+            	    ratings.getDouble("Organization and Planning Style") != null ? ratings.getDouble("Organization and Planning Style") : ratings.getDouble("organization_and_planning_style"),
+            	    ratings.getDouble("Delegation Style") != null ? ratings.getDouble("Delegation Style") : ratings.getDouble("delegation_style"),
+            	    ratings.getDouble("Perceived Professional Demeanor") != null ? ratings.getDouble("Perceived Professional Demeanor") : ratings.getDouble("perceived_professional_demeanor"),
+            	    ratings.getDouble("Overall Working Experience") != null ? ratings.getDouble("Overall Working Experience") : ratings.getDouble("overall_working_experience"),
+            	    managerCompany,
+            	    managerTitle,
+            	    text
+            	);
 
             String insertSql = """
                 INSERT INTO reviews (

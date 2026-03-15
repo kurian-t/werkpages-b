@@ -6,27 +6,26 @@ import io.vertx.pgclient.PgConnectOptions;
 import io.vertx.sqlclient.SqlClient;
 import io.vertx.sqlclient.Pool;
 import org.flywaydb.core.Flyway;
+import org.ratemymanager.config.SecretsConfig;
 
 public class Database {
 
     private static Pool client;
 
-    // Initialize pool and run Flyway migrations
-    public static void init(Vertx vertx) {
-        // PostgreSQL connection options
+    public static void init(Vertx vertx, SecretsConfig secrets) {
         PgConnectOptions connectOptions = new PgConnectOptions()
-                .setPort(5432)
-                .setHost("localhost")
-                .setDatabase("rmm")
-                .setUser("postgres")
-                .setPassword("postgres");
+            .setPort(secrets.dbPort)
+            .setHost(secrets.dbHost)
+            .setDatabase(secrets.dbName)
+            .setUser(secrets.dbUser)
+            .setPassword(secrets.dbPassword)
+            .setSslMode(io.vertx.pgclient.SslMode.REQUIRE); // always use SSL to RDS
 
         PoolOptions poolOptions = new PoolOptions().setMaxSize(10);
 
-        // Run Flyway migrations asynchronously
         vertx.executeBlocking(promise -> {
             try {
-                Class.forName("org.postgresql.Driver"); // load driver
+                Class.forName("org.postgresql.Driver");
                 runMigrations(connectOptions);
                 promise.complete();
             } catch (Exception e) {
@@ -35,8 +34,9 @@ public class Database {
         }, res -> {
             if (res.succeeded()) {
                 client = Pool.pool(vertx, connectOptions, poolOptions);
-                System.out.println("Database pool ready!");
+                System.out.println("✓ Database pool ready");
             } else {
+                System.err.println("✗ Database init failed: " + res.cause().getMessage());
                 res.cause().printStackTrace();
             }
         });
@@ -46,28 +46,25 @@ public class Database {
         return client;
     }
 
-    // Flyway migration
     private static void runMigrations(PgConnectOptions connectOptions) {
         String jdbcUrl = String.format(
-                "jdbc:postgresql://%s:%d/%s",
-                connectOptions.getHost(),
-                connectOptions.getPort(),
-                connectOptions.getDatabase()
+            "jdbc:postgresql://%s:%d/%s?sslmode=require",
+            connectOptions.getHost(),
+            connectOptions.getPort(),
+            connectOptions.getDatabase()
         );
+
         ClassLoader originalClassLoader = Thread.currentThread().getContextClassLoader();
         try {
-            // Set the ClassLoader to the one that loaded Database.class (inside the fat JAR)
             Thread.currentThread().setContextClassLoader(Database.class.getClassLoader());
-
             Flyway flyway = Flyway.configure()
-                    .dataSource(jdbcUrl, connectOptions.getUser(), connectOptions.getPassword())
-                    .schemas("public")
-                    .locations("classpath:db/migrations")
-                    .load();
-
+                .dataSource(jdbcUrl, connectOptions.getUser(), connectOptions.getPassword())
+                .schemas("public")
+                .locations("classpath:db/migrations")
+                .load();
             flyway.migrate();
+            System.out.println("✓ Flyway migrations complete");
         } finally {
-            // Restore original ClassLoader
             Thread.currentThread().setContextClassLoader(originalClassLoader);
         }
     }

@@ -85,3 +85,18 @@ CREATE TABLE reviews (
 CREATE INDEX idx_reviews_manager_id ON reviews(manager_id);
 CREATE INDEX idx_reviews_created_at ON reviews(created_at DESC);
 
+CREATE TABLE reports (
+    id          UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    manager_id  BIGINT NOT NULL REFERENCES managers(id) ON DELETE CASCADE,
+    user_id     UUID REFERENCES users(id) ON DELETE SET NULL,
+    reason      TEXT NOT NULL CHECK (reason IN (
+                    'incorrect_person',
+                    'never_worked_here',
+                    'duplicate_profile',
+                    'incorrect_information',
+                    'other'
+                )),
+    comment     TEXT,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
