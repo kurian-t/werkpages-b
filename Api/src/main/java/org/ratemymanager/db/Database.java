@@ -11,15 +11,21 @@ import org.ratemymanager.config.SecretsConfig;
 public class Database {
 
     private static Pool client;
-
+    private static boolean useSSL = "true".equalsIgnoreCase(System.getenv("USE_AWS_SECRETS"));
+    
     public static void init(Vertx vertx, SecretsConfig secrets) {
+    	
         PgConnectOptions connectOptions = new PgConnectOptions()
             .setPort(secrets.dbPort)
             .setHost(secrets.dbHost)
             .setDatabase(secrets.dbName)
             .setUser(secrets.dbUser)
-            .setPassword(secrets.dbPassword)
-            .setSslMode(io.vertx.pgclient.SslMode.REQUIRE); // always use SSL to RDS
+            .setPassword(secrets.dbPassword);
+           
+
+		if (useSSL) {
+		    connectOptions.setSslMode(io.vertx.pgclient.SslMode.REQUIRE);
+		}
 
         PoolOptions poolOptions = new PoolOptions().setMaxSize(10);
 
@@ -47,13 +53,14 @@ public class Database {
     }
 
     private static void runMigrations(PgConnectOptions connectOptions) {
-        String jdbcUrl = String.format(
-            "jdbc:postgresql://%s:%d/%s?sslmode=require",
-            connectOptions.getHost(),
-            connectOptions.getPort(),
-            connectOptions.getDatabase()
-        );
-
+    	String sslSuffix = useSSL ? "?sslmode=require" : "";
+    	String jdbcUrl = String.format(
+    		    "jdbc:postgresql://%s:%d/%s%s",
+    		    connectOptions.getHost(),
+    		    connectOptions.getPort(),
+    		    connectOptions.getDatabase(),
+    		    sslSuffix
+    		);
         ClassLoader originalClassLoader = Thread.currentThread().getContextClassLoader();
         try {
             Thread.currentThread().setContextClassLoader(Database.class.getClassLoader());

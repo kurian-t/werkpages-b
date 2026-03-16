@@ -119,8 +119,12 @@ public class MainVerticle extends AbstractVerticle {
                         allowedMethods.add(HttpMethod.OPTIONS);
 
                         // CORS — updated to production domain
+                        String allowedOrigin = "true".equalsIgnoreCase(System.getenv("USE_AWS_SECRETS"))
+                        	    ? "https://ratemymanagers.ca"
+                        	    : "http://localhost:8080";
+                        
                         router.route().handler(
-                            CorsHandler.create("https://ratemymanagers.ca")
+                            CorsHandler.create(allowedOrigin)
                                 .allowedHeaders(allowedHeaders)
                                 .allowedMethods(allowedMethods)
                                 .allowCredentials(true)

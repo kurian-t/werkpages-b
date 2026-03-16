@@ -1,0 +1,11 @@
+# Backend .dockerignore
+# Place this at: ~/eclipse-workspace/RateMyManagerBackend/RateMyManagerBackend/.dockerignore
+
+target/
+*.iml
+.idea/
+.eclipse/
+.settings/
+.classpath
+.project
+*.log

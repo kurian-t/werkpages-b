@@ -474,7 +474,7 @@ paths:
 
   /api/managers/{managerId}/reviews/{reviewId}:
     put:
-      operationId: handleUpdateReview
+      operationId: updateManagerReview
       summary: Update an existing review
       parameters:
         - in: path
