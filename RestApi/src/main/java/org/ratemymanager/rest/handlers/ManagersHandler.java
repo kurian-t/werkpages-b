@@ -616,7 +616,7 @@ public class ManagersHandler {
                 .end(new JsonObject().put("error", "Unauthorized").encode());
             return;
         }
-        String userIdQuery = "SELECT id FROM users WHERE auth0_id = $1";
+        String userIdQuery = "SELECT id, username FROM users WHERE auth0_id = $1";
         db.preparedQuery(userIdQuery).execute(Tuple.of(auth0Id), userAr -> {
             if (userAr.failed()) {
                 ctx.response()
@@ -632,7 +632,9 @@ public class ManagersHandler {
                     .end(new JsonObject().put("error", "User not found").encode());
                 return;
             }
-            UUID userId = userAr.result().iterator().next().getUUID("id");
+            Row userRow = userAr.result().iterator().next();
+            UUID userId = userRow.getUUID("id");
+            String author = userRow.getString("username"); // always use the real username, never trust the request body
             long managerId;
             try {
                 managerId = Long.parseLong(ctx.pathParam("id"));
@@ -651,19 +653,15 @@ public class ManagersHandler {
                    .end(new JsonObject().put("error", "Missing request body").encode());
                 return;
             }
-            String author = body.getString("author");
+            // author is derived from the authenticated session, not from the request body
             Double overallRating = body.getDouble("overallRating");
             JsonObject ratings = body.getJsonObject("ratings");
             String managerCompany = body.getString("managerCompany");
             String managerTitle = body.getString("managerTitle");
             String text = body.getString("text");
-            if (ValidationUtils.isBlank(author) || overallRating == null || ratings == null ||
+            if (overallRating == null || ratings == null ||
                 ValidationUtils.isBlank(managerCompany) || ValidationUtils.isBlank(managerTitle)) {
                 ValidationUtils.badRequest(ctx, "Missing required fields");
-                return;
-            }
-            if (ValidationUtils.exceedsLength(author, 50)) {
-                ValidationUtils.badRequest(ctx, "Author name must be at most 50 characters");
                 return;
             }
             if (ValidationUtils.exceedsLength(managerCompany, 100)) {
@@ -1136,22 +1134,11 @@ public class ManagersHandler {
     }
 
     public void handleRecalculateManagerStats(RoutingContext ctx) {
-        String authHeader = ctx.request().getHeader("Authorization");
-        if (authHeader == null || !authHeader.startsWith("Bearer ")) {
+        if (ctx.get("auth0Id") == null) {
             ctx.response()
                 .setStatusCode(401)
                 .putHeader("Content-Type", "application/json")
-                .end(new JsonObject().put("error", "Missing or invalid Authorization header").encode());
-            return;
-        }
-        String token = authHeader.substring("Bearer ".length());
-        try {
-            JWT.decode(token);
-        } catch (JWTDecodeException e) {
-            ctx.response()
-                .setStatusCode(401)
-                .putHeader("Content-Type", "application/json")
-                .end(new JsonObject().put("error", "Invalid token").encode());
+                .end(new JsonObject().put("error", "Unauthorized").encode());
             return;
         }
         long managerId;
