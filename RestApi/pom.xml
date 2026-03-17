@@ -66,6 +66,12 @@
 			<artifactId>vertx-web-client</artifactId>
 			<version>${vertx.version}</version> <!-- Use the latest version -->
 		</dependency>
+		<dependency>
+		    <groupId>io.vertx</groupId>
+		    <artifactId>vertx-web</artifactId>
+		  	<version>${vertx.version}</version> <!-- Use the latest version -->
+		</dependency>
+
 		<!-- Apache Commons IO (required for OpenAPI3RouterFactory) -->
 		<dependency>
 			<groupId>commons-io</groupId>

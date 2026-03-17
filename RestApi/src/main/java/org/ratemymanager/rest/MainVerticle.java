@@ -64,7 +64,6 @@ public class MainVerticle extends AbstractVerticle {
 
                         routerFactory.addHandlerByOperationId("getManagers",           managersHandler::handleGetManagers);
                         routerFactory.addHandlerByOperationId("getManagerById",        managersHandler::handleGetManagerById);
-                        routerFactory.addHandlerByOperationId("recalculateManagerStats", managersHandler::handleRecalculateManagerStats);
                         routerFactory.addHandlerByOperationId("createManager",         managersHandler::handleCreateManager);
                         routerFactory.addHandlerByOperationId("updateManager",         managersHandler::handleUpdateManager);
                         routerFactory.addHandlerByOperationId("createManagerReview",   managersHandler::handleCreateManagerReview);
@@ -82,7 +81,8 @@ public class MainVerticle extends AbstractVerticle {
                             secrets.auth0Domain,
                             secrets.auth0ClientId,
                             secrets.auth0ClientSecret,
-                            secrets.auth0Audience
+                            secrets.auth0Audience,
+                            vertx
                         );
                         routerFactory.addHandlerByOperationId("signup",  authHandler::handleSignup);
                         routerFactory.addHandlerByOperationId("signin",  authHandler::handleSignin);
@@ -91,15 +91,35 @@ public class MainVerticle extends AbstractVerticle {
                         routerFactory.addHandlerByOperationId("deleteMe", authHandler::handleDeleteMe);
                         
                         routerFactory.addSecurityHandler("bearerAuth", routingContext -> {
+                            // Accept token from Authorization header OR HttpOnly cookie
+                            String token = null;
                             String authHeader = routingContext.request().getHeader("Authorization");
-                            if (authHeader == null || !authHeader.startsWith("Bearer ")) {
+                            if (authHeader != null && authHeader.startsWith("Bearer ")) {
+                                token = authHeader.substring(7);
+                            } else {
+                                String cookieHeader = routingContext.request().getHeader("Cookie");
+                                if (cookieHeader != null) {
+                                    for (String part : cookieHeader.split(";")) {
+                                        String trimmed = part.trim();
+                                        if (trimmed.startsWith("auth_token=")) {
+                                            token = trimmed.substring("auth_token=".length());
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                            if (token == null) {
                                 routingContext.fail(401);
                                 return;
                             }
-                            String token = authHeader.substring(7);
-                            jwtAuth.authenticate(new JsonObject().put("token", token), res -> {
+                            final String finalToken = token;
+                            jwtAuth.authenticate(new JsonObject().put("token", finalToken), res -> {
                                 if (res.succeeded()) {
                                     routingContext.setUser(res.result());
+                                    try {
+                                        com.auth0.jwt.interfaces.DecodedJWT decoded = com.auth0.jwt.JWT.decode(finalToken);
+                                        routingContext.put("auth0Id", decoded.getSubject());
+                                    } catch (Exception ignored) {}
                                     routingContext.next();
                                 } else {
                                     routingContext.fail(401);
@@ -114,6 +134,7 @@ public class MainVerticle extends AbstractVerticle {
                         allowedHeaders.add("Authorization");
                         allowedHeaders.add("Content-Type");
                         allowedHeaders.add("Accept");
+                        allowedHeaders.add("Cookie");
 
                         Set<HttpMethod> allowedMethods = new HashSet<>();
                         allowedMethods.add(HttpMethod.GET);
@@ -124,7 +145,7 @@ public class MainVerticle extends AbstractVerticle {
 
                         // CORS — updated to production domain
                         String allowedOrigin = "true".equalsIgnoreCase(System.getenv("USE_AWS_SECRETS"))
-                        	    ? "https://ratemymanagers.ca|https://www.ratemymanagers.ca"
+                        	    ? "https://ratemymanagers\\.ca|https://www\\.ratemymanagers\\.ca"
                         	    : "http://localhost:8080";
                         
                         router.route().handler(
@@ -144,6 +165,20 @@ public class MainVerticle extends AbstractVerticle {
                         router.post("/api/*").handler(writeLimiter::handle);
                         router.put("/api/*").handler(writeLimiter::handle);
                         router.delete("/api/*").handler(writeLimiter::handle);
+
+                        // Security headers
+                        router.route().handler(secCtx -> {
+                            secCtx.response()
+                                .putHeader("X-Content-Type-Options", "nosniff")
+                                .putHeader("X-Frame-Options", "DENY")
+                                .putHeader("X-XSS-Protection", "0")
+                                .putHeader("Referrer-Policy", "strict-origin-when-cross-origin");
+                            boolean isProd = "true".equalsIgnoreCase(System.getenv("USE_AWS_SECRETS"));
+                            if (isProd) {
+                                secCtx.response().putHeader("Strict-Transport-Security", "max-age=31536000; includeSubDomains");
+                            }
+                            secCtx.next();
+                        });
 
                         router.mountSubRouter("/", apiRouter);
 

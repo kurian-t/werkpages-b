@@ -1,13 +1,8 @@
 package org.ratemymanager.rest.handlers;
 
+import io.vertx.core.Vertx;
 import io.vertx.core.buffer.Buffer;
-import io.vertx.core.json.JsonObject;
-
-import java.util.UUID;
-
-import com.auth0.jwt.JWT;
-import com.auth0.jwt.exceptions.JWTDecodeException;
-import com.auth0.jwt.interfaces.DecodedJWT;
+import io.vertx.core.json.JsonObject; 
 import io.vertx.ext.web.RoutingContext;
 import io.vertx.ext.web.client.HttpResponse;
 import io.vertx.ext.web.client.WebClient;
@@ -16,6 +11,8 @@ import io.vertx.sqlclient.RowSet;
 import io.vertx.sqlclient.SqlClient;
 import io.vertx.sqlclient.Tuple;
 
+import java.util.UUID;
+
 public class AuthHandler {
 
     private final SqlClient db;
@@ -23,13 +20,15 @@ public class AuthHandler {
     private final String clientId;
     private final String clientSecret;
     private final String audience;
+    private final WebClient webClient;
 
-    public AuthHandler(SqlClient db, String auth0Domain, String clientId, String clientSecret, String audience) {
+    public AuthHandler(SqlClient db, String auth0Domain, String clientId, String clientSecret, String audience, Vertx vertx) {
         this.db            = db;
         this.auth0Domain   = auth0Domain;
         this.clientId      = clientId;
         this.clientSecret  = clientSecret;
         this.audience      = audience;
+        this.webClient     = WebClient.create(vertx);
     }
 
     // ---------------- SIGNUP ----------------
@@ -77,8 +76,6 @@ public class AuthHandler {
             return;
         }
 
-        WebClient client = WebClient.create(ctx.vertx());
-
         JsonObject auth0Payload = new JsonObject()
             .put("client_id", this.clientId)
             .put("email", email)
@@ -90,7 +87,7 @@ public class AuthHandler {
                 .put("username", username)
             );
 
-        client.post(443, auth0Domain, "/dbconnections/signup")
+        this.webClient.post(443, auth0Domain, "/dbconnections/signup")
             .ssl(true)
             .putHeader("Content-Type", "application/json")
             .sendJsonObject(auth0Payload, ar -> {
@@ -104,9 +101,10 @@ public class AuthHandler {
                 if (response.statusCode() != 200) {
                     System.err.println("Auth0 signup error: " + response.statusCode() + " - " + response.bodyAsString());
                     ctx.response()
-                        .setStatusCode(response.statusCode())
+                        .setStatusCode(400)
                         .putHeader("Content-Type", "application/json")
-                        .end(response.bodyAsString());
+                        .end(new JsonObject().put("error", "registration_failed")
+                            .put("message", "Registration failed. Please check your details and try again.").encode());
                     return;
                 }
 
@@ -167,8 +165,6 @@ public class AuthHandler {
             return;
         }
 
-        WebClient client = WebClient.create(ctx.vertx());
-
         JsonObject payload = new JsonObject()
             .put("grant_type", "password")
             .put("username", email)
@@ -178,7 +174,7 @@ public class AuthHandler {
             .put("client_id", this.clientId)
             .put("client_secret", this.clientSecret);
 
-        client.post(443, auth0Domain, "/oauth/token")
+        this.webClient.post(443, auth0Domain, "/oauth/token")
             .ssl(true)
             .putHeader("Content-Type", "application/json")
             .sendJsonObject(payload, ar -> {
@@ -193,10 +189,22 @@ public class AuthHandler {
                 // Check BEFORE parsing JSON — Auth0 error responses may not be valid JSON
                 if (response.statusCode() != 200) {
                     System.err.println("Auth0 signin error: " + response.statusCode() + " - " + response.bodyAsString());
-                    ctx.response()
-                        .setStatusCode(response.statusCode())
-                        .putHeader("Content-Type", "application/json")
-                        .end(response.bodyAsString());
+                    // Check specifically for unverified email (need this UX signal, not an enumeration risk)
+                    String responseBody = response.bodyAsString();
+                    boolean isUnverified = responseBody != null && responseBody.toLowerCase().contains("verify");
+                    if (isUnverified) {
+                        ctx.response()
+                            .setStatusCode(403)
+                            .putHeader("Content-Type", "application/json")
+                            .end(new JsonObject().put("error", "email_not_verified")
+                                .put("message", "Please verify your email before signing in.").encode());
+                    } else {
+                        ctx.response()
+                            .setStatusCode(401)
+                            .putHeader("Content-Type", "application/json")
+                            .end(new JsonObject().put("error", "authentication_failed")
+                                .put("message", "Invalid email or password.").encode());
+                    }
                     return;
                 }
 
@@ -208,24 +216,29 @@ public class AuthHandler {
                     String auth0Id = decoded.getSubject();
 
                     db.preparedQuery("SELECT email, username, first_name, last_name FROM users WHERE auth0_id = $1")
-                        .execute(io.vertx.sqlclient.Tuple.of(auth0Id), dbAr -> {
+                        .execute(Tuple.of(auth0Id), dbAr -> {
                             if (dbAr.failed()) {
                                 ctx.fail(dbAr.cause());
                                 return;
                             }
 
-                            io.vertx.sqlclient.RowSet<io.vertx.sqlclient.Row> rows = dbAr.result();
+                            RowSet<Row> rows = dbAr.result();
                             if (!rows.iterator().hasNext()) {
                                 ctx.response().setStatusCode(401).end("{\"error\":\"User record not found in local database\"}");
                                 return;
                             }
 
-                            io.vertx.sqlclient.Row row = rows.iterator().next();
+                            Row row = rows.iterator().next();
 
+                            boolean isProd = "true".equalsIgnoreCase(System.getenv("USE_AWS_SECRETS"));
+                            String sameSite = isProd ? "None" : "Strict";
+                            String setCookie = "auth_token=" + accessToken
+                                + "; HttpOnly; Path=/; Max-Age=86400; SameSite=" + sameSite
+                                + (isProd ? "; Secure" : "");
                             ctx.response()
+                                .putHeader("Set-Cookie", setCookie)
                                 .putHeader("Content-Type", "application/json")
                                 .end(new JsonObject()
-                                    .put("token", accessToken)
                                     .put("user", new JsonObject()
                                         .put("email", row.getString("email"))
                                         .put("username", row.getString("username"))
@@ -244,28 +257,7 @@ public class AuthHandler {
 
     // ---------------- ME ----------------
     public void handleMe(RoutingContext ctx) {
-        String authHeader = ctx.request().getHeader("Authorization");
-        if (authHeader == null || !authHeader.startsWith("Bearer ")) {
-            ctx.response()
-               .setStatusCode(401)
-               .putHeader("Content-Type", "application/json")
-               .end(new JsonObject().put("error", "Missing or invalid Authorization header").encode());
-            return;
-        }
-
-        String token = authHeader.substring("Bearer ".length());
-        DecodedJWT decoded;
-        try {
-            decoded = JWT.decode(token);
-        } catch (JWTDecodeException e) {
-            ctx.response()
-               .setStatusCode(401)
-               .putHeader("Content-Type", "application/json")
-               .end(new JsonObject().put("error", "Invalid token").encode());
-            return;
-        }
-
-        String auth0Id = decoded.getClaim("sub").asString();
+        String auth0Id = ctx.get("auth0Id");
         if (auth0Id == null) {
             ctx.response()
                .setStatusCode(401)
@@ -273,8 +265,7 @@ public class AuthHandler {
                .end(new JsonObject().put("error", "Unauthorized").encode());
             return;
         }
-
-        db.preparedQuery("SELECT * FROM users WHERE auth0_id = $1")
+        db.preparedQuery("SELECT id, auth0_id, email, username, first_name, last_name, created_at FROM users WHERE auth0_id = $1")
           .execute(Tuple.of(auth0Id), ar -> {
             if (ar.failed()) {
                 ctx.fail(ar.cause());
@@ -311,35 +302,13 @@ public class AuthHandler {
     // ---------------- SIGNOUT ----------------
     public void handleSignout(RoutingContext ctx) {
         ctx.response()
+            .putHeader("Set-Cookie", "auth_token=; HttpOnly; Path=/; Max-Age=0")
             .putHeader("Content-Type", "application/json")
-            .end(new JsonObject()
-                .put("success", true)
-                .encode());
+            .end(new JsonObject().put("success", true).encode());
     }
     
     public void handleDeleteMe(RoutingContext ctx) {
-        String authHeader = ctx.request().getHeader("Authorization");
-        if (authHeader == null || !authHeader.startsWith("Bearer ")) {
-            ctx.response()
-               .setStatusCode(401)
-               .putHeader("Content-Type", "application/json")
-               .end(new JsonObject().put("error", "Missing or invalid Authorization header").encode());
-            return;
-        }
-
-        String token = authHeader.substring("Bearer ".length());
-        DecodedJWT decoded;
-        try {
-            decoded = JWT.decode(token);
-        } catch (JWTDecodeException e) {
-            ctx.response()
-               .setStatusCode(401)
-               .putHeader("Content-Type", "application/json")
-               .end(new JsonObject().put("error", "Invalid token").encode());
-            return;
-        }
-
-        String auth0Id = decoded.getClaim("sub").asString();
+        String auth0Id = ctx.get("auth0Id");
         if (auth0Id == null) {
             ctx.response()
                .setStatusCode(401)
@@ -347,7 +316,6 @@ public class AuthHandler {
                .end(new JsonObject().put("error", "Unauthorized").encode());
             return;
         }
-
         // Step 1: Look up the user's internal UUID
         db.preparedQuery("SELECT id FROM users WHERE auth0_id = $1")
           .execute(Tuple.of(auth0Id), userAr -> {

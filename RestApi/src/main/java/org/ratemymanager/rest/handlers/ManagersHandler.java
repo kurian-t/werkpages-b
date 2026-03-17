@@ -344,23 +344,11 @@ public class ManagersHandler {
     }
 
     public void handleCreateManager(RoutingContext ctx) {
-        String authHeader = ctx.request().getHeader("Authorization");
-        if (authHeader == null || !authHeader.startsWith("Bearer ")) {
+        if (ctx.get("auth0Id") == null) {
             ctx.response()
                 .setStatusCode(401)
                 .putHeader("Content-Type", "application/json")
-                .end(new JsonObject().put("error", "Missing or invalid Authorization header").encode());
-            return;
-        }
-        String token = authHeader.substring("Bearer ".length());
-        DecodedJWT decoded;
-        try {
-            decoded = JWT.decode(token);
-        } catch (JWTDecodeException e) {
-            ctx.response()
-                .setStatusCode(401)
-                .putHeader("Content-Type", "application/json")
-                .end(new JsonObject().put("error", "Invalid token").encode());
+                .end(new JsonObject().put("error", "Unauthorized").encode());
             return;
         }
 
@@ -450,23 +438,11 @@ public class ManagersHandler {
     }
 
     public void handleUpdateManager(RoutingContext ctx) {
-        String authHeader = ctx.request().getHeader("Authorization");
-        if (authHeader == null || !authHeader.startsWith("Bearer ")) {
+        if (ctx.get("auth0Id") == null) {
             ctx.response()
                 .setStatusCode(401)
                 .putHeader("Content-Type", "application/json")
-                .end(new JsonObject().put("error", "Missing or invalid Authorization header").encode());
-            return;
-        }
-        String token = authHeader.substring("Bearer ".length());
-        DecodedJWT decoded;
-        try {
-            decoded = JWT.decode(token);
-        } catch (JWTDecodeException e) {
-            ctx.response()
-                .setStatusCode(401)
-                .putHeader("Content-Type", "application/json")
-                .end(new JsonObject().put("error", "Invalid token").encode());
+                .end(new JsonObject().put("error", "Unauthorized").encode());
             return;
         }
         long managerId;
@@ -487,18 +463,16 @@ public class ManagersHandler {
                .end(new JsonObject().put("error", "Nothing to update").encode());
             return;
         }
-        String newCompany         = body.getString("company");
-        String newTitle           = body.getString("title");
-        String newImage           = body.getString("image");
-        String newBio             = body.getString("bio");
-        String newStatus          = body.getString("status");
-        JsonObject newCategoryAvg = body.getJsonObject("categoryAverages");
-        String newLinkedinUrl     = body.getString("linkedinUrl");
-        Number newOverallRating   = body.containsKey("overallRating") ? body.getNumber("overallRating") : null;
-        Integer newReviewsCount   = body.containsKey("reviews") ? body.getInteger("reviews") : null;
+        String newCompany     = body.getString("company");
+        String newTitle       = body.getString("title");
+        String newImage       = body.getString("image");
+        String newBio         = body.getString("bio");
+        String newStatus      = body.getString("status");
+        String newLinkedinUrl = body.getString("linkedinUrl");
+        // overallRating, reviews (reviews_count), and categoryAverages are computed fields —
+        // they are only written by recalculateAndPersist, never accepted from user input.
         boolean hasAnyField = newCompany != null || newTitle != null || newImage != null
-            || newBio != null || newStatus != null || newCategoryAvg != null
-            || newLinkedinUrl != null || newOverallRating != null || newReviewsCount != null;
+            || newBio != null || newStatus != null || newLinkedinUrl != null;
         if (!hasAnyField) {
             ctx.response()
                .setStatusCode(400)
@@ -553,15 +527,12 @@ public class ManagersHandler {
                 StringBuilder sql = new StringBuilder("UPDATE managers SET ");
                 List<Object> paramsList = new ArrayList<>();
                 int idx = 1;
-                if (newCompany != null)      { sql.append("company = $").append(idx++).append(", ");           paramsList.add(newCompany); }
-                if (newTitle != null)        { sql.append("title = $").append(idx++).append(", ");             paramsList.add(newTitle); }
-                if (newImage != null)        { sql.append("image = $").append(idx++).append(", ");             paramsList.add(newImage); }
-                if (newBio != null)          { sql.append("bio = $").append(idx++).append(", ");               paramsList.add(newBio); }
-                if (newStatus != null)       { sql.append("status = $").append(idx++).append(", ");            paramsList.add(newStatus); }
-                if (newCategoryAvg != null)  { sql.append("category_averages = $").append(idx++).append(", "); paramsList.add(newCategoryAvg); }
-                if (newLinkedinUrl != null)  { sql.append("linkedin_url = $").append(idx++).append(", ");      paramsList.add(newLinkedinUrl); }
-                if (newOverallRating != null){ sql.append("overall_rating = $").append(idx++).append(", ");    paramsList.add(newOverallRating); }
-                if (newReviewsCount != null) { sql.append("reviews_count = $").append(idx++).append(", ");     paramsList.add(newReviewsCount); }
+                if (newCompany != null)  { sql.append("company = $").append(idx++).append(", ");      paramsList.add(newCompany); }
+                if (newTitle != null)    { sql.append("title = $").append(idx++).append(", ");        paramsList.add(newTitle); }
+                if (newImage != null)    { sql.append("image = $").append(idx++).append(", ");        paramsList.add(newImage); }
+                if (newBio != null)      { sql.append("bio = $").append(idx++).append(", ");          paramsList.add(newBio); }
+                if (newStatus != null)   { sql.append("status = $").append(idx++).append(", ");       paramsList.add(newStatus); }
+                if (newLinkedinUrl != null) { sql.append("linkedin_url = $").append(idx++).append(", "); paramsList.add(newLinkedinUrl); }
                 sql.delete(sql.length() - 2, sql.length());
                 sql.append(" WHERE id = $").append(idx).append(" RETURNING *");
                 paramsList.add(managerId);
@@ -630,25 +601,12 @@ public class ManagersHandler {
     }
 
     public void handleCreateManagerReview(RoutingContext ctx) {
-        String authHeader = ctx.request().getHeader("Authorization");
-        if (authHeader == null || !authHeader.startsWith("Bearer ")) {
+        String auth0Id = ctx.get("auth0Id");
+        if (auth0Id == null) {
             ctx.response()
                 .setStatusCode(401)
                 .putHeader("Content-Type", "application/json")
-                .end(new JsonObject().put("error", "Missing or invalid Authorization header").encode());
-            return;
-        }
-        String token = authHeader.substring("Bearer ".length());
-        DecodedJWT decoded;
-        String auth0Id = null;
-        try {
-            decoded = JWT.decode(token);
-            auth0Id = decoded.getClaim("sub").asString();
-        } catch (JWTDecodeException e) {
-            ctx.response()
-                .setStatusCode(401)
-                .putHeader("Content-Type", "application/json")
-                .end(new JsonObject().put("error", "Invalid token").encode());
+                .end(new JsonObject().put("error", "Unauthorized").encode());
             return;
         }
         String userIdQuery = "SELECT id FROM users WHERE auth0_id = $1";
@@ -797,6 +755,7 @@ public class ManagersHandler {
                    .setStatusCode(201)
                    .putHeader("Content-Type", "application/json")
                    .end(response.encode());
+                recalculateInBackground(managerId);
             });
         });
     }
@@ -929,27 +888,7 @@ public class ManagersHandler {
     }
 
     public void handleUpdateReview(RoutingContext ctx) {
-        String authHeader = ctx.request().getHeader("Authorization");
-        if (authHeader == null || !authHeader.startsWith("Bearer ")) {
-            ctx.response()
-                .setStatusCode(401)
-                .putHeader("Content-Type", "application/json")
-                .end(new JsonObject().put("error", "Missing or invalid Authorization header").encode());
-            return;
-        }
-        String token = authHeader.substring("Bearer ".length());
-        DecodedJWT decoded;
-        String auth0Id;
-        try {
-            decoded = JWT.decode(token);
-            auth0Id = decoded.getClaim("sub").asString();
-        } catch (JWTDecodeException e) {
-            ctx.response()
-                .setStatusCode(401)
-                .putHeader("Content-Type", "application/json")
-                .end(new JsonObject().put("error", "Invalid token").encode());
-            return;
-        }
+        String auth0Id = ctx.get("auth0Id");
         if (auth0Id == null) {
             ctx.response()
                .setStatusCode(401)
@@ -1109,31 +1048,13 @@ public class ManagersHandler {
                .setStatusCode(200)
                .putHeader("Content-Type", "application/json")
                .end(response.encode());
+            recalculateInBackground(managerId);
             });  // end updateSql execute
         });  // end user lookup execute
     }
 
     public void handleDeleteManagerReview(RoutingContext ctx) {
-        String authHeader = ctx.request().getHeader("Authorization");
-        if (authHeader == null || !authHeader.startsWith("Bearer ")) {
-            ctx.response()
-                .setStatusCode(401)
-                .putHeader("Content-Type", "application/json")
-                .end(new JsonObject().put("error", "Missing or invalid Authorization header").encode());
-            return;
-        }
-        String token = authHeader.substring("Bearer ".length());
-        DecodedJWT decoded;
-        try {
-            decoded = JWT.decode(token);
-        } catch (JWTDecodeException e) {
-            ctx.response()
-                .setStatusCode(401)
-                .putHeader("Content-Type", "application/json")
-                .end(new JsonObject().put("error", "Invalid token").encode());
-            return;
-        }
-        String auth0Id = decoded.getClaim("sub").asString();
+        String auth0Id = ctx.get("auth0Id");
         if (auth0Id == null) {
             ctx.response()
                 .setStatusCode(401)
@@ -1201,6 +1122,7 @@ public class ManagersHandler {
                            .put("success", true)
                            .put("message", "Review deleted")
                            .encode());
+                    recalculateInBackground(managerId);
                 });
             });
         });
@@ -1255,6 +1177,60 @@ public class ManagersHandler {
                         .end(updatedManager.encode());
                 });
             });
+    }
+
+    // Fires recalculation after a review mutation without blocking the response or needing ctx
+    private void recalculateInBackground(long managerId) {
+        String recalcSql = """
+            SELECT
+                COUNT(*)::INTEGER                                           AS reviews_count,
+                ROUND(AVG(overall_rating)::NUMERIC, 1)                     AS overall_rating,
+                ROUND(AVG(communication_style)::NUMERIC, 1)                AS communication_style,
+                ROUND(AVG(perceived_approachability)::NUMERIC, 1)          AS perceived_approachability,
+                ROUND(AVG(perceived_clarity_of_expectations)::NUMERIC, 1)  AS perceived_clarity_of_expectations,
+                ROUND(AVG(feedback_style)::NUMERIC, 1)                     AS feedback_style,
+                ROUND(AVG(perceived_supportiveness)::NUMERIC, 1)           AS perceived_supportiveness,
+                ROUND(AVG(decision_making_style)::NUMERIC, 1)              AS decision_making_style,
+                ROUND(AVG(organization_and_planning_style)::NUMERIC, 1)    AS organization_and_planning_style,
+                ROUND(AVG(delegation_style)::NUMERIC, 1)                   AS delegation_style,
+                ROUND(AVG(perceived_professional_demeanor)::NUMERIC, 1)    AS perceived_professional_demeanor,
+                ROUND(AVG(overall_working_experience)::NUMERIC, 1)         AS overall_working_experience
+            FROM reviews
+            WHERE manager_id = $1
+            """;
+        db.preparedQuery(recalcSql).execute(Tuple.of(managerId), recalcAr -> {
+            if (recalcAr.failed()) {
+                System.err.println("Background recalculate failed for manager " + managerId + ": " + recalcAr.cause().getMessage());
+                return;
+            }
+            Row stats = recalcAr.result().iterator().next();
+            int reviewsCount = stats.getInteger("reviews_count");
+            java.math.BigDecimal overallRating = reviewsCount > 0 ? stats.getBigDecimal("overall_rating") : null;
+            io.vertx.core.json.JsonObject categoryAverages = new io.vertx.core.json.JsonObject();
+            if (reviewsCount > 0) {
+                categoryAverages
+                    .put("Communication Style",               nullSafeDecimal(stats.getBigDecimal("communication_style")))
+                    .put("Perceived Approachability",         nullSafeDecimal(stats.getBigDecimal("perceived_approachability")))
+                    .put("Perceived Clarity of Expectations", nullSafeDecimal(stats.getBigDecimal("perceived_clarity_of_expectations")))
+                    .put("Feedback Style",                    nullSafeDecimal(stats.getBigDecimal("feedback_style")))
+                    .put("Perceived Supportiveness",          nullSafeDecimal(stats.getBigDecimal("perceived_supportiveness")))
+                    .put("Decision Making Style",             nullSafeDecimal(stats.getBigDecimal("decision_making_style")))
+                    .put("Organization and Planning Style",   nullSafeDecimal(stats.getBigDecimal("organization_and_planning_style")))
+                    .put("Delegation Style",                  nullSafeDecimal(stats.getBigDecimal("delegation_style")))
+                    .put("Perceived Professional Demeanor",   nullSafeDecimal(stats.getBigDecimal("perceived_professional_demeanor")))
+                    .put("Overall Working Experience",        nullSafeDecimal(stats.getBigDecimal("overall_working_experience")));
+            }
+            io.vertx.core.json.JsonObject categoryAvg = reviewsCount > 0 ? categoryAverages : null;
+            String updateSql = """
+                UPDATE managers SET overall_rating = $1, reviews_count = $2, category_averages = $3, updated_at = now()
+                WHERE id = $4
+                """;
+            db.preparedQuery(updateSql).execute(Tuple.of(overallRating, reviewsCount, categoryAvg, managerId), updateAr -> {
+                if (updateAr.failed()) {
+                    System.err.println("Background recalculate update failed for manager " + managerId + ": " + updateAr.cause().getMessage());
+                }
+            });
+        });
     }
 
     public void recalculateAndPersist(long managerId, RoutingContext ctx, Handler<JsonObject> onComplete) {
@@ -1334,26 +1310,7 @@ public class ManagersHandler {
     }
 
     public void handleGetMyReviews(RoutingContext ctx) {
-        String authHeader = ctx.request().getHeader("Authorization");
-        if (authHeader == null || !authHeader.startsWith("Bearer ")) {
-            ctx.response()
-                .setStatusCode(401)
-                .putHeader("Content-Type", "application/json")
-                .end(new JsonObject().put("error", "Missing or invalid Authorization header").encode());
-            return;
-        }
-        String token = authHeader.substring("Bearer ".length());
-        DecodedJWT decoded;
-        try {
-            decoded = JWT.decode(token);
-        } catch (JWTDecodeException e) {
-            ctx.response()
-                .setStatusCode(401)
-                .putHeader("Content-Type", "application/json")
-                .end(new JsonObject().put("error", "Invalid token").encode());
-            return;
-        }
-        String auth0Id = decoded.getClaim("sub").asString();
+        String auth0Id = ctx.get("auth0Id");
         if (auth0Id == null) {
             ctx.response()
                 .setStatusCode(401)

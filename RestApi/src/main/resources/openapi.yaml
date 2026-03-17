@@ -97,7 +97,6 @@ paths:
       summary: Get current authenticated user info
       tags:
         - Auth
-      security: []
       responses:
         '200':
           description: Returns the current user
@@ -130,7 +129,6 @@ paths:
       summary: Delete the authenticated user's account and anonymize their reviews
       tags:
         - Auth
-      security: []
       responses:
         '200':
           description: Account deleted successfully
