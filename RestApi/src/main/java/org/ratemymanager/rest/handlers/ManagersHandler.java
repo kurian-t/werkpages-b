@@ -22,40 +22,7 @@ import io.vertx.sqlclient.SqlClient;
 import io.vertx.sqlclient.Tuple;
 
 public class ManagersHandler {
-	private static final String GET_MANAGERS_SQL = """
-			SELECT
-			    m.id,
-			    m.name,
-			    m.company,
-			    m.title,
-			    m.image,
-			    m.overall_rating,
-			    m.reviews_count,
-			    m.bio,
-			    m.status,
-			    m.category_averages,
-			    m.linkedin_url,
-			    m.created_at,
 
-			    COALESCE(
-			        json_agg(
-			            json_build_object(
-			                'company', ch.company,
-			                'title', ch.title,
-			                'startDate', ch.start_date,
-			                'endDate', ch.end_date
-			            )
-			            ORDER BY ch.start_date DESC
-			        ) FILTER (WHERE ch.id IS NOT NULL),
-			        '[]'
-			    ) AS career_history
-			FROM managers m
-			LEFT JOIN career_history ch ON ch.manager_id = m.id
-			GROUP BY m.id
-			ORDER BY m.overall_rating DESC
-			LIMIT $1 OFFSET $2
-			""";
-	
 	private static final String GET_MANAGER_BY_ID_SQL = """
 			SELECT
 			    m.id,
@@ -130,66 +97,139 @@ public class ManagersHandler {
 			
 			WHERE m.id = $1
 			LIMIT 1;
-
 				""";
-	
+
     private final SqlClient db;
 
     public ManagersHandler(SqlClient db) {
         this.db = db;
     }
-    
+
+    // ---------------- GET MANAGERS (with optional search) ----------------
     public void handleGetManagers(RoutingContext ctx) {
-        // Check Authorization header
-        String authHeader = ctx.request().getHeader("Authorization");
-        if (authHeader == null || !authHeader.startsWith("Bearer ")) {
-            ctx.response()
-                .setStatusCode(401)
-                .putHeader("Content-Type", "application/json")
-                .end(new JsonObject().put("error", "Missing or invalid Authorization header").encode());
-            return;
-        }
+//        String authHeader = ctx.request().getHeader("Authorization");
+//        if (authHeader == null || !authHeader.startsWith("Bearer ")) {
+//            ctx.response()
+//                .setStatusCode(401)
+//                .putHeader("Content-Type", "application/json")
+//                .end(new JsonObject().put("error", "Missing or invalid Authorization header").encode());
+//            return;
+//        }
+//        String token = authHeader.substring("Bearer ".length());
+//        try {
+//            JWT.decode(token);
+//        } catch (JWTDecodeException e) {
+//            ctx.response()
+//                .setStatusCode(401)
+//                .putHeader("Content-Type", "application/json")
+//                .end(new JsonObject().put("error", "Invalid token").encode());
+//            return;
+//        }
 
-        String token = authHeader.substring("Bearer ".length());
-        DecodedJWT decoded;
-        try {
-            decoded = JWT.decode(token); // Auth0 JWT decode
-        } catch (JWTDecodeException e) {
-            ctx.response()
-                .setStatusCode(401)
-                .putHeader("Content-Type", "application/json")
-                .end(new JsonObject().put("error", "Invalid token").encode());
-            return;
-        }
-
-        // Optional: You can also verify the token with Auth0 if you want more security
-        // e.g., using jwks-rsa to check signature & expiration
-
-        // Get query params
         int limit = Integer.parseInt(ctx.queryParam("limit").stream().findFirst().orElse("20"));
         int offset = Integer.parseInt(ctx.queryParam("offset").stream().findFirst().orElse("0"));
-        Tuple params = Tuple.of(limit, offset);
+        String search = ctx.queryParam("search").stream().findFirst().orElse(null);
+        boolean hasSearch = search != null && !search.isBlank();
+        String searchPattern = hasSearch ? "%" + search.trim() + "%" : null;
+
+        // Build SQL and tuples depending on whether search is present
+        final String dataSql;
+        final String countSql;
+        final Tuple dataTuple;
+
+        if (hasSearch) {
+            dataSql = """
+                SELECT
+                    m.id,
+                    m.name,
+                    m.company,
+                    m.title,
+                    m.image,
+                    m.overall_rating,
+                    m.reviews_count,
+                    m.bio,
+                    m.status,
+                    m.category_averages,
+                    m.linkedin_url,
+                    m.created_at,
+                    COALESCE(
+                        json_agg(
+                            json_build_object(
+                                'company', ch.company,
+                                'title', ch.title,
+                                'startDate', ch.start_date,
+                                'endDate', ch.end_date
+                            )
+                            ORDER BY ch.start_date DESC
+                        ) FILTER (WHERE ch.id IS NOT NULL),
+                        '[]'
+                    ) AS career_history
+                FROM managers m
+                LEFT JOIN career_history ch ON ch.manager_id = m.id
+                WHERE (m.name ILIKE $3 OR m.company ILIKE $3 OR m.title ILIKE $3)
+                GROUP BY m.id
+                ORDER BY m.overall_rating DESC NULLS LAST, m.id ASC
+                LIMIT $1 OFFSET $2
+                """;
+            countSql = "SELECT COUNT(*) FROM managers WHERE (name ILIKE $1 OR company ILIKE $1 OR title ILIKE $1)";
+            dataTuple = Tuple.of(limit, offset, searchPattern);
+        } else {
+            dataSql = """
+                SELECT
+                    m.id,
+                    m.name,
+                    m.company,
+                    m.title,
+                    m.image,
+                    m.overall_rating,
+                    m.reviews_count,
+                    m.bio,
+                    m.status,
+                    m.category_averages,
+                    m.linkedin_url,
+                    m.created_at,
+                    COALESCE(
+                        json_agg(
+                            json_build_object(
+                                'company', ch.company,
+                                'title', ch.title,
+                                'startDate', ch.start_date,
+                                'endDate', ch.end_date
+                            )
+                            ORDER BY ch.start_date DESC
+                        ) FILTER (WHERE ch.id IS NOT NULL),
+                        '[]'
+                    ) AS career_history
+                FROM managers m
+                LEFT JOIN career_history ch ON ch.manager_id = m.id
+                GROUP BY m.id
+                ORDER BY m.overall_rating DESC NULLS LAST, m.id ASC
+                LIMIT $1 OFFSET $2
+                """;
+            countSql = "SELECT COUNT(*) FROM managers";
+            dataTuple = Tuple.of(limit, offset);
+        }
 
         // Count future
-        Future<Long> totalFuture = Future.future(promise ->
-            db.query("SELECT COUNT(*) FROM managers").execute(ar -> {
-                if (ar.succeeded()) {
-                    long total = ar.result().iterator().next().getLong(0);
-                    promise.complete(total);
-                } else {
-                    promise.fail(ar.cause());
-                }
-            })
-        );
+        Future<Long> totalFuture = Future.future(promise -> {
+            if (hasSearch) {
+                db.preparedQuery(countSql).execute(Tuple.of(searchPattern), ar -> {
+                    if (ar.succeeded()) promise.complete(ar.result().iterator().next().getLong(0));
+                    else promise.fail(ar.cause());
+                });
+            } else {
+                db.query(countSql).execute(ar -> {
+                    if (ar.succeeded()) promise.complete(ar.result().iterator().next().getLong(0));
+                    else promise.fail(ar.cause());
+                });
+            }
+        });
 
         // Data future
         Future<RowSet<Row>> dataFuture = Future.future(promise ->
-            db.preparedQuery(GET_MANAGERS_SQL).execute(params, ar -> {
-                if (ar.succeeded()) {
-                    promise.complete(ar.result());
-                } else {
-                    promise.fail(ar.cause());
-                }
+            db.preparedQuery(dataSql).execute(dataTuple, ar -> {
+                if (ar.succeeded()) promise.complete(ar.result());
+                else promise.fail(ar.cause());
             })
         );
 
@@ -206,7 +246,6 @@ public class ManagersHandler {
 
             for (Row row : rows) {
                 String createdAt = row.getOffsetDateTime("created_at").toString();
-
                 data.add(new JsonObject()
                         .put("id", row.getLong("id"))
                         .put("name", row.getString("name"))
@@ -221,7 +260,6 @@ public class ManagersHandler {
                         .put("linkedinUrl", row.getString("linkedin_url"))
                         .put("createdAt", createdAt)
                         .put("careerHistory", row.getJsonArray("career_history"))
-                        // You may also fetch reviews from the reviews table here if needed
                 );
             }
 
@@ -237,29 +275,27 @@ public class ManagersHandler {
         });
     }
 
-    
     public void handleGetManagerById(RoutingContext ctx) {
-        String authHeader = ctx.request().getHeader("Authorization");
-        if (authHeader == null || !authHeader.startsWith("Bearer ")) {
-            ctx.response()
-                .setStatusCode(401)
-                .putHeader("Content-Type", "application/json")
-                .end(new JsonObject().put("error", "Missing or invalid Authorization header").encode());
-            return;
-        }
+//        String authHeader = ctx.request().getHeader("Authorization");
+//        if (authHeader == null || !authHeader.startsWith("Bearer ")) {
+//            ctx.response()
+//                .setStatusCode(401)
+//                .putHeader("Content-Type", "application/json")
+//                .end(new JsonObject().put("error", "Missing or invalid Authorization header").encode());
+//            return;
+//        }
+//        String token = authHeader.substring("Bearer ".length());
+//        DecodedJWT decoded;
+//        try {
+//            decoded = JWT.decode(token);
+//        } catch (JWTDecodeException e) {
+//            ctx.response()
+//                .setStatusCode(401)
+//                .putHeader("Content-Type", "application/json")
+//                .end(new JsonObject().put("error", "Invalid token").encode());
+//            return;
+//        }
 
-        String token = authHeader.substring("Bearer ".length());
-        DecodedJWT decoded;
-        try {
-            decoded = JWT.decode(token); // Auth0 JWT decode
-        } catch (JWTDecodeException e) {
-            ctx.response()
-                .setStatusCode(401)
-                .putHeader("Content-Type", "application/json")
-                .end(new JsonObject().put("error", "Invalid token").encode());
-            return;
-        }
-        
         long managerId;
         try {
             managerId = Long.parseLong(ctx.pathParam("id"));
@@ -270,18 +306,14 @@ public class ManagersHandler {
                .end(new JsonObject().put("error", "Invalid manager ID").encode());
             return;
         }
-
         Tuple params = Tuple.of(managerId);
-
         db.preparedQuery(GET_MANAGER_BY_ID_SQL).execute(params, ar -> {
             if (ar.failed()) {
                 ctx.fail(ar.cause());
                 return;
             }
-
             RowSet<Row> rows = ar.result();
             Row row = rows.iterator().hasNext() ? rows.iterator().next() : null;
-
             if (row == null) {
                 ctx.response()
                    .setStatusCode(404)
@@ -289,10 +321,7 @@ public class ManagersHandler {
                    .end(new JsonObject().put("error", "Manager not found").encode());
                 return;
             }
-
-            // Convert OffsetDateTime to ISO string
             String createdAt = row.getOffsetDateTime("created_at").toString();
-
             JsonObject response = new JsonObject()
                 .put("id", row.getLong("id"))
                 .put("name", row.getString("name"))
@@ -308,13 +337,11 @@ public class ManagersHandler {
                 .put("createdAt", createdAt)
                 .put("careerHistory", row.getJsonArray("career_history"))
                 .put("reviews", row.getJsonArray("reviews"));
-
             ctx.response()
                .putHeader("Content-Type", "application/json")
                .end(response.encode());
         });
     }
-
 
     public void handleCreateManager(RoutingContext ctx) {
         String authHeader = ctx.request().getHeader("Authorization");
@@ -325,11 +352,10 @@ public class ManagersHandler {
                 .end(new JsonObject().put("error", "Missing or invalid Authorization header").encode());
             return;
         }
-
         String token = authHeader.substring("Bearer ".length());
         DecodedJWT decoded;
         try {
-            decoded = JWT.decode(token); // Auth0 JWT decode
+            decoded = JWT.decode(token);
         } catch (JWTDecodeException e) {
             ctx.response()
                 .setStatusCode(401)
@@ -337,7 +363,7 @@ public class ManagersHandler {
                 .end(new JsonObject().put("error", "Invalid token").encode());
             return;
         }
-        
+
         JsonObject body = ctx.getBodyAsJson();
         if (body == null) {
             ctx.response()
@@ -346,14 +372,11 @@ public class ManagersHandler {
                .end(new JsonObject().put("error", "Missing request body").encode());
             return;
         }
-
-        // Required fields
         String name = body.getString("name");
         String company = body.getString("company");
         String title = body.getString("title");
         String image = body.getString("image");
         String status = body.getString("status");
-
         if (name == null || company == null || title == null || image == null || status == null) {
             ctx.response()
                .setStatusCode(400)
@@ -361,28 +384,21 @@ public class ManagersHandler {
                .end(new JsonObject().put("error", "Missing required fields").encode());
             return;
         }
-
-        // Optional fields
         String bio = body.getString("bio");
         String linkedinUrl = body.getString("linkedinUrl");
-
         String insertSql = """
             INSERT INTO managers
             (name, company, title, image, bio, status, linkedin_url, overall_rating, reviews_count, category_averages, created_at)
             VALUES ($1, $2, $3, $4, $5, $6, $7, 0, 0, '{}'::jsonb, now())
             RETURNING *
             """;
-
         Tuple params = Tuple.of(name, company, title, image, bio, status, linkedinUrl);
-
         db.preparedQuery(insertSql).execute(params, ar -> {
             if (ar.failed()) {
                 ctx.fail(ar.cause());
                 return;
             }
-
             Row row = ar.result().iterator().next();
-
             JsonObject response = new JsonObject()
                 .put("id", row.getLong("id"))
                 .put("name", row.getString("name"))
@@ -395,10 +411,8 @@ public class ManagersHandler {
                 .put("status", row.getString("status"))
                 .put("categoryAverages", row.getJsonObject("category_averages"))
                 .put("linkedinUrl", row.getString("linkedin_url"))
-                // <-- FIXED: convert OffsetDateTime to string
                 .put("createdAt", row.getOffsetDateTime("created_at").toString())
-                .put("careerHistory", new JsonArray()); // new manager has empty career history
-
+                .put("careerHistory", new JsonArray());
             ctx.response()
                .setStatusCode(201)
                .putHeader("Content-Type", "application/json")
@@ -415,7 +429,6 @@ public class ManagersHandler {
                 .end(new JsonObject().put("error", "Missing or invalid Authorization header").encode());
             return;
         }
-
         String token = authHeader.substring("Bearer ".length());
         DecodedJWT decoded;
         try {
@@ -427,7 +440,6 @@ public class ManagersHandler {
                 .end(new JsonObject().put("error", "Invalid token").encode());
             return;
         }
-
         long managerId;
         try {
             managerId = Long.parseLong(ctx.pathParam("id"));
@@ -438,7 +450,6 @@ public class ManagersHandler {
                .end(new JsonObject().put("error", "Invalid manager ID").encode());
             return;
         }
-
         JsonObject body = ctx.getBodyAsJson();
         if (body == null || body.isEmpty()) {
             ctx.response()
@@ -447,8 +458,6 @@ public class ManagersHandler {
                .end(new JsonObject().put("error", "Nothing to update").encode());
             return;
         }
-
-        // Extract all updatable fields (id, name, createdAt are not allowed)
         String newCompany         = body.getString("company");
         String newTitle           = body.getString("title");
         String newImage           = body.getString("image");
@@ -456,16 +465,11 @@ public class ManagersHandler {
         String newStatus          = body.getString("status");
         JsonObject newCategoryAvg = body.getJsonObject("categoryAverages");
         String newLinkedinUrl     = body.getString("linkedinUrl");
-        Number newOverallRating = body.containsKey("overallRating")
-            ? body.getNumber("overallRating") : null;
-        Integer newReviewsCount   = body.containsKey("reviews")
-            ? body.getInteger("reviews") : null;
-
-        // Check at least one field was actually provided
+        Number newOverallRating   = body.containsKey("overallRating") ? body.getNumber("overallRating") : null;
+        Integer newReviewsCount   = body.containsKey("reviews") ? body.getInteger("reviews") : null;
         boolean hasAnyField = newCompany != null || newTitle != null || newImage != null
             || newBio != null || newStatus != null || newCategoryAvg != null
             || newLinkedinUrl != null || newOverallRating != null || newReviewsCount != null;
-
         if (!hasAnyField) {
             ctx.response()
                .setStatusCode(400)
@@ -473,17 +477,14 @@ public class ManagersHandler {
                .end(new JsonObject().put("error", "Nothing to update").encode());
             return;
         }
-
         Tuple selectParams = Tuple.of(managerId);
         db.preparedQuery(GET_MANAGER_BY_ID_SQL).execute(selectParams, ar -> {
             if (ar.failed()) {
                 ctx.fail(ar.cause());
                 return;
             }
-
             RowSet<Row> rows = ar.result();
             Row row = rows.iterator().hasNext() ? rows.iterator().next() : null;
-
             if (row == null) {
                 ctx.response()
                    .setStatusCode(404)
@@ -491,63 +492,29 @@ public class ManagersHandler {
                    .end(new JsonObject().put("error", "Manager not found").encode());
                 return;
             }
-
             String currentCompany = row.getString("company");
             String currentTitle   = row.getString("title");
-
-            // Inline lambda for updating manager
             Runnable updateManager = () -> {
                 StringBuilder sql = new StringBuilder("UPDATE managers SET ");
                 List<Object> paramsList = new ArrayList<>();
                 int idx = 1;
-
-                if (newCompany != null) {
-                    sql.append("company = $").append(idx++).append(", ");
-                    paramsList.add(newCompany);
-                }
-                if (newTitle != null) {
-                    sql.append("title = $").append(idx++).append(", ");
-                    paramsList.add(newTitle);
-                }
-                if (newImage != null) {
-                    sql.append("image = $").append(idx++).append(", ");
-                    paramsList.add(newImage);
-                }
-                if (newBio != null) {
-                    sql.append("bio = $").append(idx++).append(", ");
-                    paramsList.add(newBio);
-                }
-                if (newStatus != null) {
-                    sql.append("status = $").append(idx++).append(", ");
-                    paramsList.add(newStatus);
-                }
-                if (newCategoryAvg != null) {
-                    sql.append("category_averages = $").append(idx++).append(", ");
-                    paramsList.add(newCategoryAvg);
-                }
-                if (newLinkedinUrl != null) {
-                    sql.append("linkedin_url = $").append(idx++).append(", ");
-                    paramsList.add(newLinkedinUrl);
-                }
-                if (newOverallRating != null) {
-                    sql.append("overall_rating = $").append(idx++).append(", ");
-                    paramsList.add(newOverallRating);
-                }
-                if (newReviewsCount != null) {
-                    sql.append("reviews_count = $").append(idx++).append(", ");
-                    paramsList.add(newReviewsCount);
-                }
-
-                sql.delete(sql.length() - 2, sql.length()); // remove trailing comma
+                if (newCompany != null)      { sql.append("company = $").append(idx++).append(", ");           paramsList.add(newCompany); }
+                if (newTitle != null)        { sql.append("title = $").append(idx++).append(", ");             paramsList.add(newTitle); }
+                if (newImage != null)        { sql.append("image = $").append(idx++).append(", ");             paramsList.add(newImage); }
+                if (newBio != null)          { sql.append("bio = $").append(idx++).append(", ");               paramsList.add(newBio); }
+                if (newStatus != null)       { sql.append("status = $").append(idx++).append(", ");            paramsList.add(newStatus); }
+                if (newCategoryAvg != null)  { sql.append("category_averages = $").append(idx++).append(", "); paramsList.add(newCategoryAvg); }
+                if (newLinkedinUrl != null)  { sql.append("linkedin_url = $").append(idx++).append(", ");      paramsList.add(newLinkedinUrl); }
+                if (newOverallRating != null){ sql.append("overall_rating = $").append(idx++).append(", ");    paramsList.add(newOverallRating); }
+                if (newReviewsCount != null) { sql.append("reviews_count = $").append(idx++).append(", ");     paramsList.add(newReviewsCount); }
+                sql.delete(sql.length() - 2, sql.length());
                 sql.append(" WHERE id = $").append(idx).append(" RETURNING *");
                 paramsList.add(managerId);
-
                 db.preparedQuery(sql.toString()).execute(Tuple.from(paramsList), updateAr -> {
                     if (updateAr.failed()) {
                         ctx.fail(updateAr.cause());
                         return;
                     }
-
                     Row updatedRow = updateAr.result().iterator().next();
                     JsonObject response = new JsonObject()
                         .put("id", updatedRow.getLong("id"))
@@ -562,8 +529,6 @@ public class ManagersHandler {
                         .put("categoryAverages", updatedRow.getJsonObject("category_averages"))
                         .put("linkedinUrl", updatedRow.getString("linkedin_url"))
                         .put("createdAt", updatedRow.getOffsetDateTime("created_at").toString());
-
-                    // Fetch career history
                     db.preparedQuery(
                         "SELECT company, title, start_date, end_date FROM career_history WHERE manager_id = $1 ORDER BY start_date DESC"
                     ).execute(Tuple.of(managerId), chAr -> {
@@ -587,25 +552,15 @@ public class ManagersHandler {
                     });
                 });
             };
-
-            // If company or title changed, archive the previous position into career_history first
             if ((newCompany != null && !newCompany.equals(currentCompany)) ||
                 (newTitle != null && !newTitle.equals(currentTitle))) {
-
                 String insertCareerSql = """
                     INSERT INTO career_history(manager_id, company, title, start_date, end_date)
                     VALUES ($1, $2, $3, $4, $5)
                     """;
-
                 OffsetDateTime now = OffsetDateTime.now();
-                Tuple careerParams = Tuple.of(
-                        managerId,
-                        currentCompany,
-                        currentTitle,
-                        row.getOffsetDateTime("created_at"),
-                        now
-                );
-
+                Tuple careerParams = Tuple.of(managerId, currentCompany, currentTitle,
+                    row.getOffsetDateTime("created_at"), now);
                 db.preparedQuery(insertCareerSql).execute(careerParams, careerAr -> {
                     if (careerAr.failed()) {
                         ctx.fail(careerAr.cause());
@@ -628,11 +583,9 @@ public class ManagersHandler {
                 .end(new JsonObject().put("error", "Missing or invalid Authorization header").encode());
             return;
         }
-
         String token = authHeader.substring("Bearer ".length());
         DecodedJWT decoded;
         String auth0Id = null;
-
         try {
             decoded = JWT.decode(token);
             auth0Id = decoded.getClaim("sub").asString();
@@ -643,8 +596,6 @@ public class ManagersHandler {
                 .end(new JsonObject().put("error", "Invalid token").encode());
             return;
         }
-
-        // Lookup user ID (UUID) from the 'users' table using the full auth0_id
         String userIdQuery = "SELECT id FROM users WHERE auth0_id = $1";
         db.preparedQuery(userIdQuery).execute(Tuple.of(auth0Id), userAr -> {
             if (userAr.failed()) {
@@ -654,7 +605,6 @@ public class ManagersHandler {
                     .end(new JsonObject().put("error", "Database error during user lookup").encode());
                 return;
             }
-
             if (!userAr.result().iterator().hasNext()) {
                 ctx.response()
                     .setStatusCode(404)
@@ -662,10 +612,7 @@ public class ManagersHandler {
                     .end(new JsonObject().put("error", "User not found").encode());
                 return;
             }
-
             UUID userId = userAr.result().iterator().next().getUUID("id");
-
-            // Parse manager ID from path
             long managerId;
             try {
                 managerId = Long.parseLong(ctx.pathParam("id"));
@@ -676,8 +623,6 @@ public class ManagersHandler {
                     .end(new JsonObject().put("error", "Invalid manager ID format").encode());
                 return;
             }
-
-            // Parse body
             JsonObject body = ctx.getBodyAsJson();
             if (body == null) {
                 ctx.response()
@@ -686,14 +631,12 @@ public class ManagersHandler {
                    .end(new JsonObject().put("error", "Missing request body").encode());
                 return;
             }
-
             String author = body.getString("author");
             Double overallRating = body.getDouble("overallRating");
             JsonObject ratings = body.getJsonObject("ratings");
             String managerCompany = body.getString("managerCompany");
             String managerTitle = body.getString("managerTitle");
             String text = body.getString("text");
-
             if (author == null || overallRating == null || ratings == null || managerCompany == null || managerTitle == null) {
                 ctx.response()
                    .setStatusCode(400)
@@ -701,28 +644,20 @@ public class ManagersHandler {
                    .end(new JsonObject().put("error", "Missing required fields").encode());
                 return;
             }
-
-            // Read ratings using display-name keys — matches what the frontend sends
             Tuple params = Tuple.of(
-            	    managerId,
-            	    userId,
-            	    author,
-            	    overallRating,
-            	    ratings.getDouble("Communication Style") != null ? ratings.getDouble("Communication Style") : ratings.getDouble("communication_style"),
-            	    ratings.getDouble("Perceived Approachability") != null ? ratings.getDouble("Perceived Approachability") : ratings.getDouble("perceived_approachability"),
-            	    ratings.getDouble("Perceived Clarity of Expectations") != null ? ratings.getDouble("Perceived Clarity of Expectations") : ratings.getDouble("perceived_clarity_of_expectations"),
-            	    ratings.getDouble("Feedback Style") != null ? ratings.getDouble("Feedback Style") : ratings.getDouble("feedback_style"),
-            	    ratings.getDouble("Perceived Supportiveness") != null ? ratings.getDouble("Perceived Supportiveness") : ratings.getDouble("perceived_supportiveness"),
-            	    ratings.getDouble("Decision Making Style") != null ? ratings.getDouble("Decision Making Style") : ratings.getDouble("decision_making_style"),
-            	    ratings.getDouble("Organization and Planning Style") != null ? ratings.getDouble("Organization and Planning Style") : ratings.getDouble("organization_and_planning_style"),
-            	    ratings.getDouble("Delegation Style") != null ? ratings.getDouble("Delegation Style") : ratings.getDouble("delegation_style"),
-            	    ratings.getDouble("Perceived Professional Demeanor") != null ? ratings.getDouble("Perceived Professional Demeanor") : ratings.getDouble("perceived_professional_demeanor"),
-            	    ratings.getDouble("Overall Working Experience") != null ? ratings.getDouble("Overall Working Experience") : ratings.getDouble("overall_working_experience"),
-            	    managerCompany,
-            	    managerTitle,
-            	    text
-            	);
-
+                managerId, userId, author, overallRating,
+                ratings.getDouble("Communication Style") != null ? ratings.getDouble("Communication Style") : ratings.getDouble("communication_style"),
+                ratings.getDouble("Perceived Approachability") != null ? ratings.getDouble("Perceived Approachability") : ratings.getDouble("perceived_approachability"),
+                ratings.getDouble("Perceived Clarity of Expectations") != null ? ratings.getDouble("Perceived Clarity of Expectations") : ratings.getDouble("perceived_clarity_of_expectations"),
+                ratings.getDouble("Feedback Style") != null ? ratings.getDouble("Feedback Style") : ratings.getDouble("feedback_style"),
+                ratings.getDouble("Perceived Supportiveness") != null ? ratings.getDouble("Perceived Supportiveness") : ratings.getDouble("perceived_supportiveness"),
+                ratings.getDouble("Decision Making Style") != null ? ratings.getDouble("Decision Making Style") : ratings.getDouble("decision_making_style"),
+                ratings.getDouble("Organization and Planning Style") != null ? ratings.getDouble("Organization and Planning Style") : ratings.getDouble("organization_and_planning_style"),
+                ratings.getDouble("Delegation Style") != null ? ratings.getDouble("Delegation Style") : ratings.getDouble("delegation_style"),
+                ratings.getDouble("Perceived Professional Demeanor") != null ? ratings.getDouble("Perceived Professional Demeanor") : ratings.getDouble("perceived_professional_demeanor"),
+                ratings.getDouble("Overall Working Experience") != null ? ratings.getDouble("Overall Working Experience") : ratings.getDouble("overall_working_experience"),
+                managerCompany, managerTitle, text
+            );
             String insertSql = """
                 INSERT INTO reviews (
                     manager_id, user_id, author, overall_rating,
@@ -735,15 +670,12 @@ public class ManagersHandler {
                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,true,0,now(),now())
                 RETURNING *
                 """;
-
             db.preparedQuery(insertSql).execute(params, ar -> {
                 if (ar.failed()) {
                     ctx.fail(ar.cause());
                     return;
                 }
-
                 Row row = ar.result().iterator().next();
-
                 JsonObject responseRatings = new JsonObject()
                     .put("Communication Style", row.getBigDecimal("communication_style"))
                     .put("Perceived Approachability", row.getBigDecimal("perceived_approachability"))
@@ -755,7 +687,6 @@ public class ManagersHandler {
                     .put("Delegation Style", row.getBigDecimal("delegation_style"))
                     .put("Perceived Professional Demeanor", row.getBigDecimal("perceived_professional_demeanor"))
                     .put("Overall Working Experience", row.getBigDecimal("overall_working_experience"));
-
                 JsonObject response = new JsonObject()
                     .put("id", row.getUUID("id").toString())
                     .put("managerId", row.getLong("manager_id"))
@@ -768,7 +699,6 @@ public class ManagersHandler {
                     .put("verified", row.getBoolean("verified"))
                     .put("helpfulCount", row.getInteger("helpful_count"))
                     .put("createdAt", row.getOffsetDateTime("created_at").toString());
-
                 ctx.response()
                    .setStatusCode(201)
                    .putHeader("Content-Type", "application/json")
@@ -776,30 +706,27 @@ public class ManagersHandler {
             });
         });
     }
-    
+
     public void handleGetManagerReviews(RoutingContext ctx) {
-        String authHeader = ctx.request().getHeader("Authorization");
-        if (authHeader == null || !authHeader.startsWith("Bearer ")) {
-            ctx.response()
-                .setStatusCode(401)
-                .putHeader("Content-Type", "application/json")
-                .end(new JsonObject().put("error", "Missing or invalid Authorization header").encode());
-            return;
-        }
-     
-        String token = authHeader.substring("Bearer ".length());
-        DecodedJWT decoded;
-        try {
-            decoded = JWT.decode(token);
-        } catch (JWTDecodeException e) {
-            ctx.response()
-                .setStatusCode(401)
-                .putHeader("Content-Type", "application/json")
-                .end(new JsonObject().put("error", "Invalid token").encode());
-            return;
-        }
-     
-        // Parse manager ID from path
+//        String authHeader = ctx.request().getHeader("Authorization");
+//        if (authHeader == null || !authHeader.startsWith("Bearer ")) {
+//            ctx.response()
+//                .setStatusCode(401)
+//                .putHeader("Content-Type", "application/json")
+//                .end(new JsonObject().put("error", "Missing or invalid Authorization header").encode());
+//            return;
+//        }
+//        String token = authHeader.substring("Bearer ".length());
+//        DecodedJWT decoded;
+//        try {
+//            decoded = JWT.decode(token);
+//        } catch (JWTDecodeException e) {
+//            ctx.response()
+//                .setStatusCode(401)
+//                .putHeader("Content-Type", "application/json")
+//                .end(new JsonObject().put("error", "Invalid token").encode());
+//            return;
+//        }
         long managerId;
         try {
             managerId = Long.parseLong(ctx.pathParam("id"));
@@ -810,13 +737,9 @@ public class ManagersHandler {
                .end(new JsonObject().put("error", "Invalid manager ID").encode());
             return;
         }
-     
-        // Query parameters with defaults
         String sortBy = ctx.queryParam("sortBy").stream().findFirst().orElse("recent");
         int limit = Integer.parseInt(ctx.queryParam("limit").stream().findFirst().orElse("50"));
         int offset = Integer.parseInt(ctx.queryParam("offset").stream().findFirst().orElse("0"));
-     
-        // Optional userId filter
         String userIdParam = ctx.queryParam("userId").stream().findFirst().orElse(null);
         UUID userId = null;
         if (userIdParam != null) {
@@ -830,49 +753,25 @@ public class ManagersHandler {
                 return;
             }
         }
-     
-        // Map sortBy to SQL ORDER BY
         String orderBy;
         switch (sortBy) {
-            case "helpful":
-                orderBy = "helpful_count DESC";
-                break;
-            case "highest":
-                orderBy = "overall_rating DESC";
-                break;
-            case "lowest":
-                orderBy = "overall_rating ASC";
-                break;
+            case "helpful": orderBy = "helpful_count DESC"; break;
+            case "highest": orderBy = "overall_rating DESC"; break;
+            case "lowest":  orderBy = "overall_rating ASC"; break;
             case "recent":
-            default:
-                orderBy = "created_at DESC";
-                break;
+            default:        orderBy = "created_at DESC"; break;
         }
-     
-        // Build WHERE clause — userId filter is optional
         String userIdFilter = userId != null ? "AND user_id = $4" : "";
-     
-        // Future for total count
         String countSql = userId != null
             ? "SELECT COUNT(*) FROM reviews WHERE manager_id = $1 AND user_id = $2"
             : "SELECT COUNT(*) FROM reviews WHERE manager_id = $1";
-     
-        Tuple countParams = userId != null
-            ? Tuple.of(managerId, userId)
-            : Tuple.of(managerId);
-     
+        Tuple countParams = userId != null ? Tuple.of(managerId, userId) : Tuple.of(managerId);
         Future<Long> totalFuture = Future.future(promise ->
             db.preparedQuery(countSql).execute(countParams, ar -> {
-                if (ar.succeeded()) {
-                    long total = ar.result().iterator().next().getLong(0);
-                    promise.complete(total);
-                } else {
-                    promise.fail(ar.cause());
-                }
+                if (ar.succeeded()) promise.complete(ar.result().iterator().next().getLong(0));
+                else promise.fail(ar.cause());
             })
         );
-     
-        // Future for review data
         String selectSql = String.format("""
             SELECT *
             FROM reviews
@@ -880,32 +779,23 @@ public class ManagersHandler {
             ORDER BY %s
             LIMIT $2 OFFSET $3
             """, userIdFilter, orderBy);
-     
         Tuple dataParams = userId != null
             ? Tuple.of(managerId, limit, offset, userId)
             : Tuple.of(managerId, limit, offset);
-     
         Future<RowSet<Row>> dataFuture = Future.future(promise ->
             db.preparedQuery(selectSql).execute(dataParams, ar -> {
-                if (ar.succeeded()) {
-                    promise.complete(ar.result());
-                } else {
-                    promise.fail(ar.cause());
-                }
+                if (ar.succeeded()) promise.complete(ar.result());
+                else promise.fail(ar.cause());
             })
         );
-     
-        // Combine futures
         Future.all((Future<?>) totalFuture, (Future<?>) dataFuture).onComplete(ar -> {
             if (ar.failed()) {
                 ctx.fail(ar.cause());
                 return;
             }
-     
             long total = totalFuture.result();
             RowSet<Row> rows = dataFuture.result();
             JsonArray data = new JsonArray();
-     
             for (Row row : rows) {
                 JsonObject ratings = new JsonObject()
                     .put("Communication Style", row.getBigDecimal("communication_style"))
@@ -918,7 +808,6 @@ public class ManagersHandler {
                     .put("Delegation Style", row.getBigDecimal("delegation_style"))
                     .put("Perceived Professional Demeanor", row.getBigDecimal("perceived_professional_demeanor"))
                     .put("Overall Working Experience", row.getBigDecimal("overall_working_experience"));
-
                 data.add(new JsonObject()
                     .put("id", row.getUUID("id"))
                     .put("managerId", row.getLong("manager_id"))
@@ -931,22 +820,20 @@ public class ManagersHandler {
                     .put("verified", row.getBoolean("verified"))
                     .put("helpfulCount", row.getInteger("helpful_count"))
                     .put("createdAt", row.getOffsetDateTime("created_at").toString())
-                    .put("updatedAt", row.getOffsetDateTime("updated_at").toString())  // added
+                    .put("updatedAt", row.getOffsetDateTime("updated_at").toString())
                 );
             }
-     
             JsonObject response = new JsonObject()
                 .put("data", data)
                 .put("total", total)
                 .put("limit", limit)
                 .put("offset", offset);
-     
             ctx.response()
                .putHeader("Content-Type", "application/json")
                .end(response.encode());
         });
     }
-    
+
     public void handleUpdateReview(RoutingContext ctx) {
         String authHeader = ctx.request().getHeader("Authorization");
         if (authHeader == null || !authHeader.startsWith("Bearer ")) {
@@ -956,11 +843,10 @@ public class ManagersHandler {
                 .end(new JsonObject().put("error", "Missing or invalid Authorization header").encode());
             return;
         }
-
         String token = authHeader.substring("Bearer ".length());
         DecodedJWT decoded;
         try {
-            decoded = JWT.decode(token); // Auth0 JWT decode
+            decoded = JWT.decode(token);
         } catch (JWTDecodeException e) {
             ctx.response()
                 .setStatusCode(401)
@@ -968,7 +854,6 @@ public class ManagersHandler {
                 .end(new JsonObject().put("error", "Invalid token").encode());
             return;
         }
-        
         long managerId;
         UUID reviewId;
         try {
@@ -981,7 +866,6 @@ public class ManagersHandler {
                .end(new JsonObject().put("error", "Invalid managerId or reviewId").encode());
             return;
         }
-
         JsonObject body = ctx.getBodyAsJson();
         if (body == null) {
             ctx.response()
@@ -990,13 +874,11 @@ public class ManagersHandler {
                .end(new JsonObject().put("error", "Missing request body").encode());
             return;
         }
-
         Double overallRating = body.getDouble("overallRating");
         JsonObject ratings = body.getJsonObject("ratings");
         String managerCompany = body.getString("managerCompany");
         String managerTitle = body.getString("managerTitle");
         String text = body.getString("text");
-
         if (overallRating == null || ratings == null || managerCompany == null || managerTitle == null) {
             ctx.response()
                .setStatusCode(400)
@@ -1004,8 +886,6 @@ public class ManagersHandler {
                .end(new JsonObject().put("error", "Missing required fields").encode());
             return;
         }
-
-        // Map JSON ratings to individual columns
         Double communicationStyle = ratings.getDouble("Communication Style");
         Double perceivedApproachability = ratings.getDouble("Perceived Approachability");
         Double perceivedClarityOfExpectations = ratings.getDouble("Perceived Clarity of Expectations");
@@ -1016,7 +896,6 @@ public class ManagersHandler {
         Double delegationStyle = ratings.getDouble("Delegation Style");
         Double perceivedProfessionalDemeanor = ratings.getDouble("Perceived Professional Demeanor");
         Double overallWorkingExperience = ratings.getDouble("Overall Working Experience");
-
         String updateSql = """
             UPDATE reviews
             SET overall_rating = $1,
@@ -1036,36 +915,21 @@ public class ManagersHandler {
                 updated_at = now()
             WHERE id = $15 AND manager_id = $16
             RETURNING *
-        """;
-
+            """;
         Tuple params = Tuple.of(
-            overallRating,
-            communicationStyle,
-            perceivedApproachability,
-            perceivedClarityOfExpectations,
-            feedbackStyle,
-            perceivedSupportiveness,
-            decisionMakingStyle,
-            organizationAndPlanningStyle,
-            delegationStyle,
-            perceivedProfessionalDemeanor,
-            overallWorkingExperience,
-            managerCompany,
-            managerTitle,
-            text,
-            reviewId,
-            managerId
+            overallRating, communicationStyle, perceivedApproachability,
+            perceivedClarityOfExpectations, feedbackStyle, perceivedSupportiveness,
+            decisionMakingStyle, organizationAndPlanningStyle, delegationStyle,
+            perceivedProfessionalDemeanor, overallWorkingExperience,
+            managerCompany, managerTitle, text, reviewId, managerId
         );
-
         db.preparedQuery(updateSql).execute(params, ar -> {
             if (ar.failed()) {
                 ctx.fail(ar.cause());
                 return;
             }
-
             RowSet<Row> rows = ar.result();
             Row row = rows.iterator().hasNext() ? rows.iterator().next() : null;
-
             if (row == null) {
                 ctx.response()
                    .setStatusCode(404)
@@ -1073,8 +937,6 @@ public class ManagersHandler {
                    .end(new JsonObject().put("error", "Review not found").encode());
                 return;
             }
-
-            // Build ratings object to return
             JsonObject ratingsResponse = new JsonObject()
                 .put("Communication Style", row.getBigDecimal("communication_style"))
                 .put("Perceived Approachability", row.getBigDecimal("perceived_approachability"))
@@ -1086,7 +948,6 @@ public class ManagersHandler {
                 .put("Delegation Style", row.getBigDecimal("delegation_style"))
                 .put("Perceived Professional Demeanor", row.getBigDecimal("perceived_professional_demeanor"))
                 .put("Overall Working Experience", row.getBigDecimal("overall_working_experience"));
-
             JsonObject response = new JsonObject()
                 .put("id", row.getUUID("id"))
                 .put("managerId", row.getLong("manager_id"))
@@ -1100,7 +961,6 @@ public class ManagersHandler {
                 .put("helpfulCount", row.getInteger("helpful_count"))
                 .put("createdAt", row.getOffsetDateTime("created_at").toString())
                 .put("updatedAt", row.getOffsetDateTime("updated_at").toString());
-
             ctx.response()
                .setStatusCode(200)
                .putHeader("Content-Type", "application/json")
@@ -1117,7 +977,6 @@ public class ManagersHandler {
                 .end(new JsonObject().put("error", "Missing or invalid Authorization header").encode());
             return;
         }
-
         String token = authHeader.substring("Bearer ".length());
         DecodedJWT decoded;
         try {
@@ -1129,7 +988,6 @@ public class ManagersHandler {
                 .end(new JsonObject().put("error", "Invalid token").encode());
             return;
         }
-
         String auth0Id = decoded.getClaim("sub").asString();
         if (auth0Id == null) {
             ctx.response()
@@ -1138,8 +996,6 @@ public class ManagersHandler {
                 .end(new JsonObject().put("error", "Unauthorized").encode());
             return;
         }
-
-        // Parse path params
         long managerId;
         UUID reviewId;
         try {
@@ -1152,15 +1008,12 @@ public class ManagersHandler {
                .end(new JsonObject().put("error", "Invalid managerId or reviewId").encode());
             return;
         }
-
-        // Resolve the internal DB UUID from the auth0_id in the token
         db.preparedQuery("SELECT id FROM users WHERE auth0_id = $1")
           .execute(Tuple.of(auth0Id), userAr -> {
             if (userAr.failed()) {
                 ctx.fail(userAr.cause());
                 return;
             }
-
             if (!userAr.result().iterator().hasNext()) {
                 ctx.response()
                    .setStatusCode(401)
@@ -1168,17 +1021,13 @@ public class ManagersHandler {
                    .end(new JsonObject().put("error", "Unauthorized").encode());
                 return;
             }
-
             UUID userId = userAr.result().iterator().next().getUUID("id");
-
-            // Verify review exists and belongs to this user
             String selectSql = "SELECT user_id FROM reviews WHERE id = $1 AND manager_id = $2";
             db.preparedQuery(selectSql).execute(Tuple.of(reviewId, managerId), ar -> {
                 if (ar.failed()) {
                     ctx.fail(ar.cause());
                     return;
                 }
-
                 if (!ar.result().iterator().hasNext()) {
                     ctx.response()
                        .setStatusCode(404)
@@ -1186,7 +1035,6 @@ public class ManagersHandler {
                        .end(new JsonObject().put("error", "Review not found").encode());
                     return;
                 }
-
                 UUID reviewOwner = ar.result().iterator().next().getUUID("user_id");
                 if (!reviewOwner.equals(userId)) {
                     ctx.response()
@@ -1195,15 +1043,12 @@ public class ManagersHandler {
                        .end(new JsonObject().put("error", "Forbidden").encode());
                     return;
                 }
-
-                // Delete the review
                 String deleteSql = "DELETE FROM reviews WHERE id = $1 AND manager_id = $2";
                 db.preparedQuery(deleteSql).execute(Tuple.of(reviewId, managerId), delAr -> {
                     if (delAr.failed()) {
                         ctx.fail(delAr.cause());
                         return;
                     }
-
                     ctx.response()
                        .setStatusCode(200)
                        .putHeader("Content-Type", "application/json")
@@ -1215,7 +1060,7 @@ public class ManagersHandler {
             });
         });
     }
-    
+
     public void handleRecalculateManagerStats(RoutingContext ctx) {
         String authHeader = ctx.request().getHeader("Authorization");
         if (authHeader == null || !authHeader.startsWith("Bearer ")) {
@@ -1225,7 +1070,6 @@ public class ManagersHandler {
                 .end(new JsonObject().put("error", "Missing or invalid Authorization header").encode());
             return;
         }
-     
         String token = authHeader.substring("Bearer ".length());
         try {
             JWT.decode(token);
@@ -1236,7 +1080,6 @@ public class ManagersHandler {
                 .end(new JsonObject().put("error", "Invalid token").encode());
             return;
         }
-     
         long managerId;
         try {
             managerId = Long.parseLong(ctx.pathParam("id"));
@@ -1247,8 +1090,6 @@ public class ManagersHandler {
                 .end(new JsonObject().put("error", "Invalid manager ID").encode());
             return;
         }
-     
-        // First confirm the manager exists
         db.preparedQuery("SELECT id FROM managers WHERE id = $1")
             .execute(Tuple.of(managerId), ar -> {
                 if (ar.failed()) {
@@ -1262,7 +1103,6 @@ public class ManagersHandler {
                         .end(new JsonObject().put("error", "Manager not found").encode());
                     return;
                 }
-     
                 recalculateAndPersist(managerId, ctx, updatedManager -> {
                     ctx.response()
                         .setStatusCode(200)
@@ -1271,15 +1111,7 @@ public class ManagersHandler {
                 });
             });
     }
-     
-    /**
-     * Recalculates overall_rating, reviews_count, and category_averages for a manager
-     * from the reviews table and persists them. Can be called from any review mutation handler.
-     *
-     * @param managerId  the manager to update
-     * @param ctx        the current RoutingContext (used for ctx.fail on DB error)
-     * @param onComplete callback receiving the updated manager JsonObject on success
-     */
+
     public void recalculateAndPersist(long managerId, RoutingContext ctx, Handler<JsonObject> onComplete) {
         String recalcSql = """
             SELECT
@@ -1298,45 +1130,28 @@ public class ManagersHandler {
             FROM reviews
             WHERE manager_id = $1
             """;
-     
         db.preparedQuery(recalcSql).execute(Tuple.of(managerId), recalcAr -> {
             if (recalcAr.failed()) {
                 ctx.fail(recalcAr.cause());
                 return;
             }
-     
             Row stats = recalcAr.result().iterator().next();
-     
             int reviewsCount         = stats.getInteger("reviews_count");
-            BigDecimal overallRating = reviewsCount > 0 ? stats.getBigDecimal("overall_rating") : BigDecimal.ZERO;
-     
-            // Build category_averages JSONB — null-safe for zero-review case
+            BigDecimal overallRating = reviewsCount > 0 ? stats.getBigDecimal("overall_rating") : null;
             JsonObject categoryAverages = new JsonObject();
             if (reviewsCount > 0) {
                 categoryAverages
-                    .put("Communication Style",
-                        nullSafeDecimal(stats.getBigDecimal("communication_style")))
-                    .put("Perceived Approachability",
-                        nullSafeDecimal(stats.getBigDecimal("perceived_approachability")))
-                    .put("Perceived Clarity of Expectations",
-                        nullSafeDecimal(stats.getBigDecimal("perceived_clarity_of_expectations")))
-                    .put("Feedback Style",
-                        nullSafeDecimal(stats.getBigDecimal("feedback_style")))
-                    .put("Perceived Supportiveness",
-                        nullSafeDecimal(stats.getBigDecimal("perceived_supportiveness")))
-                    .put("Decision Making Style",
-                        nullSafeDecimal(stats.getBigDecimal("decision_making_style")))
-                    .put("Organization and Planning Style",
-                        nullSafeDecimal(stats.getBigDecimal("organization_and_planning_style")))
-                    .put("Delegation Style",
-                        nullSafeDecimal(stats.getBigDecimal("delegation_style")))
-                    .put("Perceived Professional Demeanor",
-                        nullSafeDecimal(stats.getBigDecimal("perceived_professional_demeanor")))
-                    .put("Overall Working Experience",
-                        nullSafeDecimal(stats.getBigDecimal("overall_working_experience")));
+                    .put("Communication Style",               nullSafeDecimal(stats.getBigDecimal("communication_style")))
+                    .put("Perceived Approachability",         nullSafeDecimal(stats.getBigDecimal("perceived_approachability")))
+                    .put("Perceived Clarity of Expectations", nullSafeDecimal(stats.getBigDecimal("perceived_clarity_of_expectations")))
+                    .put("Feedback Style",                    nullSafeDecimal(stats.getBigDecimal("feedback_style")))
+                    .put("Perceived Supportiveness",          nullSafeDecimal(stats.getBigDecimal("perceived_supportiveness")))
+                    .put("Decision Making Style",             nullSafeDecimal(stats.getBigDecimal("decision_making_style")))
+                    .put("Organization and Planning Style",   nullSafeDecimal(stats.getBigDecimal("organization_and_planning_style")))
+                    .put("Delegation Style",                  nullSafeDecimal(stats.getBigDecimal("delegation_style")))
+                    .put("Perceived Professional Demeanor",   nullSafeDecimal(stats.getBigDecimal("perceived_professional_demeanor")))
+                    .put("Overall Working Experience",        nullSafeDecimal(stats.getBigDecimal("overall_working_experience")));
             }
-     
-            // Persist the recalculated values back to the manager row
             String updateSql = """
                 UPDATE managers
                 SET
@@ -1347,17 +1162,14 @@ public class ManagersHandler {
                 WHERE id = $4
                 RETURNING *
                 """;
-     
-            Tuple updateParams = Tuple.of(overallRating, reviewsCount,  categoryAverages, managerId);
-     
+            JsonObject categoryAvg = reviewsCount > 0 ? categoryAverages : null;
+            Tuple updateParams = Tuple.of(overallRating, reviewsCount, categoryAvg, managerId);
             db.preparedQuery(updateSql).execute(updateParams, updateAr -> {
                 if (updateAr.failed()) {
                     ctx.fail(updateAr.cause());
                     return;
                 }
-     
                 Row updated = updateAr.result().iterator().next();
-     
                 JsonObject response = new JsonObject()
                     .put("id",             updated.getLong("id"))
                     .put("name",           updated.getString("name"))
@@ -1371,12 +1183,11 @@ public class ManagersHandler {
                     .put("categoryAverages", updated.getJsonObject("category_averages"))
                     .put("linkedinUrl",    updated.getString("linkedin_url"))
                     .put("createdAt",      updated.getOffsetDateTime("created_at").toString());
-     
                 onComplete.handle(response);
             });
         });
     }
-     
+
     public void handleGetMyReviews(RoutingContext ctx) {
         String authHeader = ctx.request().getHeader("Authorization");
         if (authHeader == null || !authHeader.startsWith("Bearer ")) {
@@ -1386,7 +1197,6 @@ public class ManagersHandler {
                 .end(new JsonObject().put("error", "Missing or invalid Authorization header").encode());
             return;
         }
-
         String token = authHeader.substring("Bearer ".length());
         DecodedJWT decoded;
         try {
@@ -1398,7 +1208,6 @@ public class ManagersHandler {
                 .end(new JsonObject().put("error", "Invalid token").encode());
             return;
         }
-
         String auth0Id = decoded.getClaim("sub").asString();
         if (auth0Id == null) {
             ctx.response()
@@ -1407,15 +1216,12 @@ public class ManagersHandler {
                 .end(new JsonObject().put("error", "Unauthorized").encode());
             return;
         }
-
-        // Resolve internal DB UUID from auth0_id
         db.preparedQuery("SELECT id FROM users WHERE auth0_id = $1")
           .execute(Tuple.of(auth0Id), userAr -> {
             if (userAr.failed()) {
                 ctx.fail(userAr.cause());
                 return;
             }
-
             if (!userAr.result().iterator().hasNext()) {
                 ctx.response()
                    .setStatusCode(404)
@@ -1423,10 +1229,7 @@ public class ManagersHandler {
                    .end(new JsonObject().put("error", "User not found").encode());
                 return;
             }
-
             UUID userId = userAr.result().iterator().next().getUUID("id");
-
-            // Fetch all reviews by this user, joined with manager info
             String selectSql = """
                 SELECT
                     r.id,
@@ -1458,28 +1261,24 @@ public class ManagersHandler {
                 WHERE r.user_id = $1
                 ORDER BY r.created_at DESC
                 """;
-
             db.preparedQuery(selectSql).execute(Tuple.of(userId), ar -> {
                 if (ar.failed()) {
                     ctx.fail(ar.cause());
                     return;
                 }
-
                 JsonArray data = new JsonArray();
-
                 for (Row row : ar.result()) {
                     JsonObject ratings = new JsonObject()
-                        .put("Communication Style",                  row.getBigDecimal("communication_style"))
-                        .put("Perceived Approachability",            row.getBigDecimal("perceived_approachability"))
-                        .put("Perceived Clarity of Expectations",    row.getBigDecimal("perceived_clarity_of_expectations"))
-                        .put("Feedback Style",                       row.getBigDecimal("feedback_style"))
-                        .put("Perceived Supportiveness",             row.getBigDecimal("perceived_supportiveness"))
-                        .put("Decision Making Style",                row.getBigDecimal("decision_making_style"))
-                        .put("Organization and Planning Style",      row.getBigDecimal("organization_and_planning_style"))
-                        .put("Delegation Style",                     row.getBigDecimal("delegation_style"))
-                        .put("Perceived Professional Demeanor",      row.getBigDecimal("perceived_professional_demeanor"))
-                        .put("Overall Working Experience",           row.getBigDecimal("overall_working_experience"));
-
+                        .put("Communication Style",               row.getBigDecimal("communication_style"))
+                        .put("Perceived Approachability",         row.getBigDecimal("perceived_approachability"))
+                        .put("Perceived Clarity of Expectations", row.getBigDecimal("perceived_clarity_of_expectations"))
+                        .put("Feedback Style",                    row.getBigDecimal("feedback_style"))
+                        .put("Perceived Supportiveness",          row.getBigDecimal("perceived_supportiveness"))
+                        .put("Decision Making Style",             row.getBigDecimal("decision_making_style"))
+                        .put("Organization and Planning Style",   row.getBigDecimal("organization_and_planning_style"))
+                        .put("Delegation Style",                  row.getBigDecimal("delegation_style"))
+                        .put("Perceived Professional Demeanor",   row.getBigDecimal("perceived_professional_demeanor"))
+                        .put("Overall Working Experience",        row.getBigDecimal("overall_working_experience"));
                     data.add(new JsonObject()
                         .put("id",              row.getUUID("id").toString())
                         .put("managerId",       row.getLong("manager_id"))
@@ -1498,7 +1297,6 @@ public class ManagersHandler {
                         .put("updatedAt",       row.getOffsetDateTime("updated_at").toString())
                     );
                 }
-
                 ctx.response()
                    .setStatusCode(200)
                    .putHeader("Content-Type", "application/json")
@@ -1506,10 +1304,39 @@ public class ManagersHandler {
             });
         });
     }
+
+    public void handleGetStats(RoutingContext ctx) {
+        Future<Long> managersFuture = Future.future(promise ->
+            db.query("SELECT COUNT(*) FROM managers").execute(ar -> {
+                if (ar.succeeded()) promise.complete(ar.result().iterator().next().getLong(0));
+                else promise.fail(ar.cause());
+            })
+        );
+
+        Future<Long> reviewsFuture = Future.future(promise ->
+            db.query("SELECT COUNT(*) FROM reviews").execute(ar -> {
+                if (ar.succeeded()) promise.complete(ar.result().iterator().next().getLong(0));
+                else promise.fail(ar.cause());
+            })
+        );
+
+        Future.all((Future<?>) managersFuture, (Future<?>) reviewsFuture).onComplete(ar -> {
+            if (ar.failed()) {
+                ctx.fail(ar.cause());
+                return;
+            }
+
+            ctx.response()
+                .putHeader("Content-Type", "application/json")
+                .end(new JsonObject()
+                    .put("totalManagers", managersFuture.result())
+                    .put("totalReviews",  reviewsFuture.result())
+                    .encode());
+        });
+    }
     
     // Safely converts a nullable BigDecimal to double for JSON serialisation
     private double nullSafeDecimal(BigDecimal value) {
         return value != null ? value.doubleValue() : 0.0;
     }
-
 }

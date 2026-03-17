@@ -2,13 +2,10 @@ openapi: 3.0.3
 info:
   title: RateMyManager API
   version: 1.0.0
-
 servers:
   - url: http://localhost:8888
-
 security:
   - bearerAuth: []
-
 paths:
   /api/auth/signup:
     post:
@@ -127,26 +124,84 @@ paths:
                   error:
                     type: string
 
+  /api/auth/me/delete:
+    delete:
+      operationId: deleteMe
+      summary: Delete the authenticated user's account and anonymize their reviews
+      tags:
+        - Auth
+      security: []
+      responses:
+        '200':
+          description: Account deleted successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  message:
+                    type: string
+        '401':
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+        '404':
+          description: User not found
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+
   /api/users/me/reviews:
-   get:
-    operationId: getMyReviews
-    summary: Get all reviews written by the authenticated user
-    responses:
-      '200':
-        description: List of reviews with manager info
-        content:
-          application/json:
-            schema:
-              type: object
-              properties:
-                data:
-                  type: array
-                  items:
-                    $ref: '#/components/schemas/ManagerReview'
+    get:
+      operationId: getMyReviews
+      summary: Get all reviews written by the authenticated user
+      responses:
+        '200':
+          description: List of reviews with manager info
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/ManagerReview'
+
+  /api/stats:
+    get:
+      operationId: getStats
+      summary: Get site-wide stats (total managers and reviews)
+      security: []
+      responses:
+        '200':
+          description: Site-wide stats
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  totalManagers:
+                    type: integer
+                  totalReviews:
+                    type: integer
+
   /api/managers:
     get:
       operationId: getManagers
-      summary: List managers
+      summary: List managers (public)
+      security: []
       parameters:
         - in: query
           name: limit
@@ -158,6 +213,11 @@ paths:
           schema:
             type: integer
             default: 0
+        - in: query
+          name: search
+          schema:
+            type: string
+          description: Optional. Case-insensitive search across name, company, and title.
       responses:
         '200':
           description: Paginated list of managers
@@ -221,7 +281,8 @@ paths:
   /api/managers/{id}:
     get:
       operationId: getManagerById
-      summary: Get a single manager profile
+      summary: Get a single manager profile (public)
+      security: []
       parameters:
         - in: path
           name: id
@@ -303,7 +364,7 @@ paths:
   /api/managers/{id}/recalculate:
     put:
       operationId: recalculateManagerStats
-      summary: Recalculate and persist a manager's overall_rating, reviews_count, and category_averages from the reviews table
+      summary: Recalculate and persist a manager's overall_rating, reviews_count, and category_averages
       tags:
         - Managers
       parameters:
@@ -342,7 +403,8 @@ paths:
   /api/managers/{id}/reviews:
     get:
       operationId: getManagerReviews
-      summary: Get all reviews for a manager, optionally filtered by user
+      summary: Get all reviews for a manager (public)
+      security: []
       parameters:
         - in: path
           name: id
@@ -624,16 +686,26 @@ components:
         ratings:
           type: object
           properties:
-            communication_style: { type: number }
-            perceived_approachability: { type: number }
-            perceived_clarity_of_expectations: { type: number }
-            feedback_style: { type: number }
-            perceived_supportiveness: { type: number }
-            decision_making_style: { type: number }
-            organization_and_planning_style: { type: number }
-            delegation_style: { type: number }
-            perceived_professional_demeanor: { type: number }
-            overall_working_experience: { type: number }
+            communication_style:
+              type: number
+            perceived_approachability:
+              type: number
+            perceived_clarity_of_expectations:
+              type: number
+            feedback_style:
+              type: number
+            perceived_supportiveness:
+              type: number
+            decision_making_style:
+              type: number
+            organization_and_planning_style:
+              type: number
+            delegation_style:
+              type: number
+            perceived_professional_demeanor:
+              type: number
+            overall_working_experience:
+              type: number
         managerCompany:
           type: string
         managerTitle:
@@ -691,6 +763,13 @@ components:
 
     User:
       type: object
+      required:
+        - id
+        - email
+        - username
+        - firstName
+        - lastName
+        - createdAt
       properties:
         id:
           type: string
@@ -710,16 +789,15 @@ components:
         createdAt:
           type: string
           format: date-time
+
+    SignupRequest:
+      type: object
       required:
-        - id
         - email
         - username
         - firstName
         - lastName
-        - createdAt
-
-    SignupRequest:
-      type: object
+        - password
       properties:
         email:
           type: string
@@ -731,43 +809,37 @@ components:
           type: string
         password:
           type: string
-      required:
-        - email
-        - username
-        - firstName
-        - lastName
-        - password
 
     SigninRequest:
       type: object
+      required:
+        - email
+        - password
       properties:
         email:
           type: string
         password:
           type: string
-      required:
-        - email
-        - password
 
     SigninResponse:
       type: object
+      required:
+        - token
+        - user
       properties:
         token:
           type: string
           description: JWT access token
         user:
           $ref: '#/components/schemas/User'
-      required:
-        - token
-        - user
 
     SignoutResponse:
       type: object
+      required:
+        - success
       properties:
         success:
           type: boolean
-      required:
-        - success
 
     ManagerReviewUpdated:
       allOf:

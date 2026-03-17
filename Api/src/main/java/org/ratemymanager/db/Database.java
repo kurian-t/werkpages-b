@@ -24,7 +24,8 @@ public class Database {
            
 
 		if (useSSL) {
-		    connectOptions.setSslMode(io.vertx.pgclient.SslMode.REQUIRE);
+			connectOptions.setSslMode(io.vertx.pgclient.SslMode.REQUIRE);
+			connectOptions.setTrustAll(true);
 		}
 
         PoolOptions poolOptions = new PoolOptions().setMaxSize(10);

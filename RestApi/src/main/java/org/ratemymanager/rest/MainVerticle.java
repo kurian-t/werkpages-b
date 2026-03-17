@@ -72,7 +72,9 @@ public class MainVerticle extends AbstractVerticle {
                         routerFactory.addHandlerByOperationId("deleteManagerReview",   managersHandler::handleDeleteManagerReview);
                         routerFactory.addHandlerByOperationId("getMyReviews",          managersHandler::handleGetMyReviews);
                         routerFactory.addHandlerByOperationId("reportManager",         reportsHandler::handleReportManager);
-
+                        routerFactory.addHandlerByOperationId("getStats",         	   managersHandler::handleGetStats);
+                        
+                        
                         // Pass secrets into AuthHandler — no more hardcoded credentials
                         AuthHandler authHandler = new AuthHandler(
                             Database.getClient(),
@@ -85,7 +87,8 @@ public class MainVerticle extends AbstractVerticle {
                         routerFactory.addHandlerByOperationId("signin",  authHandler::handleSignin);
                         routerFactory.addHandlerByOperationId("me",      authHandler::handleMe);
                         routerFactory.addHandlerByOperationId("signout", authHandler::handleSignout);
-
+                        routerFactory.addHandlerByOperationId("deleteMe", authHandler::handleDeleteMe);
+                        
                         routerFactory.addSecurityHandler("bearerAuth", routingContext -> {
                             String authHeader = routingContext.request().getHeader("Authorization");
                             if (authHeader == null || !authHeader.startsWith("Bearer ")) {
@@ -120,7 +123,7 @@ public class MainVerticle extends AbstractVerticle {
 
                         // CORS — updated to production domain
                         String allowedOrigin = "true".equalsIgnoreCase(System.getenv("USE_AWS_SECRETS"))
-                        	    ? "https://ratemymanagers.ca"
+                        	    ? "https://ratemymanagers.ca|https://www.ratemymanagers.ca"
                         	    : "http://localhost:8080";
                         
                         router.route().handler(

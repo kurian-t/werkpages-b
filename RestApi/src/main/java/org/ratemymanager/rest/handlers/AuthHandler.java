@@ -1,9 +1,10 @@
 package org.ratemymanager.rest.handlers;
 
-import java.time.OffsetDateTime;
-
 import io.vertx.core.buffer.Buffer;
 import io.vertx.core.json.JsonObject;
+
+import java.util.UUID;
+
 import com.auth0.jwt.JWT;
 import com.auth0.jwt.exceptions.JWTDecodeException;
 import com.auth0.jwt.interfaces.DecodedJWT;
@@ -15,24 +16,23 @@ import io.vertx.sqlclient.RowSet;
 import io.vertx.sqlclient.SqlClient;
 import io.vertx.sqlclient.Tuple;
 
-
 public class AuthHandler {
-    
+
     private final SqlClient db;
     private final String auth0Domain;
     private final String clientId;
     private final String clientSecret;
     private final String audience;
-    
+
     public AuthHandler(SqlClient db, String auth0Domain, String clientId, String clientSecret, String audience) {
-        this.db           = db;
-        this.auth0Domain  = auth0Domain;
-        this.clientId     = clientId;
-        this.clientSecret = clientSecret;
-        this.audience     = audience;
+        this.db            = db;
+        this.auth0Domain   = auth0Domain;
+        this.clientId      = clientId;
+        this.clientSecret  = clientSecret;
+        this.audience      = audience;
     }
-    
- // ---------------- SIGNUP ----------------
+
+    // ---------------- SIGNUP ----------------
     public void handleSignup(RoutingContext ctx) {
         JsonObject body = ctx.getBodyAsJson();
         if (body == null) {
@@ -40,11 +40,11 @@ public class AuthHandler {
             return;
         }
 
-        String email = body.getString("email");
-        String username = body.getString("username");
+        String email     = body.getString("email");
+        String username  = body.getString("username");
         String firstName = body.getString("firstName");
-        String lastName = body.getString("lastName");
-        String password = body.getString("password");
+        String lastName  = body.getString("lastName");
+        String password  = body.getString("password");
 
         if (email == null || username == null || firstName == null ||
             lastName == null || password == null) {
@@ -65,7 +65,6 @@ public class AuthHandler {
                 .put("username", username)
             );
 
-        // Call Auth0 Signup endpoint
         client.post(443, auth0Domain, "/dbconnections/signup")
             .ssl(true)
             .putHeader("Content-Type", "application/json")
@@ -76,19 +75,18 @@ public class AuthHandler {
                 }
 
                 HttpResponse<Buffer> response = ar.result();
-                JsonObject auth0User = response.bodyAsJsonObject();
 
-                // 1. Validate Auth0 Response Status
                 if (response.statusCode() != 200) {
+                    System.err.println("Auth0 signup error: " + response.statusCode() + " - " + response.bodyAsString());
                     ctx.response()
                         .setStatusCode(response.statusCode())
                         .putHeader("Content-Type", "application/json")
-                        .end(auth0User.encode());
+                        .end(response.bodyAsString());
                     return;
                 }
 
-                // 2. Extract the raw ID and add the 'auth0|' prefix
-                // This ensures the DB ID matches the JWT 'sub' claim during sign-in
+                JsonObject auth0User = response.bodyAsJsonObject();
+
                 String rawId = auth0User.getString("_id");
                 if (rawId == null) {
                     ctx.response()
@@ -96,10 +94,9 @@ public class AuthHandler {
                         .end("{\"error\":\"Auth0 did not return a user ID\"}");
                     return;
                 }
-                
+
                 String auth0Id = "auth0|" + rawId;
 
-                // 3. Save in your local DB
                 db.preparedQuery("""
                     INSERT INTO users (auth0_id, email, username, first_name, last_name)
                     VALUES ($1, $2, $3, $4, $5)
@@ -112,7 +109,6 @@ public class AuthHandler {
                             return;
                         }
 
-                        // 4. Return successful response with 201 Created
                         ctx.response()
                             .setStatusCode(201)
                             .putHeader("Content-Type", "application/json")
@@ -138,7 +134,7 @@ public class AuthHandler {
             return;
         }
 
-        String email = body.getString("email");
+        String email    = body.getString("email");
         String password = body.getString("password");
 
         if (email == null || password == null) {
@@ -148,8 +144,6 @@ public class AuthHandler {
 
         WebClient client = WebClient.create(ctx.vertx());
 
-        // NOTE: Ensure AUTH0_AUDIENCE, AUTH0_CLIENT_ID, and AUTH0_CLIENT_SECRET 
-        // are set in your environment variables.
         JsonObject payload = new JsonObject()
             .put("grant_type", "password")
             .put("username", email)
@@ -159,9 +153,8 @@ public class AuthHandler {
             .put("client_id", this.clientId)
             .put("client_secret", this.clientSecret);
 
-        // Ensure 'auth0Domain' is the field passed into your constructor
         client.post(443, auth0Domain, "/oauth/token")
-            .ssl(true) // Required for HTTPS
+            .ssl(true)
             .putHeader("Content-Type", "application/json")
             .sendJsonObject(payload, ar -> {
                 if (ar.failed()) {
@@ -171,26 +164,24 @@ public class AuthHandler {
                 }
 
                 HttpResponse<Buffer> response = ar.result();
-                JsonObject auth0Response = response.bodyAsJsonObject();
 
-                // 1. Check if login was successful (Auth0 returns 200 for success)
+                // Check BEFORE parsing JSON — Auth0 error responses may not be valid JSON
                 if (response.statusCode() != 200) {
+                    System.err.println("Auth0 signin error: " + response.statusCode() + " - " + response.bodyAsString());
                     ctx.response()
                         .setStatusCode(response.statusCode())
                         .putHeader("Content-Type", "application/json")
-                        .end(auth0Response.encode());
+                        .end(response.bodyAsString());
                     return;
                 }
 
+                JsonObject auth0Response = response.bodyAsJsonObject();
                 String accessToken = auth0Response.getString("access_token");
 
                 try {
-                    // 2. Decode JWT to get Auth0 user_id (sub claim)
-                    // Requires: com.auth0:java-jwt dependency
                     com.auth0.jwt.interfaces.DecodedJWT decoded = com.auth0.jwt.JWT.decode(accessToken);
                     String auth0Id = decoded.getSubject();
 
-                    // 3. Look up user in local database using the Auth0 ID
                     db.preparedQuery("SELECT email, username, first_name, last_name FROM users WHERE auth0_id = $1")
                         .execute(io.vertx.sqlclient.Tuple.of(auth0Id), dbAr -> {
                             if (dbAr.failed()) {
@@ -206,7 +197,6 @@ public class AuthHandler {
 
                             io.vertx.sqlclient.Row row = rows.iterator().next();
 
-                            // 4. Return the token and user profile
                             ctx.response()
                                 .putHeader("Content-Type", "application/json")
                                 .end(new JsonObject()
@@ -281,7 +271,7 @@ public class AuthHandler {
                .setStatusCode(200)
                .putHeader("Content-Type", "application/json")
                .end(new JsonObject()
-                   .put("id", row.getUUID("id").toString())  // internal DB UUID — used for userId filtering
+                   .put("id", row.getUUID("id").toString())
                    .put("auth0Id", row.getString("auth0_id"))
                    .put("email", row.getString("email"))
                    .put("username", row.getString("username"))
@@ -292,15 +282,96 @@ public class AuthHandler {
                );
         });
     }
-    
+
     // ---------------- SIGNOUT ----------------
     public void handleSignout(RoutingContext ctx) {
-        // JWTs are stateless, just tell client to remove it
         ctx.response()
             .putHeader("Content-Type", "application/json")
             .end(new JsonObject()
                 .put("success", true)
                 .encode());
     }
+    
+    public void handleDeleteMe(RoutingContext ctx) {
+        String authHeader = ctx.request().getHeader("Authorization");
+        if (authHeader == null || !authHeader.startsWith("Bearer ")) {
+            ctx.response()
+               .setStatusCode(401)
+               .putHeader("Content-Type", "application/json")
+               .end(new JsonObject().put("error", "Missing or invalid Authorization header").encode());
+            return;
+        }
 
+        String token = authHeader.substring("Bearer ".length());
+        DecodedJWT decoded;
+        try {
+            decoded = JWT.decode(token);
+        } catch (JWTDecodeException e) {
+            ctx.response()
+               .setStatusCode(401)
+               .putHeader("Content-Type", "application/json")
+               .end(new JsonObject().put("error", "Invalid token").encode());
+            return;
+        }
+
+        String auth0Id = decoded.getClaim("sub").asString();
+        if (auth0Id == null) {
+            ctx.response()
+               .setStatusCode(401)
+               .putHeader("Content-Type", "application/json")
+               .end(new JsonObject().put("error", "Unauthorized").encode());
+            return;
+        }
+
+        // Step 1: Look up the user's internal UUID
+        db.preparedQuery("SELECT id FROM users WHERE auth0_id = $1")
+          .execute(Tuple.of(auth0Id), userAr -> {
+            if (userAr.failed()) {
+                ctx.fail(userAr.cause());
+                return;
+            }
+            if (!userAr.result().iterator().hasNext()) {
+                ctx.response()
+                   .setStatusCode(404)
+                   .putHeader("Content-Type", "application/json")
+                   .end(new JsonObject().put("error", "User not found").encode());
+                return;
+            }
+
+            UUID userId = userAr.result().iterator().next().getUUID("id");
+
+            // Step 2: Anonymize all reviews by this user
+            String anonymizeSql = """
+                UPDATE reviews
+                SET author = 'Anonymous User',
+                    user_id = NULL,
+                    updated_at = now()
+                WHERE user_id = $1
+                """;
+
+            db.preparedQuery(anonymizeSql).execute(Tuple.of(userId), anonymizeAr -> {
+                if (anonymizeAr.failed()) {
+                    ctx.fail(anonymizeAr.cause());
+                    return;
+                }
+
+                // Step 3: Delete the user record
+                db.preparedQuery("DELETE FROM users WHERE id = $1")
+                  .execute(Tuple.of(userId), deleteAr -> {
+                    if (deleteAr.failed()) {
+                        ctx.fail(deleteAr.cause());
+                        return;
+                    }
+
+                    ctx.response()
+                       .setStatusCode(200)
+                       .putHeader("Content-Type", "application/json")
+                       .end(new JsonObject()
+                           .put("success", true)
+                           .put("message", "Account deleted and reviews anonymized")
+                           .encode());
+                });
+            });
+        });
+    }
 }
