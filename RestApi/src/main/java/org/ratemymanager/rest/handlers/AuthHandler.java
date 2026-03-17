@@ -231,9 +231,8 @@ public class AuthHandler {
                             Row row = rows.iterator().next();
 
                             boolean isProd = "true".equalsIgnoreCase(System.getenv("USE_AWS_SECRETS"));
-                            String sameSite = isProd ? "None" : "Strict";
                             String setCookie = "auth_token=" + accessToken
-                                + "; HttpOnly; Path=/; Max-Age=86400; SameSite=" + sameSite
+                                + "; HttpOnly; Path=/; Max-Age=86400; SameSite=Strict"
                                 + (isProd ? "; Secure" : "");
                             ctx.response()
                                 .putHeader("Set-Cookie", setCookie)

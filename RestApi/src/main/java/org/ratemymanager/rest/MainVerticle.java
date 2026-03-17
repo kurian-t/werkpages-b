@@ -157,11 +157,13 @@ public class MainVerticle extends AbstractVerticle {
 
                         // Rate limiting — applied in order before the API sub-router
                         RateLimitHandler globalLimiter = new RateLimitHandler(200, 60_000); // 200 req/min per IP
-                        RateLimitHandler authLimiter   = new RateLimitHandler(10,  60_000); // 10 req/min  per IP on auth
+                        RateLimitHandler authLimiter   = new RateLimitHandler(10,  60_000); // 10 req/min  per IP on auth mutations
                         RateLimitHandler writeLimiter  = new RateLimitHandler(30,  60_000); // 30 req/min  per IP on writes
 
                         router.route().handler(globalLimiter::handle);
-                        router.route("/api/auth/*").handler(authLimiter::handle);
+                        // Only apply the strict auth limiter to mutation endpoints (signin/signup/signout).
+                        // GET /api/auth/me is a lightweight session check — leave it on the global limiter only.
+                        router.post("/api/auth/*").handler(authLimiter::handle);
                         router.post("/api/*").handler(writeLimiter::handle);
                         router.put("/api/*").handler(writeLimiter::handle);
                         router.delete("/api/*").handler(writeLimiter::handle);

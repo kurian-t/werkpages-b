@@ -3,10 +3,6 @@ package org.ratemymanager.rest.handlers;
 import java.util.List;
 import java.util.UUID;
 
-import com.auth0.jwt.JWT;
-import com.auth0.jwt.exceptions.JWTDecodeException;
-import com.auth0.jwt.interfaces.DecodedJWT;
-
 import io.vertx.core.json.JsonObject;
 import io.vertx.ext.web.RoutingContext;
 import io.vertx.sqlclient.Row;
@@ -23,28 +19,14 @@ public class ReportsHandler {
     
     
 	public void handleReportManager(RoutingContext ctx) {
-	    String authHeader = ctx.request().getHeader("Authorization");
-	    if (authHeader == null || !authHeader.startsWith("Bearer ")) {
+	    String auth0Id = ctx.get("auth0Id");
+	    if (auth0Id == null) {
 	        ctx.response()
 	            .setStatusCode(401)
 	            .putHeader("Content-Type", "application/json")
-	            .end(new JsonObject().put("error", "Missing or invalid Authorization header").encode());
+	            .end(new JsonObject().put("error", "Unauthorized").encode());
 	        return;
 	    }
-
-	    String token = authHeader.substring("Bearer ".length());
-	    DecodedJWT decoded;
-	    try {
-	        decoded = JWT.decode(token);
-	    } catch (JWTDecodeException e) {
-	        ctx.response()
-	            .setStatusCode(401)
-	            .putHeader("Content-Type", "application/json")
-	            .end(new JsonObject().put("error", "Invalid token").encode());
-	        return;
-	    }
-
-	    String auth0Id = decoded.getClaim("sub").asString();
 
 	    long managerId;
 	    try {

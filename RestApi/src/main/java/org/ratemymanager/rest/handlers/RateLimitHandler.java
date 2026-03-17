@@ -31,6 +31,15 @@ public class RateLimitHandler {
             return timestamps;
         });
 
+        // Periodically evict idle IPs to prevent unbounded memory growth.
+        // Only runs ~1% of the time to avoid lock contention.
+        if (Math.random() < 0.01) {
+            requestLog.entrySet().removeIf(e -> {
+                ArrayDeque<Long> ts = e.getValue();
+                return ts.isEmpty() || ts.peekLast() < windowStart;
+            });
+        }
+
         int count = requestLog.get(ip).size();
         if (count > maxRequests) {
             ctx.response()

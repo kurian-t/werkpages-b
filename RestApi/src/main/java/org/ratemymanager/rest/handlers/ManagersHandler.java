@@ -126,10 +126,17 @@ public class ManagersHandler {
 //            return;
 //        }
 
-        int limit = Integer.parseInt(ctx.queryParam("limit").stream().findFirst().orElse("20"));
-        int offset = Integer.parseInt(ctx.queryParam("offset").stream().findFirst().orElse("0"));
+        int limit = Math.min(Integer.parseInt(ctx.queryParam("limit").stream().findFirst().orElse("20")), 100);
+        int offset = Math.max(Integer.parseInt(ctx.queryParam("offset").stream().findFirst().orElse("0")), 0);
         String search = ctx.queryParam("search").stream().findFirst().orElse(null);
         boolean hasSearch = search != null && !search.isBlank();
+        if (hasSearch && search.trim().length() > 100) {
+            ctx.response()
+                .setStatusCode(400)
+                .putHeader("Content-Type", "application/json")
+                .end(new JsonObject().put("error", "Search query too long").encode());
+            return;
+        }
         String searchPattern = hasSearch ? "%" + search.trim() + "%" : null;
 
         // Build SQL and tuples depending on whether search is present
