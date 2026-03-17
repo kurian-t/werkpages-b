@@ -46,9 +46,34 @@ public class AuthHandler {
         String lastName  = body.getString("lastName");
         String password  = body.getString("password");
 
-        if (email == null || username == null || firstName == null ||
-            lastName == null || password == null) {
-            ctx.response().setStatusCode(400).end("{\"error\":\"Missing fields\"}");
+        if (ValidationUtils.isBlank(email) || ValidationUtils.isBlank(username) ||
+            ValidationUtils.isBlank(firstName) || ValidationUtils.isBlank(lastName) ||
+            ValidationUtils.isBlank(password)) {
+            ValidationUtils.badRequest(ctx, "Missing required fields");
+            return;
+        }
+        if (!ValidationUtils.isValidEmail(email)) {
+            ValidationUtils.badRequest(ctx, "Invalid email format");
+            return;
+        }
+        if (ValidationUtils.exceedsLength(email, 254)) {
+            ValidationUtils.badRequest(ctx, "Email must be at most 254 characters");
+            return;
+        }
+        if (firstName.trim().length() > 50) {
+            ValidationUtils.badRequest(ctx, "First name must be at most 50 characters");
+            return;
+        }
+        if (lastName.trim().length() > 50) {
+            ValidationUtils.badRequest(ctx, "Last name must be at most 50 characters");
+            return;
+        }
+        if (username.trim().length() < 3 || username.trim().length() > 30) {
+            ValidationUtils.badRequest(ctx, "Username must be between 3 and 30 characters");
+            return;
+        }
+        if (password.length() < 8 || password.length() > 128) {
+            ValidationUtils.badRequest(ctx, "Password must be between 8 and 128 characters");
             return;
         }
 

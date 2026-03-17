@@ -92,6 +92,13 @@ public class ReportsHandler {
 	            .end(new JsonObject().put("error", "Invalid reason").encode());
 	        return;
 	    }
+	    if (comment != null && comment.length() > 500) {
+	        ctx.response()
+	            .setStatusCode(400)
+	            .putHeader("Content-Type", "application/json")
+	            .end(new JsonObject().put("error", "Comment must be at most 500 characters").encode());
+	        return;
+	    }
 
 	    // Confirm manager exists
 	    db.preparedQuery("SELECT id FROM managers WHERE id = $1")

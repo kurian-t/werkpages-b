@@ -377,15 +377,44 @@ public class ManagersHandler {
         String title = body.getString("title");
         String image = body.getString("image");
         String status = body.getString("status");
-        if (name == null || company == null || title == null || image == null || status == null) {
-            ctx.response()
-               .setStatusCode(400)
-               .putHeader("Content-Type", "application/json")
-               .end(new JsonObject().put("error", "Missing required fields").encode());
+        if (ValidationUtils.isBlank(name) || ValidationUtils.isBlank(company) ||
+            ValidationUtils.isBlank(title) || ValidationUtils.isBlank(image) ||
+            ValidationUtils.isBlank(status)) {
+            ValidationUtils.badRequest(ctx, "Missing required fields");
+            return;
+        }
+        if (ValidationUtils.exceedsLength(name, 100)) {
+            ValidationUtils.badRequest(ctx, "Manager name must be at most 100 characters");
+            return;
+        }
+        if (ValidationUtils.exceedsLength(company, 100)) {
+            ValidationUtils.badRequest(ctx, "Company must be at most 100 characters");
+            return;
+        }
+        if (ValidationUtils.exceedsLength(title, 100)) {
+            ValidationUtils.badRequest(ctx, "Title must be at most 100 characters");
+            return;
+        }
+        if (!status.equals("active") && !status.equals("retired")) {
+            ValidationUtils.badRequest(ctx, "Status must be 'active' or 'retired'");
             return;
         }
         String bio = body.getString("bio");
         String linkedinUrl = body.getString("linkedinUrl");
+        if (bio != null && ValidationUtils.exceedsLength(bio, 1000)) {
+            ValidationUtils.badRequest(ctx, "Bio must be at most 1000 characters");
+            return;
+        }
+        if (linkedinUrl != null && !linkedinUrl.isBlank()) {
+            if (ValidationUtils.exceedsLength(linkedinUrl, 500)) {
+                ValidationUtils.badRequest(ctx, "LinkedIn URL must be at most 500 characters");
+                return;
+            }
+            if (!ValidationUtils.isValidLinkedinUrl(linkedinUrl)) {
+                ValidationUtils.badRequest(ctx, "LinkedIn URL must be a valid linkedin.com URL");
+                return;
+            }
+        }
         String insertSql = """
             INSERT INTO managers
             (name, company, title, image, bio, status, linkedin_url, overall_rating, reviews_count, category_averages, created_at)
@@ -476,6 +505,32 @@ public class ManagersHandler {
                .putHeader("Content-Type", "application/json")
                .end(new JsonObject().put("error", "Nothing to update").encode());
             return;
+        }
+        if (newCompany != null && (newCompany.isBlank() || ValidationUtils.exceedsLength(newCompany, 100))) {
+            ValidationUtils.badRequest(ctx, "Company must be between 1 and 100 characters");
+            return;
+        }
+        if (newTitle != null && (newTitle.isBlank() || ValidationUtils.exceedsLength(newTitle, 100))) {
+            ValidationUtils.badRequest(ctx, "Title must be between 1 and 100 characters");
+            return;
+        }
+        if (newBio != null && ValidationUtils.exceedsLength(newBio, 1000)) {
+            ValidationUtils.badRequest(ctx, "Bio must be at most 1000 characters");
+            return;
+        }
+        if (newStatus != null && !newStatus.equals("active") && !newStatus.equals("retired")) {
+            ValidationUtils.badRequest(ctx, "Status must be 'active' or 'retired'");
+            return;
+        }
+        if (newLinkedinUrl != null && !newLinkedinUrl.isBlank()) {
+            if (ValidationUtils.exceedsLength(newLinkedinUrl, 500)) {
+                ValidationUtils.badRequest(ctx, "LinkedIn URL must be at most 500 characters");
+                return;
+            }
+            if (!ValidationUtils.isValidLinkedinUrl(newLinkedinUrl)) {
+                ValidationUtils.badRequest(ctx, "LinkedIn URL must be a valid linkedin.com URL");
+                return;
+            }
         }
         Tuple selectParams = Tuple.of(managerId);
         db.preparedQuery(GET_MANAGER_BY_ID_SQL).execute(selectParams, ar -> {
@@ -637,12 +692,51 @@ public class ManagersHandler {
             String managerCompany = body.getString("managerCompany");
             String managerTitle = body.getString("managerTitle");
             String text = body.getString("text");
-            if (author == null || overallRating == null || ratings == null || managerCompany == null || managerTitle == null) {
-                ctx.response()
-                   .setStatusCode(400)
-                   .putHeader("Content-Type", "application/json")
-                   .end(new JsonObject().put("error", "Missing required fields").encode());
+            if (ValidationUtils.isBlank(author) || overallRating == null || ratings == null ||
+                ValidationUtils.isBlank(managerCompany) || ValidationUtils.isBlank(managerTitle)) {
+                ValidationUtils.badRequest(ctx, "Missing required fields");
                 return;
+            }
+            if (ValidationUtils.exceedsLength(author, 50)) {
+                ValidationUtils.badRequest(ctx, "Author name must be at most 50 characters");
+                return;
+            }
+            if (ValidationUtils.exceedsLength(managerCompany, 100)) {
+                ValidationUtils.badRequest(ctx, "Manager company must be at most 100 characters");
+                return;
+            }
+            if (ValidationUtils.exceedsLength(managerTitle, 100)) {
+                ValidationUtils.badRequest(ctx, "Manager title must be at most 100 characters");
+                return;
+            }
+            if (text != null && ValidationUtils.exceedsLength(text, 2000)) {
+                ValidationUtils.badRequest(ctx, "Review text must be at most 2000 characters");
+                return;
+            }
+            if (!ValidationUtils.isValidRating(overallRating)) {
+                ValidationUtils.badRequest(ctx, "Overall rating must be between 1 and 5");
+                return;
+            }
+            String[] ratingKeys = {
+                "Communication Style", "Perceived Approachability", "Perceived Clarity of Expectations",
+                "Feedback Style", "Perceived Supportiveness", "Decision Making Style",
+                "Organization and Planning Style", "Delegation Style",
+                "Perceived Professional Demeanor", "Overall Working Experience"
+            };
+            String[] ratingKeysFallback = {
+                "communication_style", "perceived_approachability", "perceived_clarity_of_expectations",
+                "feedback_style", "perceived_supportiveness", "decision_making_style",
+                "organization_and_planning_style", "delegation_style",
+                "perceived_professional_demeanor", "overall_working_experience"
+            };
+            for (int i = 0; i < ratingKeys.length; i++) {
+                Double v = ratings.getDouble(ratingKeys[i]) != null
+                    ? ratings.getDouble(ratingKeys[i])
+                    : ratings.getDouble(ratingKeysFallback[i]);
+                if (!ValidationUtils.isValidRating(v)) {
+                    ValidationUtils.badRequest(ctx, "Rating for '" + ratingKeys[i] + "' must be between 1 and 5");
+                    return;
+                }
             }
             Tuple params = Tuple.of(
                 managerId, userId, author, overallRating,
@@ -845,13 +939,22 @@ public class ManagersHandler {
         }
         String token = authHeader.substring("Bearer ".length());
         DecodedJWT decoded;
+        String auth0Id;
         try {
             decoded = JWT.decode(token);
+            auth0Id = decoded.getClaim("sub").asString();
         } catch (JWTDecodeException e) {
             ctx.response()
                 .setStatusCode(401)
                 .putHeader("Content-Type", "application/json")
                 .end(new JsonObject().put("error", "Invalid token").encode());
+            return;
+        }
+        if (auth0Id == null) {
+            ctx.response()
+               .setStatusCode(401)
+               .putHeader("Content-Type", "application/json")
+               .end(new JsonObject().put("error", "Unauthorized").encode());
             return;
         }
         long managerId;
@@ -879,12 +982,38 @@ public class ManagersHandler {
         String managerCompany = body.getString("managerCompany");
         String managerTitle = body.getString("managerTitle");
         String text = body.getString("text");
-        if (overallRating == null || ratings == null || managerCompany == null || managerTitle == null) {
-            ctx.response()
-               .setStatusCode(400)
-               .putHeader("Content-Type", "application/json")
-               .end(new JsonObject().put("error", "Missing required fields").encode());
+        if (overallRating == null || ratings == null ||
+            ValidationUtils.isBlank(managerCompany) || ValidationUtils.isBlank(managerTitle)) {
+            ValidationUtils.badRequest(ctx, "Missing required fields");
             return;
+        }
+        if (!ValidationUtils.isValidRating(overallRating)) {
+            ValidationUtils.badRequest(ctx, "Overall rating must be between 1 and 5");
+            return;
+        }
+        if (ValidationUtils.exceedsLength(managerCompany, 100)) {
+            ValidationUtils.badRequest(ctx, "Manager company must be at most 100 characters");
+            return;
+        }
+        if (ValidationUtils.exceedsLength(managerTitle, 100)) {
+            ValidationUtils.badRequest(ctx, "Manager title must be at most 100 characters");
+            return;
+        }
+        if (text != null && ValidationUtils.exceedsLength(text, 2000)) {
+            ValidationUtils.badRequest(ctx, "Review text must be at most 2000 characters");
+            return;
+        }
+        String[] updateRatingKeys = {
+            "Communication Style", "Perceived Approachability", "Perceived Clarity of Expectations",
+            "Feedback Style", "Perceived Supportiveness", "Decision Making Style",
+            "Organization and Planning Style", "Delegation Style",
+            "Perceived Professional Demeanor", "Overall Working Experience"
+        };
+        for (String key : updateRatingKeys) {
+            if (!ValidationUtils.isValidRating(ratings.getDouble(key))) {
+                ValidationUtils.badRequest(ctx, "Rating for '" + key + "' must be between 1 and 5");
+                return;
+            }
         }
         Double communicationStyle = ratings.getDouble("Communication Style");
         Double perceivedApproachability = ratings.getDouble("Perceived Approachability");
@@ -913,17 +1042,32 @@ public class ManagersHandler {
                 manager_title = $13,
                 text = $14,
                 updated_at = now()
-            WHERE id = $15 AND manager_id = $16
+            WHERE id = $15 AND manager_id = $16 AND user_id = $17
             RETURNING *
             """;
-        Tuple params = Tuple.of(
-            overallRating, communicationStyle, perceivedApproachability,
-            perceivedClarityOfExpectations, feedbackStyle, perceivedSupportiveness,
-            decisionMakingStyle, organizationAndPlanningStyle, delegationStyle,
-            perceivedProfessionalDemeanor, overallWorkingExperience,
-            managerCompany, managerTitle, text, reviewId, managerId
-        );
-        db.preparedQuery(updateSql).execute(params, ar -> {
+        // Resolve caller's internal UUID for ownership verification
+        db.preparedQuery("SELECT id FROM users WHERE auth0_id = $1")
+          .execute(Tuple.of(auth0Id), userAr -> {
+            if (userAr.failed()) {
+                ctx.fail(userAr.cause());
+                return;
+            }
+            if (!userAr.result().iterator().hasNext()) {
+                ctx.response()
+                   .setStatusCode(401)
+                   .putHeader("Content-Type", "application/json")
+                   .end(new JsonObject().put("error", "Unauthorized").encode());
+                return;
+            }
+            UUID callerId = userAr.result().iterator().next().getUUID("id");
+            Tuple params = Tuple.of(
+                overallRating, communicationStyle, perceivedApproachability,
+                perceivedClarityOfExpectations, feedbackStyle, perceivedSupportiveness,
+                decisionMakingStyle, organizationAndPlanningStyle, delegationStyle,
+                perceivedProfessionalDemeanor, overallWorkingExperience,
+                managerCompany, managerTitle, text, reviewId, managerId, callerId
+            );
+            db.preparedQuery(updateSql).execute(params, ar -> {
             if (ar.failed()) {
                 ctx.fail(ar.cause());
                 return;
@@ -965,7 +1109,8 @@ public class ManagersHandler {
                .setStatusCode(200)
                .putHeader("Content-Type", "application/json")
                .end(response.encode());
-        });
+            });  // end updateSql execute
+        });  // end user lookup execute
     }
 
     public void handleDeleteManagerReview(RoutingContext ctx) {
