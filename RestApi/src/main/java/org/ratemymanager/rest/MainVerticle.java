@@ -8,6 +8,7 @@ import org.ratemymanager.config.SecretsConfig;
 import org.ratemymanager.db.Database;
 import org.ratemymanager.rest.handlers.AuthHandler;
 import org.ratemymanager.rest.handlers.ManagersHandler;
+import org.ratemymanager.rest.handlers.RateLimitHandler;
 import org.ratemymanager.rest.handlers.ReportsHandler;
 
 import io.vertx.core.AbstractVerticle;
@@ -132,6 +133,17 @@ public class MainVerticle extends AbstractVerticle {
                                 .allowedMethods(allowedMethods)
                                 .allowCredentials(true)
                         );
+
+                        // Rate limiting — applied in order before the API sub-router
+                        RateLimitHandler globalLimiter = new RateLimitHandler(200, 60_000); // 200 req/min per IP
+                        RateLimitHandler authLimiter   = new RateLimitHandler(10,  60_000); // 10 req/min  per IP on auth
+                        RateLimitHandler writeLimiter  = new RateLimitHandler(30,  60_000); // 30 req/min  per IP on writes
+
+                        router.route().handler(globalLimiter::handle);
+                        router.route("/api/auth/*").handler(authLimiter::handle);
+                        router.post("/api/*").handler(writeLimiter::handle);
+                        router.put("/api/*").handler(writeLimiter::handle);
+                        router.delete("/api/*").handler(writeLimiter::handle);
 
                         router.mountSubRouter("/", apiRouter);
 
