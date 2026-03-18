@@ -6,6 +6,7 @@ import java.util.Set;
 
 import org.ratemymanager.config.SecretsConfig;
 import org.ratemymanager.db.Database;
+import org.ratemymanager.rest.handlers.AdminHandler;
 import org.ratemymanager.rest.handlers.AuthHandler;
 import org.ratemymanager.rest.handlers.ManagersHandler;
 import org.ratemymanager.rest.handlers.RateLimitHandler;
@@ -53,14 +54,15 @@ public class MainVerticle extends AbstractVerticle {
 
                 JWTAuth jwtAuth = JWTAuth.create(vertx, new JWTAuthOptions().setJwks(keys));
 
-                Database.init(vertx, secrets);
-
                 OpenAPI3RouterFactory.create(vertx, "openapi.yaml", routerFactoryAr -> {
                     if (routerFactoryAr.succeeded()) {
                         OpenAPI3RouterFactory routerFactory = routerFactoryAr.result();
 
+                        Database.init(vertx, secrets, () -> {
+
                         ManagersHandler managersHandler = new ManagersHandler(Database.getClient());
                         ReportsHandler reportsHandler   = new ReportsHandler(Database.getClient());
+                        AdminHandler adminHandler       = new AdminHandler(Database.getClient());
 
                         routerFactory.addHandlerByOperationId("getManagers",           managersHandler::handleGetManagers);
                         routerFactory.addHandlerByOperationId("getManagerById",        managersHandler::handleGetManagerById);
@@ -72,7 +74,16 @@ public class MainVerticle extends AbstractVerticle {
                         routerFactory.addHandlerByOperationId("deleteManagerReview",   managersHandler::handleDeleteManagerReview);
                         routerFactory.addHandlerByOperationId("getMyReviews",          managersHandler::handleGetMyReviews);
                         routerFactory.addHandlerByOperationId("reportManager",         reportsHandler::handleReportManager);
-                        routerFactory.addHandlerByOperationId("getStats",         	   managersHandler::handleGetStats);
+                        routerFactory.addHandlerByOperationId("getStats",               managersHandler::handleGetStats);
+                        routerFactory.addHandlerByOperationId("createManagerEditRequest", managersHandler::handleCreateEditRequest);
+                        routerFactory.addHandlerByOperationId("getManagerPendingEdits",   managersHandler::handleGetPendingEditsForManager);
+                        routerFactory.addHandlerByOperationId("getAdminPendingEdits",     adminHandler::handleGetPendingEdits);
+                        routerFactory.addHandlerByOperationId("approveManagerEdit",       adminHandler::handleApproveEdit);
+                        routerFactory.addHandlerByOperationId("rejectManagerEdit",        adminHandler::handleRejectEdit);
+                        routerFactory.addHandlerByOperationId("getAdminUsers",            adminHandler::handleGetUsers);
+                        routerFactory.addHandlerByOperationId("getAdminBannedUsers",      adminHandler::handleGetBannedUsers);
+                        routerFactory.addHandlerByOperationId("banUser",                  adminHandler::handleBanUser);
+                        routerFactory.addHandlerByOperationId("unbanUser",                adminHandler::handleUnbanUser);
                         
                         
                         // Pass secrets into AuthHandler — no more hardcoded credentials
@@ -198,6 +209,8 @@ public class MainVerticle extends AbstractVerticle {
                             .listen(8888)
                             .onSuccess(server -> System.out.println("✓ HTTP server started on port 8888"))
                             .onFailure(err -> System.err.println("✗ Failed to start server: " + err.getMessage()));
+
+                        }); // end Database.init onReady
                     } else {
                         System.err.println("✗ Failed to create RouterFactory: " + routerFactoryAr.cause());
                     }

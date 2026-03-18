@@ -6,6 +6,17 @@ servers:
   - url: http://localhost:8888
 security:
   - bearerAuth: []
+tags:
+  - name: Auth
+    description: Authentication and user session management
+  - name: Managers
+    description: Manager profiles, reviews, and edit requests
+  - name: Admin
+    description: Admin-only management operations
+  - name: Users
+    description: User-specific operations
+  - name: General
+    description: Site-wide statistics and general endpoints
 paths:
   /api/auth/signup:
     post:
@@ -164,6 +175,8 @@ paths:
     get:
       operationId: getMyReviews
       summary: Get all reviews written by the authenticated user
+      tags:
+        - Users
       responses:
         '200':
           description: List of reviews with manager info
@@ -181,6 +194,8 @@ paths:
     get:
       operationId: getStats
       summary: Get site-wide stats (total managers and reviews)
+      tags:
+        - General
       security: []
       responses:
         '200':
@@ -199,6 +214,8 @@ paths:
     get:
       operationId: getManagers
       summary: List managers (public)
+      tags:
+        - Managers
       security: []
       parameters:
         - in: query
@@ -238,6 +255,8 @@ paths:
     post:
       operationId: createManager
       summary: Create a new manager
+      tags:
+        - Managers
       requestBody:
         required: true
         content:
@@ -280,6 +299,8 @@ paths:
     get:
       operationId: getManagerById
       summary: Get a single manager profile (public)
+      tags:
+        - Managers
       security: []
       parameters:
         - in: path
@@ -300,6 +321,8 @@ paths:
     put:
       operationId: updateManager
       summary: Update any writeable manager fields and optionally track career history
+      tags:
+        - Managers
       parameters:
         - in: path
           name: id
@@ -402,6 +425,8 @@ paths:
     get:
       operationId: getManagerReviews
       summary: Get all reviews for a manager (public)
+      tags:
+        - Managers
       security: []
       parameters:
         - in: path
@@ -463,6 +488,8 @@ paths:
     post:
       operationId: createManagerReview
       summary: Submit a new review for a manager
+      tags:
+        - Managers
       parameters:
         - in: path
           name: id
@@ -489,6 +516,8 @@ paths:
     post:
       operationId: reportManager
       summary: Report an inaccurate or incorrect manager profile
+      tags:
+        - Managers
       parameters:
         - in: path
           name: id
@@ -532,10 +561,225 @@ paths:
                   error:
                     type: string
 
+  /api/managers/{id}/edit-requests:
+    post:
+      operationId: createManagerEditRequest
+      summary: Submit a pending edit request for a manager's company/title
+      tags:
+        - Managers
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                company:
+                  type: string
+                title:
+                  type: string
+      responses:
+        '201':
+          description: Edit request created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id:
+                    type: string
+                  status:
+                    type: string
+        '400':
+          description: Validation error
+        '404':
+          description: Manager not found
+
+  /api/managers/{id}/pending-edits:
+    get:
+      operationId: getManagerPendingEdits
+      summary: Get pending edit requests for a manager (public)
+      tags:
+        - Managers
+      security: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: List of pending edits
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items:
+                      type: object
+
+  /api/admin/pending-edits:
+    get:
+      operationId: getAdminPendingEdits
+      summary: Get all pending manager edit requests (admin only)
+      tags:
+        - Admin
+      responses:
+        '200':
+          description: List of pending edits
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items:
+                      type: object
+        '403':
+          description: Forbidden
+
+  /api/admin/pending-edits/{editId}/approve:
+    post:
+      operationId: approveManagerEdit
+      summary: Approve a pending manager edit (admin only)
+      tags:
+        - Admin
+      parameters:
+        - in: path
+          name: editId
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Edit approved and applied
+        '403':
+          description: Forbidden
+        '404':
+          description: Edit not found
+
+  /api/admin/pending-edits/{editId}/reject:
+    post:
+      operationId: rejectManagerEdit
+      summary: Reject a pending manager edit (admin only)
+      tags:
+        - Admin
+      parameters:
+        - in: path
+          name: editId
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Edit rejected
+        '403':
+          description: Forbidden
+        '404':
+          description: Edit not found
+
+  /api/admin/users:
+    get:
+      operationId: getAdminUsers
+      summary: Get all non-admin users with ban status (admin only)
+      tags:
+        - Admin
+      responses:
+        '200':
+          description: List of users
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items:
+                      type: object
+        '403':
+          description: Forbidden
+
+  /api/admin/banned-users:
+    get:
+      operationId: getAdminBannedUsers
+      summary: Get all banned users (admin only)
+      tags:
+        - Admin
+      responses:
+        '200':
+          description: List of banned users
+        '403':
+          description: Forbidden
+
+  /api/admin/users/{userId}/ban:
+    post:
+      operationId: banUser
+      summary: Ban a user (admin only)
+      tags:
+        - Admin
+      parameters:
+        - in: path
+          name: userId
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - reason
+              properties:
+                reason:
+                  type: string
+      responses:
+        '201':
+          description: User banned
+        '403':
+          description: Forbidden
+        '404':
+          description: User not found
+    delete:
+      operationId: unbanUser
+      summary: Remove a user ban (admin only)
+      tags:
+        - Admin
+      parameters:
+        - in: path
+          name: userId
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: User unbanned
+        '403':
+          description: Forbidden
+        '404':
+          description: Ban not found
+
   /api/managers/{managerId}/reviews/{reviewId}:
     put:
       operationId: updateManagerReview
       summary: Update an existing review
+      tags:
+        - Managers
       parameters:
         - in: path
           name: managerId
@@ -567,6 +811,8 @@ paths:
     delete:
       operationId: deleteManagerReview
       summary: Delete a review
+      tags:
+        - Managers
       parameters:
         - in: path
           name: managerId

@@ -1,7 +1,11 @@
 package org.ratemymanager.rest.handlers;
 
 import java.math.BigDecimal;
+import java.time.LocalDate;
 import java.time.OffsetDateTime;
+import java.time.ZoneOffset;
+import java.time.format.DateTimeFormatter;
+import java.time.format.DateTimeParseException;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
@@ -87,7 +91,9 @@ public class ManagersHandler {
 			                'text', text,
 			                'verified', verified,
 			                'helpfulCount', helpful_count,
-			                'createdAt', created_at
+			                'createdAt', created_at,
+			                'workedFrom', worked_from,
+			                'workedUntil', worked_until
 			            )
 			            ORDER BY created_at DESC
 			        ) AS reviews
@@ -103,6 +109,15 @@ public class ManagersHandler {
 
     public ManagersHandler(SqlClient db) {
         this.db = db;
+    }
+
+    private LocalDate parseYearMonth(String str, LocalDate defaultVal) {
+        if (str == null || str.isBlank()) return defaultVal;
+        try {
+            return LocalDate.parse(str + "-01", DateTimeFormatter.ofPattern("yyyy-MM-dd"));
+        } catch (DateTimeParseException e) {
+            return defaultVal;
+        }
     }
 
     // ---------------- GET MANAGERS (with optional search) ----------------
@@ -437,6 +452,14 @@ public class ManagersHandler {
                 .put("linkedinUrl", row.getString("linkedin_url"))
                 .put("createdAt", row.getOffsetDateTime("created_at").toString())
                 .put("careerHistory", new JsonArray());
+            // Seed career_history for the new manager
+            String startDateStr = body.getString("startDate");
+            LocalDate startDateLocal = parseYearMonth(startDateStr, LocalDate.now());
+            OffsetDateTime startDate = startDateLocal.atStartOfDay(ZoneOffset.UTC).toOffsetDateTime();
+            db.preparedQuery("INSERT INTO career_history(manager_id, company, title, start_date, end_date) VALUES ($1, $2, $3, $4, NULL)")
+                .execute(Tuple.of(row.getLong("id"), row.getString("company"), row.getString("title"), startDate), seedAr -> {
+                    // fire-and-forget
+                });
             ctx.response()
                .setStatusCode(201)
                .putHeader("Content-Type", "application/json")
@@ -476,6 +499,7 @@ public class ManagersHandler {
         String newBio         = body.getString("bio");
         String newStatus      = body.getString("status");
         String newLinkedinUrl = body.getString("linkedinUrl");
+        String startDateStr   = body.getString("startDate");
         // overallRating, reviews (reviews_count), and categoryAverages are computed fields —
         // they are only written by recalculateAndPersist, never accepted from user input.
         boolean hasAnyField = newCompany != null || newTitle != null || newImage != null
@@ -587,20 +611,44 @@ public class ManagersHandler {
             };
             if ((newCompany != null && !newCompany.equals(currentCompany)) ||
                 (newTitle != null && !newTitle.equals(currentTitle))) {
-                String insertCareerSql = """
-                    INSERT INTO career_history(manager_id, company, title, start_date, end_date)
-                    VALUES ($1, $2, $3, $4, $5)
-                    """;
                 OffsetDateTime now = OffsetDateTime.now();
-                Tuple careerParams = Tuple.of(managerId, currentCompany, currentTitle,
-                    row.getOffsetDateTime("created_at"), now);
-                db.preparedQuery(insertCareerSql).execute(careerParams, careerAr -> {
-                    if (careerAr.failed()) {
-                        ctx.fail(careerAr.cause());
-                        return;
-                    }
-                    updateManager.run();
-                });
+                LocalDate oldStartDateLocal = parseYearMonth(startDateStr, null);
+                OffsetDateTime oldStartDate = oldStartDateLocal != null
+                    ? oldStartDateLocal.atStartOfDay(ZoneOffset.UTC).toOffsetDateTime() : null;
+                String effectiveCo  = newCompany != null ? newCompany : currentCompany;
+                String effectiveTit = newTitle   != null ? newTitle   : currentTitle;
+                OffsetDateTime newPosStart = oldStartDate != null ? oldStartDate : now;
+                // Close any open career_history entry for this manager
+                db.preparedQuery("UPDATE career_history SET end_date = $1 WHERE manager_id = $2 AND end_date IS NULL")
+                    .execute(Tuple.of(now, managerId), updateCareerAr -> {
+                        if (updateCareerAr.failed()) { ctx.fail(updateCareerAr.cause()); return; }
+                        int closedRows = updateCareerAr.result().rowCount();
+                        Runnable insertNewThenUpdate = () ->
+                            db.preparedQuery("""
+                                INSERT INTO career_history(manager_id, company, title, start_date, end_date)
+                                VALUES ($1, $2, $3, $4, NULL)
+                                """)
+                                .execute(Tuple.of(managerId, effectiveCo, effectiveTit, newPosStart),
+                                    insertNewAr -> {
+                                        if (insertNewAr.failed()) { ctx.fail(insertNewAr.cause()); return; }
+                                        updateManager.run();
+                                    });
+                        if (closedRows == 0) {
+                            // Pre-V3 manager: no seeded entry existed, archive old position first
+                            Object oldStart = oldStartDate != null ? oldStartDate : row.getOffsetDateTime("created_at");
+                            db.preparedQuery("""
+                                INSERT INTO career_history(manager_id, company, title, start_date, end_date)
+                                VALUES ($1, $2, $3, $4, $5)
+                                """)
+                                .execute(Tuple.of(managerId, currentCompany, currentTitle, oldStart, now),
+                                    insertOldAr -> {
+                                        if (insertOldAr.failed()) { ctx.fail(insertOldAr.cause()); return; }
+                                        insertNewThenUpdate.run();
+                                    });
+                        } else {
+                            insertNewThenUpdate.run();
+                        }
+                    });
             } else {
                 updateManager.run();
             }
@@ -659,6 +707,10 @@ public class ManagersHandler {
             String managerCompany = body.getString("managerCompany");
             String managerTitle = body.getString("managerTitle");
             String text = body.getString("text");
+            String workedFromStr = body.getString("workedFrom");
+            String workedUntilStr = body.getString("workedUntil");
+            LocalDate workedFrom = parseYearMonth(workedFromStr, null);
+            LocalDate workedUntil = parseYearMonth(workedUntilStr, null);
             if (overallRating == null || ratings == null ||
                 ValidationUtils.isBlank(managerCompany) || ValidationUtils.isBlank(managerTitle)) {
                 ValidationUtils.badRequest(ctx, "Missing required fields");
@@ -713,7 +765,7 @@ public class ManagersHandler {
                 ratings.getDouble("Delegation Style") != null ? ratings.getDouble("Delegation Style") : ratings.getDouble("delegation_style"),
                 ratings.getDouble("Perceived Professional Demeanor") != null ? ratings.getDouble("Perceived Professional Demeanor") : ratings.getDouble("perceived_professional_demeanor"),
                 ratings.getDouble("Overall Working Experience") != null ? ratings.getDouble("Overall Working Experience") : ratings.getDouble("overall_working_experience"),
-                managerCompany, managerTitle, text
+                managerCompany, managerTitle, text, workedFrom, workedUntil
             );
             String insertSql = """
                 INSERT INTO reviews (
@@ -722,9 +774,10 @@ public class ManagersHandler {
                     feedback_style, perceived_supportiveness, decision_making_style,
                     organization_and_planning_style, delegation_style, perceived_professional_demeanor,
                     overall_working_experience, manager_company, manager_title, text,
+                    worked_from, worked_until,
                     verified, helpful_count, created_at, updated_at
                 )
-                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,true,0,now(),now())
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,true,0,now(),now())
                 RETURNING *
                 """;
             db.preparedQuery(insertSql).execute(params, ar -> {
@@ -755,7 +808,9 @@ public class ManagersHandler {
                     .put("text", row.getString("text"))
                     .put("verified", row.getBoolean("verified"))
                     .put("helpfulCount", row.getInteger("helpful_count"))
-                    .put("createdAt", row.getOffsetDateTime("created_at").toString());
+                    .put("createdAt", row.getOffsetDateTime("created_at").toString())
+                    .put("workedFrom", row.getLocalDate("worked_from") != null ? row.getLocalDate("worked_from").toString() : null)
+                    .put("workedUntil", row.getLocalDate("worked_until") != null ? row.getLocalDate("worked_until").toString() : null);
                 ctx.response()
                    .setStatusCode(201)
                    .putHeader("Content-Type", "application/json")
@@ -879,6 +934,8 @@ public class ManagersHandler {
                     .put("helpfulCount", row.getInteger("helpful_count"))
                     .put("createdAt", row.getOffsetDateTime("created_at").toString())
                     .put("updatedAt", row.getOffsetDateTime("updated_at").toString())
+                    .put("workedFrom",  row.getLocalDate("worked_from")  != null ? row.getLocalDate("worked_from").toString()  : null)
+                    .put("workedUntil", row.getLocalDate("worked_until") != null ? row.getLocalDate("worked_until").toString() : null)
                 );
             }
             JsonObject response = new JsonObject()
@@ -926,6 +983,10 @@ public class ManagersHandler {
         String managerCompany = body.getString("managerCompany");
         String managerTitle = body.getString("managerTitle");
         String text = body.getString("text");
+        String workedFromStr = body.getString("workedFrom");
+        String workedUntilStr = body.getString("workedUntil");
+        LocalDate workedFrom = parseYearMonth(workedFromStr, null);
+        LocalDate workedUntil = parseYearMonth(workedUntilStr, null);
         if (overallRating == null || ratings == null ||
             ValidationUtils.isBlank(managerCompany) || ValidationUtils.isBlank(managerTitle)) {
             ValidationUtils.badRequest(ctx, "Missing required fields");
@@ -985,8 +1046,10 @@ public class ManagersHandler {
                 manager_company = $12,
                 manager_title = $13,
                 text = $14,
+                worked_from = $15,
+                worked_until = $16,
                 updated_at = now()
-            WHERE id = $15 AND manager_id = $16 AND user_id = $17
+            WHERE id = $17 AND manager_id = $18 AND user_id = $19
             RETURNING *
             """;
         // Resolve caller's internal UUID for ownership verification
@@ -1009,7 +1072,8 @@ public class ManagersHandler {
                 perceivedClarityOfExpectations, feedbackStyle, perceivedSupportiveness,
                 decisionMakingStyle, organizationAndPlanningStyle, delegationStyle,
                 perceivedProfessionalDemeanor, overallWorkingExperience,
-                managerCompany, managerTitle, text, reviewId, managerId, callerId
+                managerCompany, managerTitle, text, workedFrom, workedUntil,
+                reviewId, managerId, callerId
             );
             db.preparedQuery(updateSql).execute(params, ar -> {
             if (ar.failed()) {
@@ -1048,7 +1112,9 @@ public class ManagersHandler {
                 .put("verified", row.getBoolean("verified"))
                 .put("helpfulCount", row.getInteger("helpful_count"))
                 .put("createdAt", row.getOffsetDateTime("created_at").toString())
-                .put("updatedAt", row.getOffsetDateTime("updated_at").toString());
+                .put("updatedAt", row.getOffsetDateTime("updated_at").toString())
+                .put("workedFrom", row.getLocalDate("worked_from") != null ? row.getLocalDate("worked_from").toString() : null)
+                .put("workedUntil", row.getLocalDate("worked_until") != null ? row.getLocalDate("worked_until").toString() : null);
             ctx.response()
                .setStatusCode(200)
                .putHeader("Content-Type", "application/json")
@@ -1349,6 +1415,8 @@ public class ManagersHandler {
                     r.helpful_count,
                     r.created_at,
                     r.updated_at,
+                    r.worked_from,
+                    r.worked_until,
                     m.name    AS manager_name,
                     m.image   AS manager_image,
                     m.status  AS manager_status
@@ -1391,6 +1459,8 @@ public class ManagersHandler {
                         .put("helpfulCount",    row.getInteger("helpful_count"))
                         .put("createdAt",       row.getOffsetDateTime("created_at").toString())
                         .put("updatedAt",       row.getOffsetDateTime("updated_at").toString())
+                        .put("workedFrom",      row.getLocalDate("worked_from")  != null ? row.getLocalDate("worked_from").toString()  : null)
+                        .put("workedUntil",     row.getLocalDate("worked_until") != null ? row.getLocalDate("worked_until").toString() : null)
                     );
                 }
                 ctx.response()
@@ -1431,6 +1501,129 @@ public class ManagersHandler {
         });
     }
     
+    // ── POST /api/managers/:id/edit-requests ─────────────────────────────────────
+    public void handleCreateEditRequest(RoutingContext ctx) {
+        String auth0Id = ctx.get("auth0Id");
+        if (auth0Id == null) {
+            ctx.response().setStatusCode(401)
+                .putHeader("Content-Type", "application/json")
+                .end(new JsonObject().put("error", "Unauthorized").encode());
+            return;
+        }
+        long managerId;
+        try {
+            managerId = Long.parseLong(ctx.pathParam("id"));
+        } catch (NumberFormatException e) {
+            ctx.response().setStatusCode(400)
+                .putHeader("Content-Type", "application/json")
+                .end(new JsonObject().put("error", "Invalid manager ID").encode());
+            return;
+        }
+        JsonObject body = ctx.getBodyAsJson();
+        if (body == null) {
+            ctx.response().setStatusCode(400)
+                .putHeader("Content-Type", "application/json")
+                .end(new JsonObject().put("error", "Missing request body").encode());
+            return;
+        }
+        String newCompany = body.getString("company");
+        String newTitle   = body.getString("title");
+        if ((newCompany == null || newCompany.isBlank()) && (newTitle == null || newTitle.isBlank())) {
+            ctx.response().setStatusCode(400)
+                .putHeader("Content-Type", "application/json")
+                .end(new JsonObject().put("error", "At least one of company or title is required").encode());
+            return;
+        }
+        if (newCompany != null && ValidationUtils.exceedsLength(newCompany, 100)) {
+            ValidationUtils.badRequest(ctx, "Company must be at most 100 characters"); return;
+        }
+        if (newTitle != null && ValidationUtils.exceedsLength(newTitle, 100)) {
+            ValidationUtils.badRequest(ctx, "Title must be at most 100 characters"); return;
+        }
+
+        final String effectiveCompany = (newCompany != null && !newCompany.isBlank()) ? newCompany.trim() : null;
+        final String effectiveTitle   = (newTitle   != null && !newTitle.isBlank())   ? newTitle.trim()   : null;
+
+        db.preparedQuery("SELECT id FROM users WHERE auth0_id = $1")
+            .execute(Tuple.of(auth0Id), userAr -> {
+                if (userAr.failed()) { ctx.fail(userAr.cause()); return; }
+                if (!userAr.result().iterator().hasNext()) {
+                    ctx.response().setStatusCode(401)
+                        .putHeader("Content-Type", "application/json")
+                        .end(new JsonObject().put("error", "User not found").encode());
+                    return;
+                }
+                UUID userId = userAr.result().iterator().next().getUUID("id");
+
+                // Verify manager exists
+                db.preparedQuery("SELECT id FROM managers WHERE id = $1")
+                    .execute(Tuple.of(managerId), mgrAr -> {
+                        if (mgrAr.failed()) { ctx.fail(mgrAr.cause()); return; }
+                        if (!mgrAr.result().iterator().hasNext()) {
+                            ctx.response().setStatusCode(404)
+                                .putHeader("Content-Type", "application/json")
+                                .end(new JsonObject().put("error", "Manager not found").encode());
+                            return;
+                        }
+
+                        String insertSql = """
+                            INSERT INTO manager_edits(manager_id, proposed_by, new_company, new_title)
+                            VALUES ($1, $2, $3, $4)
+                            RETURNING id, created_at
+                            """;
+                        db.preparedQuery(insertSql)
+                            .execute(Tuple.of(managerId, userId, effectiveCompany, effectiveTitle), insertAr -> {
+                                if (insertAr.failed()) { ctx.fail(insertAr.cause()); return; }
+                                Row row = insertAr.result().iterator().next();
+                                ctx.response().setStatusCode(201)
+                                    .putHeader("Content-Type", "application/json")
+                                    .end(new JsonObject()
+                                        .put("id", row.getUUID("id").toString())
+                                        .put("managerId", managerId)
+                                        .put("newCompany", effectiveCompany)
+                                        .put("newTitle", effectiveTitle)
+                                        .put("status", "pending")
+                                        .put("createdAt", row.getOffsetDateTime("created_at").toString())
+                                        .encode());
+                            });
+                    });
+            });
+    }
+
+    // ── GET /api/managers/:id/pending-edits ───────────────────────────────────────
+    public void handleGetPendingEditsForManager(RoutingContext ctx) {
+        long managerId;
+        try {
+            managerId = Long.parseLong(ctx.pathParam("id"));
+        } catch (NumberFormatException e) {
+            ctx.response().setStatusCode(400)
+                .putHeader("Content-Type", "application/json")
+                .end(new JsonObject().put("error", "Invalid manager ID").encode());
+            return;
+        }
+        db.preparedQuery("""
+            SELECT id, new_company, new_title, created_at
+            FROM manager_edits
+            WHERE manager_id = $1 AND status = 'pending'
+            ORDER BY created_at ASC
+            """)
+            .execute(Tuple.of(managerId), ar -> {
+                if (ar.failed()) { ctx.fail(ar.cause()); return; }
+                JsonArray result = new JsonArray();
+                for (Row row : ar.result()) {
+                    result.add(new JsonObject()
+                        .put("id", row.getUUID("id").toString())
+                        .put("newCompany", row.getString("new_company"))
+                        .put("newTitle", row.getString("new_title"))
+                        .put("createdAt", row.getOffsetDateTime("created_at").toString())
+                    );
+                }
+                ctx.response().setStatusCode(200)
+                    .putHeader("Content-Type", "application/json")
+                    .end(new JsonObject().put("data", result).encode());
+            });
+    }
+
     // Safely converts a nullable BigDecimal to double for JSON serialisation
     private double nullSafeDecimal(BigDecimal value) {
         return value != null ? value.doubleValue() : 0.0;

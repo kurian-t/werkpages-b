@@ -215,7 +215,7 @@ public class AuthHandler {
                     com.auth0.jwt.interfaces.DecodedJWT decoded = com.auth0.jwt.JWT.decode(accessToken);
                     String auth0Id = decoded.getSubject();
 
-                    db.preparedQuery("SELECT email, username, first_name, last_name FROM users WHERE auth0_id = $1")
+                    db.preparedQuery("SELECT email, username, first_name, last_name, role FROM users WHERE auth0_id = $1")
                         .execute(Tuple.of(auth0Id), dbAr -> {
                             if (dbAr.failed()) {
                                 ctx.fail(dbAr.cause());
@@ -243,6 +243,7 @@ public class AuthHandler {
                                         .put("username", row.getString("username"))
                                         .put("firstName", row.getString("first_name"))
                                         .put("lastName", row.getString("last_name"))
+                                        .put("role", row.getString("role"))
                                     ).encode()
                                 );
                         });
@@ -264,7 +265,7 @@ public class AuthHandler {
                .end(new JsonObject().put("error", "Unauthorized").encode());
             return;
         }
-        db.preparedQuery("SELECT id, auth0_id, email, username, first_name, last_name, created_at FROM users WHERE auth0_id = $1")
+        db.preparedQuery("SELECT id, auth0_id, email, username, first_name, last_name, role, created_at FROM users WHERE auth0_id = $1")
           .execute(Tuple.of(auth0Id), ar -> {
             if (ar.failed()) {
                 ctx.fail(ar.cause());
@@ -292,6 +293,7 @@ public class AuthHandler {
                    .put("username", row.getString("username"))
                    .put("firstName", row.getString("first_name"))
                    .put("lastName", row.getString("last_name"))
+                   .put("role", row.getString("role"))
                    .put("createdAt", row.getLocalDateTime("created_at").toString())
                    .encode()
                );

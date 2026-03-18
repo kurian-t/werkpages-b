@@ -13,7 +13,7 @@ public class Database {
     private static Pool client;
     private static boolean useSSL = "true".equalsIgnoreCase(System.getenv("USE_AWS_SECRETS"));
     
-    public static void init(Vertx vertx, SecretsConfig secrets) {
+    public static void init(Vertx vertx, SecretsConfig secrets, Runnable onReady) {
     	
         PgConnectOptions connectOptions = new PgConnectOptions()
             .setPort(secrets.dbPort)
@@ -42,6 +42,7 @@ public class Database {
             if (res.succeeded()) {
                 client = Pool.pool(vertx, connectOptions, poolOptions);
                 System.out.println("✓ Database pool ready");
+                if (onReady != null) onReady.run();
             } else {
                 System.err.println("✗ Database init failed: " + res.cause().getMessage());
                 res.cause().printStackTrace();
