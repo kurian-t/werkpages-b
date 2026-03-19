@@ -1728,14 +1728,15 @@ public class ManagersHandler {
                 .end(new JsonObject().put("error", "Missing request body").encode());
             return;
         }
-        String newCompany = body.getString("company");
-        String newTitle   = body.getString("title");
-        String newStatus  = body.getString("status");
+        String newCompany     = body.getString("company");
+        String newTitle       = body.getString("title");
+        String newStatus      = body.getString("status");
+        String newLinkedinUrl = body.getString("linkedinUrl");
         if ((newCompany == null || newCompany.isBlank()) && (newTitle == null || newTitle.isBlank())
-                && (newStatus == null || newStatus.isBlank())) {
+                && (newStatus == null || newStatus.isBlank()) && (newLinkedinUrl == null || newLinkedinUrl.isBlank())) {
             ctx.response().setStatusCode(400)
                 .putHeader("Content-Type", "application/json")
-                .end(new JsonObject().put("error", "At least one of company, title, or status is required").encode());
+                .end(new JsonObject().put("error", "At least one field is required").encode());
             return;
         }
         if (newCompany != null && ValidationUtils.exceedsLength(newCompany, 100)) {
@@ -1747,10 +1748,14 @@ public class ManagersHandler {
         if (newStatus != null && !newStatus.equals("active") && !newStatus.equals("retired")) {
             ValidationUtils.badRequest(ctx, "Status must be 'active' or 'retired'"); return;
         }
+        if (newLinkedinUrl != null && ValidationUtils.exceedsLength(newLinkedinUrl, 500)) {
+            ValidationUtils.badRequest(ctx, "LinkedIn URL must be at most 500 characters"); return;
+        }
 
-        final String effectiveCompany = (newCompany != null && !newCompany.isBlank()) ? newCompany.trim() : null;
-        final String effectiveTitle   = (newTitle   != null && !newTitle.isBlank())   ? newTitle.trim()   : null;
-        final String effectiveStatus  = (newStatus  != null && !newStatus.isBlank())  ? newStatus.trim()  : null;
+        final String effectiveCompany     = (newCompany     != null && !newCompany.isBlank())     ? newCompany.trim()     : null;
+        final String effectiveTitle       = (newTitle       != null && !newTitle.isBlank())       ? newTitle.trim()       : null;
+        final String effectiveStatus      = (newStatus      != null && !newStatus.isBlank())      ? newStatus.trim()      : null;
+        final String effectiveLinkedinUrl = (newLinkedinUrl != null && !newLinkedinUrl.isBlank()) ? newLinkedinUrl.trim() : null;
 
         db.preparedQuery("""
                 SELECT u.id, (b.id IS NOT NULL) AS is_banned
@@ -1787,17 +1792,18 @@ public class ManagersHandler {
 
                         // Upsert: overwrite any existing pending edit from this user for this manager
                         String upsertSql = """
-                            INSERT INTO manager_edits(manager_id, proposed_by, new_company, new_title, new_status)
-                            VALUES ($1, $2, $3, $4, $5)
+                            INSERT INTO manager_edits(manager_id, proposed_by, new_company, new_title, new_status, new_linkedin_url)
+                            VALUES ($1, $2, $3, $4, $5, $6)
                             ON CONFLICT (manager_id, proposed_by) WHERE status = 'pending'
-                            DO UPDATE SET new_company = EXCLUDED.new_company,
-                                          new_title   = EXCLUDED.new_title,
-                                          new_status  = EXCLUDED.new_status,
-                                          created_at  = now()
+                            DO UPDATE SET new_company      = EXCLUDED.new_company,
+                                          new_title        = EXCLUDED.new_title,
+                                          new_status       = EXCLUDED.new_status,
+                                          new_linkedin_url = EXCLUDED.new_linkedin_url,
+                                          created_at       = now()
                             RETURNING id, created_at
                             """;
                         db.preparedQuery(upsertSql)
-                            .execute(Tuple.of(managerId, userId, effectiveCompany, effectiveTitle, effectiveStatus), insertAr -> {
+                            .execute(Tuple.of(managerId, userId, effectiveCompany, effectiveTitle, effectiveStatus, effectiveLinkedinUrl), insertAr -> {
                                 if (insertAr.failed()) { ctx.fail(insertAr.cause()); return; }
                                 Row row = insertAr.result().iterator().next();
                                 ctx.response().setStatusCode(201)
@@ -1808,6 +1814,7 @@ public class ManagersHandler {
                                         .put("newCompany", effectiveCompany)
                                         .put("newTitle", effectiveTitle)
                                         .put("newStatus", effectiveStatus)
+                                        .put("newLinkedinUrl", effectiveLinkedinUrl)
                                         .put("status", "pending")
                                         .put("createdAt", row.getOffsetDateTime("created_at").toString())
                                         .encode());
@@ -1850,7 +1857,7 @@ public class ManagersHandler {
                 final long finalManagerId = managerId;
 
                 db.preparedQuery("""
-                    SELECT id, new_company, new_title, new_status, created_at
+                    SELECT id, new_company, new_title, new_status, new_linkedin_url, created_at
                     FROM manager_edits
                     WHERE manager_id = $1 AND proposed_by = $2 AND status = 'pending'
                     ORDER BY created_at DESC
@@ -1865,6 +1872,7 @@ public class ManagersHandler {
                                 .put("newCompany", row.getString("new_company"))
                                 .put("newTitle", row.getString("new_title"))
                                 .put("newStatus", row.getString("new_status"))
+                                .put("newLinkedinUrl", row.getString("new_linkedin_url"))
                                 .put("createdAt", row.getOffsetDateTime("created_at").toString())
                             );
                         }

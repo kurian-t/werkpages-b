@@ -28,16 +28,17 @@ CREATE TABLE banned_users (
 
 -- ── Manager edit requests (pending queue + audit history) ────────────────────
 CREATE TABLE manager_edits (
-    id          UUID        PRIMARY KEY DEFAULT uuid_generate_v4(),
-    manager_id  BIGINT      NOT NULL REFERENCES managers(id) ON DELETE CASCADE,
-    proposed_by UUID        NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    new_company TEXT,
-    new_title   TEXT,
-    new_status  VARCHAR(20),
-    status      TEXT        NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'approved', 'rejected')),
-    reviewed_at TIMESTAMPTZ,
-    reviewed_by UUID        REFERENCES users(id) ON DELETE SET NULL,
-    created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+    id               UUID        PRIMARY KEY DEFAULT uuid_generate_v4(),
+    manager_id       BIGINT      NOT NULL REFERENCES managers(id) ON DELETE CASCADE,
+    proposed_by      UUID        NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    new_company      TEXT,
+    new_title        TEXT,
+    new_status       VARCHAR(20),
+    new_linkedin_url TEXT,
+    status           TEXT        NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'approved', 'rejected')),
+    reviewed_at      TIMESTAMPTZ,
+    reviewed_by      UUID        REFERENCES users(id) ON DELETE SET NULL,
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
 CREATE INDEX idx_manager_edits_manager_id ON manager_edits(manager_id);

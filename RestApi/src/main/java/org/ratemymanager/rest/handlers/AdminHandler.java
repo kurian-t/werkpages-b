@@ -236,7 +236,7 @@ public class AdminHandler {
             // 1. Get the pending edit + current manager state (including proposed_by for notification)
             String fetchSql = """
                 SELECT
-                    pe.id, pe.manager_id, pe.new_company, pe.new_title, pe.new_status, pe.status, pe.proposed_by,
+                    pe.id, pe.manager_id, pe.new_company, pe.new_title, pe.new_status, pe.new_linkedin_url, pe.status, pe.proposed_by,
                     m.company AS current_company, m.title AS current_title,
                     m.created_at AS manager_created_at, m.name AS manager_name
                 FROM manager_edits pe
@@ -262,9 +262,10 @@ public class AdminHandler {
                 long managerId = row.getLong("manager_id");
                 String currentCompany = row.getString("current_company");
                 String currentTitle   = row.getString("current_title");
-                String newCompany = row.getString("new_company");
-                String newTitle   = row.getString("new_title");
-                String newStatus  = row.getString("new_status");
+                String newCompany     = row.getString("new_company");
+                String newTitle       = row.getString("new_title");
+                String newStatus      = row.getString("new_status");
+                String newLinkedinUrl = row.getString("new_linkedin_url");
                 String effectiveCo  = newCompany != null ? newCompany : currentCompany;
                 String effectiveTit = newTitle   != null ? newTitle   : currentTitle;
                 UUID proposedBy = row.getUUID("proposed_by");
@@ -281,7 +282,7 @@ public class AdminHandler {
                             db.preparedQuery("INSERT INTO career_history(manager_id, company, title, start_date, end_date) VALUES ($1, $2, $3, $4, NULL)")
                                 .execute(Tuple.of(managerId, effectiveCo, effectiveTit, now), insertAr -> {
                                     if (insertAr.failed()) { ctx.fail(insertAr.cause()); return; }
-                                    applyEditAndApprove(ctx, managerId, editId, newCompany, newTitle, newStatus,
+                                    applyEditAndApprove(ctx, managerId, editId, newCompany, newTitle, newStatus, newLinkedinUrl,
                                         effectiveCo, effectiveTit, adminId, now, proposedBy, managerName);
                                 });
 
@@ -302,7 +303,7 @@ public class AdminHandler {
     }
 
     private void applyEditAndApprove(RoutingContext ctx, long managerId, UUID editId,
-                                     String newCompany, String newTitle, String newStatus,
+                                     String newCompany, String newTitle, String newStatus, String newLinkedinUrl,
                                      String effectiveCo, String effectiveTit,
                                      UUID adminId, OffsetDateTime reviewedAt,
                                      UUID proposedBy, String managerName) {
@@ -310,9 +311,10 @@ public class AdminHandler {
         StringBuilder updateSql = new StringBuilder("UPDATE managers SET updated_at = now()");
         List<Object> paramsList = new java.util.ArrayList<>();
         int idx = 1;
-        if (newCompany != null) { updateSql.append(", company = $").append(idx++); paramsList.add(effectiveCo); }
-        if (newTitle   != null) { updateSql.append(", title = $").append(idx++);   paramsList.add(effectiveTit); }
-        if (newStatus  != null) { updateSql.append(", status = $").append(idx++);  paramsList.add(newStatus); }
+        if (newCompany     != null) { updateSql.append(", company = $").append(idx++);      paramsList.add(effectiveCo); }
+        if (newTitle       != null) { updateSql.append(", title = $").append(idx++);        paramsList.add(effectiveTit); }
+        if (newStatus      != null) { updateSql.append(", status = $").append(idx++);       paramsList.add(newStatus); }
+        if (newLinkedinUrl != null) { updateSql.append(", linkedin_url = $").append(idx++); paramsList.add(newLinkedinUrl); }
         updateSql.append(" WHERE id = $").append(idx);
         paramsList.add(managerId);
         db.preparedQuery(updateSql.toString()).execute(Tuple.from(paramsList), updateAr -> {
