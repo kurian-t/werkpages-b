@@ -38,6 +38,7 @@ public class ManagersHandler {
 			    m.reviews_count,
 			    m.bio,
 			    m.status,
+			    m.approval_status,
 			    m.category_averages,
 			    m.linkedin_url,
 			    m.created_at,
@@ -193,6 +194,7 @@ public class ManagersHandler {
                     m.reviews_count,
                     m.bio,
                     m.status,
+                    m.approval_status,
                     m.category_averages,
                     m.linkedin_url,
                     m.created_at,
@@ -211,12 +213,12 @@ public class ManagersHandler {
                 FROM managers m
                 LEFT JOIN career_history ch ON ch.manager_id = m.id
                 WHERE (m.name ILIKE $3 OR m.company ILIKE $3 OR m.title ILIKE $3)
-                  AND m.status IN ('active', 'retired')
+                  AND m.approval_status = 'approved'
                 GROUP BY m.id
                 ORDER BY m.overall_rating DESC NULLS LAST, m.id ASC
                 LIMIT $1 OFFSET $2
                 """;
-            countSql = "SELECT COUNT(*) FROM managers WHERE (name ILIKE $1 OR company ILIKE $1 OR title ILIKE $1) AND status IN ('active', 'retired')";
+            countSql = "SELECT COUNT(*) FROM managers WHERE (name ILIKE $1 OR company ILIKE $1 OR title ILIKE $1) AND approval_status = 'approved'";
             dataTuple = Tuple.of(limit, offset, searchPattern);
         } else {
             dataSql = """
@@ -230,6 +232,7 @@ public class ManagersHandler {
                     m.reviews_count,
                     m.bio,
                     m.status,
+                    m.approval_status,
                     m.category_averages,
                     m.linkedin_url,
                     m.created_at,
@@ -247,12 +250,12 @@ public class ManagersHandler {
                     ) AS career_history
                 FROM managers m
                 LEFT JOIN career_history ch ON ch.manager_id = m.id
-                WHERE m.status IN ('active', 'retired')
+                WHERE m.approval_status = 'approved'
                 GROUP BY m.id
                 ORDER BY m.overall_rating DESC NULLS LAST, m.id ASC
                 LIMIT $1 OFFSET $2
                 """;
-            countSql = "SELECT COUNT(*) FROM managers WHERE status IN ('active', 'retired')";
+            countSql = "SELECT COUNT(*) FROM managers WHERE approval_status = 'approved'";
             dataTuple = Tuple.of(limit, offset);
         }
 
@@ -302,6 +305,7 @@ public class ManagersHandler {
                         .put("reviews", row.getInteger("reviews_count"))
                         .put("bio", row.getString("bio"))
                         .put("status", row.getString("status"))
+                        .put("approvalStatus", row.getString("approval_status"))
                         .put("categoryAverages", row.getJsonObject("category_averages"))
                         .put("linkedinUrl", row.getString("linkedin_url"))
                         .put("createdAt", createdAt)
@@ -375,10 +379,10 @@ public class ManagersHandler {
                 return;
             }
 
-            String status = row.getString("status");
+            String approvalStatus = row.getString("approval_status");
 
             // Pending managers are only visible to their submitter
-            if ("pending_approval".equals(status) || "rejected".equals(status)) {
+            if ("pending_approval".equals(approvalStatus) || "rejected".equals(approvalStatus)) {
                 UUID submittedBy = row.getUUID("submitted_by");
                 String auth0Id = extractAuth0IdFromRequest(ctx);
                 if (auth0Id == null || submittedBy == null) {
@@ -424,6 +428,7 @@ public class ManagersHandler {
             .put("reviews", row.getInteger("reviews_count"))
             .put("bio", row.getString("bio"))
             .put("status", row.getString("status"))
+            .put("approvalStatus", row.getString("approval_status"))
             .put("categoryAverages", row.getJsonObject("category_averages"))
             .put("linkedinUrl", row.getString("linkedin_url"))
             .put("createdAt", createdAt)
@@ -453,9 +458,9 @@ public class ManagersHandler {
                 UUID userId = userAr.result().iterator().next().getUUID("id");
                 String sql = """
                     SELECT id, name, company, title, image, overall_rating, reviews_count,
-                           bio, status, linkedin_url, created_at
+                           bio, status, approval_status, linkedin_url, created_at
                     FROM managers
-                    WHERE submitted_by = $1 AND status IN ('pending_approval', 'rejected')
+                    WHERE submitted_by = $1 AND approval_status IN ('pending_approval', 'rejected')
                     ORDER BY created_at DESC
                     """;
                 db.preparedQuery(sql).execute(Tuple.of(userId), ar -> {
@@ -472,6 +477,7 @@ public class ManagersHandler {
                             .put("reviews", row.getInteger("reviews_count"))
                             .put("bio", row.getString("bio"))
                             .put("status", row.getString("status"))
+                            .put("approvalStatus", row.getString("approval_status"))
                             .put("linkedinUrl", row.getString("linkedin_url"))
                             .put("createdAt", row.getOffsetDateTime("created_at").toString())
                         );
@@ -561,14 +567,18 @@ public class ManagersHandler {
                 }
                 UUID userId = userRow.getUUID("id");
 
-                // All new managers go through approval; status is always pending_approval
+                // Store the submitted employment status (active/retired); system sets approval_status = pending_approval
+                String submittedStatus = body.getString("status");
+                if (submittedStatus == null || (!submittedStatus.equals("active") && !submittedStatus.equals("retired"))) {
+                    submittedStatus = "active";
+                }
                 String insertSql = """
                     INSERT INTO managers
-                    (name, company, title, image, bio, status, linkedin_url, overall_rating, reviews_count, category_averages, created_at, submitted_by)
-                    VALUES ($1, $2, $3, $4, $5, 'pending_approval', $6, 0, 0, '{}'::jsonb, now(), $7)
+                    (name, company, title, image, bio, status, approval_status, linkedin_url, overall_rating, reviews_count, category_averages, created_at, submitted_by)
+                    VALUES ($1, $2, $3, $4, $5, $6, 'pending_approval', $7, 0, 0, '{}'::jsonb, now(), $8)
                     RETURNING *
                     """;
-                Tuple params = Tuple.of(name, company, title, image, bio, linkedinUrl, userId);
+                Tuple params = Tuple.of(name, company, title, image, bio, submittedStatus, linkedinUrl, userId);
                 db.preparedQuery(insertSql).execute(params, ar -> {
                     if (ar.failed()) {
                         ctx.fail(ar.cause());
@@ -585,6 +595,7 @@ public class ManagersHandler {
                         .put("reviews", row.getInteger("reviews_count"))
                         .put("bio", row.getString("bio"))
                         .put("status", row.getString("status"))
+                        .put("approvalStatus", row.getString("approval_status"))
                         .put("categoryAverages", row.getJsonObject("category_averages"))
                         .put("linkedinUrl", row.getString("linkedin_url"))
                         .put("createdAt", row.getOffsetDateTime("created_at").toString())
@@ -724,6 +735,7 @@ public class ManagersHandler {
                         .put("reviews", updatedRow.getInteger("reviews_count"))
                         .put("bio", updatedRow.getString("bio"))
                         .put("status", updatedRow.getString("status"))
+                        .put("approvalStatus", updatedRow.getString("approval_status"))
                         .put("categoryAverages", updatedRow.getJsonObject("category_averages"))
                         .put("linkedinUrl", updatedRow.getString("linkedin_url"))
                         .put("createdAt", updatedRow.getOffsetDateTime("created_at").toString());
@@ -863,6 +875,14 @@ public class ManagersHandler {
             String workedUntilStr = body.getString("workedUntil");
             LocalDate workedFrom = parseYearMonth(workedFromStr, null);
             LocalDate workedUntil = parseYearMonth(workedUntilStr, null);
+            if (workedFrom == null && workedUntil != null) {
+                ValidationUtils.badRequest(ctx, "Cannot set a 'to' date without a 'from' date");
+                return;
+            }
+            if (workedFrom != null && workedUntil != null && workedFrom.isAfter(workedUntil)) {
+                ValidationUtils.badRequest(ctx, "The 'from' date cannot be later than the 'to' date");
+                return;
+            }
             if (overallRating == null || ratings == null ||
                 ValidationUtils.isBlank(managerCompany) || ValidationUtils.isBlank(managerTitle)) {
                 ValidationUtils.badRequest(ctx, "Missing required fields");
@@ -1139,6 +1159,14 @@ public class ManagersHandler {
         String workedUntilStr = body.getString("workedUntil");
         LocalDate workedFrom = parseYearMonth(workedFromStr, null);
         LocalDate workedUntil = parseYearMonth(workedUntilStr, null);
+        if (workedFrom == null && workedUntil != null) {
+            ValidationUtils.badRequest(ctx, "Cannot set a 'to' date without a 'from' date");
+            return;
+        }
+        if (workedFrom != null && workedUntil != null && workedFrom.isAfter(workedUntil)) {
+            ValidationUtils.badRequest(ctx, "The 'from' date cannot be later than the 'to' date");
+            return;
+        }
         if (overallRating == null || ratings == null ||
             ValidationUtils.isBlank(managerCompany) || ValidationUtils.isBlank(managerTitle)) {
             ValidationUtils.badRequest(ctx, "Missing required fields");
@@ -1647,14 +1675,14 @@ public class ManagersHandler {
 
     public void handleGetStats(RoutingContext ctx) {
         Future<Long> managersFuture = Future.future(promise ->
-            db.query("SELECT COUNT(*) FROM managers").execute(ar -> {
+            db.query("SELECT COUNT(*) FROM managers WHERE approval_status = 'approved'").execute(ar -> {
                 if (ar.succeeded()) promise.complete(ar.result().iterator().next().getLong(0));
                 else promise.fail(ar.cause());
             })
         );
 
         Future<Long> reviewsFuture = Future.future(promise ->
-            db.query("SELECT COUNT(*) FROM reviews").execute(ar -> {
+            db.query("SELECT COUNT(*) FROM reviews r JOIN managers m ON r.manager_id = m.id WHERE m.approval_status = 'approved'").execute(ar -> {
                 if (ar.succeeded()) promise.complete(ar.result().iterator().next().getLong(0));
                 else promise.fail(ar.cause());
             })
@@ -1702,10 +1730,12 @@ public class ManagersHandler {
         }
         String newCompany = body.getString("company");
         String newTitle   = body.getString("title");
-        if ((newCompany == null || newCompany.isBlank()) && (newTitle == null || newTitle.isBlank())) {
+        String newStatus  = body.getString("status");
+        if ((newCompany == null || newCompany.isBlank()) && (newTitle == null || newTitle.isBlank())
+                && (newStatus == null || newStatus.isBlank())) {
             ctx.response().setStatusCode(400)
                 .putHeader("Content-Type", "application/json")
-                .end(new JsonObject().put("error", "At least one of company or title is required").encode());
+                .end(new JsonObject().put("error", "At least one of company, title, or status is required").encode());
             return;
         }
         if (newCompany != null && ValidationUtils.exceedsLength(newCompany, 100)) {
@@ -1714,9 +1744,13 @@ public class ManagersHandler {
         if (newTitle != null && ValidationUtils.exceedsLength(newTitle, 100)) {
             ValidationUtils.badRequest(ctx, "Title must be at most 100 characters"); return;
         }
+        if (newStatus != null && !newStatus.equals("active") && !newStatus.equals("retired")) {
+            ValidationUtils.badRequest(ctx, "Status must be 'active' or 'retired'"); return;
+        }
 
         final String effectiveCompany = (newCompany != null && !newCompany.isBlank()) ? newCompany.trim() : null;
         final String effectiveTitle   = (newTitle   != null && !newTitle.isBlank())   ? newTitle.trim()   : null;
+        final String effectiveStatus  = (newStatus  != null && !newStatus.isBlank())  ? newStatus.trim()  : null;
 
         db.preparedQuery("""
                 SELECT u.id, (b.id IS NOT NULL) AS is_banned
@@ -1751,13 +1785,19 @@ public class ManagersHandler {
                             return;
                         }
 
-                        String insertSql = """
-                            INSERT INTO manager_edits(manager_id, proposed_by, new_company, new_title)
-                            VALUES ($1, $2, $3, $4)
+                        // Upsert: overwrite any existing pending edit from this user for this manager
+                        String upsertSql = """
+                            INSERT INTO manager_edits(manager_id, proposed_by, new_company, new_title, new_status)
+                            VALUES ($1, $2, $3, $4, $5)
+                            ON CONFLICT (manager_id, proposed_by) WHERE status = 'pending'
+                            DO UPDATE SET new_company = EXCLUDED.new_company,
+                                          new_title   = EXCLUDED.new_title,
+                                          new_status  = EXCLUDED.new_status,
+                                          created_at  = now()
                             RETURNING id, created_at
                             """;
-                        db.preparedQuery(insertSql)
-                            .execute(Tuple.of(managerId, userId, effectiveCompany, effectiveTitle), insertAr -> {
+                        db.preparedQuery(upsertSql)
+                            .execute(Tuple.of(managerId, userId, effectiveCompany, effectiveTitle, effectiveStatus), insertAr -> {
                                 if (insertAr.failed()) { ctx.fail(insertAr.cause()); return; }
                                 Row row = insertAr.result().iterator().next();
                                 ctx.response().setStatusCode(201)
@@ -1767,6 +1807,7 @@ public class ManagersHandler {
                                         .put("managerId", managerId)
                                         .put("newCompany", effectiveCompany)
                                         .put("newTitle", effectiveTitle)
+                                        .put("newStatus", effectiveStatus)
                                         .put("status", "pending")
                                         .put("createdAt", row.getOffsetDateTime("created_at").toString())
                                         .encode());
@@ -1776,6 +1817,7 @@ public class ManagersHandler {
     }
 
     // ── GET /api/managers/:id/pending-edits ───────────────────────────────────────
+    // Only returns the calling user's own pending edit — not visible to others.
     public void handleGetPendingEditsForManager(RoutingContext ctx) {
         long managerId;
         try {
@@ -1786,26 +1828,50 @@ public class ManagersHandler {
                 .end(new JsonObject().put("error", "Invalid manager ID").encode());
             return;
         }
-        db.preparedQuery("""
-            SELECT id, new_company, new_title, created_at
-            FROM manager_edits
-            WHERE manager_id = $1 AND status = 'pending'
-            ORDER BY created_at ASC
-            """)
-            .execute(Tuple.of(managerId), ar -> {
-                if (ar.failed()) { ctx.fail(ar.cause()); return; }
-                JsonArray result = new JsonArray();
-                for (Row row : ar.result()) {
-                    result.add(new JsonObject()
-                        .put("id", row.getUUID("id").toString())
-                        .put("newCompany", row.getString("new_company"))
-                        .put("newTitle", row.getString("new_title"))
-                        .put("createdAt", row.getOffsetDateTime("created_at").toString())
-                    );
+
+        // No auth = no edits visible
+        String auth0Id = extractAuth0IdFromRequest(ctx);
+        if (auth0Id == null) {
+            ctx.response().setStatusCode(200)
+                .putHeader("Content-Type", "application/json")
+                .end(new JsonObject().put("data", new JsonArray()).encode());
+            return;
+        }
+
+        db.preparedQuery("SELECT id FROM users WHERE auth0_id = $1")
+            .execute(Tuple.of(auth0Id), userAr -> {
+                if (userAr.failed() || !userAr.result().iterator().hasNext()) {
+                    ctx.response().setStatusCode(200)
+                        .putHeader("Content-Type", "application/json")
+                        .end(new JsonObject().put("data", new JsonArray()).encode());
+                    return;
                 }
-                ctx.response().setStatusCode(200)
-                    .putHeader("Content-Type", "application/json")
-                    .end(new JsonObject().put("data", result).encode());
+                UUID userId = userAr.result().iterator().next().getUUID("id");
+                final long finalManagerId = managerId;
+
+                db.preparedQuery("""
+                    SELECT id, new_company, new_title, new_status, created_at
+                    FROM manager_edits
+                    WHERE manager_id = $1 AND proposed_by = $2 AND status = 'pending'
+                    ORDER BY created_at DESC
+                    LIMIT 1
+                    """)
+                    .execute(Tuple.of(finalManagerId, userId), ar -> {
+                        if (ar.failed()) { ctx.fail(ar.cause()); return; }
+                        JsonArray result = new JsonArray();
+                        for (Row row : ar.result()) {
+                            result.add(new JsonObject()
+                                .put("id", row.getUUID("id").toString())
+                                .put("newCompany", row.getString("new_company"))
+                                .put("newTitle", row.getString("new_title"))
+                                .put("newStatus", row.getString("new_status"))
+                                .put("createdAt", row.getOffsetDateTime("created_at").toString())
+                            );
+                        }
+                        ctx.response().setStatusCode(200)
+                            .putHeader("Content-Type", "application/json")
+                            .end(new JsonObject().put("data", result).encode());
+                    });
             });
     }
 

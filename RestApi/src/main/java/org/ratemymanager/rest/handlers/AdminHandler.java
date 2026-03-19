@@ -10,6 +10,8 @@ import io.vertx.sqlclient.Tuple;
 
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.UUID;
 import java.util.function.Consumer;
 
@@ -65,7 +67,7 @@ public class AdminHandler {
                        u.username AS submitted_by_username
                 FROM managers m
                 LEFT JOIN users u ON u.id = m.submitted_by
-                WHERE m.status = 'pending_approval'
+                WHERE m.approval_status = 'pending_approval'
                 ORDER BY m.created_at ASC
                 """;
             db.preparedQuery(sql).execute(ar -> {
@@ -102,8 +104,8 @@ public class AdminHandler {
                 return;
             }
             db.preparedQuery(
-                "UPDATE managers SET status = 'active', updated_at = now() " +
-                "WHERE id = $1 AND status = 'pending_approval' " +
+                "UPDATE managers SET approval_status = 'approved', updated_at = now() " +
+                "WHERE id = $1 AND approval_status = 'pending_approval' " +
                 "RETURNING id, name, submitted_by")
                 .execute(Tuple.of(managerId), ar -> {
                     if (ar.failed()) { ctx.fail(ar.cause()); return; }
@@ -145,8 +147,8 @@ public class AdminHandler {
             String reason = body != null ? body.getString("reason") : null;
 
             db.preparedQuery(
-                "UPDATE managers SET status = 'rejected', updated_at = now() " +
-                "WHERE id = $1 AND status = 'pending_approval' " +
+                "UPDATE managers SET approval_status = 'rejected', updated_at = now() " +
+                "WHERE id = $1 AND approval_status = 'pending_approval' " +
                 "RETURNING id, name, submitted_by")
                 .execute(Tuple.of(managerId), ar -> {
                     if (ar.failed()) { ctx.fail(ar.cause()); return; }
@@ -234,7 +236,7 @@ public class AdminHandler {
             // 1. Get the pending edit + current manager state (including proposed_by for notification)
             String fetchSql = """
                 SELECT
-                    pe.id, pe.manager_id, pe.new_company, pe.new_title, pe.status, pe.proposed_by,
+                    pe.id, pe.manager_id, pe.new_company, pe.new_title, pe.new_status, pe.status, pe.proposed_by,
                     m.company AS current_company, m.title AS current_title,
                     m.created_at AS manager_created_at, m.name AS manager_name
                 FROM manager_edits pe
@@ -262,6 +264,7 @@ public class AdminHandler {
                 String currentTitle   = row.getString("current_title");
                 String newCompany = row.getString("new_company");
                 String newTitle   = row.getString("new_title");
+                String newStatus  = row.getString("new_status");
                 String effectiveCo  = newCompany != null ? newCompany : currentCompany;
                 String effectiveTit = newTitle   != null ? newTitle   : currentTitle;
                 UUID proposedBy = row.getUUID("proposed_by");
@@ -278,7 +281,7 @@ public class AdminHandler {
                             db.preparedQuery("INSERT INTO career_history(manager_id, company, title, start_date, end_date) VALUES ($1, $2, $3, $4, NULL)")
                                 .execute(Tuple.of(managerId, effectiveCo, effectiveTit, now), insertAr -> {
                                     if (insertAr.failed()) { ctx.fail(insertAr.cause()); return; }
-                                    applyEditAndApprove(ctx, managerId, editId, newCompany, newTitle,
+                                    applyEditAndApprove(ctx, managerId, editId, newCompany, newTitle, newStatus,
                                         effectiveCo, effectiveTit, adminId, now, proposedBy, managerName);
                                 });
 
@@ -299,24 +302,20 @@ public class AdminHandler {
     }
 
     private void applyEditAndApprove(RoutingContext ctx, long managerId, UUID editId,
-                                     String newCompany, String newTitle,
+                                     String newCompany, String newTitle, String newStatus,
                                      String effectiveCo, String effectiveTit,
                                      UUID adminId, OffsetDateTime reviewedAt,
                                      UUID proposedBy, String managerName) {
-        // 3. Update manager record
-        String updateSql;
-        Tuple updateParams;
-        if (newCompany != null && newTitle != null) {
-            updateSql = "UPDATE managers SET company = $1, title = $2, updated_at = now() WHERE id = $3";
-            updateParams = Tuple.of(effectiveCo, effectiveTit, managerId);
-        } else if (newCompany != null) {
-            updateSql = "UPDATE managers SET company = $1, updated_at = now() WHERE id = $2";
-            updateParams = Tuple.of(effectiveCo, managerId);
-        } else {
-            updateSql = "UPDATE managers SET title = $1, updated_at = now() WHERE id = $2";
-            updateParams = Tuple.of(effectiveTit, managerId);
-        }
-        db.preparedQuery(updateSql).execute(updateParams, updateAr -> {
+        // 3. Update manager record — apply all changed fields
+        StringBuilder updateSql = new StringBuilder("UPDATE managers SET updated_at = now()");
+        List<Object> paramsList = new java.util.ArrayList<>();
+        int idx = 1;
+        if (newCompany != null) { updateSql.append(", company = $").append(idx++); paramsList.add(effectiveCo); }
+        if (newTitle   != null) { updateSql.append(", title = $").append(idx++);   paramsList.add(effectiveTit); }
+        if (newStatus  != null) { updateSql.append(", status = $").append(idx++);  paramsList.add(newStatus); }
+        updateSql.append(" WHERE id = $").append(idx);
+        paramsList.add(managerId);
+        db.preparedQuery(updateSql.toString()).execute(Tuple.from(paramsList), updateAr -> {
             if (updateAr.failed()) { ctx.fail(updateAr.cause()); return; }
             // 4. Mark edit as approved with audit trail
             db.preparedQuery("UPDATE manager_edits SET status = 'approved', reviewed_at = $1, reviewed_by = $2 WHERE id = $3")
