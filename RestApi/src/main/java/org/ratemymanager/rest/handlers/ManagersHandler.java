@@ -20,6 +20,7 @@ import io.vertx.core.json.Json;
 import io.vertx.core.json.JsonArray;
 import io.vertx.core.json.JsonObject;
 import io.vertx.ext.web.RoutingContext;
+import io.vertx.sqlclient.Pool;
 import io.vertx.sqlclient.Row;
 import io.vertx.sqlclient.RowSet;
 import io.vertx.sqlclient.SqlClient;
@@ -506,6 +507,8 @@ public class ManagersHandler {
                .end(new JsonObject().put("error", "Missing request body").encode());
             return;
         }
+
+        // ── Validate manager fields ───────────────────────────────────────────
         String name = body.getString("name");
         String company = body.getString("company");
         String title = body.getString("title");
@@ -543,10 +546,168 @@ public class ManagersHandler {
                 return;
             }
         }
+        String submittedStatus = body.getString("status");
+        if (submittedStatus == null || (!submittedStatus.equals("active") && !submittedStatus.equals("retired"))) {
+            submittedStatus = "active";
+        }
+        boolean isRetired = "retired".equals(submittedStatus);
+        LocalDate today = LocalDate.now();
 
-        // Look up the submitting user's UUID so we can store submitted_by and send notifications later
+        // ── Rule 1: manager start date required and not future ────────────────
+        String startDateStr = body.getString("startDate");
+        LocalDate startDateLocal = parseYearMonth(startDateStr, null);
+        if (startDateLocal == null) {
+            ValidationUtils.badRequest(ctx, "Manager start date is required");
+            return;
+        }
+        if (startDateLocal.isAfter(today)) {
+            ValidationUtils.badRequest(ctx, "Manager start date cannot be in the future");
+            return;
+        }
+        OffsetDateTime startDate = startDateLocal.atStartOfDay(ZoneOffset.UTC).toOffsetDateTime();
+
+        // ── Rules 2/3/4: end date ─────────────────────────────────────────────
+        String endDateStr = body.getString("endDate");
+        LocalDate endDateLocal = parseYearMonth(endDateStr, null);
+        if (isRetired) {
+            if (endDateLocal == null) {
+                ValidationUtils.badRequest(ctx, "End date is required for a retired manager");
+                return;
+            }
+            if (endDateLocal.isAfter(today)) {
+                ValidationUtils.badRequest(ctx, "Manager end date cannot be in the future");
+                return;
+            }
+            if (endDateLocal.isBefore(startDateLocal)) {
+                ValidationUtils.badRequest(ctx, "Manager end date must be on or after the start date");
+                return;
+            }
+        } else {
+            // active: end date must be absent
+            endDateLocal = null;
+        }
+        OffsetDateTime endDate = endDateLocal != null
+            ? endDateLocal.atStartOfDay(ZoneOffset.UTC).toOffsetDateTime()
+            : null;
+
+        // ── Validate review fields (must be present and valid before anything is written) ──
+        JsonObject reviewBody = body.getJsonObject("review");
+        if (reviewBody == null) {
+            ValidationUtils.badRequest(ctx, "A review is required when submitting a manager");
+            return;
+        }
+        Double overallRating = reviewBody.getDouble("overallRating");
+        JsonObject ratings = reviewBody.getJsonObject("ratings");
+        String managerCompany = reviewBody.getString("managerCompany");
+        String managerTitle = reviewBody.getString("managerTitle");
+        String reviewText = reviewBody.getString("text");
+        String workedFromStr = reviewBody.getString("workedFrom");
+        String workedUntilStr = reviewBody.getString("workedUntil");
+        LocalDate workedFrom = parseYearMonth(workedFromStr, null);
+        LocalDate workedUntil = parseYearMonth(workedUntilStr, null);
+        if (overallRating == null || ratings == null ||
+            ValidationUtils.isBlank(managerCompany) || ValidationUtils.isBlank(managerTitle)) {
+            ValidationUtils.badRequest(ctx, "Review is missing required fields");
+            return;
+        }
+        // Rule 5: review from required and not future
+        if (workedFrom == null) {
+            ValidationUtils.badRequest(ctx, "Your start date working with this manager is required");
+            return;
+        }
+        if (workedFrom.isAfter(today)) {
+            ValidationUtils.badRequest(ctx, "The 'from' date cannot be in the future");
+            return;
+        }
+        // Rule 6/7: if not current, until required and not future
+        if (workedUntil == null && !isRetired) {
+            // current is allowed only for active managers — validated below for retired
+        }
+        if (workedUntil != null && workedUntil.isAfter(today)) {
+            ValidationUtils.badRequest(ctx, "The 'to' date cannot be in the future");
+            return;
+        }
+        // Rule 7 for retired: until required
+        if (isRetired && workedUntil == null) {
+            ValidationUtils.badRequest(ctx, "A retired manager cannot have a current reviewer — end date is required");
+            return;
+        }
+        // Rule 8: until >= from
+        if (workedUntil != null && workedUntil.isBefore(workedFrom)) {
+            ValidationUtils.badRequest(ctx, "The 'to' date cannot be before the 'from' date");
+            return;
+        }
+        // Rule 9: review from >= manager start
+        if (workedFrom.isBefore(startDateLocal)) {
+            ValidationUtils.badRequest(ctx, "You cannot have worked with this manager before they started in this role");
+            return;
+        }
+        // Rules 10/11: if manager end exists, review dates must be within it
+        if (endDateLocal != null) {
+            if (workedFrom.isAfter(endDateLocal)) {
+                ValidationUtils.badRequest(ctx, "Your 'from' date cannot be after the manager's end date");
+                return;
+            }
+            if (workedUntil != null && workedUntil.isAfter(endDateLocal)) {
+                ValidationUtils.badRequest(ctx, "Your 'to' date cannot be after the manager's end date");
+                return;
+            }
+        }
+        if (ValidationUtils.exceedsLength(managerCompany, 100)) {
+            ValidationUtils.badRequest(ctx, "Manager company must be at most 100 characters");
+            return;
+        }
+        if (ValidationUtils.exceedsLength(managerTitle, 100)) {
+            ValidationUtils.badRequest(ctx, "Manager title must be at most 100 characters");
+            return;
+        }
+        if (reviewText != null && ValidationUtils.exceedsLength(reviewText, 2000)) {
+            ValidationUtils.badRequest(ctx, "Review text must be at most 2000 characters");
+            return;
+        }
+        if (!ValidationUtils.isValidRating(overallRating)) {
+            ValidationUtils.badRequest(ctx, "Overall rating must be between 1 and 5");
+            return;
+        }
+        String[] ratingKeys = {
+            "Communication Style", "Perceived Approachability", "Perceived Clarity of Expectations",
+            "Feedback Style", "Perceived Supportiveness", "Decision Making Style",
+            "Organization and Planning Style", "Delegation Style",
+            "Perceived Professional Demeanor", "Overall Working Experience"
+        };
+        String[] ratingKeysFallback = {
+            "communication_style", "perceived_approachability", "perceived_clarity_of_expectations",
+            "feedback_style", "perceived_supportiveness", "decision_making_style",
+            "organization_and_planning_style", "delegation_style",
+            "perceived_professional_demeanor", "overall_working_experience"
+        };
+        for (int i = 0; i < ratingKeys.length; i++) {
+            Double v = ratings.getDouble(ratingKeys[i]) != null
+                ? ratings.getDouble(ratingKeys[i])
+                : ratings.getDouble(ratingKeysFallback[i]);
+            if (!ValidationUtils.isValidRating(v)) {
+                ValidationUtils.badRequest(ctx, "Rating for '" + ratingKeys[i] + "' must be between 1 and 5");
+                return;
+            }
+        }
+
+        // Capture effective values for use in lambdas
+        final String finalStatus = submittedStatus;
+        final LocalDate finalWorkedFrom = workedFrom;
+        final LocalDate finalWorkedUntil = workedUntil;
+        final String finalLinkedinUrl = linkedinUrl;
+        final String finalBio = bio;
+        final OffsetDateTime finalStartDate = startDate;
+        final OffsetDateTime finalEndDate = endDate;
+        final String finalReviewText = reviewText;
+        final Double finalOverallRating = overallRating;
+        final JsonObject finalRatings = ratings;
+        final String finalManagerCompany = managerCompany;
+        final String finalManagerTitle = managerTitle;
+
+        // ── Look up user ──────────────────────────────────────────────────────
         db.preparedQuery("""
-                SELECT u.id, (b.id IS NOT NULL) AS is_banned
+                SELECT u.id, u.username, (b.id IS NOT NULL) AS is_banned
                 FROM users u LEFT JOIN banned_users b ON b.user_id = u.id
                 WHERE u.auth0_id = $1
             """)
@@ -566,53 +727,84 @@ public class ManagersHandler {
                     return;
                 }
                 UUID userId = userRow.getUUID("id");
+                String author = userRow.getString("username");
 
-                // Store the submitted employment status (active/retired); system sets approval_status = pending_approval
-                String submittedStatus = body.getString("status");
-                if (submittedStatus == null || (!submittedStatus.equals("active") && !submittedStatus.equals("retired"))) {
-                    submittedStatus = "active";
-                }
-                String insertSql = """
-                    INSERT INTO managers
-                    (name, company, title, image, bio, status, approval_status, linkedin_url, overall_rating, reviews_count, category_averages, created_at, submitted_by)
-                    VALUES ($1, $2, $3, $4, $5, $6, 'pending_approval', $7, 0, 0, '{}'::jsonb, now(), $8)
-                    RETURNING *
-                    """;
-                Tuple params = Tuple.of(name, company, title, image, bio, submittedStatus, linkedinUrl, userId);
-                db.preparedQuery(insertSql).execute(params, ar -> {
-                    if (ar.failed()) {
-                        ctx.fail(ar.cause());
-                        return;
-                    }
-                    Row row = ar.result().iterator().next();
-                    JsonObject response = new JsonObject()
-                        .put("id", row.getLong("id"))
-                        .put("name", row.getString("name"))
-                        .put("company", row.getString("company"))
-                        .put("title", row.getString("title"))
-                        .put("image", row.getString("image"))
-                        .put("overallRating", row.getBigDecimal("overall_rating"))
-                        .put("reviews", row.getInteger("reviews_count"))
-                        .put("bio", row.getString("bio"))
-                        .put("status", row.getString("status"))
-                        .put("approvalStatus", row.getString("approval_status"))
-                        .put("categoryAverages", row.getJsonObject("category_averages"))
-                        .put("linkedinUrl", row.getString("linkedin_url"))
-                        .put("createdAt", row.getOffsetDateTime("created_at").toString())
-                        .put("careerHistory", new JsonArray());
-                    // Seed career_history for the new manager
-                    String startDateStr = body.getString("startDate");
-                    LocalDate startDateLocal = parseYearMonth(startDateStr, LocalDate.now());
-                    OffsetDateTime startDate = startDateLocal.atStartOfDay(ZoneOffset.UTC).toOffsetDateTime();
-                    db.preparedQuery("INSERT INTO career_history(manager_id, company, title, start_date, end_date) VALUES ($1, $2, $3, $4, NULL)")
-                        .execute(Tuple.of(row.getLong("id"), row.getString("company"), row.getString("title"), startDate), seedAr -> {
-                            // fire-and-forget
+                // ── Atomic transaction: insert manager + review ───────────────
+                ((Pool) db).withTransaction(conn -> {
+                    String insertManagerSql = """
+                        INSERT INTO managers
+                        (name, company, title, image, bio, status, approval_status, linkedin_url, overall_rating, reviews_count, category_averages, created_at, submitted_by)
+                        VALUES ($1, $2, $3, $4, $5, $6, 'pending_approval', $7, 0, 0, '{}'::jsonb, now(), $8)
+                        RETURNING *
+                        """;
+                    Tuple managerParams = Tuple.of(name, company, title, image, finalBio, finalStatus, finalLinkedinUrl, userId);
+
+                    return conn.preparedQuery(insertManagerSql)
+                        .execute(managerParams)
+                        .compose(managerResult -> {
+                            Row managerRow = managerResult.iterator().next();
+                            long managerId = managerRow.getLong("id");
+
+                            // Seed career_history within the transaction
+                            conn.preparedQuery("INSERT INTO career_history(manager_id, company, title, start_date, end_date) VALUES ($1, $2, $3, $4, $5)")
+                                .execute(Tuple.of(managerId, company, title, finalStartDate, finalEndDate), ignored -> {});
+
+                            String insertReviewSql = """
+                                INSERT INTO reviews (
+                                    manager_id, user_id, author, overall_rating,
+                                    communication_style, perceived_approachability, perceived_clarity_of_expectations,
+                                    feedback_style, perceived_supportiveness, decision_making_style,
+                                    organization_and_planning_style, delegation_style, perceived_professional_demeanor,
+                                    overall_working_experience, manager_company, manager_title, text,
+                                    worked_from, worked_until,
+                                    verified, helpful_count, created_at, updated_at
+                                )
+                                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,true,0,now(),now())
+                                RETURNING id
+                                """;
+                            Tuple reviewParams = Tuple.of(
+                                managerId, userId, author, finalOverallRating,
+                                finalRatings.getDouble("Communication Style") != null ? finalRatings.getDouble("Communication Style") : finalRatings.getDouble("communication_style"),
+                                finalRatings.getDouble("Perceived Approachability") != null ? finalRatings.getDouble("Perceived Approachability") : finalRatings.getDouble("perceived_approachability"),
+                                finalRatings.getDouble("Perceived Clarity of Expectations") != null ? finalRatings.getDouble("Perceived Clarity of Expectations") : finalRatings.getDouble("perceived_clarity_of_expectations"),
+                                finalRatings.getDouble("Feedback Style") != null ? finalRatings.getDouble("Feedback Style") : finalRatings.getDouble("feedback_style"),
+                                finalRatings.getDouble("Perceived Supportiveness") != null ? finalRatings.getDouble("Perceived Supportiveness") : finalRatings.getDouble("perceived_supportiveness"),
+                                finalRatings.getDouble("Decision Making Style") != null ? finalRatings.getDouble("Decision Making Style") : finalRatings.getDouble("decision_making_style"),
+                                finalRatings.getDouble("Organization and Planning Style") != null ? finalRatings.getDouble("Organization and Planning Style") : finalRatings.getDouble("organization_and_planning_style"),
+                                finalRatings.getDouble("Delegation Style") != null ? finalRatings.getDouble("Delegation Style") : finalRatings.getDouble("delegation_style"),
+                                finalRatings.getDouble("Perceived Professional Demeanor") != null ? finalRatings.getDouble("Perceived Professional Demeanor") : finalRatings.getDouble("perceived_professional_demeanor"),
+                                finalRatings.getDouble("Overall Working Experience") != null ? finalRatings.getDouble("Overall Working Experience") : finalRatings.getDouble("overall_working_experience"),
+                                finalManagerCompany, finalManagerTitle, finalReviewText, finalWorkedFrom, finalWorkedUntil
+                            );
+
+                            return conn.preparedQuery(insertReviewSql)
+                                .execute(reviewParams)
+                                .map(ignored -> managerRow);
                         });
+                })
+                .onSuccess(managerRow -> {
+                    JsonObject response = new JsonObject()
+                        .put("id", managerRow.getLong("id"))
+                        .put("name", managerRow.getString("name"))
+                        .put("company", managerRow.getString("company"))
+                        .put("title", managerRow.getString("title"))
+                        .put("image", managerRow.getString("image"))
+                        .put("overallRating", managerRow.getBigDecimal("overall_rating"))
+                        .put("reviews", managerRow.getInteger("reviews_count"))
+                        .put("bio", managerRow.getString("bio"))
+                        .put("status", managerRow.getString("status"))
+                        .put("approvalStatus", managerRow.getString("approval_status"))
+                        .put("categoryAverages", managerRow.getJsonObject("category_averages"))
+                        .put("linkedinUrl", managerRow.getString("linkedin_url"))
+                        .put("createdAt", managerRow.getOffsetDateTime("created_at").toString())
+                        .put("careerHistory", new JsonArray());
                     ctx.response()
                        .setStatusCode(201)
                        .putHeader("Content-Type", "application/json")
                        .end(response.encode());
-                });
+                    recalculateInBackground(managerRow.getLong("id"));
+                })
+                .onFailure(err -> ctx.fail(err));
             });
     }
 
@@ -881,6 +1073,15 @@ public class ManagersHandler {
             }
             if (workedFrom != null && workedUntil != null && workedFrom.isAfter(workedUntil)) {
                 ValidationUtils.badRequest(ctx, "The 'from' date cannot be later than the 'to' date");
+                return;
+            }
+            LocalDate today = LocalDate.now();
+            if (workedFrom != null && workedFrom.isAfter(today)) {
+                ValidationUtils.badRequest(ctx, "The 'from' date cannot be in the future");
+                return;
+            }
+            if (workedUntil != null && workedUntil.isAfter(today)) {
+                ValidationUtils.badRequest(ctx, "The 'to' date cannot be in the future");
                 return;
             }
             if (overallRating == null || ratings == null ||
@@ -1165,6 +1366,15 @@ public class ManagersHandler {
         }
         if (workedFrom != null && workedUntil != null && workedFrom.isAfter(workedUntil)) {
             ValidationUtils.badRequest(ctx, "The 'from' date cannot be later than the 'to' date");
+            return;
+        }
+        LocalDate today = LocalDate.now();
+        if (workedFrom != null && workedFrom.isAfter(today)) {
+            ValidationUtils.badRequest(ctx, "The 'from' date cannot be in the future");
+            return;
+        }
+        if (workedUntil != null && workedUntil.isAfter(today)) {
+            ValidationUtils.badRequest(ctx, "The 'to' date cannot be in the future");
             return;
         }
         if (overallRating == null || ratings == null ||
