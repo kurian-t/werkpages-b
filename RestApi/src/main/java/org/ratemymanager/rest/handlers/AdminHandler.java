@@ -50,6 +50,129 @@ public class AdminHandler {
             });
     }
 
+    // ── Helper: fire-and-forget notification insert ───────────────────────────────
+    private void sendNotification(UUID userId, String type, String title, String message) {
+        db.preparedQuery(
+            "INSERT INTO notifications (user_id, type, title, message) VALUES ($1, $2, $3, $4)")
+            .execute(Tuple.of(userId, type, title, message), ar -> { /* fire-and-forget */ });
+    }
+
+    // ── GET /api/admin/pending-managers ──────────────────────────────────────────
+    public void handleGetPendingManagers(RoutingContext ctx) {
+        requireAdmin(ctx, adminId -> {
+            String sql = """
+                SELECT m.id, m.name, m.company, m.title, m.image, m.created_at,
+                       u.username AS submitted_by_username
+                FROM managers m
+                LEFT JOIN users u ON u.id = m.submitted_by
+                WHERE m.status = 'pending_approval'
+                ORDER BY m.created_at ASC
+                """;
+            db.preparedQuery(sql).execute(ar -> {
+                if (ar.failed()) { ctx.fail(ar.cause()); return; }
+                JsonArray result = new JsonArray();
+                for (Row row : ar.result()) {
+                    result.add(new JsonObject()
+                        .put("id", row.getLong("id"))
+                        .put("name", row.getString("name"))
+                        .put("company", row.getString("company"))
+                        .put("title", row.getString("title"))
+                        .put("image", row.getString("image"))
+                        .put("submittedBy", row.getString("submitted_by_username"))
+                        .put("createdAt", row.getOffsetDateTime("created_at").toString())
+                    );
+                }
+                ctx.response().setStatusCode(200)
+                    .putHeader("Content-Type", "application/json")
+                    .end(new JsonObject().put("data", result).encode());
+            });
+        });
+    }
+
+    // ── POST /api/admin/pending-managers/:managerId/approve ──────────────────────
+    public void handleApprovePendingManager(RoutingContext ctx) {
+        requireAdmin(ctx, adminId -> {
+            long managerId;
+            try {
+                managerId = Long.parseLong(ctx.pathParam("managerId"));
+            } catch (Exception e) {
+                ctx.response().setStatusCode(400)
+                    .putHeader("Content-Type", "application/json")
+                    .end(new JsonObject().put("error", "Invalid manager ID").encode());
+                return;
+            }
+            db.preparedQuery(
+                "UPDATE managers SET status = 'active', updated_at = now() " +
+                "WHERE id = $1 AND status = 'pending_approval' " +
+                "RETURNING id, name, submitted_by")
+                .execute(Tuple.of(managerId), ar -> {
+                    if (ar.failed()) { ctx.fail(ar.cause()); return; }
+                    if (!ar.result().iterator().hasNext()) {
+                        ctx.response().setStatusCode(404)
+                            .putHeader("Content-Type", "application/json")
+                            .end(new JsonObject().put("error", "Pending manager not found").encode());
+                        return;
+                    }
+                    Row row = ar.result().iterator().next();
+                    String managerName = row.getString("name");
+                    UUID submittedBy = row.getUUID("submitted_by");
+                    if (submittedBy != null) {
+                        sendNotification(submittedBy, "manager_approved",
+                            "Manager Approved",
+                            "Your manager profile for " + managerName +
+                            " has been approved and is now live on the platform.");
+                    }
+                    ctx.response().setStatusCode(200)
+                        .putHeader("Content-Type", "application/json")
+                        .end(new JsonObject().put("success", true).put("message", "Manager approved").encode());
+                });
+        });
+    }
+
+    // ── POST /api/admin/pending-managers/:managerId/reject ───────────────────────
+    public void handleRejectPendingManager(RoutingContext ctx) {
+        requireAdmin(ctx, adminId -> {
+            long managerId;
+            try {
+                managerId = Long.parseLong(ctx.pathParam("managerId"));
+            } catch (Exception e) {
+                ctx.response().setStatusCode(400)
+                    .putHeader("Content-Type", "application/json")
+                    .end(new JsonObject().put("error", "Invalid manager ID").encode());
+                return;
+            }
+            JsonObject body = ctx.getBodyAsJson();
+            String reason = body != null ? body.getString("reason") : null;
+
+            db.preparedQuery(
+                "UPDATE managers SET status = 'rejected', updated_at = now() " +
+                "WHERE id = $1 AND status = 'pending_approval' " +
+                "RETURNING id, name, submitted_by")
+                .execute(Tuple.of(managerId), ar -> {
+                    if (ar.failed()) { ctx.fail(ar.cause()); return; }
+                    if (!ar.result().iterator().hasNext()) {
+                        ctx.response().setStatusCode(404)
+                            .putHeader("Content-Type", "application/json")
+                            .end(new JsonObject().put("error", "Pending manager not found").encode());
+                        return;
+                    }
+                    Row row = ar.result().iterator().next();
+                    String managerName = row.getString("name");
+                    UUID submittedBy = row.getUUID("submitted_by");
+                    if (submittedBy != null) {
+                        String msg = "Your submitted manager profile for " + managerName + " was not approved.";
+                        if (reason != null && !reason.isBlank()) {
+                            msg += " Reason: " + reason.trim();
+                        }
+                        sendNotification(submittedBy, "manager_rejected", "Manager Not Approved", msg);
+                    }
+                    ctx.response().setStatusCode(200)
+                        .putHeader("Content-Type", "application/json")
+                        .end(new JsonObject().put("success", true).encode());
+                });
+        });
+    }
+
     // ── GET /api/admin/pending-edits ─────────────────────────────────────────────
     public void handleGetPendingEdits(RoutingContext ctx) {
         requireAdmin(ctx, adminId -> {
@@ -108,11 +231,12 @@ public class AdminHandler {
                 return;
             }
 
-            // 1. Get the pending edit + current manager state
+            // 1. Get the pending edit + current manager state (including proposed_by for notification)
             String fetchSql = """
                 SELECT
-                    pe.id, pe.manager_id, pe.new_company, pe.new_title, pe.status,
-                    m.company AS current_company, m.title AS current_title, m.created_at AS manager_created_at
+                    pe.id, pe.manager_id, pe.new_company, pe.new_title, pe.status, pe.proposed_by,
+                    m.company AS current_company, m.title AS current_title,
+                    m.created_at AS manager_created_at, m.name AS manager_name
                 FROM manager_edits pe
                 JOIN managers m ON m.id = pe.manager_id
                 WHERE pe.id = $1
@@ -140,6 +264,8 @@ public class AdminHandler {
                 String newTitle   = row.getString("new_title");
                 String effectiveCo  = newCompany != null ? newCompany : currentCompany;
                 String effectiveTit = newTitle   != null ? newTitle   : currentTitle;
+                UUID proposedBy = row.getUUID("proposed_by");
+                String managerName = row.getString("manager_name");
                 OffsetDateTime now = OffsetDateTime.now(ZoneOffset.UTC);
 
                 // 2. Close the existing open career_history entry
@@ -152,7 +278,8 @@ public class AdminHandler {
                             db.preparedQuery("INSERT INTO career_history(manager_id, company, title, start_date, end_date) VALUES ($1, $2, $3, $4, NULL)")
                                 .execute(Tuple.of(managerId, effectiveCo, effectiveTit, now), insertAr -> {
                                     if (insertAr.failed()) { ctx.fail(insertAr.cause()); return; }
-                                    applyEditAndApprove(ctx, managerId, editId, newCompany, newTitle, effectiveCo, effectiveTit, adminId, now);
+                                    applyEditAndApprove(ctx, managerId, editId, newCompany, newTitle,
+                                        effectiveCo, effectiveTit, adminId, now, proposedBy, managerName);
                                 });
 
                         if (closed == 0) {
@@ -174,7 +301,8 @@ public class AdminHandler {
     private void applyEditAndApprove(RoutingContext ctx, long managerId, UUID editId,
                                      String newCompany, String newTitle,
                                      String effectiveCo, String effectiveTit,
-                                     UUID adminId, OffsetDateTime reviewedAt) {
+                                     UUID adminId, OffsetDateTime reviewedAt,
+                                     UUID proposedBy, String managerName) {
         // 3. Update manager record
         String updateSql;
         Tuple updateParams;
@@ -194,6 +322,13 @@ public class AdminHandler {
             db.preparedQuery("UPDATE manager_edits SET status = 'approved', reviewed_at = $1, reviewed_by = $2 WHERE id = $3")
                 .execute(Tuple.of(reviewedAt, adminId, editId), approveAr -> {
                     if (approveAr.failed()) { ctx.fail(approveAr.cause()); return; }
+                    // 5. Notify the submitter
+                    if (proposedBy != null) {
+                        sendNotification(proposedBy, "review_accepted",
+                            "Edit Request Approved",
+                            "Your edit request for " + managerName +
+                            " has been approved. The manager's profile has been updated.");
+                    }
                     ctx.response().setStatusCode(200)
                         .putHeader("Content-Type", "application/json")
                         .end(new JsonObject().put("success", true).put("message", "Edit approved and applied").encode());
@@ -213,20 +348,52 @@ public class AdminHandler {
                     .end(new JsonObject().put("error", "Invalid edit ID").encode());
                 return;
             }
-            OffsetDateTime now = OffsetDateTime.now(ZoneOffset.UTC);
-            db.preparedQuery("UPDATE manager_edits SET status = 'rejected', reviewed_at = $1, reviewed_by = $2 WHERE id = $3 AND status = 'pending' RETURNING id")
-                .execute(Tuple.of(now, adminId, editId), ar -> {
-                    if (ar.failed()) { ctx.fail(ar.cause()); return; }
-                    if (!ar.result().iterator().hasNext()) {
-                        ctx.response().setStatusCode(404)
-                            .putHeader("Content-Type", "application/json")
-                            .end(new JsonObject().put("error", "Pending edit not found").encode());
-                        return;
-                    }
-                    ctx.response().setStatusCode(200)
+
+            // Fetch edit details first so we can notify the submitter
+            String fetchSql = """
+                SELECT pe.id, pe.proposed_by, pe.status, m.name AS manager_name
+                FROM manager_edits pe
+                JOIN managers m ON m.id = pe.manager_id
+                WHERE pe.id = $1
+                """;
+            db.preparedQuery(fetchSql).execute(Tuple.of(editId), fetchAr -> {
+                if (fetchAr.failed()) { ctx.fail(fetchAr.cause()); return; }
+                if (!fetchAr.result().iterator().hasNext()) {
+                    ctx.response().setStatusCode(404)
                         .putHeader("Content-Type", "application/json")
-                        .end(new JsonObject().put("success", true).encode());
-                });
+                        .end(new JsonObject().put("error", "Pending edit not found").encode());
+                    return;
+                }
+                Row fetchRow = fetchAr.result().iterator().next();
+                if (!"pending".equals(fetchRow.getString("status"))) {
+                    ctx.response().setStatusCode(404)
+                        .putHeader("Content-Type", "application/json")
+                        .end(new JsonObject().put("error", "Pending edit not found").encode());
+                    return;
+                }
+                UUID proposedBy = fetchRow.getUUID("proposed_by");
+                String managerName = fetchRow.getString("manager_name");
+
+                OffsetDateTime now = OffsetDateTime.now(ZoneOffset.UTC);
+                db.preparedQuery("UPDATE manager_edits SET status = 'rejected', reviewed_at = $1, reviewed_by = $2 WHERE id = $3 RETURNING id")
+                    .execute(Tuple.of(now, adminId, editId), ar -> {
+                        if (ar.failed()) { ctx.fail(ar.cause()); return; }
+                        if (!ar.result().iterator().hasNext()) {
+                            ctx.response().setStatusCode(404)
+                                .putHeader("Content-Type", "application/json")
+                                .end(new JsonObject().put("error", "Pending edit not found").encode());
+                            return;
+                        }
+                        if (proposedBy != null) {
+                            sendNotification(proposedBy, "review_rejected",
+                                "Edit Request Rejected",
+                                "Your edit request for " + managerName + " was not approved.");
+                        }
+                        ctx.response().setStatusCode(200)
+                            .putHeader("Content-Type", "application/json")
+                            .end(new JsonObject().put("success", true).encode());
+                    });
+            });
         });
     }
 
@@ -324,8 +491,11 @@ public class AdminHandler {
                     String adminUsername = adminAr.result().iterator().hasNext()
                         ? adminAr.result().iterator().next().getString("username") : "admin";
 
+                    final String trimmedReason = reason.trim();
+                    final UUID finalTargetUserId = targetUserId;
+
                     db.preparedQuery("INSERT INTO banned_users(user_id, reason, banned_by) VALUES ($1, $2, $3) ON CONFLICT (user_id) DO NOTHING RETURNING id")
-                        .execute(Tuple.of(targetUserId, reason.trim(), adminUsername), banAr -> {
+                        .execute(Tuple.of(finalTargetUserId, trimmedReason, adminUsername), banAr -> {
                             if (banAr.failed()) { ctx.fail(banAr.cause()); return; }
                             if (!banAr.result().iterator().hasNext()) {
                                 ctx.response().setStatusCode(409)
@@ -333,6 +503,11 @@ public class AdminHandler {
                                     .end(new JsonObject().put("error", "User is already banned").encode());
                                 return;
                             }
+                            // Notify the banned user
+                            sendNotification(finalTargetUserId, "user_banned",
+                                "Account Suspended",
+                                "Your account has been suspended. Reason: " + trimmedReason
+                                + "\n\nIf you believe this was a mistake, you may appeal by emailing contact@ratemymanagers.ca");
                             ctx.response().setStatusCode(201)
                                 .putHeader("Content-Type", "application/json")
                                 .end(new JsonObject().put("success", true).encode());

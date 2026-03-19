@@ -215,7 +215,13 @@ public class AuthHandler {
                     com.auth0.jwt.interfaces.DecodedJWT decoded = com.auth0.jwt.JWT.decode(accessToken);
                     String auth0Id = decoded.getSubject();
 
-                    db.preparedQuery("SELECT email, username, first_name, last_name, role FROM users WHERE auth0_id = $1")
+                    db.preparedQuery("""
+                            SELECT u.email, u.username, u.first_name, u.last_name, u.role,
+                                   (b.id IS NOT NULL) AS is_banned
+                            FROM users u
+                            LEFT JOIN banned_users b ON b.user_id = u.id
+                            WHERE u.auth0_id = $1
+                        """)
                         .execute(Tuple.of(auth0Id), dbAr -> {
                             if (dbAr.failed()) {
                                 ctx.fail(dbAr.cause());
@@ -244,6 +250,7 @@ public class AuthHandler {
                                         .put("firstName", row.getString("first_name"))
                                         .put("lastName", row.getString("last_name"))
                                         .put("role", row.getString("role"))
+                                        .put("isBanned", row.getBoolean("is_banned"))
                                     ).encode()
                                 );
                         });
@@ -265,7 +272,13 @@ public class AuthHandler {
                .end(new JsonObject().put("error", "Unauthorized").encode());
             return;
         }
-        db.preparedQuery("SELECT id, auth0_id, email, username, first_name, last_name, role, created_at FROM users WHERE auth0_id = $1")
+        db.preparedQuery("""
+                SELECT u.id, u.auth0_id, u.email, u.username, u.first_name, u.last_name, u.role, u.created_at,
+                       (b.id IS NOT NULL) AS is_banned
+                FROM users u
+                LEFT JOIN banned_users b ON b.user_id = u.id
+                WHERE u.auth0_id = $1
+            """)
           .execute(Tuple.of(auth0Id), ar -> {
             if (ar.failed()) {
                 ctx.fail(ar.cause());
@@ -294,6 +307,7 @@ public class AuthHandler {
                    .put("firstName", row.getString("first_name"))
                    .put("lastName", row.getString("last_name"))
                    .put("role", row.getString("role"))
+                   .put("isBanned", row.getBoolean("is_banned"))
                    .put("createdAt", row.getLocalDateTime("created_at").toString())
                    .encode()
                );

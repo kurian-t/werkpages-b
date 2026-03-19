@@ -100,35 +100,55 @@ public class ReportsHandler {
 	        // Resolve internal user UUID from auth0_id
 	        db.preparedQuery("SELECT id FROM users WHERE auth0_id = $1")
 	          .execute(Tuple.of(auth0Id), userAr -> {
+	            if (userAr.failed()) { ctx.fail(userAr.cause()); return; }
+
 	            UUID userId = null;
 	            if (userAr.succeeded() && userAr.result().iterator().hasNext()) {
 	                userId = userAr.result().iterator().next().getUUID("id");
 	            }
+	            final UUID finalUserId = userId;
 
-	            String insertSql = """
-	                INSERT INTO reports (manager_id, user_id, reason, comment)
-	                VALUES ($1, $2, $3, $4)
-	                RETURNING id, created_at
-	                """;
-
-	            db.preparedQuery(insertSql).execute(Tuple.of(managerId, userId, reason, comment), insertAr -> {
-	                if (insertAr.failed()) {
-	                    ctx.fail(insertAr.cause());
-	                    return;
-	                }
-
-	                Row row = insertAr.result().iterator().next();
-
-	                ctx.response()
-	                    .setStatusCode(201)
-	                    .putHeader("Content-Type", "application/json")
-	                    .end(new JsonObject()
-	                        .put("success", true)
-	                        .put("reportId", row.getUUID("id").toString())
-	                        .put("createdAt", row.getOffsetDateTime("created_at").toString())
-	                        .encode());
-	            });
+	            // If authenticated user, prevent duplicate reports
+	            if (finalUserId != null) {
+	                db.preparedQuery("SELECT id FROM reports WHERE manager_id = $1 AND user_id = $2")
+	                  .execute(Tuple.of(managerId, finalUserId), dupAr -> {
+	                    if (dupAr.failed()) { ctx.fail(dupAr.cause()); return; }
+	                    if (dupAr.result().iterator().hasNext()) {
+	                        ctx.response()
+	                            .setStatusCode(409)
+	                            .putHeader("Content-Type", "application/json")
+	                            .end(new JsonObject().put("error", "already_reported").encode());
+	                        return;
+	                    }
+	                    insertReport(ctx, managerId, finalUserId, reason, comment);
+	                  });
+	            } else {
+	                insertReport(ctx, managerId, finalUserId, reason, comment);
+	            }
 	        });
+	    });
+	}
+
+	private void insertReport(RoutingContext ctx, long managerId, UUID userId, String reason, String comment) {
+	    String insertSql = """
+	        INSERT INTO reports (manager_id, user_id, reason, comment)
+	        VALUES ($1, $2, $3, $4)
+	        RETURNING id, created_at
+	        """;
+	    db.preparedQuery(insertSql).execute(Tuple.of(managerId, userId, reason, comment), insertAr -> {
+	        if (insertAr.failed()) {
+	            ctx.fail(insertAr.cause());
+	            return;
+	        }
+	        Row row = insertAr.result().iterator().next();
+	        ctx.response()
+	            .setStatusCode(201)
+	            .putHeader("Content-Type", "application/json")
+	            .end(new JsonObject()
+	                .put("success", true)
+	                .put("reportId", row.getUUID("id").toString())
+	                .put("createdAt", row.getOffsetDateTime("created_at").toString())
+	                .encode());
 	    });
 	}
 }

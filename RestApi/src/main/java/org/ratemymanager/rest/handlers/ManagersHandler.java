@@ -41,6 +41,7 @@ public class ManagersHandler {
 			    m.category_averages,
 			    m.linkedin_url,
 			    m.created_at,
+			    m.submitted_by,
 			
 			    -- Career history (pre-aggregated)
 			    COALESCE(ch.career_history, '[]') AS career_history,
@@ -109,6 +110,27 @@ public class ManagersHandler {
 
     public ManagersHandler(SqlClient db) {
         this.db = db;
+    }
+
+    private void requireNotBanned(RoutingContext ctx, String auth0Id, Runnable onAllowed) {
+        db.preparedQuery("""
+                SELECT EXISTS(
+                    SELECT 1 FROM banned_users b
+                    JOIN users u ON b.user_id = u.id
+                    WHERE u.auth0_id = $1
+                )
+            """).execute(Tuple.of(auth0Id), ar -> {
+            if (ar.failed()) { ctx.fail(ar.cause()); return; }
+            boolean isBanned = ar.result().iterator().next().getBoolean(0);
+            if (isBanned) {
+                ctx.response()
+                    .setStatusCode(403)
+                    .putHeader("Content-Type", "application/json")
+                    .end(new JsonObject().put("error", "account_suspended").encode());
+                return;
+            }
+            onAllowed.run();
+        });
     }
 
     private LocalDate parseYearMonth(String str, LocalDate defaultVal) {
@@ -189,11 +211,12 @@ public class ManagersHandler {
                 FROM managers m
                 LEFT JOIN career_history ch ON ch.manager_id = m.id
                 WHERE (m.name ILIKE $3 OR m.company ILIKE $3 OR m.title ILIKE $3)
+                  AND m.status IN ('active', 'retired')
                 GROUP BY m.id
                 ORDER BY m.overall_rating DESC NULLS LAST, m.id ASC
                 LIMIT $1 OFFSET $2
                 """;
-            countSql = "SELECT COUNT(*) FROM managers WHERE (name ILIKE $1 OR company ILIKE $1 OR title ILIKE $1)";
+            countSql = "SELECT COUNT(*) FROM managers WHERE (name ILIKE $1 OR company ILIKE $1 OR title ILIKE $1) AND status IN ('active', 'retired')";
             dataTuple = Tuple.of(limit, offset, searchPattern);
         } else {
             dataSql = """
@@ -224,11 +247,12 @@ public class ManagersHandler {
                     ) AS career_history
                 FROM managers m
                 LEFT JOIN career_history ch ON ch.manager_id = m.id
+                WHERE m.status IN ('active', 'retired')
                 GROUP BY m.id
                 ORDER BY m.overall_rating DESC NULLS LAST, m.id ASC
                 LIMIT $1 OFFSET $2
                 """;
-            countSql = "SELECT COUNT(*) FROM managers";
+            countSql = "SELECT COUNT(*) FROM managers WHERE status IN ('active', 'retired')";
             dataTuple = Tuple.of(limit, offset);
         }
 
@@ -297,27 +321,34 @@ public class ManagersHandler {
         });
     }
 
-    public void handleGetManagerById(RoutingContext ctx) {
-//        String authHeader = ctx.request().getHeader("Authorization");
-//        if (authHeader == null || !authHeader.startsWith("Bearer ")) {
-//            ctx.response()
-//                .setStatusCode(401)
-//                .putHeader("Content-Type", "application/json")
-//                .end(new JsonObject().put("error", "Missing or invalid Authorization header").encode());
-//            return;
-//        }
-//        String token = authHeader.substring("Bearer ".length());
-//        DecodedJWT decoded;
-//        try {
-//            decoded = JWT.decode(token);
-//        } catch (JWTDecodeException e) {
-//            ctx.response()
-//                .setStatusCode(401)
-//                .putHeader("Content-Type", "application/json")
-//                .end(new JsonObject().put("error", "Invalid token").encode());
-//            return;
-//        }
+    // Extract auth0Id from a JWT token in Authorization header or auth_token cookie (no signature verification).
+    private String extractAuth0IdFromRequest(RoutingContext ctx) {
+        String authHeader = ctx.request().getHeader("Authorization");
+        String token = null;
+        if (authHeader != null && authHeader.startsWith("Bearer ")) {
+            token = authHeader.substring("Bearer ".length());
+        } else {
+            String cookieHeader = ctx.request().getHeader("Cookie");
+            if (cookieHeader != null) {
+                for (String part : cookieHeader.split(";")) {
+                    String trimmed = part.trim();
+                    if (trimmed.startsWith("auth_token=")) {
+                        token = trimmed.substring("auth_token=".length());
+                        break;
+                    }
+                }
+            }
+        }
+        if (token == null) return null;
+        try {
+            DecodedJWT jwt = JWT.decode(token);
+            return jwt.getSubject();
+        } catch (JWTDecodeException e) {
+            return null;
+        }
+    }
 
+    public void handleGetManagerById(RoutingContext ctx) {
         long managerId;
         try {
             managerId = Long.parseLong(ctx.pathParam("id"));
@@ -343,30 +374,117 @@ public class ManagersHandler {
                    .end(new JsonObject().put("error", "Manager not found").encode());
                 return;
             }
-            String createdAt = row.getOffsetDateTime("created_at").toString();
-            JsonObject response = new JsonObject()
-                .put("id", row.getLong("id"))
-                .put("name", row.getString("name"))
-                .put("company", row.getString("company"))
-                .put("title", row.getString("title"))
-                .put("image", row.getString("image"))
-                .put("overallRating", row.getBigDecimal("overall_rating"))
-                .put("reviews", row.getInteger("reviews_count"))
-                .put("bio", row.getString("bio"))
-                .put("status", row.getString("status"))
-                .put("categoryAverages", row.getJsonObject("category_averages"))
-                .put("linkedinUrl", row.getString("linkedin_url"))
-                .put("createdAt", createdAt)
-                .put("careerHistory", row.getJsonArray("career_history"))
-                .put("reviews", row.getJsonArray("reviews"));
-            ctx.response()
-               .putHeader("Content-Type", "application/json")
-               .end(response.encode());
+
+            String status = row.getString("status");
+
+            // Pending managers are only visible to their submitter
+            if ("pending_approval".equals(status) || "rejected".equals(status)) {
+                UUID submittedBy = row.getUUID("submitted_by");
+                String auth0Id = extractAuth0IdFromRequest(ctx);
+                if (auth0Id == null || submittedBy == null) {
+                    ctx.response().setStatusCode(404)
+                       .putHeader("Content-Type", "application/json")
+                       .end(new JsonObject().put("error", "Manager not found").encode());
+                    return;
+                }
+                // Verify caller is the submitter
+                db.preparedQuery("SELECT id FROM users WHERE auth0_id = $1")
+                    .execute(Tuple.of(auth0Id), userAr -> {
+                        if (userAr.failed() || !userAr.result().iterator().hasNext()) {
+                            ctx.response().setStatusCode(404)
+                               .putHeader("Content-Type", "application/json")
+                               .end(new JsonObject().put("error", "Manager not found").encode());
+                            return;
+                        }
+                        UUID callerId = userAr.result().iterator().next().getUUID("id");
+                        if (!callerId.equals(submittedBy)) {
+                            ctx.response().setStatusCode(404)
+                               .putHeader("Content-Type", "application/json")
+                               .end(new JsonObject().put("error", "Manager not found").encode());
+                            return;
+                        }
+                        sendManagerResponse(ctx, row);
+                    });
+                return;
+            }
+
+            sendManagerResponse(ctx, row);
         });
     }
 
+    private void sendManagerResponse(RoutingContext ctx, Row row) {
+        String createdAt = row.getOffsetDateTime("created_at").toString();
+        JsonObject response = new JsonObject()
+            .put("id", row.getLong("id"))
+            .put("name", row.getString("name"))
+            .put("company", row.getString("company"))
+            .put("title", row.getString("title"))
+            .put("image", row.getString("image"))
+            .put("overallRating", row.getBigDecimal("overall_rating"))
+            .put("reviews", row.getInteger("reviews_count"))
+            .put("bio", row.getString("bio"))
+            .put("status", row.getString("status"))
+            .put("categoryAverages", row.getJsonObject("category_averages"))
+            .put("linkedinUrl", row.getString("linkedin_url"))
+            .put("createdAt", createdAt)
+            .put("careerHistory", row.getJsonArray("career_history"))
+            .put("reviews", row.getJsonArray("reviews"));
+        ctx.response()
+           .putHeader("Content-Type", "application/json")
+           .end(response.encode());
+    }
+
+    public void handleGetMySubmittedManagers(RoutingContext ctx) {
+        String auth0Id = ctx.get("auth0Id");
+        if (auth0Id == null) {
+            ctx.response().setStatusCode(401)
+               .putHeader("Content-Type", "application/json")
+               .end(new JsonObject().put("error", "Unauthorized").encode());
+            return;
+        }
+        db.preparedQuery("SELECT id FROM users WHERE auth0_id = $1")
+            .execute(Tuple.of(auth0Id), userAr -> {
+                if (userAr.failed() || !userAr.result().iterator().hasNext()) {
+                    ctx.response().setStatusCode(401)
+                       .putHeader("Content-Type", "application/json")
+                       .end(new JsonObject().put("error", "User not found").encode());
+                    return;
+                }
+                UUID userId = userAr.result().iterator().next().getUUID("id");
+                String sql = """
+                    SELECT id, name, company, title, image, overall_rating, reviews_count,
+                           bio, status, linkedin_url, created_at
+                    FROM managers
+                    WHERE submitted_by = $1 AND status IN ('pending_approval', 'rejected')
+                    ORDER BY created_at DESC
+                    """;
+                db.preparedQuery(sql).execute(Tuple.of(userId), ar -> {
+                    if (ar.failed()) { ctx.fail(ar.cause()); return; }
+                    JsonArray data = new JsonArray();
+                    for (Row row : ar.result()) {
+                        data.add(new JsonObject()
+                            .put("id", row.getLong("id"))
+                            .put("name", row.getString("name"))
+                            .put("company", row.getString("company"))
+                            .put("title", row.getString("title"))
+                            .put("image", row.getString("image"))
+                            .put("overallRating", row.getBigDecimal("overall_rating"))
+                            .put("reviews", row.getInteger("reviews_count"))
+                            .put("bio", row.getString("bio"))
+                            .put("status", row.getString("status"))
+                            .put("linkedinUrl", row.getString("linkedin_url"))
+                            .put("createdAt", row.getOffsetDateTime("created_at").toString())
+                        );
+                    }
+                    ctx.response().putHeader("Content-Type", "application/json")
+                       .end(new JsonObject().put("data", data).encode());
+                });
+            });
+    }
+
     public void handleCreateManager(RoutingContext ctx) {
-        if (ctx.get("auth0Id") == null) {
+        String auth0Id = ctx.get("auth0Id");
+        if (auth0Id == null) {
             ctx.response()
                 .setStatusCode(401)
                 .putHeader("Content-Type", "application/json")
@@ -386,10 +504,8 @@ public class ManagersHandler {
         String company = body.getString("company");
         String title = body.getString("title");
         String image = body.getString("image");
-        String status = body.getString("status");
         if (ValidationUtils.isBlank(name) || ValidationUtils.isBlank(company) ||
-            ValidationUtils.isBlank(title) || ValidationUtils.isBlank(image) ||
-            ValidationUtils.isBlank(status)) {
+            ValidationUtils.isBlank(title) || ValidationUtils.isBlank(image)) {
             ValidationUtils.badRequest(ctx, "Missing required fields");
             return;
         }
@@ -403,10 +519,6 @@ public class ManagersHandler {
         }
         if (ValidationUtils.exceedsLength(title, 100)) {
             ValidationUtils.badRequest(ctx, "Title must be at most 100 characters");
-            return;
-        }
-        if (!status.equals("active") && !status.equals("retired")) {
-            ValidationUtils.badRequest(ctx, "Status must be 'active' or 'retired'");
             return;
         }
         String bio = body.getString("bio");
@@ -425,50 +537,77 @@ public class ManagersHandler {
                 return;
             }
         }
-        String insertSql = """
-            INSERT INTO managers
-            (name, company, title, image, bio, status, linkedin_url, overall_rating, reviews_count, category_averages, created_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, 0, 0, '{}'::jsonb, now())
-            RETURNING *
-            """;
-        Tuple params = Tuple.of(name, company, title, image, bio, status, linkedinUrl);
-        db.preparedQuery(insertSql).execute(params, ar -> {
-            if (ar.failed()) {
-                ctx.fail(ar.cause());
-                return;
-            }
-            Row row = ar.result().iterator().next();
-            JsonObject response = new JsonObject()
-                .put("id", row.getLong("id"))
-                .put("name", row.getString("name"))
-                .put("company", row.getString("company"))
-                .put("title", row.getString("title"))
-                .put("image", row.getString("image"))
-                .put("overallRating", row.getBigDecimal("overall_rating"))
-                .put("reviews", row.getInteger("reviews_count"))
-                .put("bio", row.getString("bio"))
-                .put("status", row.getString("status"))
-                .put("categoryAverages", row.getJsonObject("category_averages"))
-                .put("linkedinUrl", row.getString("linkedin_url"))
-                .put("createdAt", row.getOffsetDateTime("created_at").toString())
-                .put("careerHistory", new JsonArray());
-            // Seed career_history for the new manager
-            String startDateStr = body.getString("startDate");
-            LocalDate startDateLocal = parseYearMonth(startDateStr, LocalDate.now());
-            OffsetDateTime startDate = startDateLocal.atStartOfDay(ZoneOffset.UTC).toOffsetDateTime();
-            db.preparedQuery("INSERT INTO career_history(manager_id, company, title, start_date, end_date) VALUES ($1, $2, $3, $4, NULL)")
-                .execute(Tuple.of(row.getLong("id"), row.getString("company"), row.getString("title"), startDate), seedAr -> {
-                    // fire-and-forget
+
+        // Look up the submitting user's UUID so we can store submitted_by and send notifications later
+        db.preparedQuery("""
+                SELECT u.id, (b.id IS NOT NULL) AS is_banned
+                FROM users u LEFT JOIN banned_users b ON b.user_id = u.id
+                WHERE u.auth0_id = $1
+            """)
+            .execute(Tuple.of(auth0Id), userAr -> {
+                if (userAr.failed()) { ctx.fail(userAr.cause()); return; }
+                if (!userAr.result().iterator().hasNext()) {
+                    ctx.response().setStatusCode(401)
+                        .putHeader("Content-Type", "application/json")
+                        .end(new JsonObject().put("error", "User not found").encode());
+                    return;
+                }
+                Row userRow = userAr.result().iterator().next();
+                if (userRow.getBoolean("is_banned")) {
+                    ctx.response().setStatusCode(403)
+                        .putHeader("Content-Type", "application/json")
+                        .end(new JsonObject().put("error", "account_suspended").encode());
+                    return;
+                }
+                UUID userId = userRow.getUUID("id");
+
+                // All new managers go through approval; status is always pending_approval
+                String insertSql = """
+                    INSERT INTO managers
+                    (name, company, title, image, bio, status, linkedin_url, overall_rating, reviews_count, category_averages, created_at, submitted_by)
+                    VALUES ($1, $2, $3, $4, $5, 'pending_approval', $6, 0, 0, '{}'::jsonb, now(), $7)
+                    RETURNING *
+                    """;
+                Tuple params = Tuple.of(name, company, title, image, bio, linkedinUrl, userId);
+                db.preparedQuery(insertSql).execute(params, ar -> {
+                    if (ar.failed()) {
+                        ctx.fail(ar.cause());
+                        return;
+                    }
+                    Row row = ar.result().iterator().next();
+                    JsonObject response = new JsonObject()
+                        .put("id", row.getLong("id"))
+                        .put("name", row.getString("name"))
+                        .put("company", row.getString("company"))
+                        .put("title", row.getString("title"))
+                        .put("image", row.getString("image"))
+                        .put("overallRating", row.getBigDecimal("overall_rating"))
+                        .put("reviews", row.getInteger("reviews_count"))
+                        .put("bio", row.getString("bio"))
+                        .put("status", row.getString("status"))
+                        .put("categoryAverages", row.getJsonObject("category_averages"))
+                        .put("linkedinUrl", row.getString("linkedin_url"))
+                        .put("createdAt", row.getOffsetDateTime("created_at").toString())
+                        .put("careerHistory", new JsonArray());
+                    // Seed career_history for the new manager
+                    String startDateStr = body.getString("startDate");
+                    LocalDate startDateLocal = parseYearMonth(startDateStr, LocalDate.now());
+                    OffsetDateTime startDate = startDateLocal.atStartOfDay(ZoneOffset.UTC).toOffsetDateTime();
+                    db.preparedQuery("INSERT INTO career_history(manager_id, company, title, start_date, end_date) VALUES ($1, $2, $3, $4, NULL)")
+                        .execute(Tuple.of(row.getLong("id"), row.getString("company"), row.getString("title"), startDate), seedAr -> {
+                            // fire-and-forget
+                        });
+                    ctx.response()
+                       .setStatusCode(201)
+                       .putHeader("Content-Type", "application/json")
+                       .end(response.encode());
                 });
-            ctx.response()
-               .setStatusCode(201)
-               .putHeader("Content-Type", "application/json")
-               .end(response.encode());
-        });
+            });
     }
 
     public void handleUpdateManager(RoutingContext ctx) {
-        if (ctx.get("auth0Id") == null) {
+        String updateManagerAuth0Id = ctx.get("auth0Id");
+        if (updateManagerAuth0Id == null) {
             ctx.response()
                 .setStatusCode(401)
                 .putHeader("Content-Type", "application/json")
@@ -537,7 +676,9 @@ public class ManagersHandler {
                 return;
             }
         }
-        Tuple selectParams = Tuple.of(managerId);
+        final long finalManagerId = managerId;
+        requireNotBanned(ctx, updateManagerAuth0Id, () -> {
+        Tuple selectParams = Tuple.of(finalManagerId);
         db.preparedQuery(GET_MANAGER_BY_ID_SQL).execute(selectParams, ar -> {
             if (ar.failed()) {
                 ctx.fail(ar.cause());
@@ -653,6 +794,7 @@ public class ManagersHandler {
                 updateManager.run();
             }
         });
+        }); // end requireNotBanned
     }
 
     public void handleCreateManagerReview(RoutingContext ctx) {
@@ -664,7 +806,11 @@ public class ManagersHandler {
                 .end(new JsonObject().put("error", "Unauthorized").encode());
             return;
         }
-        String userIdQuery = "SELECT id, username FROM users WHERE auth0_id = $1";
+        String userIdQuery = """
+                SELECT u.id, u.username, (b.id IS NOT NULL) AS is_banned
+                FROM users u LEFT JOIN banned_users b ON b.user_id = u.id
+                WHERE u.auth0_id = $1
+            """;
         db.preparedQuery(userIdQuery).execute(Tuple.of(auth0Id), userAr -> {
             if (userAr.failed()) {
                 ctx.response()
@@ -681,6 +827,12 @@ public class ManagersHandler {
                 return;
             }
             Row userRow = userAr.result().iterator().next();
+            if (userRow.getBoolean("is_banned")) {
+                ctx.response().setStatusCode(403)
+                    .putHeader("Content-Type", "application/json")
+                    .end(new JsonObject().put("error", "account_suspended").encode());
+                return;
+            }
             UUID userId = userRow.getUUID("id");
             String author = userRow.getString("username"); // always use the real username, never trust the request body
             long managerId;
@@ -1052,8 +1204,12 @@ public class ManagersHandler {
             WHERE id = $17 AND manager_id = $18 AND user_id = $19
             RETURNING *
             """;
-        // Resolve caller's internal UUID for ownership verification
-        db.preparedQuery("SELECT id FROM users WHERE auth0_id = $1")
+        // Resolve caller's internal UUID for ownership verification (with ban check)
+        db.preparedQuery("""
+                SELECT u.id, (b.id IS NOT NULL) AS is_banned
+                FROM users u LEFT JOIN banned_users b ON b.user_id = u.id
+                WHERE u.auth0_id = $1
+            """)
           .execute(Tuple.of(auth0Id), userAr -> {
             if (userAr.failed()) {
                 ctx.fail(userAr.cause());
@@ -1066,7 +1222,14 @@ public class ManagersHandler {
                    .end(new JsonObject().put("error", "Unauthorized").encode());
                 return;
             }
-            UUID callerId = userAr.result().iterator().next().getUUID("id");
+            Row callerRow = userAr.result().iterator().next();
+            if (callerRow.getBoolean("is_banned")) {
+                ctx.response().setStatusCode(403)
+                    .putHeader("Content-Type", "application/json")
+                    .end(new JsonObject().put("error", "account_suspended").encode());
+                return;
+            }
+            UUID callerId = callerRow.getUUID("id");
             Tuple params = Tuple.of(
                 overallRating, communicationStyle, perceivedApproachability,
                 perceivedClarityOfExpectations, feedbackStyle, perceivedSupportiveness,
@@ -1145,7 +1308,11 @@ public class ManagersHandler {
                .end(new JsonObject().put("error", "Invalid managerId or reviewId").encode());
             return;
         }
-        db.preparedQuery("SELECT id FROM users WHERE auth0_id = $1")
+        db.preparedQuery("""
+                SELECT u.id, (b.id IS NOT NULL) AS is_banned
+                FROM users u LEFT JOIN banned_users b ON b.user_id = u.id
+                WHERE u.auth0_id = $1
+            """)
           .execute(Tuple.of(auth0Id), userAr -> {
             if (userAr.failed()) {
                 ctx.fail(userAr.cause());
@@ -1158,7 +1325,14 @@ public class ManagersHandler {
                    .end(new JsonObject().put("error", "Unauthorized").encode());
                 return;
             }
-            UUID userId = userAr.result().iterator().next().getUUID("id");
+            Row deleteUserRow = userAr.result().iterator().next();
+            if (deleteUserRow.getBoolean("is_banned")) {
+                ctx.response().setStatusCode(403)
+                    .putHeader("Content-Type", "application/json")
+                    .end(new JsonObject().put("error", "account_suspended").encode());
+                return;
+            }
+            UUID userId = deleteUserRow.getUUID("id");
             String selectSql = "SELECT user_id FROM reviews WHERE id = $1 AND manager_id = $2";
             db.preparedQuery(selectSql).execute(Tuple.of(reviewId, managerId), ar -> {
                 if (ar.failed()) {
@@ -1544,7 +1718,11 @@ public class ManagersHandler {
         final String effectiveCompany = (newCompany != null && !newCompany.isBlank()) ? newCompany.trim() : null;
         final String effectiveTitle   = (newTitle   != null && !newTitle.isBlank())   ? newTitle.trim()   : null;
 
-        db.preparedQuery("SELECT id FROM users WHERE auth0_id = $1")
+        db.preparedQuery("""
+                SELECT u.id, (b.id IS NOT NULL) AS is_banned
+                FROM users u LEFT JOIN banned_users b ON b.user_id = u.id
+                WHERE u.auth0_id = $1
+            """)
             .execute(Tuple.of(auth0Id), userAr -> {
                 if (userAr.failed()) { ctx.fail(userAr.cause()); return; }
                 if (!userAr.result().iterator().hasNext()) {
@@ -1553,7 +1731,14 @@ public class ManagersHandler {
                         .end(new JsonObject().put("error", "User not found").encode());
                     return;
                 }
-                UUID userId = userAr.result().iterator().next().getUUID("id");
+                Row editRequestUserRow = userAr.result().iterator().next();
+                if (editRequestUserRow.getBoolean("is_banned")) {
+                    ctx.response().setStatusCode(403)
+                        .putHeader("Content-Type", "application/json")
+                        .end(new JsonObject().put("error", "account_suspended").encode());
+                    return;
+                }
+                UUID userId = editRequestUserRow.getUUID("id");
 
                 // Verify manager exists
                 db.preparedQuery("SELECT id FROM managers WHERE id = $1")

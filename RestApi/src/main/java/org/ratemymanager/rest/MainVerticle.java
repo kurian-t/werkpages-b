@@ -9,6 +9,7 @@ import org.ratemymanager.db.Database;
 import org.ratemymanager.rest.handlers.AdminHandler;
 import org.ratemymanager.rest.handlers.AuthHandler;
 import org.ratemymanager.rest.handlers.ManagersHandler;
+import org.ratemymanager.rest.handlers.NotificationsHandler;
 import org.ratemymanager.rest.handlers.RateLimitHandler;
 import org.ratemymanager.rest.handlers.ReportsHandler;
 
@@ -60,9 +61,10 @@ public class MainVerticle extends AbstractVerticle {
 
                         Database.init(vertx, secrets, () -> {
 
-                        ManagersHandler managersHandler = new ManagersHandler(Database.getClient());
-                        ReportsHandler reportsHandler   = new ReportsHandler(Database.getClient());
-                        AdminHandler adminHandler       = new AdminHandler(Database.getClient());
+                        ManagersHandler managersHandler         = new ManagersHandler(Database.getClient());
+                        ReportsHandler reportsHandler           = new ReportsHandler(Database.getClient());
+                        AdminHandler adminHandler               = new AdminHandler(Database.getClient());
+                        NotificationsHandler notificationsHandler = new NotificationsHandler(Database.getClient());
 
                         routerFactory.addHandlerByOperationId("getManagers",           managersHandler::handleGetManagers);
                         routerFactory.addHandlerByOperationId("getManagerById",        managersHandler::handleGetManagerById);
@@ -73,6 +75,7 @@ public class MainVerticle extends AbstractVerticle {
                         routerFactory.addHandlerByOperationId("updateManagerReview",   managersHandler::handleUpdateReview);
                         routerFactory.addHandlerByOperationId("deleteManagerReview",   managersHandler::handleDeleteManagerReview);
                         routerFactory.addHandlerByOperationId("getMyReviews",          managersHandler::handleGetMyReviews);
+                        routerFactory.addHandlerByOperationId("getMySubmittedManagers", managersHandler::handleGetMySubmittedManagers);
                         routerFactory.addHandlerByOperationId("reportManager",         reportsHandler::handleReportManager);
                         routerFactory.addHandlerByOperationId("getStats",               managersHandler::handleGetStats);
                         routerFactory.addHandlerByOperationId("createManagerEditRequest", managersHandler::handleCreateEditRequest);
@@ -84,6 +87,13 @@ public class MainVerticle extends AbstractVerticle {
                         routerFactory.addHandlerByOperationId("getAdminBannedUsers",      adminHandler::handleGetBannedUsers);
                         routerFactory.addHandlerByOperationId("banUser",                  adminHandler::handleBanUser);
                         routerFactory.addHandlerByOperationId("unbanUser",                adminHandler::handleUnbanUser);
+                        routerFactory.addHandlerByOperationId("getAdminPendingManagers",  adminHandler::handleGetPendingManagers);
+                        routerFactory.addHandlerByOperationId("approvePendingManager",    adminHandler::handleApprovePendingManager);
+                        routerFactory.addHandlerByOperationId("rejectPendingManager",     adminHandler::handleRejectPendingManager);
+                        routerFactory.addHandlerByOperationId("getNotifications",             notificationsHandler::handleGetNotifications);
+                        routerFactory.addHandlerByOperationId("getNotificationsUnreadCount",  notificationsHandler::handleGetUnreadCount);
+                        routerFactory.addHandlerByOperationId("markAllNotificationsRead",     notificationsHandler::handleMarkAllAsRead);
+                        routerFactory.addHandlerByOperationId("markNotificationRead",         notificationsHandler::handleMarkAsRead);
                         
                         
                         // Pass secrets into AuthHandler — no more hardcoded credentials
