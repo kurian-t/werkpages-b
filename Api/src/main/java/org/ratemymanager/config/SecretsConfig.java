@@ -28,19 +28,24 @@ public class SecretsConfig {
     public final String auth0ClientSecret;
     public final String auth0Audience;
 
+    // Cloudflare Turnstile (optional — null disables CAPTCHA verification)
+    public final String turnstileSecretKey;
+
     private SecretsConfig(
         String dbHost, int dbPort, String dbName, String dbUser, String dbPassword,
-        String auth0Domain, String auth0ClientId, String auth0ClientSecret, String auth0Audience
+        String auth0Domain, String auth0ClientId, String auth0ClientSecret, String auth0Audience,
+        String turnstileSecretKey
     ) {
-        this.dbHost            = dbHost;
-        this.dbPort            = dbPort;
-        this.dbName            = dbName;
-        this.dbUser            = dbUser;
-        this.dbPassword        = dbPassword;
-        this.auth0Domain       = auth0Domain;
-        this.auth0ClientId     = auth0ClientId;
-        this.auth0ClientSecret = auth0ClientSecret;
-        this.auth0Audience     = auth0Audience;
+        this.dbHost              = dbHost;
+        this.dbPort              = dbPort;
+        this.dbName              = dbName;
+        this.dbUser              = dbUser;
+        this.dbPassword          = dbPassword;
+        this.auth0Domain         = auth0Domain;
+        this.auth0ClientId       = auth0ClientId;
+        this.auth0ClientSecret   = auth0ClientSecret;
+        this.auth0Audience       = auth0Audience;
+        this.turnstileSecretKey  = turnstileSecretKey;
     }
 
     /**
@@ -71,12 +76,15 @@ public class SecretsConfig {
         String auth0ClientId     = requireEnv("AUTH0_CLIENT_ID");
         String auth0ClientSecret = requireEnv("AUTH0_CLIENT_SECRET");
         String auth0Audience     = requireEnv("AUTH0_AUDIENCE");
+        // Optional — dev can leave unset to skip CAPTCHA verification
+        String turnstileSecretKey = getEnv("TURNSTILE_SECRET_KEY", null);
 
         System.out.println("✓ Secrets loaded from environment variables");
 
         return new SecretsConfig(
             dbHost, dbPort, dbName, dbUser, dbPassword,
-            auth0Domain, auth0ClientId, auth0ClientSecret, auth0Audience
+            auth0Domain, auth0ClientId, auth0ClientSecret, auth0Audience,
+            turnstileSecretKey
         );
     }
 
@@ -98,16 +106,19 @@ public class SecretsConfig {
             String dbName            = dbSecret.getString("dbname");
             String dbUser            = dbSecret.getString("username");
             String dbPassword        = dbSecret.getString("password");
-            String auth0Domain       = auth0Secret.getString("domain");
-            String auth0ClientId     = auth0Secret.getString("client_id");
-            String auth0ClientSecret = auth0Secret.getString("client_secret");
-            String auth0Audience     = auth0Secret.getString("audience");
+            String auth0Domain        = auth0Secret.getString("domain");
+            String auth0ClientId      = auth0Secret.getString("client_id");
+            String auth0ClientSecret  = auth0Secret.getString("client_secret");
+            String auth0Audience      = auth0Secret.getString("audience");
+            // Optional — absent key in the secret means CAPTCHA disabled
+            String turnstileSecretKey = auth0Secret.getString("turnstile_secret_key");
 
             System.out.println("✓ Secrets loaded from AWS Secrets Manager");
 
             return new SecretsConfig(
                 dbHost, dbPort, dbName, dbUser, dbPassword,
-                auth0Domain, auth0ClientId, auth0ClientSecret, auth0Audience
+                auth0Domain, auth0ClientId, auth0ClientSecret, auth0Audience,
+                turnstileSecretKey
             );
         } catch (SecretsManagerException e) {
             throw new RuntimeException("Failed to load secrets from AWS Secrets Manager: " + e.getMessage(), e);

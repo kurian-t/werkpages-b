@@ -20,7 +20,8 @@ public class Database {
             .setHost(secrets.dbHost)
             .setDatabase(secrets.dbName)
             .setUser(secrets.dbUser)
-            .setPassword(secrets.dbPassword);
+            .setPassword(secrets.dbPassword)
+            .setConnectTimeout(5000); // 5 s to establish a connection; fail fast rather than hang
            
 
 		if (useSSL) {
@@ -28,7 +29,9 @@ public class Database {
 			connectOptions.setTrustAll(true);
 		}
 
-        PoolOptions poolOptions = new PoolOptions().setMaxSize(10);
+        PoolOptions poolOptions = new PoolOptions()
+            .setMaxSize(20)        // doubled from 10 — headroom for concurrent requests
+            .setIdleTimeout(30);   // reclaim idle connections after 30 s (keeps RDS costs down)
 
         vertx.executeBlocking(promise -> {
             try {
