@@ -2,7 +2,7 @@ package org.ratemymanager.rest.handlers;
 
 import io.vertx.core.Vertx;
 import io.vertx.core.buffer.Buffer;
-import io.vertx.core.json.JsonObject; 
+import io.vertx.core.json.JsonObject;
 import io.vertx.ext.web.RoutingContext;
 import io.vertx.ext.web.client.HttpResponse;
 import io.vertx.ext.web.client.WebClient;
@@ -11,9 +11,107 @@ import io.vertx.sqlclient.RowSet;
 import io.vertx.sqlclient.SqlClient;
 import io.vertx.sqlclient.Tuple;
 
+import java.util.Set;
 import java.util.UUID;
 
 public class AuthHandler {
+
+    // ── Disposable / temporary email domain blocklist ──────────────────────────
+    // Source: https://github.com/disposable-email-domains/disposable-email-domains
+    private static final Set<String> DISPOSABLE_DOMAINS = Set.of(
+        "10minutemail.com","10minutemail.net","10minutemail.org","10minutemail.de",
+        "20minutemail.com","33mail.com","altmails.com","anonbox.net","antispam24.de",
+        "armyspy.com","binkmail.com","blow-up.net","boxformail.in","brefmail.com",
+        "burnermail.io","byom.de","chacuo.net","chammy.info","cheatmail.de",
+        "chinatmail.com","clrmail.com","correotemporal.org","crapmail.org",
+        "dayrep.com","deadaddress.com","deadletter.ga","despam.it","discard.email",
+        "discardmail.com","discardmail.de","dispostable.com","dodgit.com",
+        "drdrb.net","dump-email.info","dumpmail.de","dumpyemail.com",
+        "e4ward.com","einrot.com","emaildrop.io","emailinfive.com","emailmiser.com",
+        "emailondeck.com","emailsensei.com","emailtemporario.com.br","emailthe.net",
+        "emailto.de","emailwarden.com","emkei.cz","fakeinbox.com","fakeinbox.info",
+        "fakeinbox.net","fakeinbox.org","fakemail.net","fakemailgenerator.com",
+        "filzmail.com","fleckens.hu","flyspam.com","freemail.ms","front14.org",
+        "getairmail.com","getonemail.com","getnada.com","getonemail.net","gishpuppy.com",
+        "grr.la","guerillamail.biz","guerillamail.com","guerillamail.de",
+        "guerillamail.info","guerillamail.net","guerillamail.org","guerrillamail.biz",
+        "guerrillamail.com","guerrillamail.de","guerrillamail.info","guerrillamail.net",
+        "guerrillamail.org","guerrillamailblock.com","gustr.com","h8s.org","haltospam.com",
+        "hatespam.org","hidemail.de","hochsitze.com","hotpop.com","hulapla.de",
+        "ieatspam.eu","ieatspam.info","ihasasecret.com","imails.info","inbax.tk",
+        "inbox2.info","inoutmail.de","inoutmail.eu","inoutmail.info","inoutmail.net",
+        "insorg.org","instantemailaddress.com","ipoo.org","irish2me.com",
+        "iwi.net","jetable.com","jetable.fr.nf","jetable.net","jetable.org",
+        "jnxjn.com","junk1.tk","kasmail.com","keepmymail.com","killmail.com",
+        "killmail.net","klassmaster.com","klzlk.com","kurzepost.de","lawlita.com",
+        "letthemeatspam.com","lhsdv.com","lifebyfood.com","lindenbaumjapan.com",
+        "litedrop.com","lol.ovpn.to","lookugly.com","lr78.com","lroid.com",
+        "maildrop.cc","mailexpire.com","mailfree.ga","mailguard.me","mailimate.com",
+        "mailinator.com","mailinator.net","mailinator.org","mailinator2.com",
+        "mailincubator.com","mailme.ir","mailme24.com","mailmetrash.com","mailmoat.com",
+        "mailnew.com","mailnull.com","mailquack.com","mailscrap.com","mailseal.de",
+        "mailshell.com","mailsiphon.com","mailslite.com","mailspam.me","mailspam.xyz",
+        "mailspam.club","mailsponge.com","mailtemp.net","mailzilla.com","mailzilla.org",
+        "marumo.ne.jp","mbx.cc","mega.zik.dj","meltmail.com","messagebeamer.de",
+        "mierdamail.com","mintemail.com","moncourrier.fr.nf","monemail.fr.nf",
+        "monmail.fr.nf","mt2009.com","mt2014.com","mypartyclip.de","myphantomemail.com",
+        "mytempemail.com","mytrashmail.com","neomailbox.com","nepwk.com","nervmich.net",
+        "nervtmich.net","netmails.com","netmails.net","netzidiot.de","neverbox.com",
+        "no-spam.ws","noblepioneer.com","nobulk.com","noclickemail.com","nogmailspam.info",
+        "nomail.pw","nomail.xl.cx","nomail2me.com","nomorespamemails.com","nonspam.eu",
+        "nonspammer.de","noref.in","nospam.ze.tc","nospam4.us","nospamfor.us",
+        "nospammail.net","nospamthanks.info","notmailinator.com","null.net",
+        "nowmymail.com","nwldx.com","nwytg.com","nwytg.net",
+        "odaymail.com","onewaymail.com","online.ms","oopi.org","outgun.com",
+        "pecinan.net","pecinan.org","pepbot.com","pfui.ru","pimpedupmyspace.com",
+        "pjjkp.com","plexolan.de","pookmail.com","postalmail.biz","postinbox.com",
+        "ppetw.com","privacy.net","proxymail.eu","prtnx.com","punkmail.com",
+        "putthisinyourspamdatabase.com","pwrby.com","quickinbox.com",
+        "rcpt.at","recode.me","recursor.net","regbypass.comsafe-mail.net",
+        "rklips.com","rmqkr.net","rppkn.com","rtrtr.com","s0ny.net","safetymail.info",
+        "safetypost.de","sandelf.de","santikasari.com","sast.ro","saynotospams.com",
+        "secretseries.biz","selfdestructingmail.com","sendspamhere.com","senseless-entertainment.com",
+        "sexical.com","sharedmailbox.org","sharklasers.com","shieldemail.com",
+        "shiftmail.com","shitmail.me","shortmail.net","sibmail.com","smellfear.com",
+        "snakemail.com","sneakemail.com","sofort-mail.de","sogetthis.com","soodonims.com",
+        "spam.la","spam.lt","spam.su","spam4.me","spamavert.com","spambob.com",
+        "spambob.net","spambob.org","spambog.com","spambog.de","spambog.ru",
+        "spambox.info","spambox.us","spamcannon.com","spamcannon.net","spamcero.com",
+        "spamcon.org","spamcorptastic.com","spamcowboy.com","spamcowboy.net",
+        "spamcowboy.org","spamday.com","spamdecoy.net","spameater.com","spameater.org",
+        "spamex.com","spamfree24.com","spamfree24.de","spamfree24.eu","spamfree24.info",
+        "spamfree24.net","spamfree24.org","spamgourmet.com","spamgourmet.net",
+        "spamgourmet.org","spamgrab.com","spamgram.net","spamherelots.com",
+        "spamhereplease.com","spamhole.com","spamify.com","spaminator.de",
+        "spamkill.info","spaml.com","spaml.de","spammotel.com","spamobox.com",
+        "spamsalad.in","spamslicer.com","spamspot.com","spamthis.co.uk",
+        "spamthisplease.com","spamtrail.com","spamtroll.net","speed.1s.fr",
+        "splyc.com","ssoia.com","startkeys.com","stinkefinger.net","stuffmail.de",
+        "super-auswahl.de","supergreatmail.com","supermailer.jp","superstachel.de",
+        "suremail.info","svk.jp","sweetxxx.de","tafmail.com","tagyourself.com",
+        "temp-mail.org","temp.email","tempalias.com","tempe-mail.com","tempinbox.com",
+        "tempmail.de","tempmail.net","tempmail2.com","tempomail.fr","temporamail.com",
+        "temporarioemail.com.br","temporaryemail.net","temporaryemail.us",
+        "temporaryforwarding.com","temporaryinbox.com","tempr.email","tempymail.com",
+        "thankyou2010.com","thecloudindex.com","thisisnotmyrealemail.com","throwam.com",
+        "throwam.net","throwam.org","throwmail.me","throwmea.com","tilien.com",
+        "tmbx.de","tmailinator.com","toiea.com","toomail.biz","top101.de",
+        "trashdevil.com","trashdevil.de","trashemail.de","trashmail.at","trashmail.com",
+        "trashmail.de","trashmail.io","trashmail.me","trashmail.net","trashmail.org",
+        "trashmail.xyz","trashmailer.com","trashme.nl","trashy.io","trbvm.com",
+        "trbvn.com","treatme.ro","trickmail.net","trillianpro.com","ttirv.net",
+        "twinmail.de","tyldd.com","umail.net","uroid.com","uuf.me","velocity.es",
+        "veryrealemail.com","viditag.com","viewcastmedia.com","viewcastmedia.net",
+        "viewcastmedia.org","vkcode.ru","vomoto.com","vpn.st","vsimcard.com",
+        "vubby.com","walala.org","walkmail.net","webemail.me","wegwerfmail.de",
+        "wegwerfmail.net","wegwerfmail.org","wh4f.org","whyspam.me","willselfdestruct.com",
+        "wimsg.com","wMailer.com","wronghead.com","wuzupmail.net","www.e4ward.com",
+        "xagloo.com","xemaps.com","xents.com","xmaily.com","xoxy.net","xyzfree.net",
+        "yanet.me","yep.it","yogamaven.com","yopmail.com","yopmail.fr","yopmail.info",
+        "you-spam.com","yourdomain.com","yuurok.com","z1p.biz","za.com","zehnminuten.de",
+        "zehnminutenmail.de","zippymail.info","zoaxe.com","zoemail.net","zoemail.org",
+        "zomg.info","zxcv.com","zxcvbnm.com","zzrgg.com"
+    );
 
     private final SqlClient db;
     private final String auth0Domain;
@@ -21,14 +119,16 @@ public class AuthHandler {
     private final String clientSecret;
     private final String audience;
     private final WebClient webClient;
+    private final String turnstileSecretKey;
 
-    public AuthHandler(SqlClient db, String auth0Domain, String clientId, String clientSecret, String audience, Vertx vertx) {
-        this.db            = db;
-        this.auth0Domain   = auth0Domain;
-        this.clientId      = clientId;
-        this.clientSecret  = clientSecret;
-        this.audience      = audience;
-        this.webClient     = WebClient.create(vertx);
+    public AuthHandler(SqlClient db, String auth0Domain, String clientId, String clientSecret, String audience, String turnstileSecretKey, Vertx vertx) {
+        this.db                 = db;
+        this.auth0Domain        = auth0Domain;
+        this.clientId           = clientId;
+        this.clientSecret       = clientSecret;
+        this.audience           = audience;
+        this.turnstileSecretKey = turnstileSecretKey;
+        this.webClient          = WebClient.create(vertx);
     }
 
     // ---------------- SIGNUP ----------------
@@ -76,6 +176,24 @@ public class AuthHandler {
             return;
         }
 
+        // ── Disposable email domain check ─────────────────────────────────────
+        String emailDomain = email.substring(email.lastIndexOf('@') + 1).toLowerCase();
+        if (DISPOSABLE_DOMAINS.contains(emailDomain)) {
+            ctx.response()
+                .setStatusCode(400)
+                .putHeader("Content-Type", "application/json")
+                .end(new JsonObject()
+                    .put("error", "disposable_email")
+                    .put("message", "Disposable or temporary email addresses are not allowed. Please use a permanent email address.").encode());
+            return;
+        }
+
+        // ── Turnstile CAPTCHA verification ────────────────────────────────────
+        String turnstileToken = body.getString("turnstileToken");
+        verifyTurnstile(turnstileToken, ctx, () -> proceedWithAuth0Signup(ctx, email, username, firstName, lastName, password));
+    }
+
+    private void proceedWithAuth0Signup(RoutingContext ctx, String email, String username, String firstName, String lastName, String password) {
         JsonObject auth0Payload = new JsonObject()
             .put("client_id", this.clientId)
             .put("email", email)
@@ -89,6 +207,7 @@ public class AuthHandler {
 
         this.webClient.post(443, auth0Domain, "/dbconnections/signup")
             .ssl(true)
+            .timeout(10_000)
             .putHeader("Content-Type", "application/json")
             .sendJsonObject(auth0Payload, ar -> {
                 if (ar.failed()) {
@@ -149,6 +268,47 @@ public class AuthHandler {
             });
     }
 
+    // ---------------- TURNSTILE VERIFICATION ----------------
+    private void verifyTurnstile(String token, RoutingContext ctx, Runnable onVerified) {
+        if (turnstileSecretKey == null || turnstileSecretKey.isBlank()) {
+            // Not configured (dev/staging without Turnstile) — skip verification
+            onVerified.run();
+            return;
+        }
+        if (token == null || token.isBlank()) {
+            ctx.response()
+                .setStatusCode(400)
+                .putHeader("Content-Type", "application/json")
+                .end(new JsonObject()
+                    .put("error", "captcha_required")
+                    .put("message", "Please complete the CAPTCHA to continue.").encode());
+            return;
+        }
+        JsonObject payload = new JsonObject()
+            .put("secret", turnstileSecretKey)
+            .put("response", token);
+        this.webClient.post(443, "challenges.cloudflare.com", "/turnstile/v0/siteverify")
+            .ssl(true)
+            .timeout(10_000)
+            .sendJsonObject(payload, ar -> {
+                if (ar.failed()) {
+                    ctx.fail(ar.cause());
+                    return;
+                }
+                JsonObject result = ar.result().bodyAsJsonObject();
+                if (!result.getBoolean("success", false)) {
+                    ctx.response()
+                        .setStatusCode(400)
+                        .putHeader("Content-Type", "application/json")
+                        .end(new JsonObject()
+                            .put("error", "captcha_failed")
+                            .put("message", "CAPTCHA verification failed. Please refresh and try again.").encode());
+                    return;
+                }
+                onVerified.run();
+            });
+    }
+
     // ---------------- SIGNIN ----------------
     public void handleSignin(RoutingContext ctx) {
         JsonObject body = ctx.getBodyAsJson();
@@ -176,6 +336,7 @@ public class AuthHandler {
 
         this.webClient.post(443, auth0Domain, "/oauth/token")
             .ssl(true)
+            .timeout(10_000)
             .putHeader("Content-Type", "application/json")
             .sendJsonObject(payload, ar -> {
                 if (ar.failed()) {

@@ -463,6 +463,7 @@ public class ManagersHandler {
                     FROM managers
                     WHERE submitted_by = $1 AND approval_status IN ('pending_approval', 'rejected')
                     ORDER BY created_at DESC
+                    LIMIT 200
                     """;
                 db.preparedQuery(sql).execute(Tuple.of(userId), ar -> {
                     if (ar.failed()) { ctx.fail(ar.cause()); return; }
@@ -729,6 +730,20 @@ public class ManagersHandler {
                 UUID userId = userRow.getUUID("id");
                 String author = userRow.getString("username");
 
+                // ── Per-user daily manager submission limit (6/day) ───────────
+                db.preparedQuery("SELECT COUNT(*) FROM managers WHERE submitted_by = $1 AND created_at >= current_date")
+                    .execute(Tuple.of(userId), limitAr -> {
+                        if (limitAr.failed()) { ctx.fail(limitAr.cause()); return; }
+                        long todayCount = limitAr.result().iterator().next().getLong(0);
+                        if (todayCount >= 6) {
+                            ctx.response().setStatusCode(429)
+                                .putHeader("Content-Type", "application/json")
+                                .end(new JsonObject()
+                                    .put("error", "daily_limit_reached")
+                                    .put("message", "You have reached the daily limit of 6 manager submissions. Please try again tomorrow.").encode());
+                            return;
+                        }
+
                 // ── Atomic transaction: insert manager + review ───────────────
                 ((Pool) db).withTransaction(conn -> {
                     String insertManagerSql = """
@@ -805,6 +820,7 @@ public class ManagersHandler {
                     recalculateInBackground(managerRow.getLong("id"));
                 })
                 .onFailure(err -> ctx.fail(err));
+                    }); // close limitAr lambda
             });
     }
 
@@ -1039,6 +1055,21 @@ public class ManagersHandler {
             }
             UUID userId = userRow.getUUID("id");
             String author = userRow.getString("username"); // always use the real username, never trust the request body
+
+            // ── Per-user daily review submission limit (6/day) ────────────────
+            db.preparedQuery("SELECT COUNT(*) FROM reviews WHERE user_id = $1 AND created_at >= current_date")
+                .execute(Tuple.of(userId), reviewLimitAr -> {
+                    if (reviewLimitAr.failed()) { ctx.fail(reviewLimitAr.cause()); return; }
+                    long todayReviews = reviewLimitAr.result().iterator().next().getLong(0);
+                    if (todayReviews >= 6) {
+                        ctx.response().setStatusCode(429)
+                            .putHeader("Content-Type", "application/json")
+                            .end(new JsonObject()
+                                .put("error", "daily_limit_reached")
+                                .put("message", "You have reached the daily limit of 6 review submissions. Please try again tomorrow.").encode());
+                        return;
+                    }
+
             long managerId;
             try {
                 managerId = Long.parseLong(ctx.pathParam("id"));
@@ -1190,6 +1221,7 @@ public class ManagersHandler {
                    .end(response.encode());
                 recalculateInBackground(managerId);
             });
+                }); // close reviewLimitAr lambda
         });
     }
 
@@ -1836,6 +1868,7 @@ public class ManagersHandler {
                 JOIN managers m ON m.id = r.manager_id
                 WHERE r.user_id = $1
                 ORDER BY r.created_at DESC
+                LIMIT 500
                 """;
             db.preparedQuery(selectSql).execute(Tuple.of(userId), ar -> {
                 if (ar.failed()) {
@@ -1989,6 +2022,20 @@ public class ManagersHandler {
                 }
                 UUID userId = editRequestUserRow.getUUID("id");
 
+                // ── Per-user daily edit request limit (6/day) ─────────────────
+                db.preparedQuery("SELECT COUNT(*) FROM manager_edits WHERE proposed_by = $1 AND created_at >= current_date")
+                    .execute(Tuple.of(userId), editLimitAr -> {
+                        if (editLimitAr.failed()) { ctx.fail(editLimitAr.cause()); return; }
+                        long todayEdits = editLimitAr.result().iterator().next().getLong(0);
+                        if (todayEdits >= 6) {
+                            ctx.response().setStatusCode(429)
+                                .putHeader("Content-Type", "application/json")
+                                .end(new JsonObject()
+                                    .put("error", "daily_limit_reached")
+                                    .put("message", "You have reached the daily limit of 6 edit requests. Please try again tomorrow.").encode());
+                            return;
+                        }
+
                 // Verify manager exists
                 db.preparedQuery("SELECT id FROM managers WHERE id = $1")
                     .execute(Tuple.of(managerId), mgrAr -> {
@@ -2030,6 +2077,7 @@ public class ManagersHandler {
                                         .encode());
                             });
                     });
+                        }); // close editLimitAr lambda
             });
     }
 

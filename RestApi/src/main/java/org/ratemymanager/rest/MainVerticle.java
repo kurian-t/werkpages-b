@@ -44,7 +44,7 @@ public class MainVerticle extends AbstractVerticle {
         WebClient client = WebClient.create(vertx);
         String jwksUrl = "https://" + secrets.auth0Domain + "/.well-known/jwks.json";
 
-        client.getAbs(jwksUrl).send(ar -> {
+        client.getAbs(jwksUrl).timeout(10_000).send(ar -> {
             if (ar.succeeded()) {
                 JsonObject responseBody = ar.result().bodyAsJsonObject();
 
@@ -103,6 +103,7 @@ public class MainVerticle extends AbstractVerticle {
                             secrets.auth0ClientId,
                             secrets.auth0ClientSecret,
                             secrets.auth0Audience,
+                            secrets.turnstileSecretKey,
                             vertx
                         );
                         routerFactory.addHandlerByOperationId("signup",  authHandler::handleSignup);

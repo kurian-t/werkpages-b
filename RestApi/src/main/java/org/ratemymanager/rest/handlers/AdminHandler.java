@@ -62,6 +62,8 @@ public class AdminHandler {
     // ── GET /api/admin/pending-managers ──────────────────────────────────────────
     public void handleGetPendingManagers(RoutingContext ctx) {
         requireAdmin(ctx, adminId -> {
+            int limit  = parseIntParam(ctx.request().getParam("limit"),  50,  1, 200);
+            int offset = parseIntParam(ctx.request().getParam("offset"), 0, 0, Integer.MAX_VALUE);
             String sql = """
                 SELECT m.id, m.name, m.company, m.title, m.image, m.created_at,
                        u.username AS submitted_by_username
@@ -69,8 +71,9 @@ public class AdminHandler {
                 LEFT JOIN users u ON u.id = m.submitted_by
                 WHERE m.approval_status = 'pending_approval'
                 ORDER BY m.created_at ASC
+                LIMIT $1 OFFSET $2
                 """;
-            db.preparedQuery(sql).execute(ar -> {
+            db.preparedQuery(sql).execute(Tuple.of(limit, offset), ar -> {
                 if (ar.failed()) { ctx.fail(ar.cause()); return; }
                 JsonArray result = new JsonArray();
                 for (Row row : ar.result()) {
@@ -86,7 +89,7 @@ public class AdminHandler {
                 }
                 ctx.response().setStatusCode(200)
                     .putHeader("Content-Type", "application/json")
-                    .end(new JsonObject().put("data", result).encode());
+                    .end(new JsonObject().put("data", result).put("limit", limit).put("offset", offset).encode());
             });
         });
     }
@@ -178,6 +181,8 @@ public class AdminHandler {
     // ── GET /api/admin/pending-edits ─────────────────────────────────────────────
     public void handleGetPendingEdits(RoutingContext ctx) {
         requireAdmin(ctx, adminId -> {
+            int limit  = parseIntParam(ctx.request().getParam("limit"),  50,  1, 200);
+            int offset = parseIntParam(ctx.request().getParam("offset"), 0, 0, Integer.MAX_VALUE);
             String sql = """
                 SELECT
                     pe.id,
@@ -195,8 +200,9 @@ public class AdminHandler {
                 JOIN users u ON u.id = pe.proposed_by
                 WHERE pe.status = 'pending'
                 ORDER BY pe.created_at ASC
+                LIMIT $1 OFFSET $2
                 """;
-            db.preparedQuery(sql).execute(ar -> {
+            db.preparedQuery(sql).execute(Tuple.of(limit, offset), ar -> {
                 if (ar.failed()) { ctx.fail(ar.cause()); return; }
                 JsonArray result = new JsonArray();
                 for (Row row : ar.result()) {
@@ -215,7 +221,7 @@ public class AdminHandler {
                 }
                 ctx.response().setStatusCode(200)
                     .putHeader("Content-Type", "application/json")
-                    .end(new JsonObject().put("data", result).encode());
+                    .end(new JsonObject().put("data", result).put("limit", limit).put("offset", offset).encode());
             });
         });
     }
@@ -401,14 +407,17 @@ public class AdminHandler {
     // ── GET /api/admin/users ──────────────────────────────────────────────────────
     public void handleGetUsers(RoutingContext ctx) {
         requireAdmin(ctx, adminId -> {
+            int limit  = parseIntParam(ctx.request().getParam("limit"),  50,  1, 200);
+            int offset = parseIntParam(ctx.request().getParam("offset"), 0, 0, Integer.MAX_VALUE);
             String sql = """
                 SELECT u.id, u.username, u.first_name, u.last_name, u.role,
                        (SELECT b.id FROM banned_users b WHERE b.user_id = u.id LIMIT 1) AS ban_id
                 FROM users u
                 WHERE u.role != 'admin'
                 ORDER BY u.username ASC
+                LIMIT $1 OFFSET $2
                 """;
-            db.preparedQuery(sql).execute(ar -> {
+            db.preparedQuery(sql).execute(Tuple.of(limit, offset), ar -> {
                 if (ar.failed()) { ctx.fail(ar.cause()); return; }
                 JsonArray result = new JsonArray();
                 for (Row row : ar.result()) {
@@ -422,7 +431,7 @@ public class AdminHandler {
                 }
                 ctx.response().setStatusCode(200)
                     .putHeader("Content-Type", "application/json")
-                    .end(new JsonObject().put("data", result).encode());
+                    .end(new JsonObject().put("data", result).put("limit", limit).put("offset", offset).encode());
             });
         });
     }
@@ -430,13 +439,16 @@ public class AdminHandler {
     // ── GET /api/admin/banned-users ───────────────────────────────────────────────
     public void handleGetBannedUsers(RoutingContext ctx) {
         requireAdmin(ctx, adminId -> {
+            int limit  = parseIntParam(ctx.request().getParam("limit"),  50,  1, 200);
+            int offset = parseIntParam(ctx.request().getParam("offset"), 0, 0, Integer.MAX_VALUE);
             String sql = """
                 SELECT b.id, b.user_id, u.username, b.reason, b.banned_by, b.banned_at
                 FROM banned_users b
                 JOIN users u ON u.id = b.user_id
                 ORDER BY b.banned_at DESC
+                LIMIT $1 OFFSET $2
                 """;
-            db.preparedQuery(sql).execute(ar -> {
+            db.preparedQuery(sql).execute(Tuple.of(limit, offset), ar -> {
                 if (ar.failed()) { ctx.fail(ar.cause()); return; }
                 JsonArray result = new JsonArray();
                 for (Row row : ar.result()) {
@@ -451,7 +463,7 @@ public class AdminHandler {
                 }
                 ctx.response().setStatusCode(200)
                     .putHeader("Content-Type", "application/json")
-                    .end(new JsonObject().put("data", result).encode());
+                    .end(new JsonObject().put("data", result).put("limit", limit).put("offset", offset).encode());
             });
         });
     }
@@ -543,5 +555,15 @@ public class AdminHandler {
                         .end(new JsonObject().put("success", true).encode());
                 });
         });
+    }
+
+    // ── Utility ───────────────────────────────────────────────────────────────────
+    private int parseIntParam(String raw, int defaultVal, int min, int max) {
+        if (raw == null) return defaultVal;
+        try {
+            return Math.min(max, Math.max(min, Integer.parseInt(raw)));
+        } catch (NumberFormatException e) {
+            return defaultVal;
+        }
     }
 }
