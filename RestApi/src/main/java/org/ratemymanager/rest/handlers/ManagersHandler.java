@@ -42,6 +42,7 @@ public class ManagersHandler {
 			    m.approval_status,
 			    m.category_averages,
 			    m.linkedin_url,
+			    m.company_logo_url,
 			    m.created_at,
 			    m.submitted_by,
 			
@@ -198,6 +199,7 @@ public class ManagersHandler {
                     m.approval_status,
                     m.category_averages,
                     m.linkedin_url,
+                    m.company_logo_url,
                     m.created_at,
                     COALESCE(
                         json_agg(
@@ -236,6 +238,7 @@ public class ManagersHandler {
                     m.approval_status,
                     m.category_averages,
                     m.linkedin_url,
+                    m.company_logo_url,
                     m.created_at,
                     COALESCE(
                         json_agg(
@@ -309,6 +312,7 @@ public class ManagersHandler {
                         .put("approvalStatus", row.getString("approval_status"))
                         .put("categoryAverages", row.getJsonObject("category_averages"))
                         .put("linkedinUrl", row.getString("linkedin_url"))
+                        .put("companyLogoUrl", row.getString("company_logo_url"))
                         .put("createdAt", createdAt)
                         .put("careerHistory", row.getJsonArray("career_history"))
                 );
@@ -413,13 +417,38 @@ public class ManagersHandler {
                 return;
             }
 
-            sendManagerResponse(ctx, row);
+            // Check if the current user has reported this manager
+            String auth0IdForReport = extractAuth0IdFromRequest(ctx);
+            if (auth0IdForReport == null) {
+                sendManagerResponse(ctx, row, false);
+                return;
+            }
+            final Row finalRow = row;
+            final long finalManagerId = managerId;
+            db.preparedQuery("SELECT id FROM users WHERE auth0_id = $1")
+                .execute(Tuple.of(auth0IdForReport), userAr -> {
+                    if (userAr.failed() || !userAr.result().iterator().hasNext()) {
+                        sendManagerResponse(ctx, finalRow, false);
+                        return;
+                    }
+                    UUID userId = userAr.result().iterator().next().getUUID("id");
+                    db.preparedQuery("SELECT id FROM reports WHERE manager_id = $1 AND user_id = $2")
+                        .execute(Tuple.of(finalManagerId, userId), reportAr -> {
+                            boolean hasReported = reportAr.succeeded() && reportAr.result().iterator().hasNext();
+                            sendManagerResponse(ctx, finalRow, hasReported);
+                        });
+                });
         });
     }
 
     private void sendManagerResponse(RoutingContext ctx, Row row) {
+        sendManagerResponse(ctx, row, false);
+    }
+
+    private void sendManagerResponse(RoutingContext ctx, Row row, boolean hasReported) {
         String createdAt = row.getOffsetDateTime("created_at").toString();
         JsonObject response = new JsonObject()
+            .put("hasReported", hasReported)
             .put("id", row.getLong("id"))
             .put("name", row.getString("name"))
             .put("company", row.getString("company"))
@@ -432,6 +461,7 @@ public class ManagersHandler {
             .put("approvalStatus", row.getString("approval_status"))
             .put("categoryAverages", row.getJsonObject("category_averages"))
             .put("linkedinUrl", row.getString("linkedin_url"))
+            .put("companyLogoUrl", row.getString("company_logo_url"))
             .put("createdAt", createdAt)
             .put("careerHistory", row.getJsonArray("career_history"))
             .put("reviews", row.getJsonArray("reviews"));
