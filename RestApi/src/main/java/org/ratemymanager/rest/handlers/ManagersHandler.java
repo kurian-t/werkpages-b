@@ -145,128 +145,73 @@ public class ManagersHandler {
         }
     }
 
-    // ---------------- GET MANAGERS (with optional search) ----------------
+    // ---------------- GET MANAGERS (with optional search + company filter) ----------------
     public void handleGetManagers(RoutingContext ctx) {
-//        String authHeader = ctx.request().getHeader("Authorization");
-//        if (authHeader == null || !authHeader.startsWith("Bearer ")) {
-//            ctx.response()
-//                .setStatusCode(401)
-//                .putHeader("Content-Type", "application/json")
-//                .end(new JsonObject().put("error", "Missing or invalid Authorization header").encode());
-//            return;
-//        }
-//        String token = authHeader.substring("Bearer ".length());
-//        try {
-//            JWT.decode(token);
-//        } catch (JWTDecodeException e) {
-//            ctx.response()
-//                .setStatusCode(401)
-//                .putHeader("Content-Type", "application/json")
-//                .end(new JsonObject().put("error", "Invalid token").encode());
-//            return;
-//        }
-
         int limit = Math.min(Integer.parseInt(ctx.queryParam("limit").stream().findFirst().orElse("20")), 100);
         int offset = Math.max(Integer.parseInt(ctx.queryParam("offset").stream().findFirst().orElse("0")), 0);
         String search = ctx.queryParam("search").stream().findFirst().orElse(null);
+        String company = ctx.queryParam("company").stream().findFirst().orElse(null);
         boolean hasSearch = search != null && !search.isBlank();
+        boolean hasCompany = company != null && !company.isBlank();
+
         if (hasSearch && search.trim().length() > 100) {
-            ctx.response()
-                .setStatusCode(400)
-                .putHeader("Content-Type", "application/json")
+            ctx.response().setStatusCode(400).putHeader("Content-Type", "application/json")
                 .end(new JsonObject().put("error", "Search query too long").encode());
             return;
         }
-        String searchPattern = hasSearch ? "%" + search.trim() + "%" : null;
 
-        // Build SQL and tuples depending on whether search is present
+        String searchPattern  = hasSearch  ? "%" + search.trim()  + "%" : null;
+        String companyPattern = hasCompany ? "%" + company.trim() + "%" : null;
+
+        final String selectBody = """
+            SELECT
+                m.id, m.name, m.company, m.title, m.image, m.overall_rating,
+                m.reviews_count, m.bio, m.status, m.approval_status,
+                m.category_averages, m.linkedin_url, m.company_logo_url, m.created_at,
+                COALESCE(
+                    json_agg(
+                        json_build_object(
+                            'company', ch.company, 'title', ch.title,
+                            'startDate', ch.start_date, 'endDate', ch.end_date
+                        ) ORDER BY ch.start_date DESC
+                    ) FILTER (WHERE ch.id IS NOT NULL), '[]'
+                ) AS career_history
+            FROM managers m
+            LEFT JOIN career_history ch ON ch.manager_id = m.id
+            """;
+
+        // Build SQL and tuples for the 4 combinations of (hasSearch, hasCompany)
         final String dataSql;
         final String countSql;
         final Tuple dataTuple;
+        final Tuple countTuple;
 
-        if (hasSearch) {
-            dataSql = """
-                SELECT
-                    m.id,
-                    m.name,
-                    m.company,
-                    m.title,
-                    m.image,
-                    m.overall_rating,
-                    m.reviews_count,
-                    m.bio,
-                    m.status,
-                    m.approval_status,
-                    m.category_averages,
-                    m.linkedin_url,
-                    m.company_logo_url,
-                    m.created_at,
-                    COALESCE(
-                        json_agg(
-                            json_build_object(
-                                'company', ch.company,
-                                'title', ch.title,
-                                'startDate', ch.start_date,
-                                'endDate', ch.end_date
-                            )
-                            ORDER BY ch.start_date DESC
-                        ) FILTER (WHERE ch.id IS NOT NULL),
-                        '[]'
-                    ) AS career_history
-                FROM managers m
-                LEFT JOIN career_history ch ON ch.manager_id = m.id
-                WHERE (m.name ILIKE $3 OR m.company ILIKE $3 OR m.title ILIKE $3)
-                  AND m.approval_status = 'approved'
-                GROUP BY m.id
-                ORDER BY m.overall_rating DESC NULLS LAST, m.id ASC
-                LIMIT $1 OFFSET $2
-                """;
+        if (hasSearch && hasCompany) {
+            dataSql  = selectBody + "WHERE (m.name ILIKE $3 OR m.company ILIKE $3 OR m.title ILIKE $3) AND m.company ILIKE $4 AND m.approval_status = 'approved' GROUP BY m.id ORDER BY m.overall_rating DESC NULLS LAST, m.id ASC LIMIT $1 OFFSET $2";
+            countSql = "SELECT COUNT(*) FROM managers WHERE (name ILIKE $1 OR company ILIKE $1 OR title ILIKE $1) AND company ILIKE $2 AND approval_status = 'approved'";
+            dataTuple  = Tuple.of(limit, offset, searchPattern, companyPattern);
+            countTuple = Tuple.of(searchPattern, companyPattern);
+        } else if (hasSearch) {
+            dataSql  = selectBody + "WHERE (m.name ILIKE $3 OR m.company ILIKE $3 OR m.title ILIKE $3) AND m.approval_status = 'approved' GROUP BY m.id ORDER BY m.overall_rating DESC NULLS LAST, m.id ASC LIMIT $1 OFFSET $2";
             countSql = "SELECT COUNT(*) FROM managers WHERE (name ILIKE $1 OR company ILIKE $1 OR title ILIKE $1) AND approval_status = 'approved'";
-            dataTuple = Tuple.of(limit, offset, searchPattern);
+            dataTuple  = Tuple.of(limit, offset, searchPattern);
+            countTuple = Tuple.of(searchPattern);
+        } else if (hasCompany) {
+            dataSql  = selectBody + "WHERE m.company ILIKE $3 AND m.approval_status = 'approved' GROUP BY m.id ORDER BY m.overall_rating DESC NULLS LAST, m.id ASC LIMIT $1 OFFSET $2";
+            countSql = "SELECT COUNT(*) FROM managers WHERE company ILIKE $1 AND approval_status = 'approved'";
+            dataTuple  = Tuple.of(limit, offset, companyPattern);
+            countTuple = Tuple.of(companyPattern);
         } else {
-            dataSql = """
-                SELECT
-                    m.id,
-                    m.name,
-                    m.company,
-                    m.title,
-                    m.image,
-                    m.overall_rating,
-                    m.reviews_count,
-                    m.bio,
-                    m.status,
-                    m.approval_status,
-                    m.category_averages,
-                    m.linkedin_url,
-                    m.company_logo_url,
-                    m.created_at,
-                    COALESCE(
-                        json_agg(
-                            json_build_object(
-                                'company', ch.company,
-                                'title', ch.title,
-                                'startDate', ch.start_date,
-                                'endDate', ch.end_date
-                            )
-                            ORDER BY ch.start_date DESC
-                        ) FILTER (WHERE ch.id IS NOT NULL),
-                        '[]'
-                    ) AS career_history
-                FROM managers m
-                LEFT JOIN career_history ch ON ch.manager_id = m.id
-                WHERE m.approval_status = 'approved'
-                GROUP BY m.id
-                ORDER BY m.overall_rating DESC NULLS LAST, m.id ASC
-                LIMIT $1 OFFSET $2
-                """;
+            dataSql  = selectBody + "WHERE m.approval_status = 'approved' GROUP BY m.id ORDER BY m.overall_rating DESC NULLS LAST, m.id ASC LIMIT $1 OFFSET $2";
             countSql = "SELECT COUNT(*) FROM managers WHERE approval_status = 'approved'";
-            dataTuple = Tuple.of(limit, offset);
+            dataTuple  = Tuple.of(limit, offset);
+            countTuple = null;
         }
 
         // Count future
         Future<Long> totalFuture = Future.future(promise -> {
-            if (hasSearch) {
-                db.preparedQuery(countSql).execute(Tuple.of(searchPattern), ar -> {
+            if (countTuple != null) {
+                db.preparedQuery(countSql).execute(countTuple, ar -> {
                     if (ar.succeeded()) promise.complete(ar.result().iterator().next().getLong(0));
                     else promise.fail(ar.cause());
                 });
@@ -299,10 +244,13 @@ public class ManagersHandler {
 
             for (Row row : rows) {
                 String createdAt = row.getOffsetDateTime("created_at").toString();
+                String rowCompany = row.getString("company");
+                String logoUrl = row.getString("company_logo_url");
+                if (logoUrl == null) logoUrl = CompanyLogoUtils.resolveLogoUrl(rowCompany);
                 data.add(new JsonObject()
                         .put("id", row.getLong("id"))
                         .put("name", row.getString("name"))
-                        .put("company", row.getString("company"))
+                        .put("company", rowCompany)
                         .put("title", row.getString("title"))
                         .put("image", row.getString("image"))
                         .put("overallRating", row.getBigDecimal("overall_rating"))
@@ -312,7 +260,7 @@ public class ManagersHandler {
                         .put("approvalStatus", row.getString("approval_status"))
                         .put("categoryAverages", row.getJsonObject("category_averages"))
                         .put("linkedinUrl", row.getString("linkedin_url"))
-                        .put("companyLogoUrl", row.getString("company_logo_url"))
+                        .put("companyLogoUrl", logoUrl)
                         .put("createdAt", createdAt)
                         .put("careerHistory", row.getJsonArray("career_history"))
                 );
@@ -328,6 +276,22 @@ public class ManagersHandler {
                     .putHeader("Content-Type", "application/json")
                     .end(response.encode());
         });
+    }
+
+    // ---------------- GET COMPANIES (distinct company names) ----------------
+    public void handleGetCompanies(RoutingContext ctx) {
+        db.query("SELECT DISTINCT company FROM managers WHERE approval_status = 'approved' ORDER BY company")
+            .execute(ar -> {
+                if (ar.failed()) { ctx.fail(ar.cause()); return; }
+                JsonArray companies = new JsonArray();
+                for (Row row : ar.result()) {
+                    String c = row.getString("company");
+                    if (c != null && !c.isBlank()) companies.add(c);
+                }
+                ctx.response()
+                    .putHeader("Content-Type", "application/json")
+                    .end(new JsonObject().put("data", companies).encode());
+            });
     }
 
     // Extract auth0Id from a JWT token in Authorization header or auth_token cookie (no signature verification).
@@ -447,11 +411,14 @@ public class ManagersHandler {
 
     private void sendManagerResponse(RoutingContext ctx, Row row, boolean hasReported) {
         String createdAt = row.getOffsetDateTime("created_at").toString();
+        String company = row.getString("company");
+        String logoUrl = row.getString("company_logo_url");
+        if (logoUrl == null) logoUrl = CompanyLogoUtils.resolveLogoUrl(company);
         JsonObject response = new JsonObject()
             .put("hasReported", hasReported)
             .put("id", row.getLong("id"))
             .put("name", row.getString("name"))
-            .put("company", row.getString("company"))
+            .put("company", company)
             .put("title", row.getString("title"))
             .put("image", row.getString("image"))
             .put("overallRating", row.getBigDecimal("overall_rating"))
@@ -461,7 +428,7 @@ public class ManagersHandler {
             .put("approvalStatus", row.getString("approval_status"))
             .put("categoryAverages", row.getJsonObject("category_averages"))
             .put("linkedinUrl", row.getString("linkedin_url"))
-            .put("companyLogoUrl", row.getString("company_logo_url"))
+            .put("companyLogoUrl", logoUrl)
             .put("createdAt", createdAt)
             .put("careerHistory", row.getJsonArray("career_history"))
             .put("reviews", row.getJsonArray("reviews"));
@@ -489,7 +456,7 @@ public class ManagersHandler {
                 UUID userId = userAr.result().iterator().next().getUUID("id");
                 String sql = """
                     SELECT id, name, company, title, image, overall_rating, reviews_count,
-                           bio, status, approval_status, linkedin_url, created_at
+                           bio, status, approval_status, linkedin_url, company_logo_url, created_at
                     FROM managers
                     WHERE submitted_by = $1 AND approval_status IN ('pending_approval', 'rejected')
                     ORDER BY created_at DESC
@@ -499,10 +466,13 @@ public class ManagersHandler {
                     if (ar.failed()) { ctx.fail(ar.cause()); return; }
                     JsonArray data = new JsonArray();
                     for (Row row : ar.result()) {
+                        String co = row.getString("company");
+                        String logo = row.getString("company_logo_url");
+                        if (logo == null) logo = CompanyLogoUtils.resolveLogoUrl(co);
                         data.add(new JsonObject()
                             .put("id", row.getLong("id"))
                             .put("name", row.getString("name"))
-                            .put("company", row.getString("company"))
+                            .put("company", co)
                             .put("title", row.getString("title"))
                             .put("image", row.getString("image"))
                             .put("overallRating", row.getBigDecimal("overall_rating"))
@@ -511,6 +481,7 @@ public class ManagersHandler {
                             .put("status", row.getString("status"))
                             .put("approvalStatus", row.getString("approval_status"))
                             .put("linkedinUrl", row.getString("linkedin_url"))
+                            .put("companyLogoUrl", logo)
                             .put("createdAt", row.getOffsetDateTime("created_at").toString())
                         );
                     }
@@ -776,13 +747,14 @@ public class ManagersHandler {
 
                 // ── Atomic transaction: insert manager + review ───────────────
                 ((Pool) db).withTransaction(conn -> {
+                    String logoUrl = CompanyLogoUtils.resolveLogoUrl(company);
                     String insertManagerSql = """
                         INSERT INTO managers
-                        (name, company, title, image, bio, status, approval_status, linkedin_url, overall_rating, reviews_count, category_averages, created_at, submitted_by)
-                        VALUES ($1, $2, $3, $4, $5, $6, 'pending_approval', $7, 0, 0, '{}'::jsonb, now(), $8)
+                        (name, company, title, image, bio, status, approval_status, linkedin_url, company_logo_url, overall_rating, reviews_count, category_averages, created_at, submitted_by)
+                        VALUES ($1, $2, $3, $4, $5, $6, 'pending_approval', $7, $8, 0, 0, '{}'::jsonb, now(), $9)
                         RETURNING *
                         """;
-                    Tuple managerParams = Tuple.of(name, company, title, image, finalBio, finalStatus, finalLinkedinUrl, userId);
+                    Tuple managerParams = Tuple.of(name, company, title, image, finalBio, finalStatus, finalLinkedinUrl, logoUrl, userId);
 
                     return conn.preparedQuery(insertManagerSql)
                         .execute(managerParams)

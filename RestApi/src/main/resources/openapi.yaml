@@ -231,6 +231,26 @@ paths:
                   totalReviews:
                     type: integer
 
+  /api/companies:
+    get:
+      operationId: getCompanies
+      summary: Get distinct company names (public)
+      tags:
+        - Managers
+      security: []
+      responses:
+        '200':
+          description: List of distinct company names
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items:
+                      type: string
+
   /api/managers:
     get:
       operationId: getManagers
@@ -254,6 +274,11 @@ paths:
           schema:
             type: string
           description: Optional. Case-insensitive search across name, company, and title.
+        - in: query
+          name: company
+          schema:
+            type: string
+          description: Optional. Filter by exact company name (case-insensitive).
       responses:
         '200':
           description: Paginated list of managers

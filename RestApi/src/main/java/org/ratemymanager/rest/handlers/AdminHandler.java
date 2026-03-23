@@ -109,7 +109,7 @@ public class AdminHandler {
             db.preparedQuery(
                 "UPDATE managers SET approval_status = 'approved', updated_at = now() " +
                 "WHERE id = $1 AND approval_status = 'pending_approval' " +
-                "RETURNING id, name, submitted_by")
+                "RETURNING id, name, company, company_logo_url, submitted_by")
                 .execute(Tuple.of(managerId), ar -> {
                     if (ar.failed()) { ctx.fail(ar.cause()); return; }
                     if (!ar.result().iterator().hasNext()) {
@@ -120,7 +120,17 @@ public class AdminHandler {
                     }
                     Row row = ar.result().iterator().next();
                     String managerName = row.getString("name");
+                    String company = row.getString("company");
+                    String existingLogo = row.getString("company_logo_url");
                     UUID submittedBy = row.getUUID("submitted_by");
+                    // Backfill logo URL if not already set (e.g. for managers created before this feature)
+                    if (existingLogo == null) {
+                        String resolvedLogo = CompanyLogoUtils.resolveLogoUrl(company);
+                        if (resolvedLogo != null) {
+                            db.preparedQuery("UPDATE managers SET company_logo_url = $1 WHERE id = $2")
+                                .execute(Tuple.of(resolvedLogo, managerId), ignored -> {});
+                        }
+                    }
                     if (submittedBy != null) {
                         sendNotification(submittedBy, "manager_approved",
                             "Manager Approved",
