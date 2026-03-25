@@ -1056,7 +1056,7 @@ public class ManagersHandler {
                 return;
             }
             UUID userId = userRow.getUUID("id");
-            String author = userRow.getString("username"); // always use the real username, never trust the request body
+            String dbUsername = userRow.getString("username");
 
             // ── Per-user daily review submission limit (6/day) ────────────────
             db.preparedQuery("SELECT COUNT(*) FROM reviews WHERE user_id = $1 AND created_at >= current_date")
@@ -1090,7 +1090,14 @@ public class ManagersHandler {
                    .end(new JsonObject().put("error", "Missing request body").encode());
                 return;
             }
-            // author is derived from the authenticated session, not from the request body
+            String authorType = body.getString("authorType", "username");
+            String author;
+            if ("real_name".equals(authorType) || "anonymous".equals(authorType)) {
+                String clientAuthor = body.getString("author", "").trim();
+                author = (clientAuthor.isEmpty() || clientAuthor.length() > 100) ? dbUsername : clientAuthor;
+            } else {
+                author = dbUsername;
+            }
             Double overallRating = body.getDouble("overallRating");
             JsonObject ratings = body.getJsonObject("ratings");
             String managerCompany = body.getString("managerCompany");
