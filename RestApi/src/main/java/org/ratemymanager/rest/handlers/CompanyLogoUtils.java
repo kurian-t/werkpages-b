@@ -96,6 +96,7 @@ public class CompanyLogoUtils {
 
         // Loblaw parent only — banners (Zehrs, No Frills, Superstore, etc.) excluded as Clearbit returns wrong logos
         put("loblaws", "loblaw.ca"); put("loblaw", "loblaw.ca"); put("loblaw companies", "loblaw.ca");
+        put("zehrs", "zehrs.ca");
         put("shoppers drug mart", "shoppersdrugmart.ca"); put("shoppers", "shoppersdrugmart.ca");
         put("pharmaprix", "pharmaprix.ca");
 
@@ -153,6 +154,8 @@ public class CompanyLogoUtils {
         put("nutrien", "nutrien.com");
         put("magna", "magna.com"); put("magna international", "magna.com");
         put("linamar", "linamar.com");
+        put("arctic wolf", "arcticwolf.com");
+        put("intero integrity", "intero-integrity.com");
     }
 
     private static void put(String key, String domain) {
@@ -163,11 +166,16 @@ public class CompanyLogoUtils {
      * Returns a Clearbit logo URL for known companies, or null for unknown ones.
      * Null means the frontend should fall back to a Google favicon or show nothing.
      */
+    private static final String LOGO_DEV_TOKEN = "pk_MXSjJV-uTC6-L5D_FbXZUA";
+
     public static String resolveLogoUrl(String company) {
         if (company == null || company.isBlank()) return null;
         String key = company.toLowerCase().trim();
         String domain = DOMAIN_MAP.get(key);
-        if (domain == null) return null;
-        return "https://www.google.com/s2/favicons?domain=" + domain + "&sz=128";
+        if (domain == null) {
+            // Best-effort: derive a domain from the company name
+            domain = key.replaceAll("[^a-z0-9]", "") + ".com";
+        }
+        return "https://img.logo.dev/" + domain + "?token=" + LOGO_DEV_TOKEN;
     }
 }
