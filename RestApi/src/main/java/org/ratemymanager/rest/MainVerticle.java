@@ -6,12 +6,22 @@ import java.util.Set;
 
 import org.ratemymanager.config.SecretsConfig;
 import org.ratemymanager.db.Database;
+import org.ratemymanager.repository.EditRepository;
+import org.ratemymanager.repository.ManagerRepository;
+import org.ratemymanager.repository.NotificationRepository;
+import org.ratemymanager.repository.ReportRepository;
+import org.ratemymanager.repository.ReviewRepository;
+import org.ratemymanager.repository.UserRepository;
 import org.ratemymanager.rest.handlers.AdminHandler;
 import org.ratemymanager.rest.handlers.AuthHandler;
 import org.ratemymanager.rest.handlers.ManagersHandler;
 import org.ratemymanager.rest.handlers.NotificationsHandler;
 import org.ratemymanager.rest.handlers.RateLimitHandler;
 import org.ratemymanager.rest.handlers.ReportsHandler;
+import org.ratemymanager.service.AdminService;
+import org.ratemymanager.service.ManagerService;
+import org.ratemymanager.service.NotificationService;
+import org.ratemymanager.service.ReportService;
 
 import io.vertx.core.AbstractVerticle;
 import io.vertx.core.Vertx;
@@ -61,10 +71,25 @@ public class MainVerticle extends AbstractVerticle {
 
                         Database.init(vertx, secrets, () -> {
 
-                        ManagersHandler managersHandler         = new ManagersHandler(Database.getClient());
-                        ReportsHandler reportsHandler           = new ReportsHandler(Database.getClient());
-                        AdminHandler adminHandler               = new AdminHandler(Database.getClient());
-                        NotificationsHandler notificationsHandler = new NotificationsHandler(Database.getClient());
+                        // ── Repositories ──────────────────────────────────────────────────────
+                        UserRepository         userRepo    = new UserRepository(Database.getClient());
+                        ManagerRepository      managerRepo = new ManagerRepository(Database.getClient());
+                        ReviewRepository       reviewRepo  = new ReviewRepository(Database.getClient());
+                        NotificationRepository notifRepo   = new NotificationRepository(Database.getClient());
+                        ReportRepository       reportRepo  = new ReportRepository(Database.getClient());
+                        EditRepository         editRepo    = new EditRepository(Database.getClient());
+
+                        // ── Services ──────────────────────────────────────────────────────────
+                        ManagerService      managerService = new ManagerService(managerRepo, reviewRepo, userRepo, editRepo, reportRepo, Database.getClient());
+                        AdminService        adminService   = new AdminService(userRepo, managerRepo, reviewRepo, editRepo, notifRepo);
+                        NotificationService notifService   = new NotificationService(userRepo, notifRepo);
+                        ReportService       reportService  = new ReportService(userRepo, reportRepo);
+
+                        // ── Handlers ──────────────────────────────────────────────────────────
+                        ManagersHandler      managersHandler      = new ManagersHandler(managerService);
+                        ReportsHandler       reportsHandler       = new ReportsHandler(reportService);
+                        AdminHandler         adminHandler         = new AdminHandler(adminService);
+                        NotificationsHandler notificationsHandler = new NotificationsHandler(notifService);
 
                         routerFactory.addHandlerByOperationId("getManagers",           managersHandler::handleGetManagers);
                         routerFactory.addHandlerByOperationId("getManagerById",        managersHandler::handleGetManagerById);
@@ -99,9 +124,8 @@ public class MainVerticle extends AbstractVerticle {
                         routerFactory.addHandlerByOperationId("markNotificationRead",         notificationsHandler::handleMarkAsRead);
                         
                         
-                        // Pass secrets into AuthHandler — no more hardcoded credentials
                         AuthHandler authHandler = new AuthHandler(
-                            Database.getClient(),
+                            userRepo,
                             secrets.auth0Domain,
                             secrets.auth0ClientId,
                             secrets.auth0ClientSecret,

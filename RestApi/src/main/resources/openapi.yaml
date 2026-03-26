@@ -15,8 +15,10 @@ tags:
     description: Admin-only management operations
   - name: Users
     description: User-specific operations
-  - name: General
-    description: Site-wide statistics and general endpoints
+  - name: Notifications
+    description: In-app notifications
+  - name: Stats
+    description: Site-wide statistics
 paths:
   /api/auth/signup:
     post:
@@ -216,7 +218,7 @@ paths:
       operationId: getStats
       summary: Get site-wide stats (total managers and reviews)
       tags:
-        - General
+        - Stats
       security: []
       responses:
         '200':
@@ -948,7 +950,7 @@ paths:
       operationId: getNotifications
       summary: Get notifications for the authenticated user
       tags:
-        - Users
+        - Notifications
       responses:
         '200':
           description: List of notifications
@@ -969,7 +971,7 @@ paths:
       operationId: getNotificationsUnreadCount
       summary: Get count of unread notifications
       tags:
-        - Users
+        - Notifications
       responses:
         '200':
           description: Unread count
@@ -988,7 +990,7 @@ paths:
       operationId: markAllNotificationsRead
       summary: Mark all notifications as read
       tags:
-        - Users
+        - Notifications
       responses:
         '200':
           description: All notifications marked as read
@@ -1000,7 +1002,7 @@ paths:
       operationId: markNotificationRead
       summary: Mark a single notification as read
       tags:
-        - Users
+        - Notifications
       parameters:
         - in: path
           name: id

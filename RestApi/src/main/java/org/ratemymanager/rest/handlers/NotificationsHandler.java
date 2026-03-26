@@ -1,116 +1,74 @@
 package org.ratemymanager.rest.handlers;
 
-import io.vertx.core.json.JsonArray;
 import io.vertx.core.json.JsonObject;
 import io.vertx.ext.web.RoutingContext;
-import io.vertx.sqlclient.Row;
-import io.vertx.sqlclient.SqlClient;
-import io.vertx.sqlclient.Tuple;
+import org.ratemymanager.service.NotificationService;
 
 import java.util.UUID;
-import java.util.function.Consumer;
 
+/**
+ * Thin HTTP adapter for notification endpoints.
+ * All business logic lives in {@link NotificationService}.
+ */
 public class NotificationsHandler {
 
-    private final SqlClient db;
+    private final NotificationService service;
 
-    public NotificationsHandler(SqlClient db) {
-        this.db = db;
-    }
-
-    private void requireAuth(RoutingContext ctx, Consumer<UUID> action) {
-        String auth0Id = ctx.get("auth0Id");
-        if (auth0Id == null) {
-            ctx.response().setStatusCode(401)
-                .putHeader("Content-Type", "application/json")
-                .end(new JsonObject().put("error", "Unauthorized").encode());
-            return;
-        }
-        db.preparedQuery("SELECT id FROM users WHERE auth0_id = $1")
-            .execute(Tuple.of(auth0Id), ar -> {
-                if (ar.failed()) { ctx.fail(ar.cause()); return; }
-                if (!ar.result().iterator().hasNext()) {
-                    ctx.response().setStatusCode(401)
-                        .putHeader("Content-Type", "application/json")
-                        .end(new JsonObject().put("error", "User not found").encode());
-                    return;
-                }
-                action.accept(ar.result().iterator().next().getUUID("id"));
-            });
+    public NotificationsHandler(NotificationService service) {
+        this.service = service;
     }
 
     // GET /api/notifications
     public void handleGetNotifications(RoutingContext ctx) {
-        requireAuth(ctx, userId -> {
-            db.preparedQuery(
-                "SELECT id, type, title, message, read, created_at " +
-                "FROM notifications WHERE user_id = $1 ORDER BY created_at DESC LIMIT 50")
-                .execute(Tuple.of(userId), ar -> {
-                    if (ar.failed()) { ctx.fail(ar.cause()); return; }
-                    JsonArray result = new JsonArray();
-                    for (Row row : ar.result()) {
-                        result.add(new JsonObject()
-                            .put("id", row.getUUID("id").toString())
-                            .put("type", row.getString("type"))
-                            .put("title", row.getString("title"))
-                            .put("message", row.getString("message"))
-                            .put("read", row.getBoolean("read"))
-                            .put("createdAt", row.getOffsetDateTime("created_at").toString())
-                        );
-                    }
-                    ctx.response().setStatusCode(200)
-                        .putHeader("Content-Type", "application/json")
-                        .end(new JsonObject().put("data", result).encode());
-                });
-        });
+        String auth0Id = requireAuth0Id(ctx); if (auth0Id == null) return;
+        service.getNotifications(auth0Id)
+            .onSuccess(json -> ok(ctx, json))
+            .onFailure(err -> ManagersHandler.handleError(ctx, err));
     }
 
     // GET /api/notifications/unread-count
     public void handleGetUnreadCount(RoutingContext ctx) {
-        requireAuth(ctx, userId -> {
-            db.preparedQuery("SELECT COUNT(*) AS cnt FROM notifications WHERE user_id = $1 AND read = FALSE")
-                .execute(Tuple.of(userId), ar -> {
-                    if (ar.failed()) { ctx.fail(ar.cause()); return; }
-                    long count = ar.result().iterator().next().getLong("cnt");
-                    ctx.response().setStatusCode(200)
-                        .putHeader("Content-Type", "application/json")
-                        .end(new JsonObject().put("unreadCount", count).encode());
-                });
-        });
+        String auth0Id = requireAuth0Id(ctx); if (auth0Id == null) return;
+        service.getUnreadCount(auth0Id)
+            .onSuccess(json -> ok(ctx, json))
+            .onFailure(err -> ManagersHandler.handleError(ctx, err));
     }
 
     // PUT /api/notifications/:id/read
     public void handleMarkAsRead(RoutingContext ctx) {
-        requireAuth(ctx, userId -> {
-            UUID notifId;
-            try {
-                notifId = UUID.fromString(ctx.pathParam("id"));
-            } catch (Exception e) {
-                ctx.response().setStatusCode(400)
-                    .putHeader("Content-Type", "application/json")
-                    .end(new JsonObject().put("error", "Invalid notification ID").encode());
-                return;
-            }
-            db.preparedQuery("UPDATE notifications SET read = TRUE WHERE id = $1 AND user_id = $2")
-                .execute(Tuple.of(notifId, userId), ar -> {
-                    if (ar.failed()) { ctx.fail(ar.cause()); return; }
-                    ctx.response().setStatusCode(200)
-                        .putHeader("Content-Type", "application/json")
-                        .end(new JsonObject().put("success", true).encode());
-                });
-        });
+        String auth0Id = requireAuth0Id(ctx); if (auth0Id == null) return;
+        UUID notifId;
+        try {
+            notifId = UUID.fromString(ctx.pathParam("id"));
+        } catch (Exception e) {
+            ctx.response().setStatusCode(400).putHeader("Content-Type", "application/json")
+                .end(new JsonObject().put("error", "Invalid notification ID").encode()); return;
+        }
+        service.markRead(auth0Id, notifId)
+            .onSuccess(json -> ok(ctx, json))
+            .onFailure(err -> ManagersHandler.handleError(ctx, err));
     }
 
     // PUT /api/notifications/read-all
     public void handleMarkAllAsRead(RoutingContext ctx) {
-        requireAuth(ctx, userId -> {
-            db.preparedQuery("UPDATE notifications SET read = TRUE WHERE user_id = $1 AND read = FALSE")
-                .execute(Tuple.of(userId), ar -> {
-                    if (ar.failed()) { ctx.fail(ar.cause()); return; }
-                    ctx.response().setStatusCode(200)
-                        .putHeader("Content-Type", "application/json")
-                        .end(new JsonObject().put("success", true).encode());
-                });
-        });
+        String auth0Id = requireAuth0Id(ctx); if (auth0Id == null) return;
+        service.markAllRead(auth0Id)
+            .onSuccess(json -> ok(ctx, json))
+            .onFailure(err -> ManagersHandler.handleError(ctx, err));
+    }
+
+    // ── Helpers ───────────────────────────────────────────────────────────────
+
+    private static String requireAuth0Id(RoutingContext ctx) {
+        String auth0Id = ctx.get("auth0Id");
+        if (auth0Id == null) {
+            ctx.response().setStatusCode(401).putHeader("Content-Type", "application/json")
+                .end(new JsonObject().put("error", "Unauthorized").encode());
+        }
+        return auth0Id;
+    }
+
+    private static void ok(RoutingContext ctx, JsonObject body) {
+        ctx.response().setStatusCode(200).putHeader("Content-Type", "application/json").end(body.encode());
     }
 }
