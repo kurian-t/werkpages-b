@@ -294,6 +294,47 @@ public class ManagersHandler {
             });
     }
 
+    public void handleGetSimilarManagers(RoutingContext ctx) {
+        String name = ctx.queryParam("name").stream().findFirst().orElse(null);
+        String company = ctx.queryParam("company").stream().findFirst().orElse(null);
+        if (name == null || name.isBlank()) {
+            ctx.response().setStatusCode(400)
+                .putHeader("Content-Type", "application/json")
+                .end(new JsonObject().put("error", "name parameter is required").encode());
+            return;
+        }
+        String nameLike = "%" + name.trim() + "%";
+        String companyLike = (company != null && !company.isBlank()) ? "%" + company.trim() + "%" : "%";
+        String sql = """
+            SELECT id, name, company, title, overall_rating, company_logo_url, approval_status
+            FROM managers
+            WHERE approval_status IN ('approved', 'pending_approval')
+              AND name ILIKE $1
+            ORDER BY
+              CASE WHEN company ILIKE $2 THEN 0 ELSE 1 END,
+              approval_status = 'approved' DESC,
+              name
+            LIMIT 5
+            """;
+        db.preparedQuery(sql).execute(Tuple.of(nameLike, companyLike), ar -> {
+            if (ar.failed()) { ctx.fail(ar.cause()); return; }
+            JsonArray results = new JsonArray();
+            for (Row row : ar.result()) {
+                results.add(new JsonObject()
+                    .put("id", row.getLong("id"))
+                    .put("name", row.getString("name"))
+                    .put("company", row.getString("company"))
+                    .put("title", row.getString("title"))
+                    .put("overallRating", row.getBigDecimal("overall_rating"))
+                    .put("companyLogoUrl", row.getString("company_logo_url"))
+                    .put("approvalStatus", row.getString("approval_status")));
+            }
+            ctx.response()
+                .putHeader("Content-Type", "application/json")
+                .end(new JsonObject().put("data", results).encode());
+        });
+    }
+
     // Extract auth0Id from a JWT token in Authorization header or auth_token cookie (no signature verification).
     private String extractAuth0IdFromRequest(RoutingContext ctx) {
         String authHeader = ctx.request().getHeader("Authorization");

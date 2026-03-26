@@ -567,6 +567,89 @@ public class AdminHandler {
         });
     }
 
+    public void handleMergeManagers(RoutingContext ctx) {
+        requireAdmin(ctx, adminId -> {
+            long keepId, mergeId;
+            try {
+                keepId  = Long.parseLong(ctx.pathParam("keepId"));
+                mergeId = Long.parseLong(ctx.pathParam("mergeId"));
+            } catch (NumberFormatException e) {
+                ctx.response().setStatusCode(400)
+                    .putHeader("Content-Type", "application/json")
+                    .end(new JsonObject().put("error", "Invalid manager ID").encode());
+                return;
+            }
+            if (keepId == mergeId) {
+                ctx.response().setStatusCode(400)
+                    .putHeader("Content-Type", "application/json")
+                    .end(new JsonObject().put("error", "Cannot merge a manager into itself").encode());
+                return;
+            }
+            // Verify both managers exist
+            db.preparedQuery("SELECT id FROM managers WHERE id = ANY($1::bigint[])")
+                .execute(Tuple.of(new Long[]{keepId, mergeId}), checkAr -> {
+                    if (checkAr.failed()) { ctx.fail(checkAr.cause()); return; }
+                    if (checkAr.result().rowCount() < 2) {
+                        ctx.response().setStatusCode(404)
+                            .putHeader("Content-Type", "application/json")
+                            .end(new JsonObject().put("error", "One or both managers not found").encode());
+                        return;
+                    }
+                    // Move reviews that don't create duplicates (same user already reviewed keepId)
+                    String moveSql = """
+                        UPDATE reviews SET manager_id = $1
+                        WHERE manager_id = $2
+                          AND user_id NOT IN (SELECT user_id FROM reviews WHERE manager_id = $1)
+                        """;
+                    db.preparedQuery(moveSql).execute(Tuple.of(keepId, mergeId), moveAr -> {
+                        if (moveAr.failed()) { ctx.fail(moveAr.cause()); return; }
+                        // Delete remaining reviews on mergeId (true duplicates — same user reviewed both)
+                        db.preparedQuery("DELETE FROM reviews WHERE manager_id = $1")
+                            .execute(Tuple.of(mergeId), delRevAr -> {
+                                if (delRevAr.failed()) { ctx.fail(delRevAr.cause()); return; }
+                                // Delete the duplicate manager
+                                db.preparedQuery("DELETE FROM managers WHERE id = $1")
+                                    .execute(Tuple.of(mergeId), delMgrAr -> {
+                                        if (delMgrAr.failed()) { ctx.fail(delMgrAr.cause()); return; }
+                                        // Recalculate ratings for the kept manager
+                                        String recalcSql = """
+                                            UPDATE managers SET
+                                                reviews_count      = sub.cnt,
+                                                overall_rating     = sub.overall_rating,
+                                                category_averages  = sub.cats::jsonb
+                                            FROM (
+                                                SELECT
+                                                    COUNT(*)::INTEGER AS cnt,
+                                                    ROUND(AVG(overall_rating)::NUMERIC, 1) AS overall_rating,
+                                                    json_build_object(
+                                                        'Communication Style',               ROUND(AVG(communication_style)::NUMERIC,1),
+                                                        'Perceived Approachability',         ROUND(AVG(perceived_approachability)::NUMERIC,1),
+                                                        'Perceived Clarity of Expectations', ROUND(AVG(perceived_clarity_of_expectations)::NUMERIC,1),
+                                                        'Feedback Style',                    ROUND(AVG(feedback_style)::NUMERIC,1),
+                                                        'Perceived Supportiveness',          ROUND(AVG(perceived_supportiveness)::NUMERIC,1),
+                                                        'Decision Making Style',             ROUND(AVG(decision_making_style)::NUMERIC,1),
+                                                        'Organization and Planning Style',   ROUND(AVG(organization_and_planning_style)::NUMERIC,1),
+                                                        'Delegation Style',                  ROUND(AVG(delegation_style)::NUMERIC,1),
+                                                        'Perceived Professional Demeanor',   ROUND(AVG(perceived_professional_demeanor)::NUMERIC,1),
+                                                        'Overall Working Experience',        ROUND(AVG(overall_working_experience)::NUMERIC,1)
+                                                    )::text AS cats
+                                                FROM reviews WHERE manager_id = $1
+                                            ) sub
+                                            WHERE managers.id = $1
+                                            """;
+                                        db.preparedQuery(recalcSql).execute(Tuple.of(keepId), recalcAr -> {
+                                            if (recalcAr.failed()) { ctx.fail(recalcAr.cause()); return; }
+                                            ctx.response()
+                                                .putHeader("Content-Type", "application/json")
+                                                .end(new JsonObject().put("success", true).put("keepId", keepId).encode());
+                                        });
+                                    });
+                            });
+                    });
+                });
+        });
+    }
+
     // ── Utility ───────────────────────────────────────────────────────────────────
     private int parseIntParam(String raw, int defaultVal, int min, int max) {
         if (raw == null) return defaultVal;

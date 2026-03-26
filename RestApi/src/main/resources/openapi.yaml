@@ -251,6 +251,32 @@ paths:
                     items:
                       type: string
 
+  /api/managers/similar:
+    get:
+      operationId: getSimilarManagers
+      summary: Find similar managers for duplicate detection (public)
+      tags:
+        - Managers
+      security: []
+      parameters:
+        - in: query
+          name: name
+          required: true
+          schema:
+            type: string
+        - in: query
+          name: company
+          required: false
+          schema:
+            type: string
+      responses:
+        '200':
+          description: List of similar managers
+          content:
+            application/json:
+              schema:
+                type: object
+
   /api/managers:
     get:
       operationId: getManagers
@@ -889,6 +915,33 @@ paths:
           description: Forbidden
         '404':
           description: Pending manager not found
+
+  /api/admin/managers/{keepId}/merge/{mergeId}:
+    post:
+      operationId: mergeManagers
+      summary: Merge a duplicate manager into another (admin only)
+      tags:
+        - Admin
+      parameters:
+        - in: path
+          name: keepId
+          required: true
+          schema:
+            type: integer
+        - in: path
+          name: mergeId
+          required: true
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: Merge successful
+        '400':
+          description: Invalid request
+        '403':
+          description: Forbidden
+        '404':
+          description: Manager not found
 
   /api/notifications:
     get:
