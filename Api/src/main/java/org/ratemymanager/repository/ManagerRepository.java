@@ -1,0 +1,403 @@
+package org.ratemymanager.repository;
+
+import io.vertx.core.Future;
+import io.vertx.sqlclient.Pool;
+import io.vertx.sqlclient.Row;
+import io.vertx.sqlclient.RowSet;
+import io.vertx.sqlclient.SqlClient;
+import io.vertx.sqlclient.Tuple;
+
+import java.math.BigDecimal;
+import java.time.OffsetDateTime;
+import java.util.ArrayList;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Optional;
+import java.util.UUID;
+
+/**
+ * Data-access layer for the {@code managers} and {@code career_history} tables.
+ */
+public class ManagerRepository {
+
+    // ── SQL constants ─────────────────────────────────────────────────────────
+
+    static final String GET_BY_ID_SQL = """
+            SELECT
+                m.id, m.name, m.company, m.title, m.image, m.overall_rating,
+                m.reviews_count, m.bio, m.status, m.approval_status,
+                m.category_averages, m.linkedin_url, m.company_logo_url,
+                m.created_at, m.submitted_by,
+                COALESCE(ch.career_history, '[]') AS career_history,
+                COALESCE(r.reviews, '[]') AS reviews
+            FROM managers m
+            LEFT JOIN (
+                SELECT manager_id,
+                    json_agg(jsonb_build_object(
+                        'company', company, 'title', title,
+                        'startDate', start_date, 'endDate', end_date
+                    ) ORDER BY start_date DESC) AS career_history
+                FROM career_history GROUP BY manager_id
+            ) ch ON ch.manager_id = m.id
+            LEFT JOIN (
+                SELECT manager_id,
+                    json_agg(jsonb_build_object(
+                        'id', id, 'author', author,
+                        'overallRating', overall_rating,
+                        'ratings', jsonb_build_object(
+                            'communication_style', communication_style,
+                            'perceived_approachability', perceived_approachability,
+                            'perceived_clarity_of_expectations', perceived_clarity_of_expectations,
+                            'feedback_style', feedback_style,
+                            'perceived_supportiveness', perceived_supportiveness,
+                            'decision_making_style', decision_making_style,
+                            'organization_and_planning_style', organization_and_planning_style,
+                            'delegation_style', delegation_style,
+                            'perceived_professional_demeanor', perceived_professional_demeanor,
+                            'overall_working_experience', overall_working_experience
+                        ),
+                        'managerCompany', manager_company, 'managerTitle', manager_title,
+                        'text', text, 'verified', verified, 'helpfulCount', helpful_count,
+                        'createdAt', created_at, 'workedFrom', worked_from, 'workedUntil', worked_until
+                    ) ORDER BY created_at DESC) AS reviews
+                FROM reviews GROUP BY manager_id
+            ) r ON r.manager_id = m.id
+            WHERE m.id = $1
+            LIMIT 1
+            """;
+
+    private static final String SELECT_BODY = """
+            SELECT
+                m.id, m.name, m.company, m.title, m.image, m.overall_rating,
+                m.reviews_count, m.bio, m.status, m.approval_status,
+                m.category_averages, m.linkedin_url, m.company_logo_url, m.created_at,
+                COALESCE(
+                    json_agg(json_build_object(
+                        'company', ch.company, 'title', ch.title,
+                        'startDate', ch.start_date, 'endDate', ch.end_date
+                    ) ORDER BY ch.start_date DESC)
+                    FILTER (WHERE ch.id IS NOT NULL), '[]'
+                ) AS career_history
+            FROM managers m
+            LEFT JOIN career_history ch ON ch.manager_id = m.id
+            """;
+
+    private final SqlClient db;
+
+    public ManagerRepository(SqlClient db) {
+        this.db = db;
+    }
+
+    // ── Read ──────────────────────────────────────────────────────────────────
+
+    public Future<Optional<Row>> findById(long id) {
+        return db.preparedQuery(GET_BY_ID_SQL)
+            .execute(Tuple.of(id))
+            .map(rows -> {
+                Iterator<Row> it = rows.iterator();
+                return it.hasNext() ? Optional.of(it.next()) : Optional.empty();
+            });
+    }
+
+    public Future<RowSet<Row>> search(int limit, int offset, String searchPattern, String companyPattern) {
+        boolean hasSearch  = searchPattern  != null;
+        boolean hasCompany = companyPattern != null;
+
+        String sql;
+        Tuple tuple;
+
+        if (hasSearch && hasCompany) {
+            sql   = SELECT_BODY + "WHERE (m.name ILIKE $3 OR m.company ILIKE $3 OR m.title ILIKE $3) AND m.company ILIKE $4 AND m.approval_status = 'approved' GROUP BY m.id ORDER BY m.overall_rating DESC NULLS LAST, m.id ASC LIMIT $1 OFFSET $2";
+            tuple = Tuple.of(limit, offset, searchPattern, companyPattern);
+        } else if (hasSearch) {
+            sql   = SELECT_BODY + "WHERE (m.name ILIKE $3 OR m.company ILIKE $3 OR m.title ILIKE $3) AND m.approval_status = 'approved' GROUP BY m.id ORDER BY m.overall_rating DESC NULLS LAST, m.id ASC LIMIT $1 OFFSET $2";
+            tuple = Tuple.of(limit, offset, searchPattern);
+        } else if (hasCompany) {
+            sql   = SELECT_BODY + "WHERE m.company ILIKE $3 AND m.approval_status = 'approved' GROUP BY m.id ORDER BY m.overall_rating DESC NULLS LAST, m.id ASC LIMIT $1 OFFSET $2";
+            tuple = Tuple.of(limit, offset, companyPattern);
+        } else {
+            sql   = SELECT_BODY + "WHERE m.approval_status = 'approved' GROUP BY m.id ORDER BY m.overall_rating DESC NULLS LAST, m.id ASC LIMIT $1 OFFSET $2";
+            tuple = Tuple.of(limit, offset);
+        }
+
+        return db.preparedQuery(sql).execute(tuple);
+    }
+
+    public Future<Long> count(String searchPattern, String companyPattern) {
+        boolean hasSearch  = searchPattern  != null;
+        boolean hasCompany = companyPattern != null;
+
+        if (hasSearch && hasCompany) {
+            return db.preparedQuery("SELECT COUNT(*) FROM managers WHERE (name ILIKE $1 OR company ILIKE $1 OR title ILIKE $1) AND company ILIKE $2 AND approval_status = 'approved'")
+                .execute(Tuple.of(searchPattern, companyPattern))
+                .map(rows -> rows.iterator().next().getLong(0));
+        } else if (hasSearch) {
+            return db.preparedQuery("SELECT COUNT(*) FROM managers WHERE (name ILIKE $1 OR company ILIKE $1 OR title ILIKE $1) AND approval_status = 'approved'")
+                .execute(Tuple.of(searchPattern))
+                .map(rows -> rows.iterator().next().getLong(0));
+        } else if (hasCompany) {
+            return db.preparedQuery("SELECT COUNT(*) FROM managers WHERE company ILIKE $1 AND approval_status = 'approved'")
+                .execute(Tuple.of(companyPattern))
+                .map(rows -> rows.iterator().next().getLong(0));
+        } else {
+            return db.query("SELECT COUNT(*) FROM managers WHERE approval_status = 'approved'")
+                .execute()
+                .map(rows -> rows.iterator().next().getLong(0));
+        }
+    }
+
+    public Future<Long> countApproved() {
+        return db.query("SELECT COUNT(*) FROM managers WHERE approval_status = 'approved'")
+            .execute()
+            .map(rows -> rows.iterator().next().getLong(0));
+    }
+
+    public Future<RowSet<Row>> findAllCompanies() {
+        return db.query("SELECT DISTINCT company FROM managers WHERE approval_status = 'approved' ORDER BY company")
+            .execute();
+    }
+
+    public Future<RowSet<Row>> findSimilar(String nameLike, String companyLike) {
+        return db.preparedQuery("""
+                SELECT id, name, company, title, overall_rating, company_logo_url, approval_status
+                FROM managers
+                WHERE approval_status IN ('approved', 'pending_approval')
+                  AND name ILIKE $1
+                ORDER BY
+                  CASE WHEN company ILIKE $2 THEN 0 ELSE 1 END,
+                  approval_status = 'approved' DESC,
+                  name
+                LIMIT 5
+                """)
+            .execute(Tuple.of(nameLike, companyLike));
+    }
+
+    public Future<RowSet<Row>> findPendingByUser(UUID userId) {
+        return db.preparedQuery("""
+                SELECT id, name, company, title, image, overall_rating, reviews_count,
+                       bio, status, approval_status, linkedin_url, company_logo_url, created_at
+                FROM managers
+                WHERE submitted_by = $1 AND approval_status IN ('pending_approval', 'rejected')
+                ORDER BY created_at DESC LIMIT 200
+                """)
+            .execute(Tuple.of(userId));
+    }
+
+    public Future<RowSet<Row>> findPendingForAdmin(int limit, int offset) {
+        return db.preparedQuery("""
+                SELECT m.id, m.name, m.company, m.title, m.image, m.created_at,
+                       u.username AS submitted_by_username
+                FROM managers m
+                LEFT JOIN users u ON u.id = m.submitted_by
+                WHERE m.approval_status = 'pending_approval'
+                ORDER BY m.created_at ASC
+                LIMIT $1 OFFSET $2
+                """)
+            .execute(Tuple.of(limit, offset));
+    }
+
+    // ── Mutations ─────────────────────────────────────────────────────────────
+
+    public Future<Row> create(String name, String company, String title, String image,
+                               String bio, String status, String linkedinUrl, String logoUrl,
+                               UUID submittedBy) {
+        return db.preparedQuery("""
+                INSERT INTO managers
+                (name, company, title, image, bio, status, approval_status, linkedin_url,
+                 company_logo_url, overall_rating, reviews_count, category_averages, created_at, submitted_by)
+                VALUES ($1,$2,$3,$4,$5,$6,'pending_approval',$7,$8,0,0,'{}'::jsonb,now(),$9)
+                RETURNING *
+                """)
+            .execute(Tuple.of(name, company, title, image, bio, status, linkedinUrl, logoUrl, submittedBy))
+            .map(rows -> rows.iterator().next());
+    }
+
+    public Future<Optional<Row>> update(long id, String newCompany, String newTitle,
+                                         String newImage, String newBio, String newStatus,
+                                         String newLinkedinUrl) {
+        StringBuilder sql = new StringBuilder("UPDATE managers SET updated_at = now()");
+        List<Object> params = new ArrayList<>();
+        int idx = 1;
+        if (newCompany     != null) { sql.append(", company = $").append(idx++);      params.add(newCompany); }
+        if (newTitle       != null) { sql.append(", title = $").append(idx++);        params.add(newTitle); }
+        if (newImage       != null) { sql.append(", image = $").append(idx++);        params.add(newImage); }
+        if (newBio         != null) { sql.append(", bio = $").append(idx++);          params.add(newBio); }
+        if (newStatus      != null) { sql.append(", status = $").append(idx++);       params.add(newStatus); }
+        if (newLinkedinUrl != null) { sql.append(", linkedin_url = $").append(idx++); params.add(newLinkedinUrl); }
+        sql.append(" WHERE id = $").append(idx).append(" RETURNING *");
+        params.add(id);
+        return db.preparedQuery(sql.toString())
+            .execute(Tuple.from(params))
+            .map(rows -> rows.iterator().hasNext()
+                ? Optional.of(rows.iterator().next())
+                : Optional.empty());
+    }
+
+    public Future<Optional<Row>> approve(long managerId) {
+        return db.preparedQuery("""
+                UPDATE managers SET approval_status = 'approved', updated_at = now()
+                WHERE id = $1 AND approval_status = 'pending_approval'
+                RETURNING id, name, company, company_logo_url, submitted_by
+                """)
+            .execute(Tuple.of(managerId))
+            .map(rows -> rows.iterator().hasNext()
+                ? Optional.of(rows.iterator().next())
+                : Optional.empty());
+    }
+
+    public Future<Boolean> updateLogoUrl(long managerId, String logoUrl) {
+        return db.preparedQuery("UPDATE managers SET company_logo_url = $1 WHERE id = $2")
+            .execute(Tuple.of(logoUrl, managerId))
+            .map(rows -> rows.rowCount() > 0);
+    }
+
+    public Future<Optional<Row>> reject(long managerId) {
+        return db.preparedQuery("""
+                UPDATE managers SET approval_status = 'rejected', updated_at = now()
+                WHERE id = $1 AND approval_status = 'pending_approval'
+                RETURNING id, name, submitted_by
+                """)
+            .execute(Tuple.of(managerId))
+            .map(rows -> rows.iterator().hasNext()
+                ? Optional.of(rows.iterator().next())
+                : Optional.empty());
+    }
+
+    public Future<Void> delete(long managerId) {
+        return db.preparedQuery("DELETE FROM managers WHERE id = $1")
+            .execute(Tuple.of(managerId))
+            .mapEmpty();
+    }
+
+    public Future<Integer> countExistingById(Long[] ids) {
+        return db.preparedQuery("SELECT id FROM managers WHERE id = ANY($1::bigint[])")
+            .execute(Tuple.of(ids))
+            .map(RowSet::rowCount);
+    }
+
+    // ── Career history ────────────────────────────────────────────────────────
+
+    public Future<RowSet<Row>> getCareerHistory(long managerId) {
+        return db.preparedQuery("""
+                SELECT company, title, start_date, end_date
+                FROM career_history WHERE manager_id = $1 ORDER BY start_date DESC
+                """)
+            .execute(Tuple.of(managerId));
+    }
+
+    public Future<Void> insertCareerEntry(long managerId, String company, String title,
+                                           OffsetDateTime startDate, OffsetDateTime endDate) {
+        return db.preparedQuery("""
+                INSERT INTO career_history(manager_id, company, title, start_date, end_date)
+                VALUES ($1, $2, $3, $4, $5)
+                """)
+            .execute(Tuple.of(managerId, company, title, startDate, endDate))
+            .mapEmpty();
+    }
+
+    public Future<Integer> closeOpenCareerEntry(long managerId, OffsetDateTime endDate) {
+        return db.preparedQuery("UPDATE career_history SET end_date = $1 WHERE manager_id = $2 AND end_date IS NULL")
+            .execute(Tuple.of(endDate, managerId))
+            .map(RowSet::rowCount);
+    }
+
+    // ── Stats recalculation ───────────────────────────────────────────────────
+
+    /** Fire-and-forget: recalculates and persists rating stats without blocking. */
+    public void recalculateInBackground(long managerId) {
+        recalculate(managerId).onFailure(err ->
+            System.err.println("Background recalculate failed for manager " + managerId + ": " + err.getMessage())
+        );
+    }
+
+    public Future<Void> recalculate(long managerId) {
+        String recalcSql = """
+            SELECT
+                COUNT(*)::INTEGER AS reviews_count,
+                ROUND(AVG(overall_rating)::NUMERIC, 1) AS overall_rating,
+                ROUND(AVG(communication_style)::NUMERIC, 1) AS communication_style,
+                ROUND(AVG(perceived_approachability)::NUMERIC, 1) AS perceived_approachability,
+                ROUND(AVG(perceived_clarity_of_expectations)::NUMERIC, 1) AS perceived_clarity_of_expectations,
+                ROUND(AVG(feedback_style)::NUMERIC, 1) AS feedback_style,
+                ROUND(AVG(perceived_supportiveness)::NUMERIC, 1) AS perceived_supportiveness,
+                ROUND(AVG(decision_making_style)::NUMERIC, 1) AS decision_making_style,
+                ROUND(AVG(organization_and_planning_style)::NUMERIC, 1) AS organization_and_planning_style,
+                ROUND(AVG(delegation_style)::NUMERIC, 1) AS delegation_style,
+                ROUND(AVG(perceived_professional_demeanor)::NUMERIC, 1) AS perceived_professional_demeanor,
+                ROUND(AVG(overall_working_experience)::NUMERIC, 1) AS overall_working_experience
+            FROM reviews WHERE manager_id = $1
+            """;
+
+        return db.preparedQuery(recalcSql)
+            .execute(Tuple.of(managerId))
+            .compose(rows -> {
+                Row stats = rows.iterator().next();
+                int reviewsCount = stats.getInteger("reviews_count");
+                BigDecimal overallRating = reviewsCount > 0 ? stats.getBigDecimal("overall_rating") : null;
+                io.vertx.core.json.JsonObject categoryAvg = null;
+                if (reviewsCount > 0) {
+                    categoryAvg = new io.vertx.core.json.JsonObject()
+                        .put("Communication Style",               nullSafe(stats.getBigDecimal("communication_style")))
+                        .put("Perceived Approachability",         nullSafe(stats.getBigDecimal("perceived_approachability")))
+                        .put("Perceived Clarity of Expectations", nullSafe(stats.getBigDecimal("perceived_clarity_of_expectations")))
+                        .put("Feedback Style",                    nullSafe(stats.getBigDecimal("feedback_style")))
+                        .put("Perceived Supportiveness",          nullSafe(stats.getBigDecimal("perceived_supportiveness")))
+                        .put("Decision Making Style",             nullSafe(stats.getBigDecimal("decision_making_style")))
+                        .put("Organization and Planning Style",   nullSafe(stats.getBigDecimal("organization_and_planning_style")))
+                        .put("Delegation Style",                  nullSafe(stats.getBigDecimal("delegation_style")))
+                        .put("Perceived Professional Demeanor",   nullSafe(stats.getBigDecimal("perceived_professional_demeanor")))
+                        .put("Overall Working Experience",        nullSafe(stats.getBigDecimal("overall_working_experience")));
+                }
+                return db.preparedQuery("""
+                        UPDATE managers SET overall_rating = $1, reviews_count = $2,
+                               category_averages = $3, updated_at = now()
+                        WHERE id = $4
+                        """)
+                    .execute(Tuple.of(overallRating, reviewsCount, categoryAvg, managerId))
+                    .mapEmpty();
+            });
+    }
+
+    private static double nullSafe(BigDecimal v) {
+        return v != null ? v.doubleValue() : 0.0;
+    }
+
+    // ── Long daily-count check ────────────────────────────────────────────────
+
+    public Future<Long> countSubmittedTodayByUser(UUID userId) {
+        return db.preparedQuery("SELECT COUNT(*) FROM managers WHERE submitted_by = $1 AND created_at >= current_date")
+            .execute(Tuple.of(userId))
+            .map(rows -> rows.iterator().next().getLong(0));
+    }
+
+    // ── Merge helpers ─────────────────────────────────────────────────────────
+
+    public Future<Void> mergeInlineRecalculate(long keepId) {
+        String sql = """
+            UPDATE managers SET
+                reviews_count     = sub.cnt,
+                overall_rating    = sub.overall_rating,
+                category_averages = sub.cats::jsonb
+            FROM (
+                SELECT
+                    COUNT(*)::INTEGER AS cnt,
+                    ROUND(AVG(overall_rating)::NUMERIC, 1) AS overall_rating,
+                    json_build_object(
+                        'Communication Style',               ROUND(AVG(communication_style)::NUMERIC,1),
+                        'Perceived Approachability',         ROUND(AVG(perceived_approachability)::NUMERIC,1),
+                        'Perceived Clarity of Expectations', ROUND(AVG(perceived_clarity_of_expectations)::NUMERIC,1),
+                        'Feedback Style',                    ROUND(AVG(feedback_style)::NUMERIC,1),
+                        'Perceived Supportiveness',          ROUND(AVG(perceived_supportiveness)::NUMERIC,1),
+                        'Decision Making Style',             ROUND(AVG(decision_making_style)::NUMERIC,1),
+                        'Organization and Planning Style',   ROUND(AVG(organization_and_planning_style)::NUMERIC,1),
+                        'Delegation Style',                  ROUND(AVG(delegation_style)::NUMERIC,1),
+                        'Perceived Professional Demeanor',   ROUND(AVG(perceived_professional_demeanor)::NUMERIC,1),
+                        'Overall Working Experience',        ROUND(AVG(overall_working_experience)::NUMERIC,1)
+                    )::text AS cats
+                FROM reviews WHERE manager_id = $1
+            ) sub
+            WHERE managers.id = $1
+            """;
+        return db.preparedQuery(sql).execute(Tuple.of(keepId)).mapEmpty();
+    }
+}

@@ -23,17 +23,24 @@ public class SecretsConfig {
     public final String dbPassword;
 
     // Auth0
-    public final String auth0Domain;
+    public final String auth0Domain;       // original tenant domain (e.g. ratemymanager.ca.auth0.com)
+    public final String auth0CustomDomain; // custom domain when set (e.g. auth.ratemymanagers.ca); null if not configured
     public final String auth0ClientId;
     public final String auth0ClientSecret;
     public final String auth0Audience;
+
+    /** Returns the domain to use for auth flows (JWKS, signup, signin). Prefers custom domain. */
+    public String effectiveAuthDomain() {
+        return (auth0CustomDomain != null && !auth0CustomDomain.isBlank()) ? auth0CustomDomain : auth0Domain;
+    }
 
     // Cloudflare Turnstile (optional — null disables CAPTCHA verification)
     public final String turnstileSecretKey;
 
     private SecretsConfig(
         String dbHost, int dbPort, String dbName, String dbUser, String dbPassword,
-        String auth0Domain, String auth0ClientId, String auth0ClientSecret, String auth0Audience,
+        String auth0Domain, String auth0CustomDomain,
+        String auth0ClientId, String auth0ClientSecret, String auth0Audience,
         String turnstileSecretKey
     ) {
         this.dbHost              = dbHost;
@@ -42,6 +49,7 @@ public class SecretsConfig {
         this.dbUser              = dbUser;
         this.dbPassword          = dbPassword;
         this.auth0Domain         = auth0Domain;
+        this.auth0CustomDomain   = auth0CustomDomain;
         this.auth0ClientId       = auth0ClientId;
         this.auth0ClientSecret   = auth0ClientSecret;
         this.auth0Audience       = auth0Audience;
@@ -72,10 +80,11 @@ public class SecretsConfig {
         String dbName            = requireEnv("DB_NAME");
         String dbUser            = requireEnv("DB_USER");
         String dbPassword        = requireEnv("DB_PASSWORD");
-        String auth0Domain       = requireEnv("AUTH0_DOMAIN");
-        String auth0ClientId     = requireEnv("AUTH0_CLIENT_ID");
-        String auth0ClientSecret = requireEnv("AUTH0_CLIENT_SECRET");
-        String auth0Audience     = requireEnv("AUTH0_AUDIENCE");
+        String auth0Domain        = requireEnv("AUTH0_DOMAIN");
+        String auth0CustomDomain  = getEnv("AUTH0_CUSTOM_DOMAIN", null); // optional
+        String auth0ClientId      = requireEnv("AUTH0_CLIENT_ID");
+        String auth0ClientSecret  = requireEnv("AUTH0_CLIENT_SECRET");
+        String auth0Audience      = requireEnv("AUTH0_AUDIENCE");
         // Optional — dev can leave unset to skip CAPTCHA verification
         String turnstileSecretKey = getEnv("TURNSTILE_SECRET_KEY", null);
 
@@ -83,7 +92,8 @@ public class SecretsConfig {
 
         return new SecretsConfig(
             dbHost, dbPort, dbName, dbUser, dbPassword,
-            auth0Domain, auth0ClientId, auth0ClientSecret, auth0Audience,
+            auth0Domain, auth0CustomDomain,
+            auth0ClientId, auth0ClientSecret, auth0Audience,
             turnstileSecretKey
         );
     }
@@ -107,6 +117,7 @@ public class SecretsConfig {
             String dbUser            = dbSecret.getString("username");
             String dbPassword        = dbSecret.getString("password");
             String auth0Domain        = auth0Secret.getString("domain");
+            String auth0CustomDomain  = auth0Secret.getString("custom_domain"); // optional key
             String auth0ClientId      = auth0Secret.getString("client_id");
             String auth0ClientSecret  = auth0Secret.getString("client_secret");
             String auth0Audience      = auth0Secret.getString("audience");
@@ -117,7 +128,8 @@ public class SecretsConfig {
 
             return new SecretsConfig(
                 dbHost, dbPort, dbName, dbUser, dbPassword,
-                auth0Domain, auth0ClientId, auth0ClientSecret, auth0Audience,
+                auth0Domain, auth0CustomDomain,
+                auth0ClientId, auth0ClientSecret, auth0Audience,
                 turnstileSecretKey
             );
         } catch (SecretsManagerException e) {

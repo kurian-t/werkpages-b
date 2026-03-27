@@ -52,7 +52,7 @@ public class MainVerticle extends AbstractVerticle {
     @Override
     public void start() {
         WebClient client = WebClient.create(vertx);
-        String jwksUrl = "https://" + secrets.auth0Domain + "/.well-known/jwks.json";
+        String jwksUrl = "https://" + secrets.effectiveAuthDomain() + "/.well-known/jwks.json";
 
         client.getAbs(jwksUrl).timeout(10_000).send(ar -> {
             if (ar.succeeded()) {
@@ -126,7 +126,7 @@ public class MainVerticle extends AbstractVerticle {
                         
                         AuthHandler authHandler = new AuthHandler(
                             userRepo,
-                            secrets.auth0Domain,
+                            secrets.effectiveAuthDomain(),
                             secrets.auth0ClientId,
                             secrets.auth0ClientSecret,
                             secrets.auth0Audience,
@@ -241,6 +241,11 @@ public class MainVerticle extends AbstractVerticle {
                             .handler(ctx -> ctx.response().putHeader("Location", "/swagger/index.html").setStatusCode(302).end());
                         router.get("/openapi.yaml")
                             .handler(ctx -> ctx.response().putHeader("Content-Type", "application/yaml").sendFile("openapi.yaml"));
+                        router.get("/logo.png")
+                            .handler(ctx -> ctx.response()
+                                .putHeader("Content-Type", "image/png")
+                                .putHeader("Cache-Control", "public, max-age=86400")
+                                .sendFile("logo.png"));
 
                         vertx.createHttpServer()
                             .requestHandler(router)
