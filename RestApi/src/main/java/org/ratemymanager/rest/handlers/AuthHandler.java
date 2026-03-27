@@ -133,6 +133,23 @@ public class AuthHandler {
         this.webClient         = WebClient.create(vertx);
     }
 
+    // ── CHECK USERNAME ────────────────────────────────────────────────────────
+
+    public void handleCheckUsername(RoutingContext ctx) {
+        String username = ctx.queryParam("username").stream().findFirst().orElse(null);
+        if (username == null || username.isBlank()) {
+            ctx.response().setStatusCode(400).putHeader("Content-Type", "application/json")
+                .end(new JsonObject().put("error", "Missing username").encode());
+            return;
+        }
+        userRepo.findEmailByUsername(username)
+            .onSuccess(opt ->
+                ctx.response().setStatusCode(200).putHeader("Content-Type", "application/json")
+                    .end(new JsonObject().put("available", opt.isEmpty()).encode())
+            )
+            .onFailure(ctx::fail);
+    }
+
     // ── SIGNUP ────────────────────────────────────────────────────────────────
 
     public void handleSignup(RoutingContext ctx) {
@@ -172,6 +189,21 @@ public class AuthHandler {
 
     private void proceedWithAuth0Signup(RoutingContext ctx, String email, String username,
                                          String firstName, String lastName, String password) {
+        userRepo.findEmailByUsername(username)
+            .onSuccess(existing -> {
+                if (existing.isPresent()) {
+                    ctx.response().setStatusCode(409).putHeader("Content-Type", "application/json")
+                        .end(new JsonObject().put("error", "username_taken")
+                            .put("message", "That username is already taken. Please choose another.").encode());
+                    return;
+                }
+                doAuth0Signup(ctx, email, username, firstName, lastName, password);
+            })
+            .onFailure(ctx::fail);
+    }
+
+    private void doAuth0Signup(RoutingContext ctx, String email, String username,
+                                String firstName, String lastName, String password) {
         JsonObject auth0Payload = new JsonObject()
             .put("client_id", this.clientId)
             .put("email", email)
@@ -238,10 +270,33 @@ public class AuthHandler {
     public void handleSignin(RoutingContext ctx) {
         JsonObject body = ctx.getBodyAsJson();
         if (body == null) { ctx.response().setStatusCode(400).end("{\"error\":\"Missing body\"}"); return; }
-        String email    = body.getString("email");
-        String password = body.getString("password");
-        if (email == null || password == null) { ctx.response().setStatusCode(400).end("{\"error\":\"Missing credentials\"}"); return; }
+        // Accept either "identifier" (new) or "email" (legacy) field name
+        String identifier = body.getString("identifier", body.getString("email"));
+        String password   = body.getString("password");
+        if (identifier == null || identifier.isBlank() || password == null) {
+            ctx.response().setStatusCode(400).end("{\"error\":\"Missing credentials\"}"); return;
+        }
 
+        // If the identifier looks like an email, use it directly; otherwise resolve via username lookup
+        boolean looksLikeEmail = identifier.contains("@");
+        if (!looksLikeEmail) {
+            userRepo.findEmailByUsername(identifier)
+                .onSuccess(opt -> {
+                    if (opt.isEmpty()) {
+                        ctx.response().setStatusCode(401).putHeader("Content-Type", "application/json")
+                            .end(new JsonObject().put("error", "authentication_failed").put("message", "Invalid credentials.").encode());
+                        return;
+                    }
+                    doSignin(ctx, opt.get(), password);
+                })
+                .onFailure(err -> ctx.response().setStatusCode(500).end("{\"error\":\"Internal error\"}"));
+            return;
+        }
+
+        doSignin(ctx, identifier, password);
+    }
+
+    private void doSignin(RoutingContext ctx, String email, String password) {
         JsonObject payload = new JsonObject()
             .put("grant_type", "password").put("username", email).put("password", password)
             .put("connection", "Username-Password-Authentication")

@@ -133,6 +133,7 @@ public class MainVerticle extends AbstractVerticle {
                             secrets.turnstileSecretKey,
                             vertx
                         );
+                        routerFactory.addHandlerByOperationId("checkUsername", authHandler::handleCheckUsername);
                         routerFactory.addHandlerByOperationId("signup",  authHandler::handleSignup);
                         routerFactory.addHandlerByOperationId("signin",  authHandler::handleSignin);
                         routerFactory.addHandlerByOperationId("me",      authHandler::handleMe);

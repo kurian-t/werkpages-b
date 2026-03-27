@@ -118,6 +118,15 @@ public class UserRepository {
                 : Optional.empty());
     }
 
+    /** Returns the email for a given username, or empty if no such user exists. */
+    public Future<Optional<String>> findEmailByUsername(String username) {
+        return db.preparedQuery("SELECT email FROM users WHERE lower(username) = lower($1)")
+            .execute(Tuple.of(username))
+            .map(rows -> rows.iterator().hasNext()
+                ? Optional.of(rows.iterator().next().getString("email"))
+                : Optional.empty());
+    }
+
     public Future<String> findUsernameByAuth0Id(String auth0Id) {
         return db.preparedQuery("SELECT username FROM users WHERE auth0_id = $1")
             .execute(Tuple.of(auth0Id))
