@@ -368,6 +368,7 @@ public class ManagerService {
         String newBio         = body.getString("bio");
         String newStatus      = body.getString("status");
         String newLinkedinUrl = body.getString("linkedinUrl");
+        String newLogoUrl     = body.getString("resolvedLogoUrl");
         String startDateStr   = body.getString("startDate");
 
         if (newCompany == null && newTitle == null && newImage == null && newBio == null && newStatus == null && newLinkedinUrl == null) {
@@ -420,16 +421,17 @@ public class ManagerService {
                                 managerRepo.insertCareerEntry(managerId, effectiveCo, effectiveTit, newPosStart, null)
                             );
                         })
-                        .compose(v -> doUpdate(managerId, newCompany, newTitle, newImage, newBio, newStatus, newLinkedinUrl));
+                        .compose(v -> doUpdate(managerId, newCompany, newTitle, newImage, newBio, newStatus, newLinkedinUrl, newLogoUrl));
                 } else {
-                    return doUpdate(managerId, newCompany, newTitle, newImage, newBio, newStatus, newLinkedinUrl);
+                    return doUpdate(managerId, newCompany, newTitle, newImage, newBio, newStatus, newLinkedinUrl, newLogoUrl);
                 }
             });
     }
 
     private Future<JsonObject> doUpdate(long managerId, String newCompany, String newTitle,
-                                         String newImage, String newBio, String newStatus, String newLinkedinUrl) {
-        return managerRepo.update(managerId, newCompany, newTitle, newImage, newBio, newStatus, newLinkedinUrl)
+                                         String newImage, String newBio, String newStatus, String newLinkedinUrl,
+                                         String newLogoUrl) {
+        return managerRepo.update(managerId, newCompany, newTitle, newImage, newBio, newStatus, newLinkedinUrl, newLogoUrl)
             .compose(opt -> {
                 if (opt.isEmpty()) return Future.failedFuture(ServiceException.notFound("Manager not found"));
                 Row row = opt.get();

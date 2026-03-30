@@ -214,16 +214,17 @@ public class ManagerRepository {
 
     public Future<Optional<Row>> update(long id, String newCompany, String newTitle,
                                          String newImage, String newBio, String newStatus,
-                                         String newLinkedinUrl) {
+                                         String newLinkedinUrl, String newLogoUrl) {
         StringBuilder sql = new StringBuilder("UPDATE managers SET updated_at = now()");
         List<Object> params = new ArrayList<>();
         int idx = 1;
-        if (newCompany     != null) { sql.append(", company = $").append(idx++);      params.add(newCompany); }
-        if (newTitle       != null) { sql.append(", title = $").append(idx++);        params.add(newTitle); }
-        if (newImage       != null) { sql.append(", image = $").append(idx++);        params.add(newImage); }
-        if (newBio         != null) { sql.append(", bio = $").append(idx++);          params.add(newBio); }
-        if (newStatus      != null) { sql.append(", status = $").append(idx++);       params.add(newStatus); }
-        if (newLinkedinUrl != null) { sql.append(", linkedin_url = $").append(idx++); params.add(newLinkedinUrl); }
+        if (newCompany     != null) { sql.append(", company = $").append(idx++);           params.add(newCompany); }
+        if (newTitle       != null) { sql.append(", title = $").append(idx++);             params.add(newTitle); }
+        if (newImage       != null) { sql.append(", image = $").append(idx++);             params.add(newImage); }
+        if (newBio         != null) { sql.append(", bio = $").append(idx++);               params.add(newBio); }
+        if (newStatus      != null) { sql.append(", status = $").append(idx++);            params.add(newStatus); }
+        if (newLinkedinUrl != null) { sql.append(", linkedin_url = $").append(idx++);      params.add(newLinkedinUrl); }
+        if (newLogoUrl     != null) { sql.append(", company_logo_url = $").append(idx++);  params.add(newLogoUrl); }
         sql.append(" WHERE id = $").append(idx).append(" RETURNING *");
         params.add(id);
         return db.preparedQuery(sql.toString())

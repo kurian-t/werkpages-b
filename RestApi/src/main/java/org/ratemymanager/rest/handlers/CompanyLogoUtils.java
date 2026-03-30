@@ -29,6 +29,8 @@ public class CompanyLogoUtils {
         put("ibm", "ibm.com");
         put("red hat", "redhat.com"); put("redhat", "redhat.com");
         put("blackberry", "blackberry.com");
+        put("tungsten automation", "tungstenautomation.com"); put("tungsten", "tungstenautomation.com");
+        put("kofax", "kofax.com");
         put("revvity", "revvity.com");
         put("shopify", "shopify.com");
         put("salesforce", "salesforce.com");

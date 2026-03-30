@@ -195,7 +195,7 @@ public class AdminService {
                                                      String effectiveCo, String effectiveTit,
                                                      UUID adminId, OffsetDateTime reviewedAt,
                                                      UUID proposedBy, String managerName) {
-        return managerRepo.update(managerId, newCompany, newTitle, null, null, newStatus, newLinkedinUrl)
+        return managerRepo.update(managerId, newCompany, newTitle, null, null, newStatus, newLinkedinUrl, null)
             .compose(opt -> editRepo.approve(editId, adminId, reviewedAt))
             .compose(v -> {
                 if (proposedBy != null) {
@@ -203,8 +203,15 @@ public class AdminService {
                         "Edit Request Approved",
                         "Your edit request for " + managerName + " has been approved. The manager's profile has been updated.");
                 }
-                return Future.succeededFuture(new JsonObject().put("success", true).put("message", "Edit approved and applied"));
+                JsonObject result = new JsonObject().put("success", true).put("message", "Edit approved and applied")
+                    .put("managerId", managerId);
+                if (newCompany != null) result.put("newCompany", newCompany);
+                return Future.succeededFuture(result);
             });
+    }
+
+    public Future<Void> updateManagerLogo(long managerId, String logoUrl) {
+        return managerRepo.updateLogoUrl(managerId, logoUrl).mapEmpty();
     }
 
     public Future<JsonObject> rejectEdit(String auth0Id, UUID editId) {

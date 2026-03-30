@@ -95,7 +95,15 @@ public class AdminHandler {
             bad(ctx, "Invalid edit ID"); return;
         }
         service.approveEdit(auth0Id, editId)
-            .onSuccess(json -> ok(ctx, json))
+            .onSuccess(json -> {
+                String newCompany = json.getString("newCompany");
+                if (newCompany != null) {
+                    long managerId = json.getLong("managerId");
+                    String logoUrl = CompanyLogoUtils.resolveLogoUrl(newCompany);
+                    if (logoUrl != null) service.updateManagerLogo(managerId, logoUrl);
+                }
+                ok(ctx, json);
+            })
             .onFailure(err -> ManagersHandler.handleError(ctx, err));
     }
 

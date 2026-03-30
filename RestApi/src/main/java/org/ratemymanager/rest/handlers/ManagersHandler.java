@@ -229,7 +229,15 @@ public class ManagersHandler {
         } catch (NumberFormatException e) {
             respond(ctx, 400, new JsonObject().put("error", "Invalid manager ID")); return;
         }
-        service.updateManager(auth0Id, managerId, ctx.getBodyAsJson())
+        JsonObject updateBody = ctx.getBodyAsJson();
+        if (updateBody != null) {
+            String newCompany = updateBody.getString("company");
+            if (newCompany != null && !newCompany.isBlank()) {
+                String resolvedLogo = CompanyLogoUtils.resolveLogoUrl(newCompany);
+                if (resolvedLogo != null) updateBody.put("resolvedLogoUrl", resolvedLogo);
+            }
+        }
+        service.updateManager(auth0Id, managerId, updateBody)
             .onSuccess(json -> ctx.response().setStatusCode(200).putHeader("Content-Type", "application/json").end(json.encode()))
             .onFailure(err -> handleError(ctx, err));
     }
