@@ -218,10 +218,26 @@ public class AuthHandler {
                 if (ar.failed()) { ctx.fail(ar.cause()); return; }
                 HttpResponse<Buffer> response = ar.result();
                 if (response.statusCode() != 200) {
-                    System.err.println("Auth0 signup error: " + response.statusCode() + " - " + response.bodyAsString());
+                    String rawBody = response.bodyAsString();
+                    System.err.println("Auth0 signup error: " + response.statusCode() + " - " + rawBody);
+                    String userMessage = "Registration failed. Please check your details and try again.";
+                    String errorCode   = "registration_failed";
+                    try {
+                        JsonObject auth0Err = response.bodyAsJsonObject();
+                        String code = auth0Err.getString("code", "");
+                        String desc = auth0Err.getString("description", auth0Err.getString("message", ""));
+                        if ("user_exists".equals(code) || "invalid_signup".equals(code)) {
+                            errorCode   = "email_already_registered";
+                            userMessage = "An account with this email already exists. Please sign in instead.";
+                        } else if ("invalid_password".equals(code)) {
+                            errorCode   = "invalid_password";
+                            userMessage = "Password does not meet the requirements. Please choose a stronger password.";
+                        } else if (desc != null && !desc.isBlank()) {
+                            userMessage = desc;
+                        }
+                    } catch (Exception ignored) {}
                     ctx.response().setStatusCode(400).putHeader("Content-Type", "application/json")
-                        .end(new JsonObject().put("error", "registration_failed")
-                            .put("message", "Registration failed. Please check your details and try again.").encode());
+                        .end(new JsonObject().put("error", errorCode).put("message", userMessage).encode());
                     return;
                 }
                 JsonObject auth0User = response.bodyAsJsonObject();
@@ -237,7 +253,23 @@ public class AuthHandler {
                                 .put("firstName", firstName).put("lastName", lastName)
                                 .put("createdAt", java.time.OffsetDateTime.now().toString()).encode())
                     )
-                    .onFailure(err -> { System.err.println("Database Error: " + err.getMessage()); ctx.fail(err); });
+                    .onFailure(err -> {
+                        System.err.println("Database Error: " + err.getMessage());
+                        String msg = err.getMessage() != null ? err.getMessage().toLowerCase() : "";
+                        if (msg.contains("unique") || msg.contains("duplicate") || msg.contains("23505")) {
+                            if (msg.contains("username")) {
+                                ctx.response().setStatusCode(409).putHeader("Content-Type", "application/json")
+                                    .end(new JsonObject().put("error", "username_taken")
+                                        .put("message", "That username is already taken. Please choose another.").encode());
+                            } else {
+                                ctx.response().setStatusCode(409).putHeader("Content-Type", "application/json")
+                                    .end(new JsonObject().put("error", "email_already_registered")
+                                        .put("message", "An account with this email already exists. Please sign in instead.").encode());
+                            }
+                        } else {
+                            ctx.fail(err);
+                        }
+                    });
             });
     }
 

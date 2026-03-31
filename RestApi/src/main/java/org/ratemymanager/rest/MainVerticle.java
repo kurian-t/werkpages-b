@@ -126,7 +126,7 @@ public class MainVerticle extends AbstractVerticle {
                         
                         AuthHandler authHandler = new AuthHandler(
                             userRepo,
-                            secrets.effectiveAuthDomain(),
+                            secrets.auth0Domain,          // original tenant domain — /dbconnections/signup and /oauth/token must use this, not the custom domain
                             secrets.auth0ClientId,
                             secrets.auth0ClientSecret,
                             secrets.auth0Audience,
