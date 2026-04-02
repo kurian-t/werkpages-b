@@ -585,6 +585,55 @@ paths:
                   error:
                     type: string
 
+  /api/managers/{id}/career-segments:
+    get:
+      operationId: getManagerCareerSegments
+      summary: Get pre-aggregated career segments for the timeline (all reviews, grouped by company+role)
+      tags:
+        - Managers
+      security: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: Aggregated career segments
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        company:
+                          type: string
+                        role:
+                          type: string
+                        startDate:
+                          type: string
+                          nullable: true
+                        endDate:
+                          type: string
+                          nullable: true
+                        isCurrent:
+                          type: boolean
+                        averageRating:
+                          type: number
+                        reviewCount:
+                          type: integer
+                        categoryAverages:
+                          type: object
+                          additionalProperties:
+                            type: number
+        '400':
+          description: Invalid manager ID
+
     post:
       operationId: createManagerReview
       summary: Submit a new review for a manager

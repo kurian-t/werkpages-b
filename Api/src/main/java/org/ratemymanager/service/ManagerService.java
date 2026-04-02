@@ -523,6 +523,48 @@ public class ManagerService {
             });
     }
 
+    // ── GET manager career segments ───────────────────────────────────────────
+
+    public Future<JsonObject> getManagerCareerSegments(long managerId) {
+        return reviewRepo.findCareerSegmentsByManager(managerId)
+            .map(rows -> {
+                JsonArray segments = new JsonArray();
+                for (Row row : rows) {
+                    boolean isCurrent   = Boolean.TRUE.equals(row.getBoolean("is_current"));
+                    LocalDate endRaw    = row.getLocalDate("end_date");
+                    LocalDate startRaw  = row.getLocalDate("start_date");
+
+                    JsonObject categoryAverages = new JsonObject()
+                        .put("Communication Style",               r1(row.getBigDecimal("communication_style")))
+                        .put("Perceived Approachability",         r1(row.getBigDecimal("perceived_approachability")))
+                        .put("Perceived Clarity of Expectations", r1(row.getBigDecimal("perceived_clarity_of_expectations")))
+                        .put("Feedback Style",                    r1(row.getBigDecimal("feedback_style")))
+                        .put("Perceived Supportiveness",          r1(row.getBigDecimal("perceived_supportiveness")))
+                        .put("Decision Making Style",             r1(row.getBigDecimal("decision_making_style")))
+                        .put("Organization and Planning Style",   r1(row.getBigDecimal("organization_and_planning_style")))
+                        .put("Delegation Style",                  r1(row.getBigDecimal("delegation_style")))
+                        .put("Perceived Professional Demeanor",   r1(row.getBigDecimal("perceived_professional_demeanor")))
+                        .put("Overall Working Experience",        r1(row.getBigDecimal("overall_working_experience")));
+
+                    segments.add(new JsonObject()
+                        .put("company",          row.getString("company"))
+                        .put("role",             row.getString("role"))
+                        .put("startDate",        startRaw  != null ? startRaw.toString() : null)
+                        .put("endDate",          isCurrent ? null : (endRaw != null ? endRaw.toString() : null))
+                        .put("isCurrent",        isCurrent)
+                        .put("averageRating",    r1(row.getBigDecimal("avg_rating")))
+                        .put("reviewCount",      row.getLong("review_count").intValue())
+                        .put("categoryAverages", categoryAverages));
+                }
+                return new JsonObject().put("data", segments);
+            });
+    }
+
+    private static double r1(BigDecimal v) {
+        if (v == null) return 0.0;
+        return Math.round(v.doubleValue() * 10.0) / 10.0;
+    }
+
     // ── UPDATE review ─────────────────────────────────────────────────────────
 
     public Future<Row> updateReview(String auth0Id, long managerId, UUID reviewId, JsonObject body) {

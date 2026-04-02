@@ -308,6 +308,20 @@ public class ManagersHandler {
             .onFailure(err -> handleError(ctx, err));
     }
 
+    // ── GET /api/managers/:id/career-segments ─────────────────────────────────
+
+    public void handleGetManagerCareerSegments(RoutingContext ctx) {
+        long managerId;
+        try {
+            managerId = Long.parseLong(ctx.pathParam("id"));
+        } catch (NumberFormatException e) {
+            respond(ctx, 400, new JsonObject().put("error", "Invalid manager ID")); return;
+        }
+        service.getManagerCareerSegments(managerId)
+            .onSuccess(json -> ctx.response().putHeader("Content-Type", "application/json").end(json.encode()))
+            .onFailure(err -> handleError(ctx, err));
+    }
+
     // ── PUT /api/managers/:managerId/reviews/:reviewId ────────────────────────
 
     public void handleUpdateReview(RoutingContext ctx) {

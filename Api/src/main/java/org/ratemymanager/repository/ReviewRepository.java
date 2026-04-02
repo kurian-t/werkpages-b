@@ -41,6 +41,34 @@ public class ReviewRepository {
         }
     }
 
+    public Future<RowSet<Row>> findCareerSegmentsByManager(long managerId) {
+        return db.preparedQuery("""
+                SELECT
+                  MIN(manager_company)                        AS company,
+                  MIN(manager_title)                          AS role,
+                  MIN(worked_from)                            AS start_date,
+                  MAX(worked_until)                           AS end_date,
+                  BOOL_OR(worked_until IS NULL)               AS is_current,
+                  AVG(overall_rating)                         AS avg_rating,
+                  COUNT(*)                                    AS review_count,
+                  AVG(communication_style)                    AS communication_style,
+                  AVG(perceived_approachability)              AS perceived_approachability,
+                  AVG(perceived_clarity_of_expectations)      AS perceived_clarity_of_expectations,
+                  AVG(feedback_style)                         AS feedback_style,
+                  AVG(perceived_supportiveness)               AS perceived_supportiveness,
+                  AVG(decision_making_style)                  AS decision_making_style,
+                  AVG(organization_and_planning_style)        AS organization_and_planning_style,
+                  AVG(delegation_style)                       AS delegation_style,
+                  AVG(perceived_professional_demeanor)        AS perceived_professional_demeanor,
+                  AVG(overall_working_experience)             AS overall_working_experience
+                FROM reviews
+                WHERE manager_id = $1
+                GROUP BY LOWER(TRIM(manager_company)), LOWER(TRIM(manager_title))
+                ORDER BY MIN(worked_from) ASC NULLS LAST
+                """)
+            .execute(Tuple.of(managerId));
+    }
+
     public Future<Long> countByManager(long managerId, UUID userIdFilter) {
         if (userIdFilter != null) {
             return db.preparedQuery("SELECT COUNT(*) FROM reviews WHERE manager_id = $1 AND user_id = $2")
