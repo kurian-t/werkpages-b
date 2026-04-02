@@ -99,6 +99,17 @@ public class ReviewRepository {
             .execute(Tuple.of(userId));
     }
 
+    /**
+     * Lightweight query — returns just the fields needed for cap / overlap / role-duplicate checks.
+     * No JOIN, no large text columns.
+     */
+    public Future<RowSet<Row>> findByUserForValidation(UUID userId) {
+        return db.preparedQuery(
+                "SELECT id, manager_id, manager_title, manager_company, worked_from, worked_until " +
+                "FROM reviews WHERE user_id = $1")
+            .execute(Tuple.of(userId));
+    }
+
     public Future<Long> countSubmittedTodayByUser(UUID userId) {
         return db.preparedQuery("SELECT COUNT(*) FROM reviews WHERE user_id = $1 AND created_at >= current_date")
             .execute(Tuple.of(userId))

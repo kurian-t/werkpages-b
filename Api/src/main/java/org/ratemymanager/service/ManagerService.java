@@ -20,6 +20,8 @@ import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
 import java.time.format.DateTimeParseException;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
 
@@ -494,12 +496,63 @@ public class ManagerService {
             if (!isValidRating(v)) return Future.failedFuture(ServiceException.badRequest("Rating for '" + RATING_KEYS[i] + "' must be between 1 and 5"));
         }
 
-        return reviewRepo.create(managerId, userId, author, overallRating,
-                getRating(ratings, 0), getRating(ratings, 1), getRating(ratings, 2),
-                getRating(ratings, 3), getRating(ratings, 4), getRating(ratings, 5),
-                getRating(ratings, 6), getRating(ratings, 7), getRating(ratings, 8),
-                getRating(ratings, 9), managerCompany, managerTitle, text, workedFrom, workedUntil)
-            .onSuccess(row -> managerRepo.recalculateInBackground(managerId));
+        // Fetch all existing reviews by this user (lightweight — no JOINs)
+        return reviewRepo.findByUserForValidation(userId)
+            .compose(existingRows -> {
+                List<Row> existing = new ArrayList<>();
+                existingRows.forEach(existing::add);
+
+                // ── 1. Cap: max 5 reviews for a single manager per user ───────────────
+                long reviewsForThisManager = existing.stream()
+                    .filter(r -> r.getLong("manager_id") == managerId)
+                    .count();
+                if (reviewsForThisManager >= 5) {
+                    return Future.failedFuture(ServiceException.conflict("role_limit_reached"));
+                }
+
+                // ── 2. Role duplicate: same normalised title under same manager ───────
+                String normTitle = managerTitle.trim().toLowerCase();
+                boolean roleTaken = existing.stream()
+                    .filter(r -> r.getLong("manager_id") == managerId)
+                    .anyMatch(r -> {
+                        String t = r.getString("manager_title");
+                        return t != null && t.trim().equalsIgnoreCase(normTitle);
+                    });
+                if (roleTaken) {
+                    return Future.failedFuture(ServiceException.conflict("already_reviewed_this_role"));
+                }
+
+                // ── 3. Date overlap: new period must not overlap any existing period ──
+                if (workedFrom != null) {
+                    // New period: [workedFrom, workedUntil) where null workedUntil = open-ended (today onward)
+                    LocalDate newFrom  = workedFrom;
+                    LocalDate newUntil = workedUntil != null ? workedUntil : LocalDate.now().plusDays(1);
+
+                    for (Row r : existing) {
+                        LocalDate existFrom  = r.getLocalDate("worked_from");
+                        LocalDate existUntil = r.getLocalDate("worked_until");
+                        if (existFrom == null) continue; // undated existing review — skip overlap check
+                        LocalDate existEnd = existUntil != null ? existUntil : LocalDate.now().plusDays(1);
+
+                        boolean overlaps = newFrom.isBefore(existEnd) && existFrom.isBefore(newUntil);
+                        if (overlaps) {
+                            String role    = r.getString("manager_title");
+                            String company = r.getString("manager_company");
+                            String from    = existFrom.toString();
+                            String until   = existUntil != null ? existUntil.toString() : "present";
+                            return Future.failedFuture(ServiceException.conflict(
+                                "date_overlap:" + role + ":" + company + ":" + from + ":" + until));
+                        }
+                    }
+                }
+
+                return reviewRepo.create(managerId, userId, author, overallRating,
+                        getRating(ratings, 0), getRating(ratings, 1), getRating(ratings, 2),
+                        getRating(ratings, 3), getRating(ratings, 4), getRating(ratings, 5),
+                        getRating(ratings, 6), getRating(ratings, 7), getRating(ratings, 8),
+                        getRating(ratings, 9), managerCompany, managerTitle, text, workedFrom, workedUntil)
+                    .onSuccess(row -> managerRepo.recalculateInBackground(managerId));
+            });
     }
 
     // ── GET manager reviews ───────────────────────────────────────────────────
@@ -604,17 +657,62 @@ public class ManagerService {
                 String author = ("real_name".equals(authorType) || "anonymous".equals(authorType))
                     && !clientAuthor.isEmpty() && clientAuthor.length() <= 100
                     ? clientAuthor : dbUsername;
-                return reviewRepo.update(reviewId, managerId, callerId, author, overallRating,
-                        ratings.getDouble("Communication Style"), ratings.getDouble("Perceived Approachability"),
-                        ratings.getDouble("Perceived Clarity of Expectations"), ratings.getDouble("Feedback Style"),
-                        ratings.getDouble("Perceived Supportiveness"), ratings.getDouble("Decision Making Style"),
-                        ratings.getDouble("Organization and Planning Style"), ratings.getDouble("Delegation Style"),
-                        ratings.getDouble("Perceived Professional Demeanor"), ratings.getDouble("Overall Working Experience"),
-                        managerCompany, managerTitle, text, workedFrom, workedUntil)
-                    .compose(rowOpt -> {
-                        if (rowOpt.isEmpty()) return Future.failedFuture(ServiceException.notFound("Review not found"));
-                        managerRepo.recalculateInBackground(managerId);
-                        return Future.succeededFuture(rowOpt.get());
+
+                // Re-validate role-duplicate and date-overlap (excluding the review being edited)
+                return reviewRepo.findByUserForValidation(callerId)
+                    .compose(existingRows -> {
+                        List<Row> existing = new ArrayList<>();
+                        existingRows.forEach(existing::add);
+
+                        // ── Role duplicate (exclude current review) ───────────────────────
+                        String normTitle = managerTitle.trim().toLowerCase();
+                        boolean roleTaken = existing.stream()
+                            .filter(r -> !r.getUUID("id").equals(reviewId))
+                            .filter(r -> r.getLong("manager_id") == managerId)
+                            .anyMatch(r -> {
+                                String t = r.getString("manager_title");
+                                return t != null && t.trim().equalsIgnoreCase(normTitle);
+                            });
+                        if (roleTaken) {
+                            return Future.failedFuture(ServiceException.conflict("already_reviewed_this_role"));
+                        }
+
+                        // ── Date overlap (exclude current review) ─────────────────────────
+                        if (workedFrom != null) {
+                            LocalDate newFrom  = workedFrom;
+                            LocalDate newUntil = workedUntil != null ? workedUntil : LocalDate.now().plusDays(1);
+
+                            for (Row r : existing) {
+                                if (r.getUUID("id").equals(reviewId)) continue; // skip self
+                                LocalDate existFrom  = r.getLocalDate("worked_from");
+                                if (existFrom == null) continue;
+                                LocalDate existUntil = r.getLocalDate("worked_until");
+                                LocalDate existEnd   = existUntil != null ? existUntil : LocalDate.now().plusDays(1);
+
+                                boolean overlaps = newFrom.isBefore(existEnd) && existFrom.isBefore(newUntil);
+                                if (overlaps) {
+                                    String role    = r.getString("manager_title");
+                                    String company = r.getString("manager_company");
+                                    String from    = existFrom.toString();
+                                    String until   = existUntil != null ? existUntil.toString() : "present";
+                                    return Future.failedFuture(ServiceException.conflict(
+                                        "date_overlap:" + role + ":" + company + ":" + from + ":" + until));
+                                }
+                            }
+                        }
+
+                        return reviewRepo.update(reviewId, managerId, callerId, author, overallRating,
+                                ratings.getDouble("Communication Style"), ratings.getDouble("Perceived Approachability"),
+                                ratings.getDouble("Perceived Clarity of Expectations"), ratings.getDouble("Feedback Style"),
+                                ratings.getDouble("Perceived Supportiveness"), ratings.getDouble("Decision Making Style"),
+                                ratings.getDouble("Organization and Planning Style"), ratings.getDouble("Delegation Style"),
+                                ratings.getDouble("Perceived Professional Demeanor"), ratings.getDouble("Overall Working Experience"),
+                                managerCompany, managerTitle, text, workedFrom, workedUntil)
+                            .compose(rowOpt -> {
+                                if (rowOpt.isEmpty()) return Future.failedFuture(ServiceException.notFound("Review not found"));
+                                managerRepo.recalculateInBackground(managerId);
+                                return Future.succeededFuture(rowOpt.get());
+                            });
                     });
             });
     }
