@@ -199,6 +199,40 @@ paths:
                   error:
                     type: string
 
+  /api/auth/callback:
+    post:
+      operationId: socialAuthCallback
+      summary: Exchange an OAuth authorization code for a session (social login)
+      security: []
+      tags:
+        - Auth
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [code, redirectUri]
+              properties:
+                code:
+                  type: string
+                redirectUri:
+                  type: string
+      responses:
+        '200':
+          description: Authentication successful — sets auth_token cookie
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  user:
+                    type: object
+        '400':
+          description: Missing code or no email from provider
+        '401':
+          description: Token exchange failed
+
   /api/users/me/reviews:
     get:
       operationId: getMyReviews
@@ -522,6 +556,32 @@ paths:
                     type: string
 
   /api/managers/{id}/reviews:
+    post:
+      operationId: createManagerReview
+      summary: Submit a new review for a manager
+      tags:
+        - Managers
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ManagerReviewInput'
+      responses:
+        '201':
+          description: Review created successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ManagerReview'
+        '404':
+          description: Manager not found
     get:
       operationId: getManagerReviews
       summary: Get all reviews for a manager (public)
@@ -633,33 +693,6 @@ paths:
                             type: number
         '400':
           description: Invalid manager ID
-
-    post:
-      operationId: createManagerReview
-      summary: Submit a new review for a manager
-      tags:
-        - Managers
-      parameters:
-        - in: path
-          name: id
-          required: true
-          schema:
-            type: integer
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: '#/components/schemas/ManagerReviewInput'
-      responses:
-        '201':
-          description: Review created successfully
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ManagerReview'
-        '404':
-          description: Manager not found
 
   /api/managers/{id}/report:
     post:
@@ -1274,6 +1307,22 @@ components:
         text:
           type: string
           nullable: true
+        workedFrom:
+          type: string
+          nullable: true
+          description: "YYYY-MM date the reviewer started working with this manager"
+        workedUntil:
+          type: string
+          nullable: true
+          description: "YYYY-MM date the reviewer stopped working with this manager (null = current)"
+        managerRoleStart:
+          type: string
+          nullable: true
+          description: "YYYY-MM date the manager started this role"
+        managerRoleEnd:
+          type: string
+          nullable: true
+          description: "YYYY-MM date the manager left this role (null = still in role)"
         verified:
           type: boolean
         helpfulCount:
@@ -1289,11 +1338,16 @@ components:
         - ratings
         - managerCompany
         - managerTitle
+        - managerRoleStart
       properties:
         author:
           type: string
+        authorType:
+          type: string
         ratings:
           $ref: '#/components/schemas/ManagerReview/properties/ratings'
+        overallRating:
+          type: number
         managerCompany:
           type: string
         managerTitle:
@@ -1301,6 +1355,19 @@ components:
         text:
           type: string
           nullable: true
+        workedFrom:
+          type: string
+          nullable: true
+        workedUntil:
+          type: string
+          nullable: true
+        managerRoleStart:
+          type: string
+          description: "YYYY-MM date the manager started this role"
+        managerRoleEnd:
+          type: string
+          nullable: true
+          description: "YYYY-MM date the manager left this role (null = still in role)"
 
     ManagerReviewUpdate:
       type: object
@@ -1312,6 +1379,10 @@ components:
       properties:
         overallRating:
           type: number
+        authorType:
+          type: string
+        author:
+          type: string
         ratings:
           $ref: '#/components/schemas/ManagerReview/properties/ratings'
         managerCompany:
@@ -1319,6 +1390,18 @@ components:
         managerTitle:
           type: string
         text:
+          type: string
+          nullable: true
+        workedFrom:
+          type: string
+          nullable: true
+        workedUntil:
+          type: string
+          nullable: true
+        managerRoleStart:
+          type: string
+          nullable: true
+        managerRoleEnd:
           type: string
           nullable: true
 

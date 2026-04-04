@@ -28,25 +28,28 @@ public class EditRepository {
     }
 
     public Future<Row> upsert(long managerId, UUID proposedBy, String newCompany,
-                               String newTitle, String newStatus, String newLinkedinUrl) {
+                               String newTitle, String newStatus, String newLinkedinUrl,
+                               OffsetDateTime newStartDate, OffsetDateTime newEndDate) {
         return db.preparedQuery("""
-                INSERT INTO manager_edits(manager_id, proposed_by, new_company, new_title, new_status, new_linkedin_url)
-                VALUES ($1, $2, $3, $4, $5, $6)
+                INSERT INTO manager_edits(manager_id, proposed_by, new_company, new_title, new_status, new_linkedin_url, new_start_date, new_end_date)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
                 ON CONFLICT (manager_id, proposed_by) WHERE status = 'pending'
                 DO UPDATE SET new_company      = EXCLUDED.new_company,
                               new_title        = EXCLUDED.new_title,
                               new_status       = EXCLUDED.new_status,
                               new_linkedin_url = EXCLUDED.new_linkedin_url,
+                              new_start_date   = EXCLUDED.new_start_date,
+                              new_end_date     = EXCLUDED.new_end_date,
                               created_at       = now()
                 RETURNING id, created_at
                 """)
-            .execute(Tuple.of(managerId, proposedBy, newCompany, newTitle, newStatus, newLinkedinUrl))
+            .execute(Tuple.of(managerId, proposedBy, newCompany, newTitle, newStatus, newLinkedinUrl, newStartDate, newEndDate))
             .map(rows -> rows.iterator().next());
     }
 
     public Future<RowSet<Row>> findPendingByManagerAndUser(long managerId, UUID userId) {
         return db.preparedQuery("""
-                SELECT id, new_company, new_title, new_status, new_linkedin_url, created_at
+                SELECT id, new_company, new_title, new_status, new_linkedin_url, new_start_date, new_end_date, created_at
                 FROM manager_edits
                 WHERE manager_id = $1 AND proposed_by = $2 AND status = 'pending'
                 ORDER BY created_at DESC LIMIT 1

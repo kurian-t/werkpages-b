@@ -473,19 +473,36 @@ public class ManagerService {
     }
 
     private Future<Row> validateAndInsertReview(JsonObject body, long managerId, UUID userId, String author) {
-        Double overallRating  = body.getDouble("overallRating");
-        JsonObject ratings    = body.getJsonObject("ratings");
-        String managerCompany = body.getString("managerCompany");
-        String managerTitle   = body.getString("managerTitle");
-        String text           = body.getString("text");
-        LocalDate workedFrom  = parseYearMonth(body.getString("workedFrom"));
-        LocalDate workedUntil = parseYearMonth(body.getString("workedUntil"));
+        Double overallRating      = body.getDouble("overallRating");
+        JsonObject ratings        = body.getJsonObject("ratings");
+        String managerCompany     = body.getString("managerCompany");
+        String managerTitle       = body.getString("managerTitle");
+        String text               = body.getString("text");
+        LocalDate workedFrom      = parseYearMonth(body.getString("workedFrom"));
+        LocalDate workedUntil     = parseYearMonth(body.getString("workedUntil"));
+        LocalDate managerRoleStart = parseYearMonth(body.getString("managerRoleStart"));
+        LocalDate managerRoleEnd   = parseYearMonth(body.getString("managerRoleEnd")); // null = still in role
         LocalDate today = LocalDate.now();
 
-        if (workedFrom == null && workedUntil != null) return Future.failedFuture(ServiceException.badRequest("Cannot set a 'to' date without a 'from' date"));
-        if (workedFrom != null && workedUntil != null && workedFrom.isAfter(workedUntil)) return Future.failedFuture(ServiceException.badRequest("The 'from' date cannot be later than the 'to' date"));
-        if (workedFrom != null && workedFrom.isAfter(today)) return Future.failedFuture(ServiceException.badRequest("The 'from' date cannot be in the future"));
-        if (workedUntil != null && workedUntil.isAfter(today)) return Future.failedFuture(ServiceException.badRequest("The 'to' date cannot be in the future"));
+        // ── Manager role date validation ─────────────────────────────────────────
+        if (managerRoleStart == null) return Future.failedFuture(ServiceException.badRequest("Manager role start date is required"));
+        if (managerRoleStart.isAfter(today)) return Future.failedFuture(ServiceException.badRequest("Manager role start date cannot be in the future"));
+        if (managerRoleEnd != null) {
+            if (managerRoleEnd.isAfter(today)) return Future.failedFuture(ServiceException.badRequest("Manager role end date cannot be in the future"));
+            if (managerRoleEnd.isBefore(managerRoleStart)) return Future.failedFuture(ServiceException.badRequest("Manager role end date must be on or after the start date"));
+        }
+
+        // ── User work date validation ─────────────────────────────────────────────
+        if (workedFrom == null) return Future.failedFuture(ServiceException.badRequest("Your start date working with this manager is required"));
+        if (workedFrom.isAfter(today)) return Future.failedFuture(ServiceException.badRequest("Your 'from' date cannot be in the future"));
+        if (workedUntil != null && workedUntil.isAfter(today)) return Future.failedFuture(ServiceException.badRequest("Your 'to' date cannot be in the future"));
+        if (workedUntil != null && workedFrom.isAfter(workedUntil)) return Future.failedFuture(ServiceException.badRequest("Your 'from' date cannot be later than your 'to' date"));
+
+        // ── Cross-validation: user dates must fall within the manager's role period ─
+        if (workedFrom.isBefore(managerRoleStart)) return Future.failedFuture(ServiceException.badRequest("Your start date cannot be before the manager started this role (" + formatYM(managerRoleStart) + ")"));
+        if (managerRoleEnd != null && workedFrom.isAfter(managerRoleEnd)) return Future.failedFuture(ServiceException.badRequest("Your start date cannot be after the manager left this role (" + formatYM(managerRoleEnd) + ")"));
+        if (managerRoleEnd != null && workedUntil != null && workedUntil.isAfter(managerRoleEnd)) return Future.failedFuture(ServiceException.badRequest("Your end date cannot be after the manager left this role (" + formatYM(managerRoleEnd) + ")"));
+
         if (overallRating == null || ratings == null || isBlank(managerCompany) || isBlank(managerTitle)) return Future.failedFuture(ServiceException.badRequest("Missing required fields"));
         if (managerCompany.length() > 100) return Future.failedFuture(ServiceException.badRequest("Manager company must be at most 100 characters"));
         if (managerTitle.length()   > 100) return Future.failedFuture(ServiceException.badRequest("Manager title must be at most 100 characters"));
@@ -510,49 +527,49 @@ public class ManagerService {
                     return Future.failedFuture(ServiceException.conflict("role_limit_reached"));
                 }
 
-                // ── 2. Role duplicate: same normalised title under same manager ───────
-                String normTitle = managerTitle.trim().toLowerCase();
+                // ── 2. Role duplicate: same normalised title+company under same manager ─
+                String normTitle   = managerTitle.trim().toLowerCase();
+                String normCompany = managerCompany.trim().toLowerCase();
                 boolean roleTaken = existing.stream()
                     .filter(r -> r.getLong("manager_id") == managerId)
                     .anyMatch(r -> {
                         String t = r.getString("manager_title");
-                        return t != null && t.trim().equalsIgnoreCase(normTitle);
+                        String c = r.getString("manager_company");
+                        return t != null && c != null
+                            && t.trim().equalsIgnoreCase(normTitle)
+                            && c.trim().equalsIgnoreCase(normCompany);
                     });
                 if (roleTaken) {
                     return Future.failedFuture(ServiceException.conflict("already_reviewed_this_role"));
                 }
 
-                // ── 3. Date overlap: new period must not overlap any existing period ──
-                if (workedFrom != null) {
-                    // New period: [workedFrom, workedUntil) where null workedUntil = open-ended (today onward)
-                    LocalDate newFrom  = workedFrom;
-                    LocalDate newUntil = workedUntil != null ? workedUntil : LocalDate.now().plusDays(1);
-
-                    for (Row r : existing) {
-                        LocalDate existFrom  = r.getLocalDate("worked_from");
-                        LocalDate existUntil = r.getLocalDate("worked_until");
-                        if (existFrom == null) continue; // undated existing review — skip overlap check
-                        LocalDate existEnd = existUntil != null ? existUntil : LocalDate.now().plusDays(1);
-
-                        boolean overlaps = newFrom.isBefore(existEnd) && existFrom.isBefore(newUntil);
-                        if (overlaps) {
-                            String role    = r.getString("manager_title");
-                            String company = r.getString("manager_company");
-                            String from    = existFrom.toString();
-                            String until   = existUntil != null ? existUntil.toString() : "present";
-                            return Future.failedFuture(ServiceException.conflict(
-                                "date_overlap:" + role + ":" + company + ":" + from + ":" + until));
+                // ── 3. Manager role period overlap: check ALL reviews for this manager (any user) ─
+                return reviewRepo.findRolePeriodsForManager(managerId)
+                    .compose(allRoleRows -> {
+                        LocalDate newRoleEnd = managerRoleEnd != null ? managerRoleEnd : LocalDate.of(9999, 12, 31);
+                        for (Row r : allRoleRows) {
+                            LocalDate existRoleStart = r.getLocalDate("manager_role_start");
+                            LocalDate existRoleEndRaw = r.getLocalDate("manager_role_end");
+                            LocalDate existRoleEnd = existRoleEndRaw != null ? existRoleEndRaw : LocalDate.of(9999, 12, 31);
+                            boolean overlaps = !managerRoleStart.isAfter(existRoleEnd) && !existRoleStart.isAfter(newRoleEnd);
+                            if (overlaps) {
+                                String existTitle   = r.getString("manager_title");
+                                String existCompany = r.getString("manager_company");
+                                return Future.failedFuture(ServiceException.conflict(
+                                    "manager_role_overlap:" + existTitle + ":" + existCompany + ":" +
+                                    formatYM(existRoleStart) + ":" + (existRoleEndRaw != null ? formatYM(existRoleEndRaw) : "present")));
+                            }
                         }
-                    }
-                }
 
-                return reviewRepo.create(managerId, userId, author, overallRating,
-                        getRating(ratings, 0), getRating(ratings, 1), getRating(ratings, 2),
-                        getRating(ratings, 3), getRating(ratings, 4), getRating(ratings, 5),
-                        getRating(ratings, 6), getRating(ratings, 7), getRating(ratings, 8),
-                        getRating(ratings, 9), managerCompany, managerTitle, text, workedFrom, workedUntil)
-                    .onSuccess(row -> managerRepo.recalculateInBackground(managerId));
-            });
+                        return reviewRepo.create(managerId, userId, author, overallRating,
+                                getRating(ratings, 0), getRating(ratings, 1), getRating(ratings, 2),
+                                getRating(ratings, 3), getRating(ratings, 4), getRating(ratings, 5),
+                                getRating(ratings, 6), getRating(ratings, 7), getRating(ratings, 8),
+                                getRating(ratings, 9), managerCompany, managerTitle, text,
+                                workedFrom, workedUntil, managerRoleStart, managerRoleEnd)
+                            .onSuccess(row -> managerRepo.recalculateInBackground(managerId));
+                    });  // closes allRoleRows compose
+            });  // closes existingRows compose
     }
 
     // ── GET manager reviews ───────────────────────────────────────────────────
@@ -599,15 +616,19 @@ public class ManagerService {
                         .put("Perceived Professional Demeanor",   r1(row.getBigDecimal("perceived_professional_demeanor")))
                         .put("Overall Working Experience",        r1(row.getBigDecimal("overall_working_experience")));
 
+                    LocalDate mrStart = row.getLocalDate("manager_role_start");
+                    LocalDate mrEnd   = row.getLocalDate("manager_role_end");
                     segments.add(new JsonObject()
-                        .put("company",          row.getString("company"))
-                        .put("role",             row.getString("role"))
-                        .put("startDate",        startRaw  != null ? startRaw.toString() : null)
-                        .put("endDate",          isCurrent ? null : (endRaw != null ? endRaw.toString() : null))
-                        .put("isCurrent",        isCurrent)
-                        .put("averageRating",    r1(row.getBigDecimal("avg_rating")))
-                        .put("reviewCount",      row.getLong("review_count").intValue())
-                        .put("categoryAverages", categoryAverages));
+                        .put("company",           row.getString("company"))
+                        .put("role",              row.getString("role"))
+                        .put("startDate",         startRaw  != null ? startRaw.toString() : null)
+                        .put("endDate",           isCurrent ? null : (endRaw != null ? endRaw.toString() : null))
+                        .put("isCurrent",         isCurrent)
+                        .put("averageRating",     r1(row.getBigDecimal("avg_rating")))
+                        .put("reviewCount",       row.getLong("review_count").intValue())
+                        .put("categoryAverages",  categoryAverages)
+                        .put("managerRoleStart",  mrStart != null ? mrStart.toString() : null)
+                        .put("managerRoleEnd",    mrEnd   != null ? mrEnd.toString()   : null));
                 }
                 return new JsonObject().put("data", segments);
             });
@@ -623,21 +644,37 @@ public class ManagerService {
     public Future<Row> updateReview(String auth0Id, long managerId, UUID reviewId, JsonObject body) {
         if (body == null) return Future.failedFuture(ServiceException.badRequest("Missing request body"));
 
-        Double overallRating  = body.getDouble("overallRating");
-        JsonObject ratings    = body.getJsonObject("ratings");
-        String managerCompany = body.getString("managerCompany");
-        String managerTitle   = body.getString("managerTitle");
-        String text           = body.getString("text");
-        String authorType     = body.getString("authorType", "username");
-        String clientAuthor   = body.getString("author", "").trim();
-        LocalDate workedFrom  = parseYearMonth(body.getString("workedFrom"));
-        LocalDate workedUntil = parseYearMonth(body.getString("workedUntil"));
+        Double overallRating       = body.getDouble("overallRating");
+        JsonObject ratings         = body.getJsonObject("ratings");
+        String managerCompany      = body.getString("managerCompany");
+        String managerTitle        = body.getString("managerTitle");
+        String text                = body.getString("text");
+        String authorType          = body.getString("authorType", "username");
+        String clientAuthor        = body.getString("author", "").trim();
+        LocalDate workedFrom       = parseYearMonth(body.getString("workedFrom"));
+        LocalDate workedUntil      = parseYearMonth(body.getString("workedUntil"));
+        LocalDate managerRoleStart = parseYearMonth(body.getString("managerRoleStart")); // optional for legacy edits
+        LocalDate managerRoleEnd   = parseYearMonth(body.getString("managerRoleEnd"));
         LocalDate today = LocalDate.now();
 
-        if (workedFrom == null && workedUntil != null) return Future.failedFuture(ServiceException.badRequest("Cannot set a 'to' date without a 'from' date"));
-        if (workedFrom != null && workedUntil != null && workedFrom.isAfter(workedUntil)) return Future.failedFuture(ServiceException.badRequest("The 'from' date cannot be later than the 'to' date"));
-        if (workedFrom != null && workedFrom.isAfter(today)) return Future.failedFuture(ServiceException.badRequest("The 'from' date cannot be in the future"));
-        if (workedUntil != null && workedUntil.isAfter(today)) return Future.failedFuture(ServiceException.badRequest("The 'to' date cannot be in the future"));
+        // ── User work date validation ─────────────────────────────────────────────
+        if (workedFrom != null && workedUntil != null && workedFrom.isAfter(workedUntil)) return Future.failedFuture(ServiceException.badRequest("Your 'from' date cannot be later than your 'to' date"));
+        if (workedFrom != null && workedFrom.isAfter(today)) return Future.failedFuture(ServiceException.badRequest("Your 'from' date cannot be in the future"));
+        if (workedUntil != null && workedUntil.isAfter(today)) return Future.failedFuture(ServiceException.badRequest("Your 'to' date cannot be in the future"));
+
+        // ── Manager role date validation (if provided) ───────────────────────────
+        if (managerRoleStart != null) {
+            if (managerRoleStart.isAfter(today)) return Future.failedFuture(ServiceException.badRequest("Manager role start date cannot be in the future"));
+            if (managerRoleEnd != null) {
+                if (managerRoleEnd.isAfter(today)) return Future.failedFuture(ServiceException.badRequest("Manager role end date cannot be in the future"));
+                if (managerRoleEnd.isBefore(managerRoleStart)) return Future.failedFuture(ServiceException.badRequest("Manager role end date must be on or after the start date"));
+            }
+            // Cross-validation: user dates must fall within the manager's role period
+            if (workedFrom != null && workedFrom.isBefore(managerRoleStart)) return Future.failedFuture(ServiceException.badRequest("Your start date cannot be before the manager started this role (" + formatYM(managerRoleStart) + ")"));
+            if (managerRoleEnd != null && workedFrom != null && workedFrom.isAfter(managerRoleEnd)) return Future.failedFuture(ServiceException.badRequest("Your start date cannot be after the manager left this role (" + formatYM(managerRoleEnd) + ")"));
+            if (managerRoleEnd != null && workedUntil != null && workedUntil.isAfter(managerRoleEnd)) return Future.failedFuture(ServiceException.badRequest("Your end date cannot be after the manager left this role (" + formatYM(managerRoleEnd) + ")"));
+        }
+
         if (overallRating == null || ratings == null || isBlank(managerCompany) || isBlank(managerTitle)) return Future.failedFuture(ServiceException.badRequest("Missing required fields"));
         if (!isValidRating(overallRating)) return Future.failedFuture(ServiceException.badRequest("Overall rating must be between 1 and 5"));
         if (managerCompany.length() > 100) return Future.failedFuture(ServiceException.badRequest("Manager company must be at most 100 characters"));
@@ -658,45 +695,45 @@ public class ManagerService {
                     && !clientAuthor.isEmpty() && clientAuthor.length() <= 100
                     ? clientAuthor : dbUsername;
 
-                // Re-validate role-duplicate and date-overlap (excluding the review being edited)
                 return reviewRepo.findByUserForValidation(callerId)
                     .compose(existingRows -> {
                         List<Row> existing = new ArrayList<>();
                         existingRows.forEach(existing::add);
 
                         // ── Role duplicate (exclude current review) ───────────────────────
-                        String normTitle = managerTitle.trim().toLowerCase();
+                        String normTitle   = managerTitle.trim().toLowerCase();
+                        String normCompany = managerCompany.trim().toLowerCase();
                         boolean roleTaken = existing.stream()
                             .filter(r -> !r.getUUID("id").equals(reviewId))
                             .filter(r -> r.getLong("manager_id") == managerId)
                             .anyMatch(r -> {
                                 String t = r.getString("manager_title");
-                                return t != null && t.trim().equalsIgnoreCase(normTitle);
+                                String c = r.getString("manager_company");
+                                return t != null && c != null
+                                    && t.trim().equalsIgnoreCase(normTitle)
+                                    && c.trim().equalsIgnoreCase(normCompany);
                             });
                         if (roleTaken) {
                             return Future.failedFuture(ServiceException.conflict("already_reviewed_this_role"));
                         }
 
-                        // ── Date overlap (exclude current review) ─────────────────────────
-                        if (workedFrom != null) {
-                            LocalDate newFrom  = workedFrom;
-                            LocalDate newUntil = workedUntil != null ? workedUntil : LocalDate.now().plusDays(1);
-
+                        // ── Manager role period overlap (exclude current review) ──────────
+                        if (managerRoleStart != null) {
+                            LocalDate newRoleEnd = managerRoleEnd != null ? managerRoleEnd : LocalDate.of(9999, 12, 31);
                             for (Row r : existing) {
                                 if (r.getUUID("id").equals(reviewId)) continue; // skip self
-                                LocalDate existFrom  = r.getLocalDate("worked_from");
-                                if (existFrom == null) continue;
-                                LocalDate existUntil = r.getLocalDate("worked_until");
-                                LocalDate existEnd   = existUntil != null ? existUntil : LocalDate.now().plusDays(1);
-
-                                boolean overlaps = newFrom.isBefore(existEnd) && existFrom.isBefore(newUntil);
+                                if (r.getLong("manager_id") != managerId) continue;
+                                LocalDate existRoleStart = r.getLocalDate("manager_role_start");
+                                if (existRoleStart == null) continue;
+                                LocalDate existRoleEndRaw = r.getLocalDate("manager_role_end");
+                                LocalDate existRoleEnd = existRoleEndRaw != null ? existRoleEndRaw : LocalDate.of(9999, 12, 31);
+                                boolean overlaps = !managerRoleStart.isAfter(existRoleEnd) && !existRoleStart.isAfter(newRoleEnd);
                                 if (overlaps) {
-                                    String role    = r.getString("manager_title");
-                                    String company = r.getString("manager_company");
-                                    String from    = existFrom.toString();
-                                    String until   = existUntil != null ? existUntil.toString() : "present";
+                                    String existTitle   = r.getString("manager_title");
+                                    String existCompany = r.getString("manager_company");
                                     return Future.failedFuture(ServiceException.conflict(
-                                        "date_overlap:" + role + ":" + company + ":" + from + ":" + until));
+                                        "manager_role_overlap:" + existTitle + ":" + existCompany + ":" +
+                                        formatYM(existRoleStart) + ":" + (existRoleEndRaw != null ? formatYM(existRoleEndRaw) : "present")));
                                 }
                             }
                         }
@@ -707,7 +744,8 @@ public class ManagerService {
                                 ratings.getDouble("Perceived Supportiveness"), ratings.getDouble("Decision Making Style"),
                                 ratings.getDouble("Organization and Planning Style"), ratings.getDouble("Delegation Style"),
                                 ratings.getDouble("Perceived Professional Demeanor"), ratings.getDouble("Overall Working Experience"),
-                                managerCompany, managerTitle, text, workedFrom, workedUntil)
+                                managerCompany, managerTitle, text, workedFrom, workedUntil,
+                                managerRoleStart, managerRoleEnd)
                             .compose(rowOpt -> {
                                 if (rowOpt.isEmpty()) return Future.failedFuture(ServiceException.notFound("Review not found"));
                                 managerRepo.recalculateInBackground(managerId);
@@ -758,18 +796,26 @@ public class ManagerService {
 
     public Future<JsonObject> createEditRequest(String auth0Id, long managerId, JsonObject body) {
         if (body == null) return Future.failedFuture(ServiceException.badRequest("Missing request body"));
-        String newCompany = body.getString("company");
-        String newTitle   = body.getString("title");
-        String newStatus  = body.getString("status");
+        String newCompany     = body.getString("company");
+        String newTitle       = body.getString("title");
+        String newStatus      = body.getString("status");
         String newLinkedinUrl = body.getString("linkedinUrl");
+        String startDateStr   = body.getString("startDate");
+        String endDateStr     = body.getString("endDate");
 
-        if (isBlank(newCompany) && isBlank(newTitle) && isBlank(newStatus) && isBlank(newLinkedinUrl)) {
+        if (isBlank(newCompany) && isBlank(newTitle) && isBlank(newStatus) && isBlank(newLinkedinUrl)
+                && isBlank(startDateStr) && isBlank(endDateStr)) {
             return Future.failedFuture(ServiceException.badRequest("At least one field is required"));
         }
         if (newCompany    != null && newCompany.length() > 100)    return Future.failedFuture(ServiceException.badRequest("Company must be at most 100 characters"));
         if (newTitle      != null && newTitle.length()   > 100)    return Future.failedFuture(ServiceException.badRequest("Title must be at most 100 characters"));
         if (newStatus     != null && !newStatus.equals("active") && !newStatus.equals("retired")) return Future.failedFuture(ServiceException.badRequest("Status must be 'active' or 'retired'"));
         if (newLinkedinUrl != null && newLinkedinUrl.length() > 500) return Future.failedFuture(ServiceException.badRequest("LinkedIn URL must be at most 500 characters"));
+
+        LocalDate startDateLocal = parseYearMonth(startDateStr);
+        LocalDate endDateLocal   = parseYearMonth(endDateStr);
+        OffsetDateTime newStartDate = startDateLocal != null ? startDateLocal.atStartOfDay(ZoneOffset.UTC).toOffsetDateTime() : null;
+        OffsetDateTime newEndDate   = endDateLocal   != null ? endDateLocal.atStartOfDay(ZoneOffset.UTC).toOffsetDateTime()   : null;
 
         String effectiveCompany     = toNullIfBlank(newCompany);
         String effectiveTitle       = toNullIfBlank(newTitle);
@@ -788,7 +834,7 @@ public class ManagerService {
                         return managerRepo.findById(managerId)
                             .compose(mgrOpt -> {
                                 if (mgrOpt.isEmpty()) return Future.failedFuture(ServiceException.notFound("Manager not found"));
-                                return editRepo.upsert(managerId, userId, effectiveCompany, effectiveTitle, effectiveStatus, effectiveLinkedinUrl)
+                                return editRepo.upsert(managerId, userId, effectiveCompany, effectiveTitle, effectiveStatus, effectiveLinkedinUrl, newStartDate, newEndDate)
                                     .map(row -> new JsonObject()
                                         .put("id", row.getUUID("id").toString())
                                         .put("managerId", managerId)
@@ -886,8 +932,10 @@ public class ManagerService {
             .put("helpfulCount",  row.getInteger("helpful_count"))
             .put("createdAt",     row.getOffsetDateTime("created_at").toString())
             .put("updatedAt",     row.getOffsetDateTime("updated_at").toString())
-            .put("workedFrom",    row.getLocalDate("worked_from")  != null ? row.getLocalDate("worked_from").toString()  : null)
-            .put("workedUntil",   row.getLocalDate("worked_until") != null ? row.getLocalDate("worked_until").toString() : null);
+            .put("workedFrom",         row.getLocalDate("worked_from")        != null ? row.getLocalDate("worked_from").toString()        : null)
+            .put("workedUntil",        row.getLocalDate("worked_until")       != null ? row.getLocalDate("worked_until").toString()       : null)
+            .put("managerRoleStart",   row.getLocalDate("manager_role_start") != null ? row.getLocalDate("manager_role_start").toString() : null)
+            .put("managerRoleEnd",     row.getLocalDate("manager_role_end")   != null ? row.getLocalDate("manager_role_end").toString()   : null);
     }
 
     private JsonObject buildManagerUpdateJson(Row row, RowSet<Row> chRows) {
@@ -925,6 +973,10 @@ public class ManagerService {
 
     private static boolean isValidLinkedinUrl(String url) {
         return url != null && (url.startsWith("https://www.linkedin.com/") || url.startsWith("https://linkedin.com/"));
+    }
+
+    private static String formatYM(LocalDate d) {
+        return d.getMonth().getDisplayName(java.time.format.TextStyle.SHORT, java.util.Locale.ENGLISH) + " " + d.getYear();
     }
 
     private static LocalDate parseYearMonth(String str) {

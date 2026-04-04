@@ -68,14 +68,18 @@ public class RateLimitHandler {
     /**
      * Returns the real client IP.
      *
-     * X-Forwarded-For is only trusted when the direct connection comes from a
-     * private/loopback address — i.e., a trusted reverse proxy or load balancer
-     * on the same network. If a client connects directly with a public IP they
-     * cannot inject a spoofed X-Forwarded-For header.
+     * When the direct connection comes from a trusted proxy (private/loopback),
+     * we first check the CF-Connecting-IP header set by Cloudflare, which always
+     * reflects the real visitor IP and cannot be spoofed from outside Cloudflare.
+     * Falls back to the first entry of X-Forwarded-For for non-Cloudflare proxies.
      */
     private String getClientIp(RoutingContext ctx) {
         String remoteIp = ctx.request().remoteAddress().host();
         if (isTrustedProxy(remoteIp)) {
+            String cfIp = ctx.request().getHeader("CF-Connecting-IP");
+            if (cfIp != null && !cfIp.isBlank()) {
+                return cfIp.trim();
+            }
             String forwarded = ctx.request().getHeader("X-Forwarded-For");
             if (forwarded != null && !forwarded.isBlank()) {
                 return forwarded.split(",")[0].trim();

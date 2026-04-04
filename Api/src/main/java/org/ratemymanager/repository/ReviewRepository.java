@@ -60,7 +60,9 @@ public class ReviewRepository {
                   AVG(organization_and_planning_style)        AS organization_and_planning_style,
                   AVG(delegation_style)                       AS delegation_style,
                   AVG(perceived_professional_demeanor)        AS perceived_professional_demeanor,
-                  AVG(overall_working_experience)             AS overall_working_experience
+                  AVG(overall_working_experience)             AS overall_working_experience,
+                  MIN(manager_role_start)                     AS manager_role_start,
+                  MAX(manager_role_end)                       AS manager_role_end
                 FROM reviews
                 WHERE manager_id = $1
                 GROUP BY LOWER(TRIM(manager_company)), LOWER(TRIM(manager_title))
@@ -90,6 +92,7 @@ public class ReviewRepository {
                     r.perceived_professional_demeanor, r.overall_working_experience,
                     r.manager_company, r.manager_title, r.text, r.verified, r.helpful_count,
                     r.created_at, r.updated_at, r.worked_from, r.worked_until,
+                    r.manager_role_start, r.manager_role_end,
                     m.name AS manager_name, m.image AS manager_image, m.status AS manager_status
                 FROM reviews r
                 JOIN managers m ON m.id = r.manager_id
@@ -105,9 +108,18 @@ public class ReviewRepository {
      */
     public Future<RowSet<Row>> findByUserForValidation(UUID userId) {
         return db.preparedQuery(
-                "SELECT id, manager_id, manager_title, manager_company, worked_from, worked_until " +
+                "SELECT id, manager_id, manager_title, manager_company, worked_from, worked_until, " +
+                "manager_role_start, manager_role_end " +
                 "FROM reviews WHERE user_id = $1")
             .execute(Tuple.of(userId));
+    }
+
+    /** Returns role-period rows for all reviews of a manager (any user). Used to detect concurrent-role conflicts. */
+    public Future<RowSet<Row>> findRolePeriodsForManager(long managerId) {
+        return db.preparedQuery(
+                "SELECT id, manager_title, manager_company, manager_role_start, manager_role_end " +
+                "FROM reviews WHERE manager_id = $1 AND manager_role_start IS NOT NULL")
+            .execute(Tuple.of(managerId));
     }
 
     public Future<Long> countSubmittedTodayByUser(UUID userId) {
@@ -126,7 +138,8 @@ public class ReviewRepository {
                                double organizationAndPlanningStyle, double delegationStyle,
                                double perceivedProfessionalDemeanor, double overallWorkingExperience,
                                String managerCompany, String managerTitle, String text,
-                               LocalDate workedFrom, LocalDate workedUntil) {
+                               LocalDate workedFrom, LocalDate workedUntil,
+                               LocalDate managerRoleStart, LocalDate managerRoleEnd) {
         return db.preparedQuery("""
                 INSERT INTO reviews (
                     manager_id, user_id, author, overall_rating,
@@ -134,9 +147,10 @@ public class ReviewRepository {
                     feedback_style, perceived_supportiveness, decision_making_style,
                     organization_and_planning_style, delegation_style, perceived_professional_demeanor,
                     overall_working_experience, manager_company, manager_title, text,
-                    worked_from, worked_until, verified, helpful_count, created_at, updated_at
+                    worked_from, worked_until, manager_role_start, manager_role_end,
+                    verified, helpful_count, created_at, updated_at
                 )
-                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,true,0,now(),now())
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,true,0,now(),now())
                 RETURNING *
                 """)
             .execute(Tuple.of(
@@ -145,7 +159,7 @@ public class ReviewRepository {
                 feedbackStyle, perceivedSupportiveness, decisionMakingStyle,
                 organizationAndPlanningStyle, delegationStyle, perceivedProfessionalDemeanor,
                 overallWorkingExperience, managerCompany, managerTitle, text,
-                workedFrom, workedUntil
+                workedFrom, workedUntil, managerRoleStart, managerRoleEnd
             ))
             .map(rows -> rows.iterator().next());
     }
@@ -158,7 +172,8 @@ public class ReviewRepository {
                                          double organizationAndPlanningStyle, double delegationStyle,
                                          double perceivedProfessionalDemeanor, double overallWorkingExperience,
                                          String managerCompany, String managerTitle, String text,
-                                         LocalDate workedFrom, LocalDate workedUntil) {
+                                         LocalDate workedFrom, LocalDate workedUntil,
+                                         LocalDate managerRoleStart, LocalDate managerRoleEnd) {
         return db.preparedQuery("""
                 UPDATE reviews SET
                     overall_rating = $1,
@@ -169,6 +184,7 @@ public class ReviewRepository {
                     perceived_professional_demeanor = $10, overall_working_experience = $11,
                     manager_company = $12, manager_title = $13, text = $14,
                     worked_from = $15, worked_until = $16, author = $17,
+                    manager_role_start = $21, manager_role_end = $22,
                     updated_at = now()
                 WHERE id = $18 AND manager_id = $19 AND user_id = $20
                 RETURNING *
@@ -179,7 +195,8 @@ public class ReviewRepository {
                 decisionMakingStyle, organizationAndPlanningStyle, delegationStyle,
                 perceivedProfessionalDemeanor, overallWorkingExperience,
                 managerCompany, managerTitle, text, workedFrom, workedUntil,
-                author, reviewId, managerId, callerId
+                author, reviewId, managerId, callerId,
+                managerRoleStart, managerRoleEnd
             ))
             .map(rows -> rows.iterator().hasNext()
                 ? Optional.of(rows.iterator().next())

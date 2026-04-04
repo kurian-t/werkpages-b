@@ -407,7 +407,7 @@ public class ManagersHandler {
             ctx.response()
                 .setStatusCode(se.getStatusCode())
                 .putHeader("Content-Type", "application/json")
-                .end(new JsonObject().put("error", se.getMessage()).encode());
+                .end(new JsonObject().put("message", se.getMessage()).encode());
         } else {
             ctx.fail(err);
         }

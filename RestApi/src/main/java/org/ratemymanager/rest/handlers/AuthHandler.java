@@ -416,6 +416,124 @@ public class AuthHandler {
             .onFailure(ctx::fail);
     }
 
+    // ── SOCIAL LOGIN CALLBACK ─────────────────────────────────────────────────
+
+    /**
+     * Exchanges an Auth0 authorization code (from Google/Facebook/Apple OAuth) for a session.
+     * Creates the user in the local DB on first login with an auto-generated username.
+     */
+    public void handleCallback(RoutingContext ctx) {
+        JsonObject body = ctx.getBodyAsJson();
+        if (body == null) { ctx.response().setStatusCode(400).end("{\"error\":\"Missing body\"}"); return; }
+        String code        = body.getString("code");
+        String redirectUri = body.getString("redirectUri");
+        if (code == null || redirectUri == null) {
+            ctx.response().setStatusCode(400).putHeader("Content-Type", "application/json")
+                .end(new JsonObject().put("error", "Missing code or redirectUri").encode()); return;
+        }
+
+        JsonObject tokenPayload = new JsonObject()
+            .put("grant_type", "authorization_code")
+            .put("client_id", this.clientId)
+            .put("client_secret", this.clientSecret)
+            .put("code", code)
+            .put("redirect_uri", redirectUri)
+            .put("audience", this.audience);
+
+        this.webClient.post(443, auth0Domain, "/oauth/token")
+            .ssl(true).timeout(10_000).putHeader("Content-Type", "application/json")
+            .sendJsonObject(tokenPayload, ar -> {
+                if (ar.failed()) { ctx.fail(ar.cause()); return; }
+                if (ar.result().statusCode() != 200) {
+                    System.err.println("Auth0 code exchange error: " + ar.result().statusCode() + " - " + ar.result().bodyAsString());
+                    ctx.response().setStatusCode(401).putHeader("Content-Type", "application/json")
+                        .end(new JsonObject().put("error", "token_exchange_failed")
+                            .put("message", "Authentication failed. Please try again.").encode()); return;
+                }
+                JsonObject tokens    = ar.result().bodyAsJsonObject();
+                String accessToken   = tokens.getString("access_token");
+                String idToken       = tokens.getString("id_token");
+                String auth0Id;
+                try {
+                    // id_token is always a JWT — use it for identity; fall back to access_token
+                    String tokenToDecode = idToken != null ? idToken : accessToken;
+                    auth0Id = com.auth0.jwt.JWT.decode(tokenToDecode).getSubject();
+                } catch (Exception e) {
+                    System.err.println("Failed to decode token. id_token=" + idToken + " access_token=" + accessToken);
+                    ctx.response().setStatusCode(500).end("{\"error\":\"Failed to decode token\"}"); return;
+                }
+
+                // Fetch user profile from Auth0 /userinfo
+                final String fAuth0Id     = auth0Id;
+                final String fAccessToken = accessToken;
+                this.webClient.get(443, auth0Domain, "/userinfo")
+                    .ssl(true).timeout(10_000)
+                    .putHeader("Authorization", "Bearer " + accessToken)
+                    .send(uiAr -> {
+                        if (uiAr.failed()) { ctx.fail(uiAr.cause()); return; }
+                        JsonObject info      = uiAr.result().bodyAsJsonObject();
+                        String email         = info.getString("email");
+                        String givenName     = info.getString("given_name", "");
+                        String familyName    = info.getString("family_name", "");
+                        if (givenName.isBlank() && familyName.isBlank()) {
+                            String[] parts = info.getString("name", "Social User").split(" ", 2);
+                            givenName  = parts[0];
+                            familyName = parts.length > 1 ? parts[1] : "";
+                        }
+                        if (email == null || email.isBlank()) {
+                            ctx.response().setStatusCode(400).putHeader("Content-Type", "application/json")
+                                .end(new JsonObject().put("error", "no_email")
+                                    .put("message", "Your social account did not share an email address. Please use email sign-up.").encode()); return;
+                        }
+
+                        final String fEmail      = email;
+                        final String fFirstName  = givenName.isBlank()  ? "User" : givenName;
+                        final String fLastName   = familyName;
+
+                        userRepo.findByAuth0IdWithBan(fAuth0Id)
+                            .compose(opt -> {
+                                if (opt.isPresent()) {
+                                    return io.vertx.core.Future.succeededFuture(opt.get());
+                                }
+                                // New social user — auto-generate a unique username
+                                String username = "user_" + UUID.randomUUID().toString().replace("-", "").substring(0, 8);
+                                return userRepo.create(fAuth0Id, fEmail, username, fFirstName, fLastName)
+                                    .compose(ignored -> userRepo.findByAuth0IdWithBan(fAuth0Id))
+                                    .map(java.util.Optional::get);
+                            })
+                            .onSuccess(row -> {
+                                if (row.getBoolean("is_banned")) {
+                                    ctx.response().setStatusCode(403).putHeader("Content-Type", "application/json")
+                                        .end(new JsonObject().put("error", "account_suspended").encode()); return;
+                                }
+                                boolean isProd = "true".equalsIgnoreCase(System.getenv("USE_AWS_SECRETS"));
+                                String setCookie = "auth_token=" + fAccessToken
+                                    + "; HttpOnly; Path=/; Max-Age=86400; SameSite=Strict" + (isProd ? "; Secure" : "");
+                                ctx.response().putHeader("Set-Cookie", setCookie).putHeader("Content-Type", "application/json")
+                                    .end(new JsonObject().put("user", new JsonObject()
+                                        .put("email",     row.getString("email"))
+                                        .put("username",  row.getString("username"))
+                                        .put("firstName", row.getString("first_name"))
+                                        .put("lastName",  row.getString("last_name"))
+                                        .put("role",      row.getString("role"))
+                                        .put("isBanned",  row.getBoolean("is_banned"))
+                                    ).encode());
+                            })
+                            .onFailure(err -> {
+                                String msg = err.getMessage() != null ? err.getMessage().toLowerCase() : "";
+                                if (msg.contains("unique") || msg.contains("duplicate") || msg.contains("23505")) {
+                                    // Email already exists under a different auth0Id (email/password account)
+                                    ctx.response().setStatusCode(409).putHeader("Content-Type", "application/json")
+                                        .end(new JsonObject().put("error", "email_already_registered")
+                                            .put("message", "An account with this email already exists. Please sign in with your password instead.").encode());
+                                } else {
+                                    ctx.fail(err);
+                                }
+                            });
+                    });
+            });
+    }
+
     // ── SIGNOUT ───────────────────────────────────────────────────────────────
 
     public void handleSignout(RoutingContext ctx) {

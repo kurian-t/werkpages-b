@@ -134,12 +134,13 @@ public class MainVerticle extends AbstractVerticle {
                             secrets.turnstileSecretKey,
                             vertx
                         );
-                        routerFactory.addHandlerByOperationId("checkUsername", authHandler::handleCheckUsername);
-                        routerFactory.addHandlerByOperationId("signup",  authHandler::handleSignup);
-                        routerFactory.addHandlerByOperationId("signin",  authHandler::handleSignin);
-                        routerFactory.addHandlerByOperationId("me",      authHandler::handleMe);
-                        routerFactory.addHandlerByOperationId("signout", authHandler::handleSignout);
-                        routerFactory.addHandlerByOperationId("deleteMe", authHandler::handleDeleteMe);
+                        routerFactory.addHandlerByOperationId("checkUsername",     authHandler::handleCheckUsername);
+                        routerFactory.addHandlerByOperationId("signup",            authHandler::handleSignup);
+                        routerFactory.addHandlerByOperationId("signin",            authHandler::handleSignin);
+                        routerFactory.addHandlerByOperationId("socialAuthCallback",authHandler::handleCallback);
+                        routerFactory.addHandlerByOperationId("me",                authHandler::handleMe);
+                        routerFactory.addHandlerByOperationId("signout",           authHandler::handleSignout);
+                        routerFactory.addHandlerByOperationId("deleteMe",          authHandler::handleDeleteMe);
                         
                         routerFactory.addSecurityHandler("bearerAuth", routingContext -> {
                             // Accept token from Authorization header OR HttpOnly cookie
