@@ -366,7 +366,7 @@ public class AuthHandler {
                             io.vertx.sqlclient.Row row = opt.get();
                             boolean isProd = "true".equalsIgnoreCase(System.getenv("USE_AWS_SECRETS"));
                             String setCookie = "auth_token=" + accessToken
-                                + "; HttpOnly; Path=/; Max-Age=86400; SameSite=Strict" + (isProd ? "; Secure" : "");
+                                + "; HttpOnly; Path=/; Max-Age=86400; SameSite=Lax" + (isProd ? "; Secure" : "");
                             ctx.response().putHeader("Set-Cookie", setCookie).putHeader("Content-Type", "application/json")
                                 .end(new JsonObject().put("user", new JsonObject()
                                     .put("email", row.getString("email"))
@@ -466,6 +466,10 @@ public class AuthHandler {
                 // Fetch user profile from Auth0 /userinfo
                 final String fAuth0Id     = auth0Id;
                 final String fAccessToken = accessToken;
+                // id_token is always a JWT (OIDC); access_token may be opaque when no audience is
+                // included in the authorization request, causing JWT validation to fail on subsequent
+                // API calls. Prefer id_token for the session cookie.
+                final String fTokenForCookie = (idToken != null && !idToken.isBlank()) ? idToken : accessToken;
                 this.webClient.get(443, auth0Domain, "/userinfo")
                     .ssl(true).timeout(10_000)
                     .putHeader("Authorization", "Bearer " + accessToken)
@@ -507,8 +511,8 @@ public class AuthHandler {
                                         .end(new JsonObject().put("error", "account_suspended").encode()); return;
                                 }
                                 boolean isProd = "true".equalsIgnoreCase(System.getenv("USE_AWS_SECRETS"));
-                                String setCookie = "auth_token=" + fAccessToken
-                                    + "; HttpOnly; Path=/; Max-Age=86400; SameSite=Strict" + (isProd ? "; Secure" : "");
+                                String setCookie = "auth_token=" + fTokenForCookie
+                                    + "; HttpOnly; Path=/; Max-Age=86400; SameSite=Lax" + (isProd ? "; Secure" : "");
                                 ctx.response().putHeader("Set-Cookie", setCookie).putHeader("Content-Type", "application/json")
                                     .end(new JsonObject().put("user", new JsonObject()
                                         .put("email",     row.getString("email"))
