@@ -21,7 +21,7 @@ public class NotificationRepository {
 
     public Future<RowSet<Row>> findByUser(UUID userId) {
         return db.preparedQuery(
-                "SELECT id, type, title, message, read, created_at " +
+                "SELECT id, type, title, message, read, created_at, manager_id " +
                 "FROM notifications WHERE user_id = $1 ORDER BY created_at DESC LIMIT 50")
             .execute(Tuple.of(userId));
     }
@@ -46,7 +46,12 @@ public class NotificationRepository {
 
     /** Fire-and-forget: inserts a notification without blocking the caller. */
     public void sendAsync(UUID userId, String type, String title, String message) {
-        db.preparedQuery("INSERT INTO notifications (user_id, type, title, message) VALUES ($1, $2, $3, $4)")
-            .execute(Tuple.of(userId, type, title, message), ar -> { /* fire-and-forget */ });
+        sendAsync(userId, type, title, message, null);
+    }
+
+    /** Fire-and-forget with optional manager link. */
+    public void sendAsync(UUID userId, String type, String title, String message, Long managerId) {
+        db.preparedQuery("INSERT INTO notifications (user_id, type, title, message, manager_id) VALUES ($1, $2, $3, $4, $5)")
+            .execute(Tuple.of(userId, type, title, message, managerId), ar -> { /* fire-and-forget */ });
     }
 }

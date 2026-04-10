@@ -29,14 +29,16 @@ public class NotificationService {
                 .map(rows -> {
                     JsonArray result = new JsonArray();
                     for (Row row : rows) {
-                        result.add(new JsonObject()
+                        JsonObject obj = new JsonObject()
                             .put("id", row.getUUID("id").toString())
                             .put("type", row.getString("type"))
                             .put("title", row.getString("title"))
                             .put("message", row.getString("message"))
                             .put("read", row.getBoolean("read"))
-                            .put("createdAt", row.getOffsetDateTime("created_at").toString())
-                        );
+                            .put("createdAt", row.getOffsetDateTime("created_at").toString());
+                        Long managerId = row.getLong("manager_id");
+                        if (managerId != null) obj.put("managerId", managerId);
+                        result.add(obj);
                     }
                     return new JsonObject().put("data", result);
                 })

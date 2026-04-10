@@ -96,7 +96,8 @@ public class AdminService {
                     notifRepo.sendAsync(submittedBy, "manager_approved",
                         "Manager Approved",
                         "Your manager profile for " + managerName +
-                        " has been approved and is now live on the platform.");
+                        " has been approved and is now live on the platform.",
+                        managerId);
                 }
                 return Future.succeededFuture(new JsonObject()
                     .put("success", true)
@@ -201,7 +202,8 @@ public class AdminService {
                 if (proposedBy != null) {
                     notifRepo.sendAsync(proposedBy, "review_accepted",
                         "Edit Request Approved",
-                        "Your edit request for " + managerName + " has been approved. The manager's profile has been updated.");
+                        "Your edit request for " + managerName + " has been approved. The manager's profile has been updated.",
+                        managerId);
                 }
                 JsonObject result = new JsonObject().put("success", true).put("message", "Edit approved and applied")
                     .put("managerId", managerId);
