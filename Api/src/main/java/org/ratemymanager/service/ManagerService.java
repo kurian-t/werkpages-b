@@ -467,6 +467,15 @@ public class ManagerService {
                 return reviewRepo.countSubmittedTodayByUser(userId)
                     .compose(todayCount -> {
                         if (todayCount >= 6) return Future.failedFuture(ServiceException.tooManyRequests("daily_limit_reached"));
+                        return reviewRepo.findRecentDeletion(userId, managerId);
+                    })
+                    .compose(recentDeletion -> {
+                        if (recentDeletion.isPresent()) {
+                            OffsetDateTime deletedAt = recentDeletion.get();
+                            OffsetDateTime cooldownEnd = deletedAt.plusDays(30);
+                            String cooldownEndStr = cooldownEnd.toLocalDate().toString(); // YYYY-MM-DD
+                            return Future.failedFuture(ServiceException.conflict("review_cooldown:" + cooldownEndStr));
+                        }
                         return validateAndInsertReview(body, managerId, userId, author);
                     });
             });
@@ -484,12 +493,13 @@ public class ManagerService {
         LocalDate managerRoleEnd   = parseYearMonth(body.getString("managerRoleEnd")); // null = still in role
         LocalDate today = LocalDate.now();
 
-        // ── Manager role date validation ─────────────────────────────────────────
-        if (managerRoleStart == null) return Future.failedFuture(ServiceException.badRequest("Manager role start date is required"));
-        if (managerRoleStart.isAfter(today)) return Future.failedFuture(ServiceException.badRequest("Manager role start date cannot be in the future"));
-        if (managerRoleEnd != null) {
-            if (managerRoleEnd.isAfter(today)) return Future.failedFuture(ServiceException.badRequest("Manager role end date cannot be in the future"));
-            if (managerRoleEnd.isBefore(managerRoleStart)) return Future.failedFuture(ServiceException.badRequest("Manager role end date must be on or after the start date"));
+        // ── Manager role date validation (optional — not all reviewers know manager tenure) ─
+        if (managerRoleStart != null) {
+            if (managerRoleStart.isAfter(today)) return Future.failedFuture(ServiceException.badRequest("Manager role start date cannot be in the future"));
+            if (managerRoleEnd != null) {
+                if (managerRoleEnd.isAfter(today)) return Future.failedFuture(ServiceException.badRequest("Manager role end date cannot be in the future"));
+                if (managerRoleEnd.isBefore(managerRoleStart)) return Future.failedFuture(ServiceException.badRequest("Manager role end date must be on or after the start date"));
+            }
         }
 
         // ── User work date validation ─────────────────────────────────────────────
@@ -498,10 +508,12 @@ public class ManagerService {
         if (workedUntil != null && workedUntil.isAfter(today)) return Future.failedFuture(ServiceException.badRequest("Your 'to' date cannot be in the future"));
         if (workedUntil != null && workedFrom.isAfter(workedUntil)) return Future.failedFuture(ServiceException.badRequest("Your 'from' date cannot be later than your 'to' date"));
 
-        // ── Cross-validation: user dates must fall within the manager's role period ─
-        if (workedFrom.isBefore(managerRoleStart)) return Future.failedFuture(ServiceException.badRequest("Your start date cannot be before the manager started this role (" + formatYM(managerRoleStart) + ")"));
-        if (managerRoleEnd != null && workedFrom.isAfter(managerRoleEnd)) return Future.failedFuture(ServiceException.badRequest("Your start date cannot be after the manager left this role (" + formatYM(managerRoleEnd) + ")"));
-        if (managerRoleEnd != null && workedUntil != null && workedUntil.isAfter(managerRoleEnd)) return Future.failedFuture(ServiceException.badRequest("Your end date cannot be after the manager left this role (" + formatYM(managerRoleEnd) + ")"));
+        // ── Cross-validation: user dates vs manager role period (only when provided) ─
+        if (managerRoleStart != null) {
+            if (workedFrom.isBefore(managerRoleStart)) return Future.failedFuture(ServiceException.badRequest("Your start date cannot be before the manager started this role (" + formatYM(managerRoleStart) + ")"));
+            if (managerRoleEnd != null && workedFrom.isAfter(managerRoleEnd)) return Future.failedFuture(ServiceException.badRequest("Your start date cannot be after the manager left this role (" + formatYM(managerRoleEnd) + ")"));
+            if (managerRoleEnd != null && workedUntil != null && workedUntil.isAfter(managerRoleEnd)) return Future.failedFuture(ServiceException.badRequest("Your end date cannot be after the manager left this role (" + formatYM(managerRoleEnd) + ")"));
+        }
 
         if (overallRating == null || ratings == null || isBlank(managerCompany) || isBlank(managerTitle)) return Future.failedFuture(ServiceException.badRequest("Missing required fields"));
         if (managerCompany.length() > 100) return Future.failedFuture(ServiceException.badRequest("Manager company must be at most 100 characters"));
@@ -543,7 +555,16 @@ public class ManagerService {
                     return Future.failedFuture(ServiceException.conflict("already_reviewed_this_role"));
                 }
 
-                // ── 3. Manager role period overlap: check ALL reviews for this manager (any user) ─
+                // ── 3. Manager role period overlap (only when role dates were provided) ─
+                if (managerRoleStart == null) {
+                    return reviewRepo.create(managerId, userId, author, overallRating,
+                            getRating(ratings, 0), getRating(ratings, 1), getRating(ratings, 2),
+                            getRating(ratings, 3), getRating(ratings, 4), getRating(ratings, 5),
+                            getRating(ratings, 6), getRating(ratings, 7), getRating(ratings, 8),
+                            getRating(ratings, 9), managerCompany, managerTitle, text,
+                            workedFrom, workedUntil, null, null)
+                        .onSuccess(row -> managerRepo.recalculateInBackground(managerId));
+                }
                 return reviewRepo.findRolePeriodsForManager(managerId)
                     .compose(allRoleRows -> {
                         LocalDate newRoleEnd = managerRoleEnd != null ? managerRoleEnd : LocalDate.of(9999, 12, 31);
@@ -769,10 +790,43 @@ public class ManagerService {
                         if (ownerOpt.isEmpty()) return Future.failedFuture(ServiceException.notFound("Review not found"));
                         if (!ownerOpt.get().equals(userId)) return Future.failedFuture(ServiceException.forbidden("Forbidden"));
                         return reviewRepo.delete(reviewId, managerId)
+                            .compose(v -> reviewRepo.recordDeletion(userId, managerId))
                             .map(v -> {
                                 managerRepo.recalculateInBackground(managerId);
                                 return new JsonObject().put("success", true).put("message", "Review deleted");
                             });
+                    });
+            });
+    }
+
+    // ── REPLACE review (delete old + create new, no cooldown recorded) ────────
+
+    public Future<Row> replaceReview(String auth0Id, long managerId, UUID oldReviewId, JsonObject body) {
+        return userRepo.findByAuth0IdWithBan(auth0Id)
+            .compose(opt -> {
+                if (opt.isEmpty()) return Future.failedFuture(ServiceException.unauthorized("Unauthorized"));
+                Row userRow = opt.get();
+                if (userRow.getBoolean("is_banned")) return Future.failedFuture(ServiceException.forbidden("account_suspended"));
+                UUID userId = userRow.getUUID("id");
+                String dbUsername = userRow.getString("username");
+
+                String authorType = body.getString("authorType", "username");
+                String author;
+                if ("real_name".equals(authorType) || "anonymous".equals(authorType)) {
+                    String clientAuthor = body.getString("author", "").trim();
+                    author = (clientAuthor.isEmpty() || clientAuthor.length() > 100) ? dbUsername : clientAuthor;
+                } else {
+                    author = dbUsername;
+                }
+
+                return reviewRepo.findOwnerUserId(oldReviewId, managerId)
+                    .compose(ownerOpt -> {
+                        if (ownerOpt.isEmpty()) return Future.failedFuture(ServiceException.notFound("Review not found"));
+                        if (!ownerOpt.get().equals(userId)) return Future.failedFuture(ServiceException.forbidden("Forbidden"));
+                        // Delete without recording cooldown, then create new review
+                        return reviewRepo.delete(oldReviewId, managerId)
+                            .compose(v -> validateAndInsertReview(body, managerId, userId, author))
+                            .onSuccess(row -> managerRepo.recalculateInBackground(managerId));
                     });
             });
     }

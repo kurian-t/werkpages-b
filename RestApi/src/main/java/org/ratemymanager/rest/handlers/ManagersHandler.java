@@ -359,6 +359,26 @@ public class ManagersHandler {
             .onFailure(err -> handleError(ctx, err));
     }
 
+    // ── POST /api/managers/:managerId/reviews/:reviewId/replace ──────────────
+
+    public void handleReplaceManagerReview(RoutingContext ctx) {
+        String auth0Id = ctx.get("auth0Id");
+        if (auth0Id == null) { respond(ctx, 401, new JsonObject().put("error", "Unauthorized")); return; }
+        long managerId;
+        UUID reviewId;
+        try {
+            managerId = Long.parseLong(ctx.pathParam("managerId"));
+            reviewId  = UUID.fromString(ctx.pathParam("reviewId"));
+        } catch (Exception e) {
+            respond(ctx, 400, new JsonObject().put("error", "Invalid managerId or reviewId")); return;
+        }
+        JsonObject body = ctx.body().asJsonObject();
+        service.replaceReview(auth0Id, managerId, reviewId, body)
+            .onSuccess(row -> ctx.response().setStatusCode(200).putHeader("Content-Type", "application/json")
+                .end(new JsonObject().put("success", true).encode()))
+            .onFailure(err -> handleError(ctx, err));
+    }
+
     // ── GET /api/me/reviews ───────────────────────────────────────────────────
 
     public void handleGetMyReviews(RoutingContext ctx) {

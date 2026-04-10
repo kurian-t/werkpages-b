@@ -7,6 +7,7 @@ import io.vertx.sqlclient.SqlClient;
 import io.vertx.sqlclient.Tuple;
 
 import java.time.LocalDate;
+import java.time.OffsetDateTime;
 import java.util.Optional;
 import java.util.UUID;
 
@@ -216,6 +217,32 @@ public class ReviewRepository {
         return db.preparedQuery("DELETE FROM reviews WHERE id = $1 AND manager_id = $2")
             .execute(Tuple.of(reviewId, managerId))
             .mapEmpty();
+    }
+
+    /** Records that a user deleted a review for a manager (for the 30-day re-review cooldown). */
+    public Future<Void> recordDeletion(UUID userId, long managerId) {
+        return db.preparedQuery("INSERT INTO review_deletions (user_id, manager_id) VALUES ($1, $2)")
+            .execute(Tuple.of(userId, managerId))
+            .mapEmpty();
+    }
+
+    /**
+     * Returns the most recent deletion timestamp for this user+manager pair within the last 30 days,
+     * or empty if none exists (i.e. no active cooldown).
+     */
+    public Future<Optional<java.time.OffsetDateTime>> findRecentDeletion(UUID userId, long managerId) {
+        return db.preparedQuery("""
+                SELECT deleted_at FROM review_deletions
+                WHERE user_id = $1 AND manager_id = $2
+                  AND deleted_at > now() - INTERVAL '30 days'
+                ORDER BY deleted_at DESC
+                LIMIT 1
+                """)
+            .execute(Tuple.of(userId, managerId))
+            .map(rows -> {
+                if (!rows.iterator().hasNext()) return Optional.empty();
+                return Optional.of(rows.iterator().next().getOffsetDateTime("deleted_at"));
+            });
     }
 
     /** Moves reviews from one manager to another, skipping users who already reviewed keepId. */

@@ -1194,6 +1194,38 @@ paths:
         '404':
           description: Review not found
 
+  /api/managers/{managerId}/reviews/{reviewId}/replace:
+    post:
+      operationId: replaceManagerReview
+      summary: Replace an existing review with a new one (no cooldown recorded)
+      tags:
+        - Managers
+      parameters:
+        - in: path
+          name: managerId
+          required: true
+          schema:
+            type: integer
+        - in: path
+          name: reviewId
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ManagerReview'
+      responses:
+        '200':
+          description: Review replaced successfully
+        '401':
+          description: Unauthorized
+        '404':
+          description: Review not found
+
 components:
   schemas:
     ManagerSummary:
@@ -1338,7 +1370,6 @@ components:
         - ratings
         - managerCompany
         - managerTitle
-        - managerRoleStart
       properties:
         author:
           type: string
