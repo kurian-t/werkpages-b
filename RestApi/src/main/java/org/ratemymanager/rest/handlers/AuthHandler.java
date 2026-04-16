@@ -494,12 +494,14 @@ public class AuthHandler {
                         final String fFirstName  = givenName.isBlank()  ? "User" : givenName;
                         final String fLastName   = familyName;
 
+                        final boolean[] isNewUserHolder = {false};
                         userRepo.findByAuth0IdWithBan(fAuth0Id)
                             .compose(opt -> {
                                 if (opt.isPresent()) {
                                     return io.vertx.core.Future.succeededFuture(opt.get());
                                 }
                                 // New social user — auto-generate a unique username
+                                isNewUserHolder[0] = true;
                                 String username = "user_" + UUID.randomUUID().toString().replace("-", "").substring(0, 8);
                                 return userRepo.create(fAuth0Id, fEmail, username, fFirstName, fLastName)
                                     .compose(ignored -> userRepo.findByAuth0IdWithBan(fAuth0Id))
@@ -521,7 +523,7 @@ public class AuthHandler {
                                         .put("lastName",  row.getString("last_name"))
                                         .put("role",      row.getString("role"))
                                         .put("isBanned",  row.getBoolean("is_banned"))
-                                    ).encode());
+                                    ).put("isNewUser", isNewUserHolder[0]).encode());
                             })
                             .onFailure(err -> {
                                 String msg = err.getMessage() != null ? err.getMessage().toLowerCase() : "";
