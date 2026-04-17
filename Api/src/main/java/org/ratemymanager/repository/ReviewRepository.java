@@ -261,4 +261,24 @@ public class ReviewRepository {
             .execute(Tuple.of(managerId))
             .mapEmpty();
     }
+
+    /**
+     * Returns the single most current review for a manager: a review with
+     * {@code worked_until IS NULL} (still working there) takes precedence;
+     * otherwise the review with the latest {@code worked_from} is returned.
+     * Returns null via the future if no reviews exist.
+     */
+    public Future<Row> findMostCurrentReviewForManager(long managerId) {
+        return db.preparedQuery("""
+                SELECT id, manager_company, manager_title, worked_from, worked_until
+                FROM reviews
+                WHERE manager_id = $1
+                ORDER BY
+                    CASE WHEN worked_until IS NULL THEN 0 ELSE 1 END,
+                    worked_from DESC
+                LIMIT 1
+                """)
+            .execute(Tuple.of(managerId))
+            .map(rows -> rows.iterator().hasNext() ? rows.iterator().next() : null);
+    }
 }

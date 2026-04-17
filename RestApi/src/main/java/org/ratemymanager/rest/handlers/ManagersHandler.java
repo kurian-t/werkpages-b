@@ -281,6 +281,9 @@ public class ManagersHandler {
                     .put("workedFrom", row.getLocalDate("worked_from") != null ? row.getLocalDate("worked_from").toString() : null)
                     .put("workedUntil", row.getLocalDate("worked_until") != null ? row.getLocalDate("worked_until").toString() : null);
                 ctx.response().setStatusCode(201).putHeader("Content-Type", "application/json").end(response.encode());
+                // Fire-and-forget: update manager profile if this is the most current review
+                String logoUrl = CompanyLogoUtils.resolveLogoUrl(row.getString("manager_company"));
+                service.maybeUpdateManagerProfileFromReview(managerId, row, logoUrl);
             })
             .onFailure(err -> handleError(ctx, err));
     }

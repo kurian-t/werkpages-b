@@ -593,6 +593,31 @@ public class ManagerService {
             });  // closes existingRows compose
     }
 
+    /**
+     * Fire-and-forget: if {@code newReviewRow} is the most current review for
+     * the manager (worked_until IS NULL wins; otherwise latest worked_from),
+     * update the manager's company, title, and logo URL to match.
+     *
+     * @param newReviewRow the Row returned by {@code reviewRepo.create()}
+     * @param resolvedLogoUrl logo URL already resolved by the caller (may be null)
+     */
+    public void maybeUpdateManagerProfileFromReview(long managerId, Row newReviewRow, String resolvedLogoUrl) {
+        reviewRepo.findMostCurrentReviewForManager(managerId)
+            .onSuccess(mostCurrent -> {
+                if (mostCurrent == null) return;
+                UUID newId = newReviewRow.getUUID("id");
+                UUID currentId = mostCurrent.getUUID("id");
+                if (!newId.equals(currentId)) return; // new review is not the most current — nothing to update
+                String company = newReviewRow.getString("manager_company");
+                String title   = newReviewRow.getString("manager_title");
+                managerRepo.update(managerId, company, title, null, null, null, null, resolvedLogoUrl)
+                    .onFailure(err -> System.err.println(
+                        "maybeUpdateManagerProfile: update failed for manager " + managerId + ": " + err.getMessage()));
+            })
+            .onFailure(err -> System.err.println(
+                "maybeUpdateManagerProfile: query failed for manager " + managerId + ": " + err.getMessage()));
+    }
+
     // ── GET manager reviews ───────────────────────────────────────────────────
 
     public Future<JsonObject> getManagerReviews(long managerId, int limit, int offset,
