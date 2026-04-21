@@ -253,7 +253,9 @@ public class ManagersHandler {
         } catch (NumberFormatException e) {
             respond(ctx, 400, new JsonObject().put("error", "Invalid manager ID format")); return;
         }
-        service.createReview(auth0Id, managerId, ctx.getBodyAsJson())
+        JsonObject body = ctx.getBodyAsJson();
+        String resolvedLogoUrl = CompanyLogoUtils.resolveLogoUrl(body != null ? body.getString("managerCompany") : null);
+        service.createReview(auth0Id, managerId, body, resolvedLogoUrl)
             .onSuccess(row -> {
                 JsonObject ratings = new JsonObject()
                     .put("Communication Style",               row.getBigDecimal("communication_style"))
@@ -281,9 +283,6 @@ public class ManagersHandler {
                     .put("workedFrom", row.getLocalDate("worked_from") != null ? row.getLocalDate("worked_from").toString() : null)
                     .put("workedUntil", row.getLocalDate("worked_until") != null ? row.getLocalDate("worked_until").toString() : null);
                 ctx.response().setStatusCode(201).putHeader("Content-Type", "application/json").end(response.encode());
-                // Fire-and-forget: update manager profile if this is the most current review
-                String logoUrl = CompanyLogoUtils.resolveLogoUrl(row.getString("manager_company"));
-                service.maybeUpdateManagerProfileFromReview(managerId, row, logoUrl);
             })
             .onFailure(err -> handleError(ctx, err));
     }
@@ -376,7 +375,8 @@ public class ManagersHandler {
             respond(ctx, 400, new JsonObject().put("error", "Invalid managerId or reviewId")); return;
         }
         JsonObject body = ctx.body().asJsonObject();
-        service.replaceReview(auth0Id, managerId, reviewId, body)
+        String resolvedLogoUrl = CompanyLogoUtils.resolveLogoUrl(body != null ? body.getString("managerCompany") : null);
+        service.replaceReview(auth0Id, managerId, reviewId, body, resolvedLogoUrl)
             .onSuccess(row -> ctx.response().setStatusCode(200).putHeader("Content-Type", "application/json")
                 .end(new JsonObject().put("success", true).encode()))
             .onFailure(err -> handleError(ctx, err));

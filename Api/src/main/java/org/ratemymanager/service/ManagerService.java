@@ -444,7 +444,7 @@ public class ManagerService {
 
     // ── CREATE review ─────────────────────────────────────────────────────────
 
-    public Future<Row> createReview(String auth0Id, long managerId, JsonObject body) {
+    public Future<Row> createReview(String auth0Id, long managerId, JsonObject body, String resolvedLogoUrl) {
         if (body == null) return Future.failedFuture(ServiceException.badRequest("Missing request body"));
 
         return userRepo.findByAuth0IdWithBan(auth0Id)
@@ -473,15 +473,17 @@ public class ManagerService {
                         if (recentDeletion.isPresent()) {
                             OffsetDateTime deletedAt = recentDeletion.get();
                             OffsetDateTime cooldownEnd = deletedAt.plusDays(30);
-                            String cooldownEndStr = cooldownEnd.toLocalDate().toString(); // YYYY-MM-DD
-                            return Future.failedFuture(ServiceException.conflict("review_cooldown:" + cooldownEndStr));
+                            if (OffsetDateTime.now(ZoneOffset.UTC).isBefore(cooldownEnd)) {
+                                String cooldownEndStr = cooldownEnd.toLocalDate().toString(); // YYYY-MM-DD
+                                return Future.failedFuture(ServiceException.conflict("review_cooldown:" + cooldownEndStr));
+                            }
                         }
-                        return validateAndInsertReview(body, managerId, userId, author);
+                        return validateAndInsertReview(body, managerId, userId, author, resolvedLogoUrl);
                     });
             });
     }
 
-    private Future<Row> validateAndInsertReview(JsonObject body, long managerId, UUID userId, String author) {
+    private Future<Row> validateAndInsertReview(JsonObject body, long managerId, UUID userId, String author, String resolvedLogoUrl) {
         Double overallRating      = body.getDouble("overallRating");
         JsonObject ratings        = body.getJsonObject("ratings");
         String managerCompany     = body.getString("managerCompany");
@@ -529,7 +531,7 @@ public class ManagerService {
         return reviewRepo.findByUserForValidation(userId)
             .compose(existingRows -> {
                 List<Row> existing = new ArrayList<>();
-                existingRows.forEach(existing::add);
+                for (Row r : existingRows) existing.add(r);
 
                 // ── 1. Cap: max 5 reviews for a single manager per user ───────────────
                 long reviewsForThisManager = existing.stream()
@@ -557,13 +559,9 @@ public class ManagerService {
 
                 // ── 3. Manager role period overlap (only when role dates were provided) ─
                 if (managerRoleStart == null) {
-                    return reviewRepo.create(managerId, userId, author, overallRating,
-                            getRating(ratings, 0), getRating(ratings, 1), getRating(ratings, 2),
-                            getRating(ratings, 3), getRating(ratings, 4), getRating(ratings, 5),
-                            getRating(ratings, 6), getRating(ratings, 7), getRating(ratings, 8),
-                            getRating(ratings, 9), managerCompany, managerTitle, text,
-                            workedFrom, workedUntil, null, null)
-                        .onSuccess(row -> managerRepo.recalculateInBackground(managerId));
+                    return insertReviewTransactionally(managerId, userId, author, overallRating,
+                            ratings, managerCompany, managerTitle, text,
+                            workedFrom, workedUntil, null, null, resolvedLogoUrl);
                 }
                 return reviewRepo.findRolePeriodsForManager(managerId)
                     .compose(allRoleRows -> {
@@ -582,40 +580,73 @@ public class ManagerService {
                             }
                         }
 
-                        return reviewRepo.create(managerId, userId, author, overallRating,
-                                getRating(ratings, 0), getRating(ratings, 1), getRating(ratings, 2),
-                                getRating(ratings, 3), getRating(ratings, 4), getRating(ratings, 5),
-                                getRating(ratings, 6), getRating(ratings, 7), getRating(ratings, 8),
-                                getRating(ratings, 9), managerCompany, managerTitle, text,
-                                workedFrom, workedUntil, managerRoleStart, managerRoleEnd)
-                            .onSuccess(row -> managerRepo.recalculateInBackground(managerId));
+                        return insertReviewTransactionally(managerId, userId, author, overallRating,
+                                ratings, managerCompany, managerTitle, text,
+                                workedFrom, workedUntil, managerRoleStart, managerRoleEnd, resolvedLogoUrl);
                     });  // closes allRoleRows compose
             });  // closes existingRows compose
     }
 
     /**
-     * Fire-and-forget: if {@code newReviewRow} is the most current review for
-     * the manager (worked_until IS NULL wins; otherwise latest worked_from),
-     * update the manager's company, title, and logo URL to match.
-     *
-     * @param newReviewRow the Row returned by {@code reviewRepo.create()}
-     * @param resolvedLogoUrl logo URL already resolved by the caller (may be null)
+     * Inserts a review and, within the same transaction, updates the manager's
+     * company/title/logo if this review is the most current one for that manager.
+     * Either both succeed or both roll back — the caller gets a failed Future on error.
      */
-    public void maybeUpdateManagerProfileFromReview(long managerId, Row newReviewRow, String resolvedLogoUrl) {
-        reviewRepo.findMostCurrentReviewForManager(managerId)
-            .onSuccess(mostCurrent -> {
-                if (mostCurrent == null) return;
-                UUID newId = newReviewRow.getUUID("id");
-                UUID currentId = mostCurrent.getUUID("id");
-                if (!newId.equals(currentId)) return; // new review is not the most current — nothing to update
-                String company = newReviewRow.getString("manager_company");
-                String title   = newReviewRow.getString("manager_title");
-                managerRepo.update(managerId, company, title, null, null, null, null, resolvedLogoUrl)
-                    .onFailure(err -> System.err.println(
-                        "maybeUpdateManagerProfile: update failed for manager " + managerId + ": " + err.getMessage()));
-            })
-            .onFailure(err -> System.err.println(
-                "maybeUpdateManagerProfile: query failed for manager " + managerId + ": " + err.getMessage()));
+    private Future<Row> insertReviewTransactionally(
+            long managerId, UUID userId, String author, double overallRating,
+            JsonObject ratings, String managerCompany, String managerTitle, String text,
+            LocalDate workedFrom, LocalDate workedUntil,
+            LocalDate managerRoleStart, LocalDate managerRoleEnd,
+            String resolvedLogoUrl) {
+
+        return ((Pool) db).withTransaction(conn ->
+            conn.preparedQuery("""
+                    INSERT INTO reviews (
+                        manager_id, user_id, author, overall_rating,
+                        communication_style, perceived_approachability, perceived_clarity_of_expectations,
+                        feedback_style, perceived_supportiveness, decision_making_style,
+                        organization_and_planning_style, delegation_style, perceived_professional_demeanor,
+                        overall_working_experience, manager_company, manager_title, text,
+                        worked_from, worked_until, manager_role_start, manager_role_end,
+                        verified, helpful_count, created_at, updated_at
+                    )
+                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,true,0,now(),now())
+                    RETURNING *
+                    """)
+                .execute(Tuple.of(
+                    managerId, userId, author, overallRating,
+                    getRating(ratings, 0), getRating(ratings, 1), getRating(ratings, 2),
+                    getRating(ratings, 3), getRating(ratings, 4), getRating(ratings, 5),
+                    getRating(ratings, 6), getRating(ratings, 7), getRating(ratings, 8),
+                    getRating(ratings, 9), managerCompany, managerTitle, text,
+                    workedFrom, workedUntil, managerRoleStart, managerRoleEnd
+                ))
+                .compose(reviewResult -> {
+                    Row reviewRow = reviewResult.iterator().next();
+                    UUID newId = reviewRow.getUUID("id");
+                    return conn.preparedQuery("""
+                            SELECT id, manager_company, manager_title, worked_from, worked_until
+                            FROM reviews
+                            WHERE manager_id = $1
+                            ORDER BY
+                                CASE WHEN worked_until IS NULL THEN 0 ELSE 1 END,
+                                worked_from DESC
+                            LIMIT 1
+                            """)
+                        .execute(Tuple.of(managerId))
+                        .compose(currentResult -> {
+                            var it = currentResult.iterator();
+                            Row mostCurrent = it.hasNext() ? it.next() : null;
+                            if (mostCurrent != null && newId.equals(mostCurrent.getUUID("id"))) {
+                                return conn.preparedQuery(
+                                        "UPDATE managers SET updated_at = now(), company = $1, title = $2, company_logo_url = $3 WHERE id = $4")
+                                    .execute(Tuple.of(managerCompany, managerTitle, resolvedLogoUrl, managerId))
+                                    .map(ignored -> reviewRow);
+                            }
+                            return Future.succeededFuture(reviewRow);
+                        });
+                })
+        ).onSuccess(row -> managerRepo.recalculateInBackground(managerId));
     }
 
     // ── GET manager reviews ───────────────────────────────────────────────────
@@ -744,7 +775,7 @@ public class ManagerService {
                 return reviewRepo.findByUserForValidation(callerId)
                     .compose(existingRows -> {
                         List<Row> existing = new ArrayList<>();
-                        existingRows.forEach(existing::add);
+                        for (Row r : existingRows) existing.add(r);
 
                         // ── Role duplicate (exclude current review) ───────────────────────
                         String normTitle   = managerTitle.trim().toLowerCase();
@@ -826,7 +857,7 @@ public class ManagerService {
 
     // ── REPLACE review (delete old + create new, no cooldown recorded) ────────
 
-    public Future<Row> replaceReview(String auth0Id, long managerId, UUID oldReviewId, JsonObject body) {
+    public Future<Row> replaceReview(String auth0Id, long managerId, UUID oldReviewId, JsonObject body, String resolvedLogoUrl) {
         return userRepo.findByAuth0IdWithBan(auth0Id)
             .compose(opt -> {
                 if (opt.isEmpty()) return Future.failedFuture(ServiceException.unauthorized("Unauthorized"));
@@ -850,8 +881,7 @@ public class ManagerService {
                         if (!ownerOpt.get().equals(userId)) return Future.failedFuture(ServiceException.forbidden("Forbidden"));
                         // Delete without recording cooldown, then create new review
                         return reviewRepo.delete(oldReviewId, managerId)
-                            .compose(v -> validateAndInsertReview(body, managerId, userId, author))
-                            .onSuccess(row -> managerRepo.recalculateInBackground(managerId));
+                            .compose(v -> validateAndInsertReview(body, managerId, userId, author, resolvedLogoUrl));
                     });
             });
     }
