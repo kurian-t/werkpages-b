@@ -42,7 +42,7 @@ public class ReviewRepository {
         }
     }
 
-    public Future<RowSet<Row>> findCareerSegmentsByManager(long managerId) {
+    public Future<RowSet<Row>> findCareerSegmentsByManager(long managerId, int limit, int offset) {
         return db.preparedQuery("""
                 SELECT
                   MIN(manager_company)                        AS company,
@@ -68,8 +68,21 @@ public class ReviewRepository {
                 WHERE manager_id = $1
                 GROUP BY LOWER(TRIM(manager_company)), LOWER(TRIM(manager_title))
                 ORDER BY MIN(worked_from) ASC NULLS LAST
+                LIMIT $2 OFFSET $3
                 """)
-            .execute(Tuple.of(managerId));
+            .execute(Tuple.of(managerId, limit, offset));
+    }
+
+    public Future<Long> countCareerSegmentsByManager(long managerId) {
+        return db.preparedQuery("""
+                SELECT COUNT(*) FROM (
+                  SELECT 1 FROM reviews
+                  WHERE manager_id = $1
+                  GROUP BY LOWER(TRIM(manager_company)), LOWER(TRIM(manager_title))
+                ) sub
+                """)
+            .execute(Tuple.of(managerId))
+            .map(rows -> rows.iterator().next().getLong(0));
     }
 
     public Future<Long> countByManager(long managerId, UUID userIdFilter) {
@@ -83,7 +96,7 @@ public class ReviewRepository {
             .map(rows -> rows.iterator().next().getLong(0));
     }
 
-    public Future<RowSet<Row>> findByUser(UUID userId) {
+    public Future<RowSet<Row>> findByUser(UUID userId, int limit, int offset) {
         return db.preparedQuery("""
                 SELECT r.id, r.manager_id, r.author, r.overall_rating,
                     r.communication_style, r.perceived_approachability,
@@ -98,9 +111,15 @@ public class ReviewRepository {
                 FROM reviews r
                 JOIN managers m ON m.id = r.manager_id
                 WHERE r.user_id = $1
-                ORDER BY r.created_at DESC LIMIT 500
+                ORDER BY r.created_at DESC LIMIT $2 OFFSET $3
                 """)
-            .execute(Tuple.of(userId));
+            .execute(Tuple.of(userId, limit, offset));
+    }
+
+    public Future<Long> countByUser(UUID userId) {
+        return db.preparedQuery("SELECT COUNT(*) FROM reviews WHERE user_id = $1")
+            .execute(Tuple.of(userId))
+            .map(rows -> rows.iterator().next().getLong(0));
     }
 
     /**

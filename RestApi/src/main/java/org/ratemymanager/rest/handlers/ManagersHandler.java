@@ -41,6 +41,10 @@ public class ManagersHandler {
             respond(ctx, 400, new JsonObject().put("error", "Search query too long"));
             return;
         }
+        if (company != null && !company.isBlank() && company.trim().length() > 100) {
+            respond(ctx, 400, new JsonObject().put("error", "Company filter too long"));
+            return;
+        }
 
         String searchPattern  = (search  != null && !search.isBlank())  ? "%" + search.trim()  + "%" : null;
         String companyPattern = (company != null && !company.isBlank()) ? "%" + company.trim() + "%" : null;
@@ -319,7 +323,9 @@ public class ManagersHandler {
         } catch (NumberFormatException e) {
             respond(ctx, 400, new JsonObject().put("error", "Invalid manager ID")); return;
         }
-        service.getManagerCareerSegments(managerId)
+        int limit  = parseIntParam(ctx.queryParam("limit").stream().findFirst().orElse("20"),  20, 1, 50);
+        int offset = parseIntParam(ctx.queryParam("offset").stream().findFirst().orElse("0"),   0, 0, Integer.MAX_VALUE);
+        service.getManagerCareerSegments(managerId, limit, offset)
             .onSuccess(json -> ctx.response().putHeader("Content-Type", "application/json").end(json.encode()))
             .onFailure(err -> handleError(ctx, err));
     }
@@ -387,7 +393,9 @@ public class ManagersHandler {
     public void handleGetMyReviews(RoutingContext ctx) {
         String auth0Id = ctx.get("auth0Id");
         if (auth0Id == null) { respond(ctx, 401, new JsonObject().put("error", "Unauthorized")); return; }
-        service.getMyReviews(auth0Id)
+        int limit  = parseIntParam(ctx.queryParam("limit").stream().findFirst().orElse("50"),  50, 1, 50);
+        int offset = parseIntParam(ctx.queryParam("offset").stream().findFirst().orElse("0"),   0, 0, Integer.MAX_VALUE);
+        service.getMyReviews(auth0Id, limit, offset)
             .onSuccess(json -> ctx.response().setStatusCode(200).putHeader("Content-Type", "application/json").end(json.encode()))
             .onFailure(err -> handleError(ctx, err));
     }

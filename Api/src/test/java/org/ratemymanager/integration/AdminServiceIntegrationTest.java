@@ -212,20 +212,41 @@ class AdminServiceIntegrationTest {
     }
 
     @Test
-    void rejectPendingManager_withSubmitter_sendsNotification() throws Exception {
+    void rejectPendingManager_withSubmitter_sendsNotificationWithNameCompanyAndReason() throws Exception {
         String adminAuth0    = insertUser("auth0|admin10", "Admin10", "admin");
         String submitterAuth = insertUser("auth0|sub02",   "Submitter02", "user");
         UUID   submitterId   = findUserId(submitterAuth);
-        long managerId = insertPendingManager("Frank Lee", "Corp", "Title", submitterId);
+        long managerId = insertPendingManager("Frank Lee", "TechCorp", "Title", submitterId);
 
         await(service.rejectPendingManager(adminAuth0, managerId, "Duplicate"));
         Thread.sleep(300);
 
-        long notifCount = await(pool
-            .preparedQuery("SELECT COUNT(*) FROM notifications WHERE user_id = $1 AND type = $2")
+        String message = await(pool
+            .preparedQuery("SELECT message FROM notifications WHERE user_id = $1 AND type = $2")
             .execute(Tuple.of(submitterId, "manager_rejected"))
-            .map(rs -> rs.iterator().next().getLong(0)));
-        assertEquals(1L, notifCount);
+            .map(rs -> rs.iterator().next().getString("message")));
+        assertTrue(message.contains("Frank Lee"));
+        assertTrue(message.contains("TechCorp"));
+        assertTrue(message.contains("Reason: Duplicate"));
+    }
+
+    @Test
+    void rejectPendingManager_withSubmitter_nullReason_notificationHasNoReasonLine() throws Exception {
+        String adminAuth0    = insertUser("auth0|admin30", "Admin30", "admin");
+        String submitterAuth = insertUser("auth0|sub30",   "Submitter30", "user");
+        UUID   submitterId   = findUserId(submitterAuth);
+        long managerId = insertPendingManager("Grace Kim", "StartupInc", "Title", submitterId);
+
+        await(service.rejectPendingManager(adminAuth0, managerId, null));
+        Thread.sleep(300);
+
+        String message = await(pool
+            .preparedQuery("SELECT message FROM notifications WHERE user_id = $1 AND type = $2")
+            .execute(Tuple.of(submitterId, "manager_rejected"))
+            .map(rs -> rs.iterator().next().getString("message")));
+        assertTrue(message.contains("Grace Kim"));
+        assertTrue(message.contains("StartupInc"));
+        assertFalse(message.contains("Reason:"));
     }
 
     // ══════════════════════════════════════════════════════════════════════════

@@ -19,6 +19,7 @@ import org.ratemymanager.rest.handlers.NotificationsHandler;
 import org.ratemymanager.rest.handlers.RateLimitHandler;
 import org.ratemymanager.rest.handlers.ReportsHandler;
 import org.ratemymanager.service.AdminService;
+import org.ratemymanager.rest.handlers.CompanyLogoUtils;
 import org.ratemymanager.service.ManagerService;
 import org.ratemymanager.service.NotificationService;
 import org.ratemymanager.service.ReportService;
@@ -80,7 +81,7 @@ public class MainVerticle extends AbstractVerticle {
                         EditRepository         editRepo    = new EditRepository(Database.getClient());
 
                         // ── Services ──────────────────────────────────────────────────────────
-                        ManagerService      managerService = new ManagerService(managerRepo, reviewRepo, userRepo, editRepo, reportRepo, Database.getClient());
+                        ManagerService      managerService = new ManagerService(managerRepo, reviewRepo, userRepo, editRepo, reportRepo, Database.getClient(), CompanyLogoUtils::resolveLogoUrl);
                         AdminService        adminService   = new AdminService(userRepo, managerRepo, reviewRepo, editRepo, notifRepo);
                         NotificationService notifService   = new NotificationService(userRepo, notifRepo);
                         ReportService       reportService  = new ReportService(userRepo, reportRepo);

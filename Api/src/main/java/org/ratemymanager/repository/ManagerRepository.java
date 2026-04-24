@@ -153,7 +153,7 @@ public class ManagerRepository {
     }
 
     public Future<RowSet<Row>> findAllCompanies() {
-        return db.query("SELECT DISTINCT company FROM managers WHERE approval_status = 'approved' ORDER BY company")
+        return db.query("SELECT DISTINCT company FROM managers WHERE approval_status = 'approved' ORDER BY company LIMIT 100")
             .execute();
     }
 
@@ -256,7 +256,7 @@ public class ManagerRepository {
         return db.preparedQuery("""
                 UPDATE managers SET approval_status = 'rejected', updated_at = now()
                 WHERE id = $1 AND approval_status = 'pending_approval'
-                RETURNING id, name, submitted_by
+                RETURNING id, name, company, submitted_by
                 """)
             .execute(Tuple.of(managerId))
             .map(rows -> rows.iterator().hasNext()

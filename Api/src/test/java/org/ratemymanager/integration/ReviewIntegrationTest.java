@@ -529,6 +529,132 @@ class ReviewIntegrationTest {
         assertEquals(1L, countReviews(managerId));
     }
 
+    @Test
+    void replaceReview_nonExistentReview_returns404() throws Exception {
+        long managerId = insertManager("Replace 404 Mgr", "Corp", "Title");
+        String auth0Id = insertUser("auth0|rep-404", "Rep404User01");
+
+        ServiceException ex = assertServiceException(
+            service.replaceReview(auth0Id, managerId, UUID.randomUUID(),
+                validBody("Corp", "Title", "2022-01", null), null));
+        assertEquals(404, ex.getStatusCode());
+    }
+
+    @Test
+    void replaceReview_invalidBody_returns400_andOriginalReviewIntact() throws Exception {
+        long managerId = insertManager("Replace 400 Mgr", "Corp", "Title");
+        String auth0Id = insertUser("auth0|rep-400", "Rep400User01");
+
+        Row original = await(service.createReview(auth0Id, managerId,
+            validBody("Corp", "Title", "2022-01", null), null));
+
+        // workedFrom in future → sync validation fails before the delete
+        JsonObject badBody = validBody("Corp", "NewTitle", null, null)
+            .put("workedFrom", "2099-01");
+        ServiceException ex = assertServiceException(
+            service.replaceReview(auth0Id, managerId, original.getUUID("id"), badBody, null));
+        assertEquals(400, ex.getStatusCode());
+
+        // Critical: original review must still exist — validation fired before the delete
+        assertEquals(1L, countReviews(managerId),
+            "Original review must survive a failed replace — sync validation must run before delete");
+    }
+
+    @Test
+    void replaceReview_soloReview_managerProfileUpdatedToNewReview() throws Exception {
+        // Only one review exists; after replace, the new review is the only and most-current one.
+        long managerId = insertManager("Solo Replace Mgr", "InitCorp", "InitTitle");
+        String auth0Id = insertUser("auth0|solo-replace", "SoloReplace01");
+
+        Row original = await(service.createReview(auth0Id, managerId,
+            validBody("OldCorp", "Old Role", "2021-01", "2022-12"), null));
+
+        await(service.replaceReview(auth0Id, managerId, original.getUUID("id"),
+            validBody("NewCorp", "New Role", "2023-01", null), null));
+
+        Row manager = await(pool
+            .preparedQuery("SELECT company, title FROM managers WHERE id = $1")
+            .execute(Tuple.of(managerId))
+            .map(rs -> rs.iterator().next()));
+        assertEquals("NewCorp",  manager.getString("company"));
+        assertEquals("New Role", manager.getString("title"));
+        assertEquals(1L, countReviews(managerId));
+    }
+
+    @Test
+    void replaceReview_withEarlierDates_managerProfileUpdatedToNewMostCurrent() throws Exception {
+        // Setup: two users review the same manager.
+        // User A's review (2023-present) is the most current → manager profile shows "CurrentCorp / Current Role".
+        // User B (userA here) replaces their review with earlier dates (2020-2021).
+        // After the replace, User B's "CurrentCorp" review is gone.
+        // The NEW most-current review is user B's older replacement, but only if no other review is more current.
+        // More interesting case: User A has the most-current, User B has a more-recent one.
+        // After User B replaces with older dates, User A's review becomes the most-current again.
+
+        long managerId = insertManager("Profile Resync Mgr", "InitCorp", "InitTitle");
+
+        String userA = insertUser("auth0|resync-a", "ResyncUserA");
+        String userB = insertUser("auth0|resync-b", "ResyncUserB");
+
+        // User A: older role (2019-2020) → does NOT set manager profile (User B's will be more recent)
+        await(service.createReview(userA, managerId,
+            validBody("OldCorp", "Junior Dev", "2019-01", "2020-12"), null));
+
+        // User B: recent role (2023-present) → becomes the most current, sets manager profile
+        Row originalB = await(service.createReview(userB, managerId,
+            validBody("CurrentCorp", "Staff Lead", "2023-01", null), null));
+        UUID oldBId = originalB.getUUID("id");
+
+        // Confirm manager profile reflects User B's (most current) review
+        Row beforeReplace = await(pool
+            .preparedQuery("SELECT company, title FROM managers WHERE id = $1")
+            .execute(Tuple.of(managerId))
+            .map(rs -> rs.iterator().next()));
+        assertEquals("CurrentCorp", beforeReplace.getString("company"));
+        assertEquals("Staff Lead",  beforeReplace.getString("title"));
+
+        // User B replaces their review with EARLIER dates (2018-2019) — now it's no longer most current
+        await(service.replaceReview(userB, managerId, oldBId,
+            validBody("OldestCorp", "Intern", "2018-01", "2018-12"), null));
+
+        // After replace: User A's review (2019-2020) is now the most current
+        Row afterReplace = await(pool
+            .preparedQuery("SELECT company, title FROM managers WHERE id = $1")
+            .execute(Tuple.of(managerId))
+            .map(rs -> rs.iterator().next()));
+        assertEquals("OldCorp",    afterReplace.getString("company"),
+            "Manager profile should reflect User A's review (now the most current)");
+        assertEquals("Junior Dev", afterReplace.getString("title"),
+            "Manager title should reflect the new most-current review");
+    }
+
+    @Test
+    void replaceReview_withMoreRecentDates_managerProfileUpdatedToNewReview() throws Exception {
+        long managerId = insertManager("Profile Forward Mgr", "InitCorp", "InitTitle");
+        String userA = insertUser("auth0|forward-a", "ForwardUserA");
+        String userB = insertUser("auth0|forward-b", "ForwardUserB");
+
+        // User A: current role (most recent)
+        await(service.createReview(userA, managerId,
+            validBody("ExistingCorp", "Manager", "2022-01", null), null));
+
+        // User B: older role
+        Row originalB = await(service.createReview(userB, managerId,
+            validBody("OldCorp", "Analyst", "2019-01", "2021-12"), null));
+        UUID oldBId = originalB.getUUID("id");
+
+        // User B replaces with a NEWER date (2024-present) — now User B is most current
+        await(service.replaceReview(userB, managerId, oldBId,
+            validBody("NewestCorp", "Director", "2024-01", null), null));
+
+        Row afterReplace = await(pool
+            .preparedQuery("SELECT company, title FROM managers WHERE id = $1")
+            .execute(Tuple.of(managerId))
+            .map(rs -> rs.iterator().next()));
+        assertEquals("NewestCorp", afterReplace.getString("company"));
+        assertEquals("Director",   afterReplace.getString("title"));
+    }
+
     // ══════════════════════════════════════════════════════════════════════════
     // updateReview
     // ══════════════════════════════════════════════════════════════════════════
@@ -595,15 +721,33 @@ class ReviewIntegrationTest {
         await(service.createReview(auth0, mgrB, validBody("CorpB", "TitleB", "2022-01", "2023-12"), null));
 
         io.vertx.core.json.JsonObject result =
-            (io.vertx.core.json.JsonObject) await(service.getMyReviews(auth0));
+            (io.vertx.core.json.JsonObject) await(service.getMyReviews(auth0, 50, 0));
         assertNotNull(result);
         assertEquals(2, result.getJsonArray("data").size());
+        assertEquals(2L, (long) result.getLong("total"));
     }
 
     @Test
     void getMyReviews_unknownUser_returns404() {
-        ServiceException ex = assertServiceException(service.getMyReviews("auth0|no-such-user"));
+        ServiceException ex = assertServiceException(service.getMyReviews("auth0|no-such-user", 50, 0));
         assertEquals(404, ex.getStatusCode());
+    }
+
+    @Test
+    void getMyReviews_pagination_offsetSkipsReviews() throws Exception {
+        long mgr = insertManager("Paginate Mgr", "PaginateCorp", "PaginateTitle");
+        String auth0 = insertUser("auth0|paginate-user", "PaginateUser01");
+        await(service.createReview(auth0, mgr, validBody("PaginateCorp", "PaginateTitle", "2021-01", "2021-06"), null));
+
+        io.vertx.core.json.JsonObject page1 =
+            (io.vertx.core.json.JsonObject) await(service.getMyReviews(auth0, 50, 0));
+        assertEquals(1, page1.getJsonArray("data").size());
+        assertEquals(1L, (long) page1.getLong("total"));
+
+        io.vertx.core.json.JsonObject page2 =
+            (io.vertx.core.json.JsonObject) await(service.getMyReviews(auth0, 50, 1));
+        assertEquals(0, page2.getJsonArray("data").size());
+        assertEquals(1L, (long) page2.getLong("total"));
     }
 
     // ══════════════════════════════════════════════════════════════════════════
@@ -733,6 +877,62 @@ class ReviewIntegrationTest {
         body.put("managerRoleStart", roleStart.toString().substring(0, 7)); // YYYY-MM
         if (roleEnd != null) body.put("managerRoleEnd", roleEnd.toString().substring(0, 7));
         return body;
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // getManagerCareerSegments
+    // ══════════════════════════════════════════════════════════════════════════
+
+    @Test
+    void getManagerCareerSegments_returnsSegmentsWithPagination() throws Exception {
+        long managerId = insertManager("Career Mgr", "CareerCorp", "Title");
+        String userA = insertUser("auth0|career-a", "CareerUserA");
+        String userB = insertUser("auth0|career-b", "CareerUserB");
+
+        // Two distinct company+title combinations → two segments
+        await(service.createReview(userA, managerId, validBody("CorpA", "RoleA", "2021-01", "2022-06"), null));
+        await(service.createReview(userB, managerId, validBody("CorpB", "RoleB", "2022-07", "2023-12"), null));
+
+        io.vertx.core.json.JsonObject result =
+            (io.vertx.core.json.JsonObject) await(service.getManagerCareerSegments(managerId, 20, 0));
+        assertNotNull(result);
+        assertEquals(2L, (long) result.getLong("total"));
+        assertEquals(2, result.getJsonArray("data").size());
+        assertEquals(20, (int) result.getInteger("limit"));
+        assertEquals(0, (int) result.getInteger("offset"));
+    }
+
+    @Test
+    void getManagerCareerSegments_pagination_offsetSkipsSegments() throws Exception {
+        long managerId = insertManager("Career Page Mgr", "CPCorp", "Title");
+        String userA = insertUser("auth0|cp-a", "CpUserA");
+        String userB = insertUser("auth0|cp-b", "CpUserB");
+
+        await(service.createReview(userA, managerId, validBody("CorpA", "RoleA", "2021-01", "2022-06"), null));
+        await(service.createReview(userB, managerId, validBody("CorpB", "RoleB", "2022-07", "2023-12"), null));
+
+        // Offset 0, limit 1 → first segment only
+        io.vertx.core.json.JsonObject page1 =
+            (io.vertx.core.json.JsonObject) await(service.getManagerCareerSegments(managerId, 1, 0));
+        assertEquals(1, page1.getJsonArray("data").size());
+        assertEquals(2L, (long) page1.getLong("total"));
+
+        // Offset 1, limit 1 → second segment
+        io.vertx.core.json.JsonObject page2 =
+            (io.vertx.core.json.JsonObject) await(service.getManagerCareerSegments(managerId, 1, 1));
+        assertEquals(1, page2.getJsonArray("data").size());
+        assertEquals(2L, (long) page2.getLong("total"));
+    }
+
+    @Test
+    void getManagerCareerSegments_noReviews_returnsEmptyWithZeroTotal() throws Exception {
+        long managerId = insertManager("Empty Career Mgr", "EmptyCorp", "Title");
+
+        io.vertx.core.json.JsonObject result =
+            (io.vertx.core.json.JsonObject) await(service.getManagerCareerSegments(managerId, 20, 0));
+        assertNotNull(result);
+        assertEquals(0L, (long) result.getLong("total"));
+        assertEquals(0, result.getJsonArray("data").size());
     }
 
     private static ServiceException assertServiceException(Future<?> future) {

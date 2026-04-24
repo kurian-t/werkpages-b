@@ -24,6 +24,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
+import java.util.function.Function;
 
 /**
  * Business logic for managers and their reviews.
@@ -44,22 +45,31 @@ public class ManagerService {
         "perceived_professional_demeanor", "overall_working_experience"
     };
 
-    private final ManagerRepository managerRepo;
-    private final ReviewRepository  reviewRepo;
-    private final UserRepository    userRepo;
-    private final EditRepository    editRepo;
-    private final ReportRepository  reportRepo;
-    private final SqlClient         db; // needed for transactions
+    private final ManagerRepository          managerRepo;
+    private final ReviewRepository           reviewRepo;
+    private final UserRepository             userRepo;
+    private final EditRepository             editRepo;
+    private final ReportRepository           reportRepo;
+    private final SqlClient                  db; // needed for transactions
+    private final Function<String, String>   logoResolver;
 
     public ManagerService(ManagerRepository managerRepo, ReviewRepository reviewRepo,
                           UserRepository userRepo, EditRepository editRepo,
                           ReportRepository reportRepo, SqlClient db) {
-        this.managerRepo = managerRepo;
-        this.reviewRepo  = reviewRepo;
-        this.userRepo    = userRepo;
-        this.editRepo    = editRepo;
-        this.reportRepo  = reportRepo;
-        this.db          = db;
+        this(managerRepo, reviewRepo, userRepo, editRepo, reportRepo, db, company -> null);
+    }
+
+    public ManagerService(ManagerRepository managerRepo, ReviewRepository reviewRepo,
+                          UserRepository userRepo, EditRepository editRepo,
+                          ReportRepository reportRepo, SqlClient db,
+                          Function<String, String> logoResolver) {
+        this.managerRepo  = managerRepo;
+        this.reviewRepo   = reviewRepo;
+        this.userRepo     = userRepo;
+        this.editRepo     = editRepo;
+        this.reportRepo   = reportRepo;
+        this.db           = db;
+        this.logoResolver = logoResolver;
     }
 
     // ── GET managers list ─────────────────────────────────────────────────────
@@ -76,6 +86,9 @@ public class ManagerService {
 
         if (searchPattern != null && search.trim().length() > 100) {
             return Future.failedFuture(ServiceException.badRequest("Search query too long"));
+        }
+        if (companyPattern != null && company.trim().length() > 100) {
+            return Future.failedFuture(ServiceException.badRequest("Company filter too long"));
         }
 
         Future<Long>         totalFuture = managerRepo.count(searchPattern, companyPattern);
@@ -113,8 +126,11 @@ public class ManagerService {
                 if (opt.isEmpty()) return Future.failedFuture(ServiceException.notFound("Manager not found"));
                 Row row = opt.get();
                 String approvalStatus = row.getString("approval_status");
-                if ("pending_approval".equals(approvalStatus) || "rejected".equals(approvalStatus)) {
+                if ("pending_approval".equals(approvalStatus)) {
                     return enforceSubmitterAccess(row, auth0Id);
+                }
+                if ("rejected".equals(approvalStatus)) {
+                    return Future.failedFuture(ServiceException.notFound("Manager not found"));
                 }
                 return Future.succeededFuture(row);
             });
@@ -637,13 +653,23 @@ public class ManagerService {
                         .compose(currentResult -> {
                             var it = currentResult.iterator();
                             Row mostCurrent = it.hasNext() ? it.next() : null;
-                            if (mostCurrent != null && newId.equals(mostCurrent.getUUID("id"))) {
-                                return conn.preparedQuery(
-                                        "UPDATE managers SET updated_at = now(), company = $1, title = $2, company_logo_url = $3 WHERE id = $4")
-                                    .execute(Tuple.of(managerCompany, managerTitle, resolvedLogoUrl, managerId))
-                                    .map(ignored -> reviewRow);
-                            }
-                            return Future.succeededFuture(reviewRow);
+                            if (mostCurrent == null) return Future.succeededFuture(reviewRow);
+                            // Always sync the manager's company/title/logo from whatever
+                            // the true most-current review is — this handles the case where a
+                            // replace pushes the new review's dates earlier than another review.
+                            String currentCompany = newId.equals(mostCurrent.getUUID("id"))
+                                ? managerCompany
+                                : mostCurrent.getString("manager_company");
+                            String currentTitle = newId.equals(mostCurrent.getUUID("id"))
+                                ? managerTitle
+                                : mostCurrent.getString("manager_title");
+                            String currentLogo = newId.equals(mostCurrent.getUUID("id"))
+                                ? resolvedLogoUrl
+                                : logoResolver.apply(currentCompany);
+                            return conn.preparedQuery(
+                                    "UPDATE managers SET updated_at = now(), company = $1, title = $2, company_logo_url = $3 WHERE id = $4")
+                                .execute(Tuple.of(currentCompany, currentTitle, currentLogo, managerId))
+                                .map(ignored -> reviewRow);
                         });
                 })
         ).onSuccess(row -> managerRepo.recalculateInBackground(managerId));
@@ -672,43 +698,53 @@ public class ManagerService {
 
     // ── GET manager career segments ───────────────────────────────────────────
 
-    public Future<JsonObject> getManagerCareerSegments(long managerId) {
-        return reviewRepo.findCareerSegmentsByManager(managerId)
-            .map(rows -> {
-                JsonArray segments = new JsonArray();
-                for (Row row : rows) {
-                    boolean isCurrent   = Boolean.TRUE.equals(row.getBoolean("is_current"));
-                    LocalDate endRaw    = row.getLocalDate("end_date");
-                    LocalDate startRaw  = row.getLocalDate("start_date");
+    public Future<JsonObject> getManagerCareerSegments(long managerId, int limit, int offset) {
+        int effectiveLimit  = Math.min(Math.max(limit, 1), 50);
+        int effectiveOffset = Math.max(offset, 0);
+        return Future.all(
+            reviewRepo.countCareerSegmentsByManager(managerId),
+            reviewRepo.findCareerSegmentsByManager(managerId, effectiveLimit, effectiveOffset)
+        ).map(cf -> {
+            long total = cf.resultAt(0);
+            RowSet<Row> rows = cf.resultAt(1);
+            JsonArray segments = new JsonArray();
+            for (Row row : rows) {
+                boolean isCurrent   = Boolean.TRUE.equals(row.getBoolean("is_current"));
+                LocalDate endRaw    = row.getLocalDate("end_date");
+                LocalDate startRaw  = row.getLocalDate("start_date");
 
-                    JsonObject categoryAverages = new JsonObject()
-                        .put("Communication Style",               r1(row.getBigDecimal("communication_style")))
-                        .put("Perceived Approachability",         r1(row.getBigDecimal("perceived_approachability")))
-                        .put("Perceived Clarity of Expectations", r1(row.getBigDecimal("perceived_clarity_of_expectations")))
-                        .put("Feedback Style",                    r1(row.getBigDecimal("feedback_style")))
-                        .put("Perceived Supportiveness",          r1(row.getBigDecimal("perceived_supportiveness")))
-                        .put("Decision Making Style",             r1(row.getBigDecimal("decision_making_style")))
-                        .put("Organization and Planning Style",   r1(row.getBigDecimal("organization_and_planning_style")))
-                        .put("Delegation Style",                  r1(row.getBigDecimal("delegation_style")))
-                        .put("Perceived Professional Demeanor",   r1(row.getBigDecimal("perceived_professional_demeanor")))
-                        .put("Overall Working Experience",        r1(row.getBigDecimal("overall_working_experience")));
+                JsonObject categoryAverages = new JsonObject()
+                    .put("Communication Style",               r1(row.getBigDecimal("communication_style")))
+                    .put("Perceived Approachability",         r1(row.getBigDecimal("perceived_approachability")))
+                    .put("Perceived Clarity of Expectations", r1(row.getBigDecimal("perceived_clarity_of_expectations")))
+                    .put("Feedback Style",                    r1(row.getBigDecimal("feedback_style")))
+                    .put("Perceived Supportiveness",          r1(row.getBigDecimal("perceived_supportiveness")))
+                    .put("Decision Making Style",             r1(row.getBigDecimal("decision_making_style")))
+                    .put("Organization and Planning Style",   r1(row.getBigDecimal("organization_and_planning_style")))
+                    .put("Delegation Style",                  r1(row.getBigDecimal("delegation_style")))
+                    .put("Perceived Professional Demeanor",   r1(row.getBigDecimal("perceived_professional_demeanor")))
+                    .put("Overall Working Experience",        r1(row.getBigDecimal("overall_working_experience")));
 
-                    LocalDate mrStart = row.getLocalDate("manager_role_start");
-                    LocalDate mrEnd   = row.getLocalDate("manager_role_end");
-                    segments.add(new JsonObject()
-                        .put("company",           row.getString("company"))
-                        .put("role",              row.getString("role"))
-                        .put("startDate",         startRaw  != null ? startRaw.toString() : null)
-                        .put("endDate",           isCurrent ? null : (endRaw != null ? endRaw.toString() : null))
-                        .put("isCurrent",         isCurrent)
-                        .put("averageRating",     r1(row.getBigDecimal("avg_rating")))
-                        .put("reviewCount",       row.getLong("review_count").intValue())
-                        .put("categoryAverages",  categoryAverages)
-                        .put("managerRoleStart",  mrStart != null ? mrStart.toString() : null)
-                        .put("managerRoleEnd",    mrEnd   != null ? mrEnd.toString()   : null));
-                }
-                return new JsonObject().put("data", segments);
-            });
+                LocalDate mrStart = row.getLocalDate("manager_role_start");
+                LocalDate mrEnd   = row.getLocalDate("manager_role_end");
+                segments.add(new JsonObject()
+                    .put("company",           row.getString("company"))
+                    .put("role",              row.getString("role"))
+                    .put("startDate",         startRaw  != null ? startRaw.toString() : null)
+                    .put("endDate",           isCurrent ? null : (endRaw != null ? endRaw.toString() : null))
+                    .put("isCurrent",         isCurrent)
+                    .put("averageRating",     r1(row.getBigDecimal("avg_rating")))
+                    .put("reviewCount",       row.getLong("review_count").intValue())
+                    .put("categoryAverages",  categoryAverages)
+                    .put("managerRoleStart",  mrStart != null ? mrStart.toString() : null)
+                    .put("managerRoleEnd",    mrEnd   != null ? mrEnd.toString()   : null));
+            }
+            return new JsonObject()
+                .put("data",   segments)
+                .put("total",  total)
+                .put("limit",  effectiveLimit)
+                .put("offset", effectiveOffset);
+        });
     }
 
     private static double r1(BigDecimal v) {
@@ -875,6 +911,12 @@ public class ManagerService {
                     author = dbUsername;
                 }
 
+                // Validate body synchronously before touching the DB — if the body is
+                // invalid we must reject before deleting, otherwise the old review would
+                // be permanently lost with nothing replacing it.
+                ServiceException syncError = validateBodySync(body);
+                if (syncError != null) return Future.failedFuture(syncError);
+
                 return reviewRepo.findOwnerUserId(oldReviewId, managerId)
                     .compose(ownerOpt -> {
                         if (ownerOpt.isEmpty()) return Future.failedFuture(ServiceException.notFound("Review not found"));
@@ -886,18 +928,76 @@ public class ManagerService {
             });
     }
 
+    /**
+     * Runs all synchronous (non-DB) field validation on a review body.
+     * Returns a {@link ServiceException} if invalid, or {@code null} if valid.
+     * Used by replaceReview to guard against deleting a review before validation passes.
+     */
+    private ServiceException validateBodySync(JsonObject body) {
+        if (body == null) return ServiceException.badRequest("Missing request body");
+        Double overallRating  = body.getDouble("overallRating");
+        JsonObject ratings    = body.getJsonObject("ratings");
+        String managerCompany = body.getString("managerCompany");
+        String managerTitle   = body.getString("managerTitle");
+        String text           = body.getString("text");
+        LocalDate workedFrom  = parseYearMonth(body.getString("workedFrom"));
+        LocalDate workedUntil = parseYearMonth(body.getString("workedUntil"));
+        LocalDate managerRoleStart = parseYearMonth(body.getString("managerRoleStart"));
+        LocalDate managerRoleEnd   = parseYearMonth(body.getString("managerRoleEnd"));
+        LocalDate today = LocalDate.now();
+
+        if (managerRoleStart != null) {
+            if (managerRoleStart.isAfter(today)) return ServiceException.badRequest("Manager role start date cannot be in the future");
+            if (managerRoleEnd != null) {
+                if (managerRoleEnd.isAfter(today)) return ServiceException.badRequest("Manager role end date cannot be in the future");
+                if (managerRoleEnd.isBefore(managerRoleStart)) return ServiceException.badRequest("Manager role end date must be on or after the start date");
+            }
+        }
+        if (workedFrom == null) return ServiceException.badRequest("Your start date working with this manager is required");
+        if (workedFrom.isAfter(today)) return ServiceException.badRequest("Your 'from' date cannot be in the future");
+        if (workedUntil != null && workedUntil.isAfter(today)) return ServiceException.badRequest("Your 'to' date cannot be in the future");
+        if (workedUntil != null && workedFrom.isAfter(workedUntil)) return ServiceException.badRequest("Your 'from' date cannot be later than your 'to' date");
+        if (managerRoleStart != null) {
+            if (workedFrom.isBefore(managerRoleStart)) return ServiceException.badRequest("Your start date cannot be before the manager started this role (" + formatYM(managerRoleStart) + ")");
+            if (managerRoleEnd != null && workedFrom.isAfter(managerRoleEnd)) return ServiceException.badRequest("Your start date cannot be after the manager left this role (" + formatYM(managerRoleEnd) + ")");
+            if (managerRoleEnd != null && workedUntil != null && workedUntil.isAfter(managerRoleEnd)) return ServiceException.badRequest("Your end date cannot be after the manager left this role (" + formatYM(managerRoleEnd) + ")");
+        }
+        if (overallRating == null || ratings == null || isBlank(managerCompany) || isBlank(managerTitle)) return ServiceException.badRequest("Missing required fields");
+        if (managerCompany.length() > 100) return ServiceException.badRequest("Manager company must be at most 100 characters");
+        if (managerTitle.length()   > 100) return ServiceException.badRequest("Manager title must be at most 100 characters");
+        if (text != null && text.length() > 2000) return ServiceException.badRequest("Review text must be at most 2000 characters");
+        if (!isValidRating(overallRating)) return ServiceException.badRequest("Overall rating must be between 1 and 5");
+        for (int i = 0; i < RATING_KEYS.length; i++) {
+            Double v = getRating(ratings, i);
+            if (!isValidRating(v)) return ServiceException.badRequest("Rating for '" + RATING_KEYS[i] + "' must be between 1 and 5");
+        }
+        return null;
+    }
+
     // ── GET my reviews ────────────────────────────────────────────────────────
 
-    public Future<JsonObject> getMyReviews(String auth0Id) {
+    public Future<JsonObject> getMyReviews(String auth0Id, int limit, int offset) {
+        int effectiveLimit  = Math.min(Math.max(limit, 1), 50);
+        int effectiveOffset = Math.max(offset, 0);
         return userRepo.findIdByAuth0Id(auth0Id)
             .compose(opt -> {
                 if (opt.isEmpty()) return Future.failedFuture(ServiceException.notFound("User not found"));
-                return reviewRepo.findByUser(opt.get());
+                UUID userId = opt.get();
+                return Future.all(
+                    reviewRepo.countByUser(userId),
+                    reviewRepo.findByUser(userId, effectiveLimit, effectiveOffset)
+                );
             })
-            .map(rows -> {
+            .map(cf -> {
+                long total = cf.resultAt(0);
+                RowSet<Row> rows = cf.resultAt(1);
                 JsonArray data = new JsonArray();
                 for (Row row : rows) data.add(buildMyReviewJson(row));
-                return new JsonObject().put("data", data);
+                return new JsonObject()
+                    .put("data",   data)
+                    .put("total",  total)
+                    .put("limit",  effectiveLimit)
+                    .put("offset", effectiveOffset);
             });
     }
 

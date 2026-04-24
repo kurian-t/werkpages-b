@@ -175,45 +175,51 @@ class AdminServiceTest {
     }
 
     @Test
-    void rejectPendingManager_withReason_includesReasonInNotification() throws Exception {
+    void rejectPendingManager_withReason_includesNameCompanyAndReasonInNotification() throws Exception {
         UUID submittedBy = UUID.randomUUID();
-        Row rejected = rejectedManagerRow(MANAGER_ID, submittedBy, "Carol White");
+        Row rejected = rejectedManagerRow(MANAGER_ID, submittedBy, "Carol White", "Acme Corp");
         when(managerRepo.reject(MANAGER_ID))
             .thenReturn(Future.succeededFuture(Optional.of(rejected)));
 
         JsonObject result = await(service.rejectPendingManager(ADMIN_AUTH0_ID, MANAGER_ID, "Duplicate profile"));
         assertTrue(result.getBoolean("success"));
         verify(notifRepo).sendAsync(eq(submittedBy), eq("manager_rejected"), anyString(),
-            argThat(msg -> msg.contains("Reason: Duplicate profile")));
+            argThat(msg -> msg.contains("Carol White")
+                        && msg.contains("Acme Corp")
+                        && msg.contains("Reason: Duplicate profile")));
     }
 
     @Test
-    void rejectPendingManager_nullReason_noReasonInNotification() throws Exception {
+    void rejectPendingManager_nullReason_messageContainsNameAndCompanyButNoReason() throws Exception {
         UUID submittedBy = UUID.randomUUID();
-        Row rejected = rejectedManagerRow(MANAGER_ID, submittedBy, "Carol White");
+        Row rejected = rejectedManagerRow(MANAGER_ID, submittedBy, "Carol White", "Acme Corp");
         when(managerRepo.reject(MANAGER_ID))
             .thenReturn(Future.succeededFuture(Optional.of(rejected)));
 
         await(service.rejectPendingManager(ADMIN_AUTH0_ID, MANAGER_ID, null));
         verify(notifRepo).sendAsync(eq(submittedBy), eq("manager_rejected"), anyString(),
-            argThat(msg -> !msg.contains("Reason:")));
+            argThat(msg -> msg.contains("Carol White")
+                        && msg.contains("Acme Corp")
+                        && !msg.contains("Reason:")));
     }
 
     @Test
-    void rejectPendingManager_blankReason_noReasonInNotification() throws Exception {
+    void rejectPendingManager_blankReason_messageContainsNameAndCompanyButNoReason() throws Exception {
         UUID submittedBy = UUID.randomUUID();
-        Row rejected = rejectedManagerRow(MANAGER_ID, submittedBy, "Carol White");
+        Row rejected = rejectedManagerRow(MANAGER_ID, submittedBy, "Carol White", "Acme Corp");
         when(managerRepo.reject(MANAGER_ID))
             .thenReturn(Future.succeededFuture(Optional.of(rejected)));
 
         await(service.rejectPendingManager(ADMIN_AUTH0_ID, MANAGER_ID, "   "));
         verify(notifRepo).sendAsync(eq(submittedBy), eq("manager_rejected"), anyString(),
-            argThat(msg -> !msg.contains("Reason:")));
+            argThat(msg -> msg.contains("Carol White")
+                        && msg.contains("Acme Corp")
+                        && !msg.contains("Reason:")));
     }
 
     @Test
     void rejectPendingManager_nullSubmittedBy_noNotification() throws Exception {
-        Row rejected = rejectedManagerRow(MANAGER_ID, null, "Dave Brown");
+        Row rejected = rejectedManagerRow(MANAGER_ID, null, "Dave Brown", "Some Corp");
         when(managerRepo.reject(MANAGER_ID))
             .thenReturn(Future.succeededFuture(Optional.of(rejected)));
 
@@ -666,11 +672,12 @@ class AdminServiceTest {
         return row;
     }
 
-    private static Row rejectedManagerRow(long id, UUID submittedBy, String name) {
+    private static Row rejectedManagerRow(long id, UUID submittedBy, String name, String company) {
         Row row = mock(Row.class);
         when(row.getLong("id")).thenReturn(id);
         when(row.getUUID("submitted_by")).thenReturn(submittedBy);
         when(row.getString("name")).thenReturn(name);
+        when(row.getString("company")).thenReturn(company);
         return row;
     }
 

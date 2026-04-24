@@ -117,8 +117,9 @@ public class AdminService {
                 Row row = opt.get();
                 UUID submittedBy = row.getUUID("submitted_by");
                 String managerName = row.getString("name");
+                String managerCompany = row.getString("company");
                 if (submittedBy != null) {
-                    String msg = "Your submitted manager profile for " + managerName + " was not approved.";
+                    String msg = "Your submitted manager profile for " + managerName + " at " + managerCompany + " was not approved.";
                     if (reason != null && !reason.isBlank()) msg += " Reason: " + reason.trim();
                     notifRepo.sendAsync(submittedBy, "manager_rejected", "Manager Not Approved", msg);
                 }

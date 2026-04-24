@@ -382,14 +382,17 @@ class ManagerServiceValidationTest {
     }
 
     @Test
-    void happyPath_managerUpdateSkippedWhenNotMostCurrent() throws Exception {
+    void happyPath_differentMostCurrentReview_managerUpdatedWithCurrentData() throws Exception {
         SqlConnection conn  = mock(SqlConnection.class);
         UUID newId          = UUID.randomUUID();
         UUID newerReviewId  = UUID.randomUUID(); // a newer review already exists
 
         Row insertedRow = insertedReviewRow(newId, MANAGER_ID, "Acme Corp", "Engineering Manager");
-        Row currentRow  = mostCurrentRow(newerReviewId); // different ID — our review is NOT most current
+        // The most-current review belongs to someone else — different company/title
+        Row currentRow  = mostCurrentRow(newerReviewId, "Newer Corp", "Senior Lead");
         PreparedQuery<RowSet<Row>> updatePq = mock(PreparedQuery.class);
+        RowSet<Row> updateRs = rowSetOf();
+        when(updatePq.execute(any(Tuple.class))).thenReturn(Future.succeededFuture(updateRs));
 
         stubConnInsert(conn, insertedRow);
         stubConnSelectCurrent(conn, currentRow);
@@ -402,7 +405,8 @@ class ManagerServiceValidationTest {
 
         await(service.createReview(AUTH0_ID, MANAGER_ID, validBody(), "https://logo.test"));
 
-        verify(updatePq, never()).execute(any(Tuple.class));
+        // Manager profile is always synced from the most-current review — even if it's not the new one
+        verify(updatePq).execute(any(Tuple.class));
     }
 
     @Test
@@ -489,8 +493,14 @@ class ManagerServiceValidationTest {
     }
 
     private static Row mostCurrentRow(UUID id) {
+        return mostCurrentRow(id, "Acme Corp", "Engineering Manager");
+    }
+
+    private static Row mostCurrentRow(UUID id, String company, String title) {
         Row row = mock(Row.class);
         when(row.getUUID("id")).thenReturn(id);
+        when(row.getString("manager_company")).thenReturn(company);
+        when(row.getString("manager_title")).thenReturn(title);
         return row;
     }
 
@@ -1212,7 +1222,7 @@ class ManagerServiceValidationTest {
     @Test
     void getMyReviews_userNotFound_returns404() {
         when(userRepo.findIdByAuth0Id(AUTH0_ID)).thenReturn(Future.succeededFuture(Optional.empty()));
-        ServiceException ex = assertServiceFails(service.getMyReviews(AUTH0_ID));
+        ServiceException ex = assertServiceFails(service.getMyReviews(AUTH0_ID, 50, 0));
         assertEquals(404, ex.getStatusCode());
     }
 
@@ -1220,11 +1230,40 @@ class ManagerServiceValidationTest {
     void getMyReviews_noReviews_returnsEmptyArray() throws Exception {
         RowSet<Row> emptyRs = rowSetOf(); // pre-create before when/thenReturn
         when(userRepo.findIdByAuth0Id(AUTH0_ID)).thenReturn(Future.succeededFuture(Optional.of(USER_ID)));
-        when(reviewRepo.findByUser(USER_ID)).thenReturn(Future.succeededFuture(emptyRs));
+        when(reviewRepo.findByUser(eq(USER_ID), anyInt(), anyInt())).thenReturn(Future.succeededFuture(emptyRs));
+        when(reviewRepo.countByUser(USER_ID)).thenReturn(Future.succeededFuture(0L));
 
-        JsonObject result = (JsonObject) await(service.getMyReviews(AUTH0_ID));
+        JsonObject result = (JsonObject) await(service.getMyReviews(AUTH0_ID, 50, 0));
         assertNotNull(result);
         assertEquals(0, result.getJsonArray("data").size());
+        assertEquals(0, (int) result.getInteger("total"));
+    }
+
+    @Test
+    void getMyReviews_returnsPaginationFields() throws Exception {
+        RowSet<Row> emptyRs = rowSetOf();
+        when(userRepo.findIdByAuth0Id(AUTH0_ID)).thenReturn(Future.succeededFuture(Optional.of(USER_ID)));
+        when(reviewRepo.findByUser(eq(USER_ID), anyInt(), anyInt())).thenReturn(Future.succeededFuture(emptyRs));
+        when(reviewRepo.countByUser(USER_ID)).thenReturn(Future.succeededFuture(3L));
+
+        JsonObject result = (JsonObject) await(service.getMyReviews(AUTH0_ID, 50, 0));
+        assertNotNull(result);
+        assertEquals(3, (long) result.getLong("total"));
+        assertEquals(50, (int) result.getInteger("limit"));
+        assertEquals(0, (int) result.getInteger("offset"));
+    }
+
+    @Test
+    void getMyReviews_limitCappedAt50() throws Exception {
+        RowSet<Row> emptyRs = rowSetOf();
+        when(userRepo.findIdByAuth0Id(AUTH0_ID)).thenReturn(Future.succeededFuture(Optional.of(USER_ID)));
+        when(reviewRepo.findByUser(eq(USER_ID), eq(50), eq(0))).thenReturn(Future.succeededFuture(emptyRs));
+        when(reviewRepo.countByUser(USER_ID)).thenReturn(Future.succeededFuture(0L));
+
+        // Requesting 200 should be silently capped to 50
+        JsonObject result = (JsonObject) await(service.getMyReviews(AUTH0_ID, 200, 0));
+        assertNotNull(result);
+        assertEquals(50, (int) result.getInteger("limit"));
     }
 
     // ══════════════════════════════════════════════════════════════════════════
@@ -1305,15 +1344,70 @@ class ManagerServiceValidationTest {
     }
 
     @Test
-    void getManagerById_rejected_submitterAllowed() throws Exception {
+    void getManagerById_rejected_submitterReturns404() {
         Row managerRow = mock(Row.class);
         when(managerRow.getString("approval_status")).thenReturn("rejected");
         when(managerRow.getUUID("submitted_by")).thenReturn(USER_ID);
         when(managerRepo.findById(MANAGER_ID)).thenReturn(Future.succeededFuture(Optional.of(managerRow)));
-        when(userRepo.findIdByAuth0Id(AUTH0_ID)).thenReturn(Future.succeededFuture(Optional.of(USER_ID)));
 
-        Row result = await(service.getManagerById(MANAGER_ID, AUTH0_ID));
+        ServiceException ex = assertServiceFails(service.getManagerById(MANAGER_ID, AUTH0_ID));
+        assertEquals(404, ex.getStatusCode());
+    }
+
+    @Test
+    void getManagerById_rejected_anonymousReturns404() {
+        Row managerRow = mock(Row.class);
+        when(managerRow.getString("approval_status")).thenReturn("rejected");
+        when(managerRepo.findById(MANAGER_ID)).thenReturn(Future.succeededFuture(Optional.of(managerRow)));
+
+        ServiceException ex = assertServiceFails(service.getManagerById(MANAGER_ID, null));
+        assertEquals(404, ex.getStatusCode());
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // getManagerCareerSegments
+    // ══════════════════════════════════════════════════════════════════════════
+
+    @Test
+    void getManagerCareerSegments_returnsPaginationFields() throws Exception {
+        RowSet<Row> emptyRs = rowSetOf();
+        when(reviewRepo.findCareerSegmentsByManager(MANAGER_ID, 20, 0))
+            .thenReturn(Future.succeededFuture(emptyRs));
+        when(reviewRepo.countCareerSegmentsByManager(MANAGER_ID))
+            .thenReturn(Future.succeededFuture(5L));
+
+        JsonObject result = (JsonObject) await(service.getManagerCareerSegments(MANAGER_ID, 20, 0));
         assertNotNull(result);
+        assertNotNull(result.getJsonArray("data"));
+        assertEquals(5L, (long) result.getLong("total"));
+        assertEquals(20, (int) result.getInteger("limit"));
+        assertEquals(0, (int) result.getInteger("offset"));
+    }
+
+    @Test
+    void getManagerCareerSegments_limitCappedAt50() throws Exception {
+        RowSet<Row> emptyRs = rowSetOf();
+        when(reviewRepo.findCareerSegmentsByManager(eq(MANAGER_ID), eq(50), eq(0)))
+            .thenReturn(Future.succeededFuture(emptyRs));
+        when(reviewRepo.countCareerSegmentsByManager(MANAGER_ID))
+            .thenReturn(Future.succeededFuture(0L));
+
+        JsonObject result = (JsonObject) await(service.getManagerCareerSegments(MANAGER_ID, 999, 0));
+        assertNotNull(result);
+        assertEquals(50, (int) result.getInteger("limit"));
+    }
+
+    @Test
+    void getManagerCareerSegments_offsetNormalisedToZeroWhenNegative() throws Exception {
+        RowSet<Row> emptyRs = rowSetOf();
+        when(reviewRepo.findCareerSegmentsByManager(eq(MANAGER_ID), anyInt(), eq(0)))
+            .thenReturn(Future.succeededFuture(emptyRs));
+        when(reviewRepo.countCareerSegmentsByManager(MANAGER_ID))
+            .thenReturn(Future.succeededFuture(0L));
+
+        JsonObject result = (JsonObject) await(service.getManagerCareerSegments(MANAGER_ID, 20, -5));
+        assertNotNull(result);
+        assertEquals(0, (int) result.getInteger("offset"));
     }
 
     // ══════════════════════════════════════════════════════════════════════════
