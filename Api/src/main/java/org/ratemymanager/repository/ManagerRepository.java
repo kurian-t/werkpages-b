@@ -70,7 +70,8 @@ public class ManagerRepository {
             SELECT
                 m.id, m.name, m.company, m.title, m.image, m.overall_rating,
                 m.reviews_count, m.bio, m.status, m.approval_status,
-                m.category_averages, m.linkedin_url, m.company_logo_url, m.created_at, m.submitted_by,
+                m.category_averages, m.linkedin_url, m.company_logo_url, m.created_at,
+                m.submitted_by, m.external_id,
                 COALESCE(
                     json_agg(json_build_object(
                         'company', ch.company, 'title', ch.title,
@@ -131,7 +132,7 @@ public class ManagerRepository {
             case "name"    -> "ORDER BY m.name ASC";
             // Real profiles (submitted_by IS NOT NULL) first; pseudo-random within each group
             // via MD5 hash of the ID — deterministic so pagination stays stable
-            default        -> "ORDER BY CASE WHEN m.submitted_by IS NOT NULL THEN 0 ELSE 1 END, MD5(CAST(m.id AS text))";
+            default        -> "ORDER BY CASE WHEN m.submitted_by IS NOT NULL AND m.external_id IS NULL THEN 0 ELSE 1 END, MD5(CAST(m.id AS text))";
         };
     }
 

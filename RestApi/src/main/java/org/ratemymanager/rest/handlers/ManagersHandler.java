@@ -77,7 +77,7 @@ public class ManagersHandler {
                     .put("companyLogoUrl", logoUrl)
                     .put("createdAt", row.getOffsetDateTime("created_at").toString())
                     .put("careerHistory", row.getJsonArray("career_history"))
-                    .put("community", row.getValue("submitted_by") != null)
+                    .put("community", row.getValue("submitted_by") != null && row.getString("external_id") == null)
                 );
             }
             ctx.response().putHeader("Content-Type", "application/json")
