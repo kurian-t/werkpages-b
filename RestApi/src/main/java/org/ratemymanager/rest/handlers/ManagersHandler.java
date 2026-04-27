@@ -33,6 +33,7 @@ public class ManagersHandler {
         int offset = parseIntParam(ctx.queryParam("offset").stream().findFirst().orElse("0"),  0,  0, Integer.MAX_VALUE);
         String search  = ctx.queryParam("search").stream().findFirst().orElse(null);
         String company = ctx.queryParam("company").stream().findFirst().orElse(null);
+        String sortBy  = ctx.queryParam("sortBy").stream().findFirst().orElse(null);
 
         int effectiveLimit  = Math.min(limit, 100);
         int effectiveOffset = Math.max(offset, 0);
@@ -50,7 +51,7 @@ public class ManagersHandler {
         String companyPattern = (company != null && !company.isBlank()) ? "%" + company.trim() + "%" : null;
 
         Future<Long>         totalFuture = service.countManagers(search, company);
-        Future<RowSet<Row>>  dataFuture  = service.getManagerRows(effectiveLimit, effectiveOffset, search, company);
+        Future<RowSet<Row>>  dataFuture  = service.getManagerRows(effectiveLimit, effectiveOffset, search, company, sortBy);
 
         Future.all(totalFuture, dataFuture).onComplete(ar -> {
             if (ar.failed()) { ctx.fail(ar.cause()); return; }
@@ -76,6 +77,7 @@ public class ManagersHandler {
                     .put("companyLogoUrl", logoUrl)
                     .put("createdAt", row.getOffsetDateTime("created_at").toString())
                     .put("careerHistory", row.getJsonArray("career_history"))
+                    .put("community", row.getValue("submitted_by") != null)
                 );
             }
             ctx.response().putHeader("Content-Type", "application/json")

@@ -92,7 +92,7 @@ public class ManagerService {
         }
 
         Future<Long>         totalFuture = managerRepo.count(searchPattern, companyPattern);
-        Future<RowSet<Row>>  dataFuture  = managerRepo.search(effectiveLimit, effectiveOffset, searchPattern, companyPattern);
+        Future<RowSet<Row>>  dataFuture  = managerRepo.search(effectiveLimit, effectiveOffset, searchPattern, companyPattern, null);
 
         return Future.all(totalFuture, dataFuture)
             .map(cf -> new JsonObject()
@@ -104,12 +104,12 @@ public class ManagerService {
     }
 
     /** Returns raw RowSet so the handler can resolve logos. */
-    public Future<RowSet<Row>> getManagerRows(int limit, int offset, String search, String company) {
+    public Future<RowSet<Row>> getManagerRows(int limit, int offset, String search, String company, String sortBy) {
         int effectiveLimit  = Math.min(Math.max(limit, 1), 100);
         int effectiveOffset = Math.max(offset, 0);
         String searchPattern  = (search  != null && !search.isBlank())  ? "%" + search.trim()  + "%" : null;
         String companyPattern = (company != null && !company.isBlank()) ? "%" + company.trim() + "%" : null;
-        return managerRepo.search(effectiveLimit, effectiveOffset, searchPattern, companyPattern);
+        return managerRepo.search(effectiveLimit, effectiveOffset, searchPattern, companyPattern, sortBy);
     }
 
     public Future<Long> countManagers(String search, String company) {

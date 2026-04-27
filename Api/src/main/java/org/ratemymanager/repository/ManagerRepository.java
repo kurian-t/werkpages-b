@@ -99,28 +99,40 @@ public class ManagerRepository {
             });
     }
 
-    public Future<RowSet<Row>> search(int limit, int offset, String searchPattern, String companyPattern) {
+    public Future<RowSet<Row>> search(int limit, int offset, String searchPattern, String companyPattern, String sortBy) {
         boolean hasSearch  = searchPattern  != null;
         boolean hasCompany = companyPattern != null;
+        String orderBy = buildOrderBy(sortBy);
 
         String sql;
         Tuple tuple;
 
         if (hasSearch && hasCompany) {
-            sql   = SELECT_BODY + "WHERE (m.name ILIKE $3 OR m.company ILIKE $3 OR m.title ILIKE $3) AND m.company ILIKE $4 AND m.approval_status = 'approved' GROUP BY m.id ORDER BY m.overall_rating DESC NULLS LAST, m.id ASC LIMIT $1 OFFSET $2";
+            sql   = SELECT_BODY + "WHERE (m.name ILIKE $3 OR m.company ILIKE $3 OR m.title ILIKE $3) AND m.company ILIKE $4 AND m.approval_status = 'approved' GROUP BY m.id " + orderBy + " LIMIT $1 OFFSET $2";
             tuple = Tuple.of(limit, offset, searchPattern, companyPattern);
         } else if (hasSearch) {
-            sql   = SELECT_BODY + "WHERE (m.name ILIKE $3 OR m.company ILIKE $3 OR m.title ILIKE $3) AND m.approval_status = 'approved' GROUP BY m.id ORDER BY m.overall_rating DESC NULLS LAST, m.id ASC LIMIT $1 OFFSET $2";
+            sql   = SELECT_BODY + "WHERE (m.name ILIKE $3 OR m.company ILIKE $3 OR m.title ILIKE $3) AND m.approval_status = 'approved' GROUP BY m.id " + orderBy + " LIMIT $1 OFFSET $2";
             tuple = Tuple.of(limit, offset, searchPattern);
         } else if (hasCompany) {
-            sql   = SELECT_BODY + "WHERE m.company ILIKE $3 AND m.approval_status = 'approved' GROUP BY m.id ORDER BY m.overall_rating DESC NULLS LAST, m.id ASC LIMIT $1 OFFSET $2";
+            sql   = SELECT_BODY + "WHERE m.company ILIKE $3 AND m.approval_status = 'approved' GROUP BY m.id " + orderBy + " LIMIT $1 OFFSET $2";
             tuple = Tuple.of(limit, offset, companyPattern);
         } else {
-            sql   = SELECT_BODY + "WHERE m.approval_status = 'approved' GROUP BY m.id ORDER BY m.overall_rating DESC NULLS LAST, m.id ASC LIMIT $1 OFFSET $2";
+            sql   = SELECT_BODY + "WHERE m.approval_status = 'approved' GROUP BY m.id " + orderBy + " LIMIT $1 OFFSET $2";
             tuple = Tuple.of(limit, offset);
         }
 
         return db.preparedQuery(sql).execute(tuple);
+    }
+
+    private String buildOrderBy(String sortBy) {
+        return switch (sortBy == null ? "featured" : sortBy) {
+            case "rating"  -> "ORDER BY m.overall_rating DESC NULLS LAST, m.id ASC";
+            case "reviews" -> "ORDER BY m.reviews_count DESC, m.id ASC";
+            case "name"    -> "ORDER BY m.name ASC";
+            // Real profiles (submitted_by IS NOT NULL) first; pseudo-random within each group
+            // via MD5 hash of the ID — deterministic so pagination stays stable
+            default        -> "ORDER BY CASE WHEN m.submitted_by IS NOT NULL THEN 0 ELSE 1 END, MD5(CAST(m.id AS text))";
+        };
     }
 
     public Future<Long> count(String searchPattern, String companyPattern) {
