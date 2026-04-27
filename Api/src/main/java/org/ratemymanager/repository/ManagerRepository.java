@@ -70,7 +70,7 @@ public class ManagerRepository {
             SELECT
                 m.id, m.name, m.company, m.title, m.image, m.overall_rating,
                 m.reviews_count, m.bio, m.status, m.approval_status,
-                m.category_averages, m.linkedin_url, m.company_logo_url, m.created_at,
+                m.category_averages, m.linkedin_url, m.company_logo_url, m.created_at, m.submitted_by,
                 COALESCE(
                     json_agg(json_build_object(
                         'company', ch.company, 'title', ch.title,
