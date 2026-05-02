@@ -565,7 +565,9 @@ public class AuthHandler {
                 return userRepo.deleteWithReviewAnonymization(opt.get());
             })
             .onSuccess(v ->
-                ctx.response().setStatusCode(200).putHeader("Content-Type", "application/json")
+                ctx.response().setStatusCode(200)
+                    .putHeader("Set-Cookie", "auth_token=; HttpOnly; Path=/; Max-Age=0")
+                    .putHeader("Content-Type", "application/json")
                     .end(new JsonObject().put("success", true).put("message", "Account deleted and reviews anonymized").encode())
             )
             .onFailure(err -> {
