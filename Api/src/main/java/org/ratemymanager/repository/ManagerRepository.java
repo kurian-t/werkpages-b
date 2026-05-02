@@ -26,7 +26,7 @@ public class ManagerRepository {
             SELECT
                 m.id, m.name, m.company, m.title, m.image, m.overall_rating,
                 m.reviews_count, m.bio, m.status, m.approval_status,
-                m.category_averages, m.linkedin_url, m.company_logo_url,
+                m.category_averages, m.linkedin_url, m.company_logo_url, m.country,
                 m.created_at, m.submitted_by,
                 COALESCE(ch.career_history, '[]') AS career_history,
                 COALESCE(r.reviews, '[]') AS reviews
@@ -70,7 +70,7 @@ public class ManagerRepository {
             SELECT
                 m.id, m.name, m.company, m.title, m.image, m.overall_rating,
                 m.reviews_count, m.bio, m.status, m.approval_status,
-                m.category_averages, m.linkedin_url, m.company_logo_url, m.created_at,
+                m.category_averages, m.linkedin_url, m.company_logo_url, m.country, m.created_at,
                 m.submitted_by, m.external_id,
                 COALESCE(
                     json_agg(json_build_object(
@@ -193,7 +193,7 @@ public class ManagerRepository {
     public Future<RowSet<Row>> findPendingByUser(UUID userId) {
         return db.preparedQuery("""
                 SELECT id, name, company, title, image, overall_rating, reviews_count,
-                       bio, status, approval_status, linkedin_url, company_logo_url, created_at
+                       bio, status, approval_status, linkedin_url, company_logo_url, country, created_at
                 FROM managers
                 WHERE submitted_by = $1 AND approval_status IN ('pending_approval', 'rejected')
                 ORDER BY created_at DESC LIMIT 200
@@ -217,22 +217,22 @@ public class ManagerRepository {
     // ── Mutations ─────────────────────────────────────────────────────────────
 
     public Future<Row> create(String name, String company, String title, String image,
-                               String bio, String status, String linkedinUrl, String logoUrl,
-                               UUID submittedBy) {
+                               String bio, String status, String country, String linkedinUrl,
+                               String logoUrl, UUID submittedBy) {
         return db.preparedQuery("""
                 INSERT INTO managers
-                (name, company, title, image, bio, status, approval_status, linkedin_url,
+                (name, company, title, image, bio, status, approval_status, country, linkedin_url,
                  company_logo_url, overall_rating, reviews_count, category_averages, created_at, submitted_by)
-                VALUES ($1,$2,$3,$4,$5,$6,'pending_approval',$7,$8,0,0,'{}'::jsonb,now(),$9)
+                VALUES ($1,$2,$3,$4,$5,$6,'pending_approval',$7,$8,$9,0,0,'{}'::jsonb,now(),$10)
                 RETURNING *
                 """)
-            .execute(Tuple.of(name, company, title, image, bio, status, linkedinUrl, logoUrl, submittedBy))
+            .execute(Tuple.of(name, company, title, image, bio, status, country, linkedinUrl, logoUrl, submittedBy))
             .map(rows -> rows.iterator().next());
     }
 
     public Future<Optional<Row>> update(long id, String newCompany, String newTitle,
                                          String newImage, String newBio, String newStatus,
-                                         String newLinkedinUrl, String newLogoUrl) {
+                                         String newCountry, String newLinkedinUrl, String newLogoUrl) {
         StringBuilder sql = new StringBuilder("UPDATE managers SET updated_at = now()");
         List<Object> params = new ArrayList<>();
         int idx = 1;
@@ -241,6 +241,7 @@ public class ManagerRepository {
         if (newImage       != null) { sql.append(", image = $").append(idx++);             params.add(newImage); }
         if (newBio         != null) { sql.append(", bio = $").append(idx++);               params.add(newBio); }
         if (newStatus      != null) { sql.append(", status = $").append(idx++);            params.add(newStatus); }
+        if (newCountry     != null) { sql.append(", country = $").append(idx++);           params.add(newCountry); }
         if (newLinkedinUrl != null) { sql.append(", linkedin_url = $").append(idx++);      params.add(newLinkedinUrl); }
         if (newLogoUrl     != null) { sql.append(", company_logo_url = $").append(idx++);  params.add(newLogoUrl); }
         sql.append(" WHERE id = $").append(idx).append(" RETURNING *");

@@ -241,8 +241,11 @@ public class ManagerService {
         if (company.length() > 100) return Future.failedFuture(ServiceException.badRequest("Company must be at most 100 characters"));
         if (title.length() > 100)   return Future.failedFuture(ServiceException.badRequest("Title must be at most 100 characters"));
 
+        String country     = body.getString("country")     != null ? body.getString("country").trim()     : null;
         String bio         = body.getString("bio")         != null ? body.getString("bio").trim()         : null;
         String linkedinUrl = body.getString("linkedinUrl") != null ? body.getString("linkedinUrl").trim() : null;
+        if (isBlank(country)) return Future.failedFuture(ServiceException.badRequest("Country is required"));
+        if (country.length() > 100) return Future.failedFuture(ServiceException.badRequest("Country must be at most 100 characters"));
         if (bio != null && bio.length() > 1000) return Future.failedFuture(ServiceException.badRequest("Bio must be at most 1000 characters"));
         if (!isBlank(linkedinUrl)) {
             if (linkedinUrl.length() > 500) return Future.failedFuture(ServiceException.badRequest("LinkedIn URL must be at most 500 characters"));
@@ -308,6 +311,7 @@ public class ManagerService {
         final String   fReviewAuthorType     = reviewBody.getString("authorType", "username");
         final String   fReviewClientAuthor   = reviewBody.getString("author", "").trim();
         final LocalDate fEndDate      = endDateLocal;
+        final String   fCountry       = country;
         final String   fBio           = bio;
         final String   fLinkedinUrl   = linkedinUrl;
         final String   fReviewText    = reviewText;
@@ -337,12 +341,12 @@ public class ManagerService {
                         return ((Pool) db).withTransaction(conn ->
                             conn.preparedQuery("""
                                 INSERT INTO managers
-                                (name, company, title, image, bio, status, approval_status, linkedin_url,
+                                (name, company, title, image, bio, status, approval_status, country, linkedin_url,
                                  company_logo_url, overall_rating, reviews_count, category_averages, created_at, submitted_by)
-                                VALUES ($1,$2,$3,$4,$5,$6,'pending_approval',$7,$8,0,0,'{}'::jsonb,now(),$9)
+                                VALUES ($1,$2,$3,$4,$5,$6,'pending_approval',$7,$8,$9,0,0,'{}'::jsonb,now(),$10)
                                 RETURNING *
                                 """)
-                                .execute(Tuple.of(name, company, title, image, fBio, fStatus, fLinkedinUrl, resolvedLogoUrl, userId))
+                                .execute(Tuple.of(name, company, title, image, fBio, fStatus, fCountry, fLinkedinUrl, resolvedLogoUrl, userId))
                                 .compose(managerResult -> {
                                     Row managerRow = managerResult.iterator().next();
                                     long managerId = managerRow.getLong("id");
@@ -385,11 +389,12 @@ public class ManagerService {
         String newImage       = body.getString("image");
         String newBio         = body.getString("bio");
         String newStatus      = body.getString("status");
+        String newCountry     = body.getString("country");
         String newLinkedinUrl = body.getString("linkedinUrl");
         String newLogoUrl     = body.getString("resolvedLogoUrl");
         String startDateStr   = body.getString("startDate");
 
-        if (newCompany == null && newTitle == null && newImage == null && newBio == null && newStatus == null && newLinkedinUrl == null) {
+        if (newCompany == null && newTitle == null && newImage == null && newBio == null && newStatus == null && newCountry == null && newLinkedinUrl == null) {
             return Future.failedFuture(ServiceException.badRequest("Nothing to update"));
         }
         if (newCompany != null && (newCompany.isBlank() || newCompany.length() > 100)) return Future.failedFuture(ServiceException.badRequest("Company must be between 1 and 100 characters"));
@@ -439,17 +444,17 @@ public class ManagerService {
                                 managerRepo.insertCareerEntry(managerId, effectiveCo, effectiveTit, newPosStart, null)
                             );
                         })
-                        .compose(v -> doUpdate(managerId, newCompany, newTitle, newImage, newBio, newStatus, newLinkedinUrl, newLogoUrl));
+                        .compose(v -> doUpdate(managerId, newCompany, newTitle, newImage, newBio, newStatus, newCountry, newLinkedinUrl, newLogoUrl));
                 } else {
-                    return doUpdate(managerId, newCompany, newTitle, newImage, newBio, newStatus, newLinkedinUrl, newLogoUrl);
+                    return doUpdate(managerId, newCompany, newTitle, newImage, newBio, newStatus, newCountry, newLinkedinUrl, newLogoUrl);
                 }
             });
     }
 
     private Future<JsonObject> doUpdate(long managerId, String newCompany, String newTitle,
-                                         String newImage, String newBio, String newStatus, String newLinkedinUrl,
-                                         String newLogoUrl) {
-        return managerRepo.update(managerId, newCompany, newTitle, newImage, newBio, newStatus, newLinkedinUrl, newLogoUrl)
+                                         String newImage, String newBio, String newStatus, String newCountry,
+                                         String newLinkedinUrl, String newLogoUrl) {
+        return managerRepo.update(managerId, newCompany, newTitle, newImage, newBio, newStatus, newCountry, newLinkedinUrl, newLogoUrl)
             .compose(opt -> {
                 if (opt.isEmpty()) return Future.failedFuture(ServiceException.notFound("Manager not found"));
                 Row row = opt.get();
@@ -1008,17 +1013,19 @@ public class ManagerService {
         String newCompany     = body.getString("company");
         String newTitle       = body.getString("title");
         String newStatus      = body.getString("status");
+        String newCountry     = body.getString("country");
         String newLinkedinUrl = body.getString("linkedinUrl");
         String startDateStr   = body.getString("startDate");
         String endDateStr     = body.getString("endDate");
 
-        if (isBlank(newCompany) && isBlank(newTitle) && isBlank(newStatus) && isBlank(newLinkedinUrl)
+        if (isBlank(newCompany) && isBlank(newTitle) && isBlank(newStatus) && isBlank(newCountry) && isBlank(newLinkedinUrl)
                 && isBlank(startDateStr) && isBlank(endDateStr)) {
             return Future.failedFuture(ServiceException.badRequest("At least one field is required"));
         }
         if (newCompany    != null && newCompany.length() > 100)    return Future.failedFuture(ServiceException.badRequest("Company must be at most 100 characters"));
         if (newTitle      != null && newTitle.length()   > 100)    return Future.failedFuture(ServiceException.badRequest("Title must be at most 100 characters"));
         if (newStatus     != null && !newStatus.equals("active") && !newStatus.equals("retired")) return Future.failedFuture(ServiceException.badRequest("Status must be 'active' or 'retired'"));
+        if (newCountry    != null && newCountry.length() > 100)    return Future.failedFuture(ServiceException.badRequest("Country must be at most 100 characters"));
         if (newLinkedinUrl != null && newLinkedinUrl.length() > 500) return Future.failedFuture(ServiceException.badRequest("LinkedIn URL must be at most 500 characters"));
 
         LocalDate startDateLocal = parseYearMonth(startDateStr);
@@ -1029,6 +1036,7 @@ public class ManagerService {
         String effectiveCompany     = toNullIfBlank(newCompany);
         String effectiveTitle       = toNullIfBlank(newTitle);
         String effectiveStatus      = toNullIfBlank(newStatus);
+        String effectiveCountry     = toNullIfBlank(newCountry);
         String effectiveLinkedinUrl = toNullIfBlank(newLinkedinUrl);
 
         return userRepo.findByAuth0IdWithBan(auth0Id)
@@ -1043,13 +1051,14 @@ public class ManagerService {
                         return managerRepo.findById(managerId)
                             .compose(mgrOpt -> {
                                 if (mgrOpt.isEmpty()) return Future.failedFuture(ServiceException.notFound("Manager not found"));
-                                return editRepo.upsert(managerId, userId, effectiveCompany, effectiveTitle, effectiveStatus, effectiveLinkedinUrl, newStartDate, newEndDate)
+                                return editRepo.upsert(managerId, userId, effectiveCompany, effectiveTitle, effectiveStatus, effectiveCountry, effectiveLinkedinUrl, newStartDate, newEndDate)
                                     .map(row -> new JsonObject()
                                         .put("id", row.getUUID("id").toString())
                                         .put("managerId", managerId)
                                         .put("newCompany", effectiveCompany)
                                         .put("newTitle", effectiveTitle)
                                         .put("newStatus", effectiveStatus)
+                                        .put("newCountry", effectiveCountry)
                                         .put("newLinkedinUrl", effectiveLinkedinUrl)
                                         .put("status", "pending")
                                         .put("createdAt", row.getOffsetDateTime("created_at").toString())
@@ -1073,6 +1082,7 @@ public class ManagerService {
                                 .put("newCompany", row.getString("new_company"))
                                 .put("newTitle", row.getString("new_title"))
                                 .put("newStatus", row.getString("new_status"))
+                                .put("newCountry", row.getString("new_country"))
                                 .put("newLinkedinUrl", row.getString("new_linkedin_url"))
                                 .put("createdAt", row.getOffsetDateTime("created_at").toString())
                             );
@@ -1170,6 +1180,7 @@ public class ManagerService {
             .put("approvalStatus", row.getString("approval_status"))
             .put("categoryAverages", row.getJsonObject("category_averages"))
             .put("linkedinUrl",    row.getString("linkedin_url"))
+            .put("country",        row.getString("country"))
             .put("createdAt",      row.getOffsetDateTime("created_at").toString())
             .put("careerHistory",  careerHistory);
     }

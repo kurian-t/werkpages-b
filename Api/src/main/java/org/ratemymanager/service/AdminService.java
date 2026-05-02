@@ -166,6 +166,7 @@ public class AdminService {
                     String newCompany    = row.getString("new_company");
                     String newTitle      = row.getString("new_title");
                     String newStatus     = row.getString("new_status");
+                    String newCountry    = row.getString("new_country");
                     String newLinkedinUrl= row.getString("new_linkedin_url");
                     String effectiveCo   = newCompany != null ? newCompany : currentCompany;
                     String effectiveTit  = newTitle   != null ? newTitle   : currentTitle;
@@ -187,17 +188,17 @@ public class AdminService {
                                 managerRepo.insertCareerEntry(managerId, effectiveCo, effectiveTit, now, null)
                             );
                         })
-                        .compose(v -> applyEditAndApprove(managerId, editId, newCompany, newTitle, newStatus, newLinkedinUrl, effectiveCo, effectiveTit, adminId, now, proposedBy, managerName));
+                        .compose(v -> applyEditAndApprove(managerId, editId, newCompany, newTitle, newStatus, newCountry, newLinkedinUrl, effectiveCo, effectiveTit, adminId, now, proposedBy, managerName));
                 })
             );
     }
 
     private Future<JsonObject> applyEditAndApprove(long managerId, UUID editId,
-                                                     String newCompany, String newTitle, String newStatus, String newLinkedinUrl,
-                                                     String effectiveCo, String effectiveTit,
+                                                     String newCompany, String newTitle, String newStatus, String newCountry,
+                                                     String newLinkedinUrl, String effectiveCo, String effectiveTit,
                                                      UUID adminId, OffsetDateTime reviewedAt,
                                                      UUID proposedBy, String managerName) {
-        return managerRepo.update(managerId, newCompany, newTitle, null, null, newStatus, newLinkedinUrl, null)
+        return managerRepo.update(managerId, newCompany, newTitle, null, null, newStatus, newCountry, newLinkedinUrl, null)
             .compose(opt -> editRepo.approve(editId, adminId, reviewedAt))
             .compose(v -> {
                 if (proposedBy != null) {

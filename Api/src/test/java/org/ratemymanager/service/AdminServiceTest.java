@@ -297,7 +297,7 @@ class AdminServiceTest {
             .thenReturn(Future.succeededFuture(1));
         when(managerRepo.insertCareerEntry(eq(MANAGER_ID), anyString(), anyString(), any(), isNull()))
             .thenReturn(Future.succeededFuture());
-        when(managerRepo.update(eq(MANAGER_ID), anyString(), anyString(), isNull(), isNull(), isNull(), isNull(), isNull()))
+        when(managerRepo.update(eq(MANAGER_ID), anyString(), anyString(), isNull(), isNull(), isNull(), isNull(), isNull(), isNull()))
             .thenReturn(Future.succeededFuture(Optional.empty()));
         when(editRepo.approve(eq(editId), eq(ADMIN_ID), any()))
             .thenReturn(Future.succeededFuture());
@@ -322,7 +322,7 @@ class AdminServiceTest {
             .thenReturn(Future.succeededFuture(0));
         when(managerRepo.insertCareerEntry(eq(MANAGER_ID), anyString(), anyString(), any(), any()))
             .thenReturn(Future.succeededFuture());
-        when(managerRepo.update(eq(MANAGER_ID), anyString(), anyString(), isNull(), isNull(), isNull(), isNull(), isNull()))
+        when(managerRepo.update(eq(MANAGER_ID), anyString(), anyString(), isNull(), isNull(), isNull(), isNull(), isNull(), isNull()))
             .thenReturn(Future.succeededFuture(Optional.empty()));
         when(editRepo.approve(eq(editId), eq(ADMIN_ID), any()))
             .thenReturn(Future.succeededFuture());
@@ -345,7 +345,7 @@ class AdminServiceTest {
             .thenReturn(Future.succeededFuture(1));
         when(managerRepo.insertCareerEntry(eq(MANAGER_ID), anyString(), anyString(), any(), isNull()))
             .thenReturn(Future.succeededFuture());
-        when(managerRepo.update(eq(MANAGER_ID), anyString(), anyString(), isNull(), isNull(), isNull(), isNull(), isNull()))
+        when(managerRepo.update(eq(MANAGER_ID), anyString(), anyString(), isNull(), isNull(), isNull(), isNull(), isNull(), isNull()))
             .thenReturn(Future.succeededFuture(Optional.empty()));
         when(editRepo.approve(eq(editId), eq(ADMIN_ID), any()))
             .thenReturn(Future.succeededFuture());

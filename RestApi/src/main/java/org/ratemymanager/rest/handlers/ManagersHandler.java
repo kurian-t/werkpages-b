@@ -74,6 +74,7 @@ public class ManagersHandler {
                     .put("approvalStatus", row.getString("approval_status"))
                     .put("categoryAverages", row.getJsonObject("category_averages"))
                     .put("linkedinUrl", row.getString("linkedin_url"))
+                    .put("country", row.getString("country"))
                     .put("companyLogoUrl", logoUrl)
                     .put("createdAt", row.getOffsetDateTime("created_at").toString())
                     .put("careerHistory", row.getJsonArray("career_history"))
@@ -128,6 +129,7 @@ public class ManagersHandler {
             .put("approvalStatus", row.getString("approval_status"))
             .put("categoryAverages", row.getJsonObject("category_averages"))
             .put("linkedinUrl", row.getString("linkedin_url"))
+            .put("country", row.getString("country"))
             .put("companyLogoUrl", logoUrl)
             .put("createdAt", row.getOffsetDateTime("created_at").toString())
             .put("careerHistory", row.getJsonArray("career_history"));
@@ -183,6 +185,7 @@ public class ManagersHandler {
                         .put("status", row.getString("status"))
                         .put("approvalStatus", row.getString("approval_status"))
                         .put("linkedinUrl", row.getString("linkedin_url"))
+                        .put("country", row.getString("country"))
                         .put("companyLogoUrl", logo)
                         .put("createdAt", row.getOffsetDateTime("created_at").toString())
                     );
@@ -217,6 +220,7 @@ public class ManagersHandler {
                     .put("approvalStatus", row.getString("approval_status"))
                     .put("categoryAverages", row.getJsonObject("category_averages"))
                     .put("linkedinUrl", row.getString("linkedin_url"))
+                    .put("country", row.getString("country"))
                     .put("createdAt", row.getOffsetDateTime("created_at").toString())
                     .put("careerHistory", new JsonArray());
                 ctx.response().setStatusCode(201).putHeader("Content-Type", "application/json").end(response.encode());

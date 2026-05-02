@@ -403,6 +403,7 @@ paths:
                 - title
                 - image
                 - status
+                - country
               properties:
                 name:
                   type: string
@@ -418,6 +419,8 @@ paths:
                 status:
                   type: string
                   enum: [active, retired]
+                country:
+                  type: string
                 linkedinUrl:
                   type: string
                   nullable: true
@@ -483,6 +486,9 @@ paths:
                 status:
                   type: string
                   enum: [active, retired]
+                country:
+                  type: string
+                  nullable: true
                 linkedinUrl:
                   type: string
                   nullable: true
@@ -1245,6 +1251,9 @@ components:
           type: number
         reviews:
           type: integer
+        country:
+          type: string
+          nullable: true
 
     ManagerDetail:
       type: object
@@ -1273,6 +1282,9 @@ components:
           additionalProperties:
             type: number
         linkedinUrl:
+          type: string
+          nullable: true
+        country:
           type: string
           nullable: true
         createdAt:
