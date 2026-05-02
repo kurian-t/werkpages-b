@@ -130,9 +130,14 @@ public class ManagerRepository {
             case "rating"  -> "ORDER BY m.overall_rating DESC NULLS LAST, m.id ASC";
             case "reviews" -> "ORDER BY m.reviews_count DESC, m.id ASC";
             case "name"    -> "ORDER BY m.name ASC";
-            // Real profiles (submitted_by IS NOT NULL) first; pseudo-random within each group
-            // via MD5 hash of the ID — deterministic so pagination stays stable
-            default        -> "ORDER BY CASE WHEN m.submitted_by IS NOT NULL AND m.external_id IS NULL THEN 0 ELSE 1 END, MD5(CAST(m.id AS text))";
+            // Tier 0: user-submitted managers
+            // Tier 1: seeded/scraped — real logos (company_logo_url IS NOT NULL) surface first,
+            //         then the rest in stable pseudo-random order so pagination doesn't shift.
+            default        -> """
+                ORDER BY
+                  CASE WHEN m.submitted_by IS NOT NULL AND m.external_id IS NULL THEN 0 ELSE 1 END,
+                  CASE WHEN m.company_logo_url IS NOT NULL THEN 0 ELSE 1 END,
+                  MD5(CAST(m.id AS text))""";
         };
     }
 

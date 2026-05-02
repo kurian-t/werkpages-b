@@ -230,9 +230,9 @@ public class ManagerService {
     public Future<Row> createManager(String auth0Id, JsonObject body, String resolvedLogoUrl) {
         if (body == null) return Future.failedFuture(ServiceException.badRequest("Missing request body"));
 
-        String name    = body.getString("name");
-        String company = body.getString("company");
-        String title   = body.getString("title");
+        String name    = toProperNameCase(body.getString("name"));
+        String company = body.getString("company") != null ? body.getString("company").trim() : null;
+        String title   = body.getString("title")   != null ? body.getString("title").trim()   : null;
         String image   = body.getString("image");
         if (isBlank(name) || isBlank(company) || isBlank(title) || isBlank(image)) {
             return Future.failedFuture(ServiceException.badRequest("Missing required fields"));
@@ -241,8 +241,8 @@ public class ManagerService {
         if (company.length() > 100) return Future.failedFuture(ServiceException.badRequest("Company must be at most 100 characters"));
         if (title.length() > 100)   return Future.failedFuture(ServiceException.badRequest("Title must be at most 100 characters"));
 
-        String bio         = body.getString("bio");
-        String linkedinUrl = body.getString("linkedinUrl");
+        String bio         = body.getString("bio")         != null ? body.getString("bio").trim()         : null;
+        String linkedinUrl = body.getString("linkedinUrl") != null ? body.getString("linkedinUrl").trim() : null;
         if (bio != null && bio.length() > 1000) return Future.failedFuture(ServiceException.badRequest("Bio must be at most 1000 characters"));
         if (!isBlank(linkedinUrl)) {
             if (linkedinUrl.length() > 500) return Future.failedFuture(ServiceException.badRequest("LinkedIn URL must be at most 500 characters"));
@@ -474,7 +474,7 @@ public class ManagerService {
                 String authorType = body.getString("authorType", "username");
                 String author;
                 if ("real_name".equals(authorType) || "anonymous".equals(authorType)) {
-                    String clientAuthor = body.getString("author", "").trim();
+                    String clientAuthor = toProperNameCase(body.getString("author", ""));
                     author = (clientAuthor.isEmpty() || clientAuthor.length() > 100) ? dbUsername : clientAuthor;
                 } else {
                     author = dbUsername;
@@ -502,9 +502,9 @@ public class ManagerService {
     private Future<Row> validateAndInsertReview(JsonObject body, long managerId, UUID userId, String author, String resolvedLogoUrl) {
         Double overallRating      = body.getDouble("overallRating");
         JsonObject ratings        = body.getJsonObject("ratings");
-        String managerCompany     = body.getString("managerCompany");
-        String managerTitle       = body.getString("managerTitle");
-        String text               = body.getString("text");
+        String managerCompany     = body.getString("managerCompany") != null ? body.getString("managerCompany").trim() : null;
+        String managerTitle       = body.getString("managerTitle")   != null ? body.getString("managerTitle").trim()   : null;
+        String text               = body.getString("text")           != null ? body.getString("text").trim()           : null;
         LocalDate workedFrom      = parseYearMonth(body.getString("workedFrom"));
         LocalDate workedUntil     = parseYearMonth(body.getString("workedUntil"));
         LocalDate managerRoleStart = parseYearMonth(body.getString("managerRoleStart"));
@@ -759,11 +759,11 @@ public class ManagerService {
 
         Double overallRating       = body.getDouble("overallRating");
         JsonObject ratings         = body.getJsonObject("ratings");
-        String managerCompany      = body.getString("managerCompany");
-        String managerTitle        = body.getString("managerTitle");
-        String text                = body.getString("text");
+        String managerCompany      = body.getString("managerCompany") != null ? body.getString("managerCompany").trim() : null;
+        String managerTitle        = body.getString("managerTitle")   != null ? body.getString("managerTitle").trim()   : null;
+        String text                = body.getString("text")           != null ? body.getString("text").trim()           : null;
         String authorType          = body.getString("authorType", "username");
-        String clientAuthor        = body.getString("author", "").trim();
+        String clientAuthor        = toProperNameCase(body.getString("author", ""));
         LocalDate workedFrom       = parseYearMonth(body.getString("workedFrom"));
         LocalDate workedUntil      = parseYearMonth(body.getString("workedUntil"));
         LocalDate managerRoleStart = parseYearMonth(body.getString("managerRoleStart")); // optional for legacy edits
@@ -905,7 +905,7 @@ public class ManagerService {
                 String authorType = body.getString("authorType", "username");
                 String author;
                 if ("real_name".equals(authorType) || "anonymous".equals(authorType)) {
-                    String clientAuthor = body.getString("author", "").trim();
+                    String clientAuthor = toProperNameCase(body.getString("author", ""));
                     author = (clientAuthor.isEmpty() || clientAuthor.length() > 100) ? dbUsername : clientAuthor;
                 } else {
                     author = dbUsername;
@@ -1199,6 +1199,43 @@ public class ManagerService {
 
     private static String toNullIfBlank(String s) {
         return (s != null && !s.isBlank()) ? s.trim() : null;
+    }
+
+    // Converts any casing variant to proper name case: "TIM COOK" / "tIM cOOk" → "Tim Cook".
+    // Handles hyphenated names (Smith-Jones) and Irish/Scottish apostrophes (O'Brien).
+    static String toProperNameCase(String input) {
+        if (input == null) return null;
+        String trimmed = input.trim();
+        if (trimmed.isEmpty()) return trimmed;
+        String[] words = trimmed.split("\\s+");
+        StringBuilder result = new StringBuilder();
+        for (int i = 0; i < words.length; i++) {
+            if (i > 0) result.append(' ');
+            result.append(capitalizeNameWord(words[i]));
+        }
+        return result.toString();
+    }
+
+    private static String capitalizeNameWord(String word) {
+        if (word.isEmpty()) return word;
+        if (word.contains("-")) {
+            String[] parts = word.split("-", -1);
+            StringBuilder sb = new StringBuilder();
+            for (int i = 0; i < parts.length; i++) {
+                if (i > 0) sb.append('-');
+                sb.append(capitalizeNameWord(parts[i]));
+            }
+            return sb.toString();
+        }
+        int ap = word.indexOf('\'');
+        if (ap > 0 && ap < word.length() - 1) {
+            String before = word.substring(0, ap);
+            String after  = word.substring(ap + 1);
+            return Character.toUpperCase(before.charAt(0)) + before.substring(1).toLowerCase()
+                + "'"
+                + Character.toUpperCase(after.charAt(0)) + after.substring(1).toLowerCase();
+        }
+        return Character.toUpperCase(word.charAt(0)) + word.substring(1).toLowerCase();
     }
 
     /** Returns the rating value, trying the pretty key first then the snake_case fallback. */

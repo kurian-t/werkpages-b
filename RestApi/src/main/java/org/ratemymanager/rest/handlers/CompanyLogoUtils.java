@@ -170,14 +170,28 @@ public class CompanyLogoUtils {
      */
     private static final String LOGO_DEV_TOKEN = "pk_MXSjJV-uTC6-L5D_FbXZUA";
 
+    private static final java.util.regex.Pattern CORP_SUFFIX_RE = java.util.regex.Pattern.compile(
+        "[\\s,]+(?:inc\\.?|incorporated|corp\\.?|corporation|llc\\.?|ltd\\.?|limited|" +
+        "co\\.?|plc\\.?|lp\\.?|l\\.p\\.|l\\.l\\.c\\.|companies|company|group|holdings|" +
+        "enterprises|international|worldwide)\\.?$",
+        java.util.regex.Pattern.CASE_INSENSITIVE
+    );
+
+    static String companyDomain(String company) {
+        String cleaned = company.trim();
+        String prev;
+        do {
+            prev = cleaned;
+            cleaned = CORP_SUFFIX_RE.matcher(cleaned).replaceFirst("").trim();
+        } while (!cleaned.equals(prev));
+        return cleaned.toLowerCase().replaceAll("[^a-z0-9]", "") + ".com";
+    }
+
     public static String resolveLogoUrl(String company) {
         if (company == null || company.isBlank()) return null;
         String key = company.toLowerCase().trim();
         String domain = DOMAIN_MAP.get(key);
-        if (domain == null) {
-            // Best-effort: derive a domain from the company name
-            domain = key.replaceAll("[^a-z0-9]", "") + ".com";
-        }
+        if (domain == null) domain = companyDomain(company);
         return "https://img.logo.dev/" + domain + "?token=" + LOGO_DEV_TOKEN;
     }
 }
