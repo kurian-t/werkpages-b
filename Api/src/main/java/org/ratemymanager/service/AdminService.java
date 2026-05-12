@@ -144,6 +144,9 @@ public class AdminService {
                         .put("requestedBy", row.getString("requested_by"))
                         .put("newCompany", row.getString("new_company"))
                         .put("newTitle", row.getString("new_title"))
+                        .put("newStatus", row.getString("new_status"))
+                        .put("newCountry", row.getString("new_country"))
+                        .put("newLinkedinUrl", row.getString("new_linkedin_url"))
                         .put("status", row.getString("status"))
                         .put("createdAt", row.getOffsetDateTime("created_at").toString())
                     );
