@@ -446,7 +446,10 @@ public class ManagersHandler {
                 .putHeader("Content-Type", "application/json")
                 .end(new JsonObject().put("message", se.getMessage()).encode());
         } else {
-            ctx.fail(err);
+            ctx.response()
+                .setStatusCode(500)
+                .putHeader("Content-Type", "application/json")
+                .end(new JsonObject().put("message", "Internal server error").encode());
         }
     }
 

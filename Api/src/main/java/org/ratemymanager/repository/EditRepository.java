@@ -64,7 +64,8 @@ public class EditRepository {
                 SELECT pe.id, pe.manager_id, m.name AS manager_name,
                        m.company AS current_company, m.title AS current_title,
                        u.username AS requested_by,
-                       pe.new_company, pe.new_title, pe.status, pe.created_at
+                       pe.new_company, pe.new_title, pe.new_status, pe.new_country,
+                       pe.new_linkedin_url, pe.status, pe.created_at
                 FROM manager_edits pe
                 JOIN managers m ON m.id = pe.manager_id
                 JOIN users u ON u.id = pe.proposed_by
