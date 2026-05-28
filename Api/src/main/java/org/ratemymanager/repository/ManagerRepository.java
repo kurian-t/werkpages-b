@@ -420,4 +420,34 @@ public class ManagerRepository {
             """;
         return db.preparedQuery(sql).execute(Tuple.of(keepId)).mapEmpty();
     }
+
+    // ── Find-or-create ────────────────────────────────────────────────────────
+
+    public Future<RowSet<Row>> findByNameAndCompany(String fullName, String company) {
+        return db.preparedQuery(SELECT_BODY + """
+                WHERE m.name ILIKE $3
+                  AND m.company ILIKE $4
+                  AND m.approval_status = 'approved'
+                GROUP BY m.id
+                ORDER BY m.reviews_count DESC, m.id ASC
+                LIMIT 5
+                """)
+            .execute(Tuple.of(5, 0, fullName, "%" + company.trim() + "%"));
+    }
+
+    public Future<Row> createAutoApproved(String name, String company, String title,
+                                          String country, UUID submittedBy, String logoUrl) {
+        return db.preparedQuery("""
+                INSERT INTO managers
+                (name, company, title, status, approval_status, country,
+                 overall_rating, reviews_count, category_averages, submitted_by,
+                 company_logo_url, created_at, updated_at)
+                VALUES ($1,$2,$3,'active','approved',$4,
+                        0,0,'{}'::jsonb,$5,
+                        $6,now(),now())
+                RETURNING *
+                """)
+            .execute(Tuple.of(name, company.trim(), title.trim(), country.trim(), submittedBy, logoUrl))
+            .map(rows -> rows.iterator().next());
+    }
 }

@@ -437,6 +437,42 @@ public class ManagersHandler {
             .onFailure(err -> handleError(ctx, err));
     }
 
+    // ── Find-or-create ────────────────────────────────────────────────────────
+
+    public void handleFindOrCreate(RoutingContext ctx) {
+        String auth0Id = ctx.get("auth0Id");
+        if (auth0Id == null) {
+            respond(ctx, 401, new JsonObject().put("message", "Unauthorized"));
+            return;
+        }
+        JsonObject body = ctx.getBodyAsJson();
+        if (body == null) { respond(ctx, 400, new JsonObject().put("message", "Request body required")); return; }
+
+        String firstName = body.getString("firstName", "").trim();
+        String lastName  = body.getString("lastName",  "").trim();
+        String title     = body.getString("title",     "").trim();
+        String company   = body.getString("company",   "").trim();
+        String country   = body.getString("country",   "").trim();
+
+        String logoUrl = CompanyLogoUtils.resolveLogoUrl(company);
+        service.findOrCreate(auth0Id, firstName, lastName, title, company, country, logoUrl)
+            .onSuccess(json -> {
+                // Back-fill logo on any rows that don't already have one (existing managers)
+                io.vertx.core.json.JsonArray data = json.getJsonArray("data");
+                if (data != null) {
+                    for (int i = 0; i < data.size(); i++) {
+                        JsonObject m = data.getJsonObject(i);
+                        if (m.getString("companyLogoUrl") == null) {
+                            String resolved = CompanyLogoUtils.resolveLogoUrl(m.getString("company"));
+                            if (resolved != null) m.put("companyLogoUrl", resolved);
+                        }
+                    }
+                }
+                respond(ctx, 200, json);
+            })
+            .onFailure(err -> handleError(ctx, err));
+    }
+
     // ── Shared helpers ────────────────────────────────────────────────────────
 
     static void handleError(RoutingContext ctx, Throwable err) {

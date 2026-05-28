@@ -1,0 +1,1 @@
+ALTER TABLE users ADD COLUMN has_auto_created_manager BOOLEAN NOT NULL DEFAULT FALSE;

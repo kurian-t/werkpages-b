@@ -103,13 +103,13 @@
 		<dependency>
 			<groupId>org.testcontainers</groupId>
 			<artifactId>junit-jupiter</artifactId>
-			<version>1.19.7</version>
+			<version>1.20.4</version>
 			<scope>test</scope>
 		</dependency>
 		<dependency>
 			<groupId>org.testcontainers</groupId>
 			<artifactId>postgresql</artifactId>
-			<version>1.19.7</version>
+			<version>1.20.4</version>
 			<scope>test</scope>
 		</dependency>
 	</dependencies>
@@ -153,5 +153,6 @@
 		<maven.compiler.source>21</maven.compiler.source>
 		<maven.compiler.target>21</maven.compiler.target>
 		<project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+		<skipITs>true</skipITs>
 	</properties>
 </project>

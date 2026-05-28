@@ -108,6 +108,7 @@ public class MainVerticle extends AbstractVerticle {
                         routerFactory.addHandlerByOperationId("getStats",               managersHandler::handleGetStats);
                         routerFactory.addHandlerByOperationId("getCompanies",           managersHandler::handleGetCompanies);
                         routerFactory.addHandlerByOperationId("getSimilarManagers",     managersHandler::handleGetSimilarManagers);
+                        routerFactory.addHandlerByOperationId("findOrCreateManager",    managersHandler::handleFindOrCreate);
                         routerFactory.addHandlerByOperationId("createManagerEditRequest", managersHandler::handleCreateEditRequest);
                         routerFactory.addHandlerByOperationId("getManagerPendingEdits",   managersHandler::handleGetPendingEditsForManager);
                         routerFactory.addHandlerByOperationId("getAdminPendingEdits",     adminHandler::handleGetPendingEdits);

@@ -1255,4 +1255,63 @@ public class ManagerService {
         if (v == null) v = ratings.getDouble(RATING_KEYS_SNAKE[index]);
         return v != null ? v : 0.0;
     }
+
+    // ── Find-or-create ────────────────────────────────────────────────────────
+
+    public Future<JsonObject> findOrCreate(String auth0Id,
+                                           String firstName, String lastName,
+                                           String title, String company, String country,
+                                           String resolvedLogoUrl) {
+        NameValidator.ValidationResult validation =
+            NameValidator.validate(firstName, lastName, title, company, country);
+        if (!validation.valid())
+            return Future.failedFuture(ServiceException.badRequest(validation.reason()));
+
+        String fullName = firstName.trim() + " " + lastName.trim();
+
+        return userRepo.findIdByAuth0Id(auth0Id)
+            .compose(opt -> {
+                if (opt.isEmpty())
+                    return Future.failedFuture(ServiceException.unauthorized("User not found"));
+                UUID userId = opt.get();
+
+                return managerRepo.findByNameAndCompany(fullName, company)
+                    .compose(rows -> {
+                        if (rows.size() > 0) {
+                            JsonArray data = new JsonArray();
+                            for (Row row : rows) data.add(rowToManagerJson(row));
+                            return Future.succeededFuture(
+                                new JsonObject().put("data", data).put("created", false));
+                        }
+
+                        return userRepo.hasAutoCreatedManager(userId)
+                            .compose(alreadyUsed -> {
+                                if (alreadyUsed)
+                                    return Future.succeededFuture(
+                                        new JsonObject().put("data", new JsonArray()).put("created", false));
+
+                                return managerRepo.createAutoApproved(fullName, company, title, country, userId, resolvedLogoUrl)
+                                    .compose(row -> userRepo.markAutoCreatedManager(userId)
+                                        .map(v -> {
+                                            JsonArray data = new JsonArray().add(rowToManagerJson(row));
+                                            return new JsonObject().put("data", data).put("created", true);
+                                        }));
+                            });
+                    });
+            });
+    }
+
+    private static JsonObject rowToManagerJson(Row row) {
+        return new JsonObject()
+            .put("id",             row.getLong("id"))
+            .put("name",           row.getString("name"))
+            .put("company",        row.getString("company"))
+            .put("title",          row.getString("title"))
+            .put("image",          row.getString("image"))
+            .put("overallRating",  row.getBigDecimal("overall_rating"))
+            .put("reviews",        row.getInteger("reviews_count"))
+            .put("status",         row.getString("status"))
+            .put("country",        row.getString("country"))
+            .put("companyLogoUrl", row.getString("company_logo_url"));
+    }
 }

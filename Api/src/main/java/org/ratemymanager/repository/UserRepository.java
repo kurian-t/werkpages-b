@@ -176,4 +176,21 @@ public class UserRepository {
                 """)
             .execute(Tuple.of(limit, offset));
     }
+
+    // ── Auto-create tracking ──────────────────────────────────────────────────
+
+    public Future<Boolean> hasAutoCreatedManager(UUID userId) {
+        return db.preparedQuery("SELECT has_auto_created_manager FROM users WHERE id = $1")
+            .execute(Tuple.of(userId))
+            .map(rows -> {
+                if (!rows.iterator().hasNext()) return true; // user not found — treat as used
+                return rows.iterator().next().getBoolean("has_auto_created_manager");
+            });
+    }
+
+    public Future<Void> markAutoCreatedManager(UUID userId) {
+        return db.preparedQuery("UPDATE users SET has_auto_created_manager = TRUE WHERE id = $1")
+            .execute(Tuple.of(userId))
+            .mapEmpty();
+    }
 }

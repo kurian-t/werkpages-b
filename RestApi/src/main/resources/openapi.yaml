@@ -339,6 +339,50 @@ paths:
               schema:
                 type: object
 
+  /api/managers/find-or-create:
+    post:
+      operationId: findOrCreateManager
+      summary: Search for a manager by structured fields; auto-creates one on first search if not found (auth required)
+      tags:
+        - Managers
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - firstName
+                - lastName
+                - title
+                - company
+                - country
+              properties:
+                firstName:
+                  type: string
+                lastName:
+                  type: string
+                title:
+                  type: string
+                company:
+                  type: string
+                country:
+                  type: string
+      responses:
+        '200':
+          description: Search results (may include a newly created manager)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/ManagerSummary'
+                  created:
+                    type: boolean
+
   /api/managers:
     get:
       operationId: getManagers
