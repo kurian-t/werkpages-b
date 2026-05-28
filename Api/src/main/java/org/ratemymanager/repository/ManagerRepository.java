@@ -426,13 +426,12 @@ public class ManagerRepository {
     public Future<RowSet<Row>> findByNameAndCompany(String fullName, String company) {
         return db.preparedQuery(SELECT_BODY + """
                 WHERE m.name ILIKE $3
-                  AND m.company ILIKE $4
                   AND m.approval_status = 'approved'
                 GROUP BY m.id
                 ORDER BY m.reviews_count DESC, m.id ASC
                 LIMIT 5
                 """)
-            .execute(Tuple.of(5, 0, fullName, "%" + company.trim() + "%"));
+            .execute(Tuple.of(5, 0, fullName));
     }
 
     public Future<Row> createAutoApproved(String name, String company, String title,
