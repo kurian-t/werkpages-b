@@ -1286,43 +1286,86 @@ public class ManagerService {
 
                 return Future.all(
                     userRepo.hasContributed(userId),
-                    userRepo.hasAutoCreatedManager(userId)
+                    userRepo.hasAutoCreatedManager(userId),
+                    managerRepo.findByNameAndCompany(fullName, company)
                 ).compose(cf -> {
-                    boolean contributed    = cf.resultAt(0);
-                    boolean alreadyCreated = cf.resultAt(1);
+                    boolean     contributed    = cf.resultAt(0);
+                    boolean     alreadyCreated = cf.resultAt(1);
+                    RowSet<Row> rows           = cf.resultAt(2);
 
-                    return managerRepo.findByNameAndCompany(fullName, company)
-                        .compose(rows -> {
-                            if (rows.size() > 0) {
-                                JsonArray data = new JsonArray();
-                                for (Row row : rows) data.add(rowToManagerJson(row));
-                                return Future.succeededFuture(
-                                    new JsonObject()
-                                        .put("data", data)
-                                        .put("created", false)
-                                        .put("hasContributed", contributed));
-                            }
+                    if (rows.size() > 0) {
+                        JsonArray data = new JsonArray();
+                        for (Row row : rows) data.add(rowToManagerJson(row));
+                        return Future.succeededFuture(
+                            new JsonObject()
+                                .put("data", data)
+                                .put("created", false)
+                                .put("hasContributed", contributed));
+                    }
 
-                            // Manager not found — only create a ghost on the user's very first search
-                            if (alreadyCreated) {
-                                return Future.succeededFuture(
-                                    new JsonObject()
-                                        .put("data", new JsonArray())
-                                        .put("created", false)
-                                        .put("hasContributed", contributed));
-                            }
+                    // Manager not found — only create a ghost the very first time this user
+                    // searches for someone not in the DB. All subsequent not-found searches
+                    // return empty results so the user can use the "Add manager" flow.
+                    if (alreadyCreated) {
+                        return Future.succeededFuture(
+                            new JsonObject()
+                                .put("data", new JsonArray())
+                                .put("created", false)
+                                .put("hasContributed", contributed));
+                    }
 
-                            return userRepo.markAutoCreatedManager(userId)
-                                .compose(v -> managerRepo.createAutoApproved(fullName, company, title, country, userId, resolvedLogoUrl))
-                                .map(row -> {
-                                    JsonArray data = new JsonArray().add(rowToManagerJson(row));
-                                    return new JsonObject()
-                                        .put("data", data)
-                                        .put("created", true)
-                                        .put("hasContributed", contributed);
-                                });
+                    // Create the ghost first, then mark the flag. If the insert fails the flag
+                    // is never set, so the user gets another chance on their next search.
+                    return managerRepo.createAutoApproved(fullName, company, title, country, userId, resolvedLogoUrl)
+                        .compose(row -> userRepo.markAutoCreatedManager(userId).map(v -> row))
+                        .map(row -> {
+                            JsonArray data = new JsonArray().add(rowToManagerJson(row));
+                            return new JsonObject()
+                                .put("data", data)
+                                .put("created", true)
+                                .put("hasContributed", contributed);
                         });
                 });
+            });
+    }
+
+    // ── Ghost capture ─────────────────────────────────────────────────────────
+
+    /**
+     * Creates a ghost manager record for early intent capture (no auth required).
+     * Returns the existing record if a matching approved/ghost manager already exists.
+     */
+    public Future<JsonObject> createGhostManager(JsonObject body, String resolvedLogoUrl) {
+        if (body == null) return Future.failedFuture(ServiceException.badRequest("Missing request body"));
+        String name    = toProperNameCase(body.getString("name"));
+        String company = body.getString("company") != null ? body.getString("company").trim() : null;
+        String title   = body.getString("title")   != null ? body.getString("title").trim()   : null;
+        String country = body.getString("country") != null ? body.getString("country").trim() : null;
+        if (isBlank(name) || isBlank(company) || isBlank(title) || isBlank(country)) {
+            return Future.failedFuture(ServiceException.badRequest("Missing required fields"));
+        }
+        if (name.length()    > 100) return Future.failedFuture(ServiceException.badRequest("Name too long"));
+        if (company.length() > 100) return Future.failedFuture(ServiceException.badRequest("Company too long"));
+        if (title.length()   > 100) return Future.failedFuture(ServiceException.badRequest("Title too long"));
+        if (country.length() > 100) return Future.failedFuture(ServiceException.badRequest("Country too long"));
+
+        return managerRepo.findByNameAndCompany(name, company)
+            .compose(rows -> {
+                if (rows.iterator().hasNext()) {
+                    Row row = rows.iterator().next();
+                    return Future.succeededFuture(
+                        new JsonObject()
+                            .put("id", row.getLong("id"))
+                            .put("name", row.getString("name"))
+                            .put("created", false)
+                    );
+                }
+                return managerRepo.createGhost(name, company, title, country, resolvedLogoUrl)
+                    .map(row -> new JsonObject()
+                        .put("id", row.getLong("id"))
+                        .put("name", row.getString("name"))
+                        .put("created", true)
+                    );
             });
     }
 

@@ -109,16 +109,16 @@ public class ManagerRepository {
         Tuple tuple;
 
         if (hasSearch && hasCompany) {
-            sql   = SELECT_BODY + "WHERE (m.name ILIKE $3 OR m.company ILIKE $3 OR m.title ILIKE $3) AND m.company ILIKE $4 AND m.approval_status = 'approved' GROUP BY m.id " + orderBy + " LIMIT $1 OFFSET $2";
+            sql   = SELECT_BODY + "WHERE (m.name ILIKE $3 OR m.company ILIKE $3 OR m.title ILIKE $3) AND m.company ILIKE $4 AND m.approval_status IN ('approved','ghost') GROUP BY m.id " + orderBy + " LIMIT $1 OFFSET $2";
             tuple = Tuple.of(limit, offset, searchPattern, companyPattern);
         } else if (hasSearch) {
-            sql   = SELECT_BODY + "WHERE (m.name ILIKE $3 OR m.company ILIKE $3 OR m.title ILIKE $3) AND m.approval_status = 'approved' GROUP BY m.id " + orderBy + " LIMIT $1 OFFSET $2";
+            sql   = SELECT_BODY + "WHERE (m.name ILIKE $3 OR m.company ILIKE $3 OR m.title ILIKE $3) AND m.approval_status IN ('approved','ghost') GROUP BY m.id " + orderBy + " LIMIT $1 OFFSET $2";
             tuple = Tuple.of(limit, offset, searchPattern);
         } else if (hasCompany) {
-            sql   = SELECT_BODY + "WHERE m.company ILIKE $3 AND m.approval_status = 'approved' GROUP BY m.id " + orderBy + " LIMIT $1 OFFSET $2";
+            sql   = SELECT_BODY + "WHERE m.company ILIKE $3 AND m.approval_status IN ('approved','ghost') GROUP BY m.id " + orderBy + " LIMIT $1 OFFSET $2";
             tuple = Tuple.of(limit, offset, companyPattern);
         } else {
-            sql   = SELECT_BODY + "WHERE m.approval_status = 'approved' GROUP BY m.id " + orderBy + " LIMIT $1 OFFSET $2";
+            sql   = SELECT_BODY + "WHERE m.approval_status IN ('approved','ghost') GROUP BY m.id " + orderBy + " LIMIT $1 OFFSET $2";
             tuple = Tuple.of(limit, offset);
         }
 
@@ -146,32 +146,32 @@ public class ManagerRepository {
         boolean hasCompany = companyPattern != null;
 
         if (hasSearch && hasCompany) {
-            return db.preparedQuery("SELECT COUNT(*) FROM managers WHERE (name ILIKE $1 OR company ILIKE $1 OR title ILIKE $1) AND company ILIKE $2 AND approval_status = 'approved'")
+            return db.preparedQuery("SELECT COUNT(*) FROM managers WHERE (name ILIKE $1 OR company ILIKE $1 OR title ILIKE $1) AND company ILIKE $2 AND approval_status IN ('approved','ghost')")
                 .execute(Tuple.of(searchPattern, companyPattern))
                 .map(rows -> rows.iterator().next().getLong(0));
         } else if (hasSearch) {
-            return db.preparedQuery("SELECT COUNT(*) FROM managers WHERE (name ILIKE $1 OR company ILIKE $1 OR title ILIKE $1) AND approval_status = 'approved'")
+            return db.preparedQuery("SELECT COUNT(*) FROM managers WHERE (name ILIKE $1 OR company ILIKE $1 OR title ILIKE $1) AND approval_status IN ('approved','ghost')")
                 .execute(Tuple.of(searchPattern))
                 .map(rows -> rows.iterator().next().getLong(0));
         } else if (hasCompany) {
-            return db.preparedQuery("SELECT COUNT(*) FROM managers WHERE company ILIKE $1 AND approval_status = 'approved'")
+            return db.preparedQuery("SELECT COUNT(*) FROM managers WHERE company ILIKE $1 AND approval_status IN ('approved','ghost')")
                 .execute(Tuple.of(companyPattern))
                 .map(rows -> rows.iterator().next().getLong(0));
         } else {
-            return db.query("SELECT COUNT(*) FROM managers WHERE approval_status = 'approved'")
+            return db.query("SELECT COUNT(*) FROM managers WHERE approval_status IN ('approved','ghost')")
                 .execute()
                 .map(rows -> rows.iterator().next().getLong(0));
         }
     }
 
     public Future<Long> countApproved() {
-        return db.query("SELECT COUNT(*) FROM managers WHERE approval_status = 'approved'")
+        return db.query("SELECT COUNT(*) FROM managers WHERE approval_status IN ('approved','ghost')")
             .execute()
             .map(rows -> rows.iterator().next().getLong(0));
     }
 
     public Future<RowSet<Row>> findAllCompanies() {
-        return db.query("SELECT DISTINCT company FROM managers WHERE approval_status = 'approved' ORDER BY company LIMIT 100")
+        return db.query("SELECT DISTINCT company FROM managers WHERE approval_status IN ('approved','ghost') ORDER BY company LIMIT 100")
             .execute();
     }
 
@@ -179,7 +179,7 @@ public class ManagerRepository {
         return db.preparedQuery("""
                 SELECT id, name, company, title, overall_rating, company_logo_url, approval_status
                 FROM managers
-                WHERE approval_status IN ('approved', 'pending_approval')
+                WHERE approval_status IN ('approved', 'ghost', 'pending_approval')
                   AND name ILIKE $1
                 ORDER BY
                   CASE WHEN company ILIKE $2 THEN 0 ELSE 1 END,
@@ -448,6 +448,22 @@ public class ManagerRepository {
                 RETURNING *
                 """)
             .execute(Tuple.of(name, company.trim(), title.trim(), country.trim(), submittedBy, logoUrl))
+            .map(rows -> rows.iterator().next());
+    }
+
+    public Future<Row> createGhost(String name, String company, String title,
+                                   String country, String logoUrl) {
+        return db.preparedQuery("""
+                INSERT INTO managers
+                (name, company, title, status, approval_status, country,
+                 overall_rating, reviews_count, category_averages,
+                 company_logo_url, created_at, updated_at)
+                VALUES ($1,$2,$3,'active','ghost',$4,
+                        0,0,'{}'::jsonb,
+                        $5,now(),now())
+                RETURNING *
+                """)
+            .execute(Tuple.of(name, company.trim(), title.trim(), country.trim(), logoUrl))
             .map(rows -> rows.iterator().next());
     }
 }

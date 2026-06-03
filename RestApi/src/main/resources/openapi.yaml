@@ -400,6 +400,61 @@ paths:
                   created:
                     type: boolean
 
+  /api/managers/ghost:
+    post:
+      operationId: createGhostManager
+      summary: Capture manager intent as a ghost record — no auth required
+      tags:
+        - Managers
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - name
+                - company
+                - title
+                - country
+              properties:
+                name:
+                  type: string
+                company:
+                  type: string
+                title:
+                  type: string
+                country:
+                  type: string
+      responses:
+        '200':
+          description: Existing manager found — no new record created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id:
+                    type: integer
+                  name:
+                    type: string
+                  created:
+                    type: boolean
+        '201':
+          description: New ghost manager created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id:
+                    type: integer
+                  name:
+                    type: string
+                  created:
+                    type: boolean
+
   /api/managers:
     get:
       operationId: getManagers

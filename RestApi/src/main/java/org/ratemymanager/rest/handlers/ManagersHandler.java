@@ -447,6 +447,20 @@ public class ManagersHandler {
             .onFailure(err -> handleError(ctx, err));
     }
 
+    // ── Ghost capture (no auth) ───────────────────────────────────────────────
+
+    public void handleCreateGhostManager(RoutingContext ctx) {
+        JsonObject body = ctx.getBodyAsJson();
+        String company = body != null ? body.getString("company") : null;
+        String logoUrl = CompanyLogoUtils.resolveLogoUrl(company);
+        service.createGhostManager(body, logoUrl)
+            .onSuccess(json -> {
+                int status = Boolean.TRUE.equals(json.getBoolean("created")) ? 201 : 200;
+                ctx.response().setStatusCode(status).putHeader("Content-Type", "application/json").end(json.encode());
+            })
+            .onFailure(err -> handleError(ctx, err));
+    }
+
     // ── Find-or-create ────────────────────────────────────────────────────────
 
     public void handleFindOrCreate(RoutingContext ctx) {

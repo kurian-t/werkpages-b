@@ -136,6 +136,13 @@
 					<includes>
 						<include>**/*IntegrationTest.java</include>
 					</includes>
+					<environmentVariables>
+						<DOCKER_HOST>unix:///home/noragrats/.docker/desktop/docker.sock</DOCKER_HOST>
+						<TESTCONTAINERS_RYUK_DISABLED>true</TESTCONTAINERS_RYUK_DISABLED>
+					</environmentVariables>
+					<systemPropertyVariables>
+						<api.version>1.44</api.version>
+					</systemPropertyVariables>
 				</configuration>
 				<executions>
 					<execution>
