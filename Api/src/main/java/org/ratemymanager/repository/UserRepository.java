@@ -193,4 +193,11 @@ public class UserRepository {
             .execute(Tuple.of(userId))
             .mapEmpty();
     }
+
+    public Future<Boolean> hasContributed(UUID userId) {
+        return db.preparedQuery(
+                "SELECT EXISTS(SELECT 1 FROM reviews WHERE user_id = $1) AS contributed")
+            .execute(Tuple.of(userId))
+            .map(rows -> rows.iterator().next().getBoolean("contributed"));
+    }
 }

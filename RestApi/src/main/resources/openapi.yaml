@@ -273,6 +273,23 @@ paths:
                     items:
                       type: object
 
+  /api/users/me/has-contributed:
+    get:
+      operationId: hasContributed
+      summary: Check if the authenticated user has at least one approved review
+      tags:
+        - Users
+      responses:
+        '200':
+          description: Contribution status
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  hasContributed:
+                    type: boolean
+
   /api/stats:
     get:
       operationId: getStats

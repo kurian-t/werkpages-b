@@ -406,6 +406,16 @@ public class ManagersHandler {
             .onFailure(err -> handleError(ctx, err));
     }
 
+    // ── GET /api/users/me/has-contributed ────────────────────────────────────
+
+    public void handleHasContributed(RoutingContext ctx) {
+        String auth0Id = ctx.get("auth0Id");
+        if (auth0Id == null) { respond(ctx, 401, new JsonObject().put("error", "Unauthorized")); return; }
+        service.hasContributed(auth0Id)
+            .onSuccess(json -> ctx.response().setStatusCode(200).putHeader("Content-Type", "application/json").end(json.encode()))
+            .onFailure(err -> handleError(ctx, err));
+    }
+
     // ── POST /api/managers/:id/edit-requests ──────────────────────────────────
 
     public void handleCreateEditRequest(RoutingContext ctx) {

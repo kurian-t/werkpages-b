@@ -425,13 +425,14 @@ public class ManagerRepository {
 
     public Future<RowSet<Row>> findByNameAndCompany(String fullName, String company) {
         return db.preparedQuery(SELECT_BODY + """
-                WHERE m.name ILIKE $3
-                  AND m.approval_status = 'approved'
+                WHERE m.name ILIKE $1
+                  AND m.company ILIKE $2
+                  AND m.approval_status IN ('approved', 'ghost')
                 GROUP BY m.id
                 ORDER BY m.reviews_count DESC, m.id ASC
                 LIMIT 5
                 """)
-            .execute(Tuple.of(5, 0, fullName));
+            .execute(Tuple.of(fullName, "%" + company.trim() + "%"));
     }
 
     public Future<Row> createAutoApproved(String name, String company, String title,
@@ -441,7 +442,7 @@ public class ManagerRepository {
                 (name, company, title, status, approval_status, country,
                  overall_rating, reviews_count, category_averages, submitted_by,
                  company_logo_url, created_at, updated_at)
-                VALUES ($1,$2,$3,'active','approved',$4,
+                VALUES ($1,$2,$3,'active','ghost',$4,
                         0,0,'{}'::jsonb,$5,
                         $6,now(),now())
                 RETURNING *

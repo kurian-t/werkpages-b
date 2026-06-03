@@ -981,6 +981,15 @@ public class ManagerService {
 
     // ── GET my reviews ────────────────────────────────────────────────────────
 
+    public Future<JsonObject> hasContributed(String auth0Id) {
+        return userRepo.findIdByAuth0Id(auth0Id)
+            .compose(opt -> {
+                if (opt.isEmpty()) return Future.failedFuture(ServiceException.notFound("User not found"));
+                return userRepo.hasContributed(opt.get());
+            })
+            .map(contributed -> new JsonObject().put("hasContributed", contributed));
+    }
+
     public Future<JsonObject> getMyReviews(String auth0Id, int limit, int offset) {
         int effectiveLimit  = Math.min(Math.max(limit, 1), 50);
         int effectiveOffset = Math.max(offset, 0);
@@ -1275,29 +1284,45 @@ public class ManagerService {
                     return Future.failedFuture(ServiceException.unauthorized("User not found"));
                 UUID userId = opt.get();
 
-                return managerRepo.findByNameAndCompany(fullName, company)
-                    .compose(rows -> {
-                        if (rows.size() > 0) {
-                            JsonArray data = new JsonArray();
-                            for (Row row : rows) data.add(rowToManagerJson(row));
-                            return Future.succeededFuture(
-                                new JsonObject().put("data", data).put("created", false));
-                        }
+                return Future.all(
+                    userRepo.hasContributed(userId),
+                    userRepo.hasAutoCreatedManager(userId)
+                ).compose(cf -> {
+                    boolean contributed    = cf.resultAt(0);
+                    boolean alreadyCreated = cf.resultAt(1);
 
-                        return userRepo.hasAutoCreatedManager(userId)
-                            .compose(alreadyUsed -> {
-                                if (alreadyUsed)
-                                    return Future.succeededFuture(
-                                        new JsonObject().put("data", new JsonArray()).put("created", false));
+                    return managerRepo.findByNameAndCompany(fullName, company)
+                        .compose(rows -> {
+                            if (rows.size() > 0) {
+                                JsonArray data = new JsonArray();
+                                for (Row row : rows) data.add(rowToManagerJson(row));
+                                return Future.succeededFuture(
+                                    new JsonObject()
+                                        .put("data", data)
+                                        .put("created", false)
+                                        .put("hasContributed", contributed));
+                            }
 
-                                return managerRepo.createAutoApproved(fullName, company, title, country, userId, resolvedLogoUrl)
-                                    .compose(row -> userRepo.markAutoCreatedManager(userId)
-                                        .map(v -> {
-                                            JsonArray data = new JsonArray().add(rowToManagerJson(row));
-                                            return new JsonObject().put("data", data).put("created", true);
-                                        }));
-                            });
-                    });
+                            // Manager not found — only create a ghost on the user's very first search
+                            if (alreadyCreated) {
+                                return Future.succeededFuture(
+                                    new JsonObject()
+                                        .put("data", new JsonArray())
+                                        .put("created", false)
+                                        .put("hasContributed", contributed));
+                            }
+
+                            return userRepo.markAutoCreatedManager(userId)
+                                .compose(v -> managerRepo.createAutoApproved(fullName, company, title, country, userId, resolvedLogoUrl))
+                                .map(row -> {
+                                    JsonArray data = new JsonArray().add(rowToManagerJson(row));
+                                    return new JsonObject()
+                                        .put("data", data)
+                                        .put("created", true)
+                                        .put("hasContributed", contributed);
+                                });
+                        });
+                });
             });
     }
 
@@ -1312,6 +1337,7 @@ public class ManagerService {
             .put("reviews",        row.getInteger("reviews_count"))
             .put("status",         row.getString("status"))
             .put("country",        row.getString("country"))
-            .put("companyLogoUrl", row.getString("company_logo_url"));
+            .put("companyLogoUrl", row.getString("company_logo_url"))
+            .put("approvalStatus", row.getString("approval_status"));
     }
 }
