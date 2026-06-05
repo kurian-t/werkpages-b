@@ -485,15 +485,18 @@ public class ManagerRepository {
     /** Updates a ghost manager with richer data from the add-manager form. */
     public Future<Optional<Row>> updateForAttach(long id, String name, String title,
                                                   String status, String country,
-                                                  String linkedinUrl, String logoUrl) {
+                                                  String linkedinUrl, String logoUrl,
+                                                  UUID submittedBy) {
         return db.preparedQuery("""
                 UPDATE managers
                 SET name = $1, title = $2, status = $3, country = $4,
-                    linkedin_url = $5, company_logo_url = $6, updated_at = now()
-                WHERE id = $7
+                    linkedin_url = $5, company_logo_url = $6,
+                    submitted_by = COALESCE(submitted_by, $7),
+                    updated_at = now()
+                WHERE id = $8
                 RETURNING *
                 """)
-            .execute(Tuple.of(name, title, status, country, linkedinUrl, logoUrl, id))
+            .execute(Tuple.of(name, title, status, country, linkedinUrl, logoUrl, submittedBy, id))
             .map(rows -> rows.iterator().hasNext()
                 ? Optional.of(rows.iterator().next())
                 : Optional.empty());
@@ -512,5 +515,18 @@ public class ManagerRepository {
         return db.preparedQuery("SELECT COUNT(*) FROM career_history WHERE manager_id = $1")
             .execute(Tuple.of(managerId))
             .map(rows -> rows.iterator().next().getLong(0) > 0);
+    }
+
+    /** Promotes a ghost to pending_approval once a real user has attached a rated review. */
+    public Future<Optional<Row>> promoteGhostToPending(long id) {
+        return db.preparedQuery("""
+                UPDATE managers SET approval_status = 'pending_approval', updated_at = now()
+                WHERE id = $1 AND approval_status = 'ghost'
+                RETURNING *
+                """)
+            .execute(Tuple.of(id))
+            .map(rows -> rows.iterator().hasNext()
+                ? Optional.of(rows.iterator().next())
+                : Optional.empty());
     }
 }

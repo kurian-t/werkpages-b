@@ -204,7 +204,7 @@ public class ManagerService {
 
     public Future<JsonObject> getStats() {
         Future<Long> managersFuture = managerRepo.countApproved();
-        Future<Long> reviewsFuture = db.query("SELECT COUNT(*) FROM reviews r JOIN managers m ON r.manager_id = m.id WHERE m.approval_status = 'approved'")
+        Future<Long> reviewsFuture = db.query("SELECT COUNT(*) FROM reviews r JOIN managers m ON r.manager_id = m.id WHERE m.approval_status IN ('approved', 'ghost')")
             .execute()
             .map(rows -> rows.iterator().next().getLong(0));
         return Future.all(managersFuture, reviewsFuture)
@@ -433,7 +433,7 @@ public class ManagerService {
         if ("ghost".equals(approvalStatus)) {
             // Enrich the ghost record with the more complete form data, add career history,
             // then attach the review.
-            return managerRepo.updateForAttach(existingId, name, title, status, country, linkedinUrl, logoUrl)
+            return managerRepo.updateForAttach(existingId, name, title, status, country, linkedinUrl, logoUrl, userId)
                 .compose(updatedOpt -> {
                     if (updatedOpt.isEmpty()) return Future.failedFuture(ServiceException.notFound("Manager not found"));
                     Row updatedRow = updatedOpt.get();
@@ -446,7 +446,8 @@ public class ManagerService {
                                 : managerRepo.insertCareerEntry(existingId, company, title, startDt, endDt);
                             return histFuture
                                 .compose(v -> validateAndInsertReview(reviewBody, existingId, userId, author, logoUrl))
-                                .map(ignored -> updatedRow);
+                                .compose(ignored -> managerRepo.promoteGhostToPending(existingId))
+                                .map(promotedOpt -> promotedOpt.orElse(updatedRow));
                         });
                 });
         } else {
