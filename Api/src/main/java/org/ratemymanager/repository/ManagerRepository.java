@@ -135,7 +135,7 @@ public class ManagerRepository {
             //         then the rest in stable pseudo-random order so pagination doesn't shift.
             default        -> """
                 ORDER BY
-                  CASE WHEN m.submitted_by IS NOT NULL AND m.external_id IS NULL THEN 0 ELSE 1 END,
+                  CASE WHEN m.external_id IS NULL THEN 0 ELSE 1 END,
                   CASE WHEN m.company_logo_url IS NOT NULL THEN 0 ELSE 1 END,
                   MD5(CAST(m.id AS text))""";
         };
