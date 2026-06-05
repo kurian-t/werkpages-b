@@ -335,48 +335,130 @@ public class ManagerService {
                 return managerRepo.countSubmittedTodayByUser(userId)
                     .compose(todayCount -> {
                         if (todayCount >= 6) return Future.failedFuture(ServiceException.tooManyRequests("daily_limit_reached"));
-                        // Transactional insert
-                        OffsetDateTime startDt = fStartDate.atStartOfDay(ZoneOffset.UTC).toOffsetDateTime();
-                        OffsetDateTime endDt   = fEndDate != null ? fEndDate.atStartOfDay(ZoneOffset.UTC).toOffsetDateTime() : null;
-                        return ((Pool) db).withTransaction(conn ->
-                            conn.preparedQuery("""
-                                INSERT INTO managers
-                                (name, company, title, image, bio, status, approval_status, country, linkedin_url,
-                                 company_logo_url, overall_rating, reviews_count, category_averages, created_at, submitted_by)
-                                VALUES ($1,$2,$3,$4,$5,$6,'pending_approval',$7,$8,$9,0,0,'{}'::jsonb,now(),$10)
-                                RETURNING *
-                                """)
-                                .execute(Tuple.of(name, company, title, image, fBio, fStatus, fCountry, fLinkedinUrl, resolvedLogoUrl, userId))
-                                .compose(managerResult -> {
-                                    Row managerRow = managerResult.iterator().next();
-                                    long managerId = managerRow.getLong("id");
-                                    conn.preparedQuery("INSERT INTO career_history(manager_id, company, title, start_date, end_date) VALUES ($1,$2,$3,$4,$5)")
-                                        .execute(Tuple.of(managerId, company, title, startDt, endDt), ignored -> {});
-                                    return conn.preparedQuery("""
-                                        INSERT INTO reviews (
-                                            manager_id, user_id, author, overall_rating,
-                                            communication_style, perceived_approachability, perceived_clarity_of_expectations,
-                                            feedback_style, perceived_supportiveness, decision_making_style,
-                                            organization_and_planning_style, delegation_style, perceived_professional_demeanor,
-                                            overall_working_experience, manager_company, manager_title, text,
-                                            worked_from, worked_until, verified, helpful_count, created_at, updated_at
-                                        )
-                                        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,true,0,now(),now())
-                                        RETURNING id
+
+                        // Check for an existing manager with the same company and a fuzzy-matching name
+                        // (Levenshtein distance ≤ 1). If found, attach the review there instead of
+                        // creating a duplicate pending_approval entry.
+                        return managerRepo.findByCompanyExact(company)
+                            .compose(candidates -> {
+                                Row fuzzyMatch = findFuzzyNameMatch(candidates, name);
+                                if (fuzzyMatch != null) {
+                                    return doAttachToExisting(fuzzyMatch, userId, author,
+                                        name, company, title, fStatus, fCountry, fLinkedinUrl, resolvedLogoUrl,
+                                        fStartDate, fEndDate, fOverallRating, fRatings,
+                                        fMgrCompany, fMgrTitle, fReviewText, fWorkedFrom, fWorkedUntil);
+                                }
+                                // No match — create a new pending_approval manager with its first review
+                                OffsetDateTime startDt = fStartDate.atStartOfDay(ZoneOffset.UTC).toOffsetDateTime();
+                                OffsetDateTime endDt   = fEndDate != null ? fEndDate.atStartOfDay(ZoneOffset.UTC).toOffsetDateTime() : null;
+                                return ((Pool) db).withTransaction(conn ->
+                                    conn.preparedQuery("""
+                                        INSERT INTO managers
+                                        (name, company, title, image, bio, status, approval_status, country, linkedin_url,
+                                         company_logo_url, overall_rating, reviews_count, category_averages, created_at, submitted_by)
+                                        VALUES ($1,$2,$3,$4,$5,$6,'pending_approval',$7,$8,$9,0,0,'{}'::jsonb,now(),$10)
+                                        RETURNING *
                                         """)
-                                        .execute(Tuple.of(
-                                            managerId, userId, author, fOverallRating,
-                                            getRating(fRatings, 0), getRating(fRatings, 1), getRating(fRatings, 2),
-                                            getRating(fRatings, 3), getRating(fRatings, 4), getRating(fRatings, 5),
-                                            getRating(fRatings, 6), getRating(fRatings, 7), getRating(fRatings, 8),
-                                            getRating(fRatings, 9), fMgrCompany, fMgrTitle, fReviewText,
-                                            fWorkedFrom, fWorkedUntil
-                                        ))
-                                        .map(ignored -> managerRow);
-                                })
-                        ).onSuccess(managerRow -> managerRepo.recalculateInBackground(managerRow.getLong("id")));
+                                        .execute(Tuple.of(name, company, title, image, fBio, fStatus, fCountry, fLinkedinUrl, resolvedLogoUrl, userId))
+                                        .compose(managerResult -> {
+                                            Row managerRow = managerResult.iterator().next();
+                                            long managerId = managerRow.getLong("id");
+                                            conn.preparedQuery("INSERT INTO career_history(manager_id, company, title, start_date, end_date) VALUES ($1,$2,$3,$4,$5)")
+                                                .execute(Tuple.of(managerId, company, title, startDt, endDt), ignored -> {});
+                                            return conn.preparedQuery("""
+                                                INSERT INTO reviews (
+                                                    manager_id, user_id, author, overall_rating,
+                                                    communication_style, perceived_approachability, perceived_clarity_of_expectations,
+                                                    feedback_style, perceived_supportiveness, decision_making_style,
+                                                    organization_and_planning_style, delegation_style, perceived_professional_demeanor,
+                                                    overall_working_experience, manager_company, manager_title, text,
+                                                    worked_from, worked_until, verified, helpful_count, created_at, updated_at
+                                                )
+                                                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,true,0,now(),now())
+                                                RETURNING id
+                                                """)
+                                                .execute(Tuple.of(
+                                                    managerId, userId, author, fOverallRating,
+                                                    getRating(fRatings, 0), getRating(fRatings, 1), getRating(fRatings, 2),
+                                                    getRating(fRatings, 3), getRating(fRatings, 4), getRating(fRatings, 5),
+                                                    getRating(fRatings, 6), getRating(fRatings, 7), getRating(fRatings, 8),
+                                                    getRating(fRatings, 9), fMgrCompany, fMgrTitle, fReviewText,
+                                                    fWorkedFrom, fWorkedUntil
+                                                ))
+                                                .map(ignored -> managerRow);
+                                        })
+                                ).onSuccess(managerRow -> managerRepo.recalculateInBackground(managerRow.getLong("id")));
+                            });
                     });
             });
+    }
+
+    private static Row findFuzzyNameMatch(RowSet<Row> candidates, String targetName) {
+        for (Row row : candidates) {
+            String candidateName = row.getString("name");
+            if (candidateName != null && LevenshteinUtil.distance(targetName, candidateName) <= 1) {
+                return row;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Attaches a new review to an existing manager instead of creating a duplicate.
+     * For ghost managers, also enriches the manager record with the richer form data.
+     */
+    private Future<Row> doAttachToExisting(
+            Row match, UUID userId, String author,
+            String name, String company, String title,
+            String status, String country, String linkedinUrl, String logoUrl,
+            LocalDate startDate, LocalDate endDate,
+            double overallRating, JsonObject ratings,
+            String mgrCompany, String mgrTitle, String reviewText,
+            LocalDate workedFrom, LocalDate workedUntil) {
+
+        long existingId      = match.getLong("id");
+        String approvalStatus = match.getString("approval_status");
+
+        String workedFromStr  = workedFrom  != null ? workedFrom.toString().substring(0, 7)  : null;
+        String workedUntilStr = workedUntil != null ? workedUntil.toString().substring(0, 7) : null;
+        JsonObject reviewBody = new JsonObject()
+            .put("overallRating",  overallRating)
+            .put("ratings",        ratings)
+            .put("managerCompany", mgrCompany)
+            .put("managerTitle",   mgrTitle)
+            .put("text",           reviewText)
+            .put("workedFrom",     workedFromStr)
+            .put("workedUntil",    workedUntilStr);
+
+        if ("ghost".equals(approvalStatus)) {
+            // Enrich the ghost record with the more complete form data, add career history,
+            // then attach the review.
+            return managerRepo.updateForAttach(existingId, name, title, status, country, linkedinUrl, logoUrl)
+                .compose(updatedOpt -> {
+                    if (updatedOpt.isEmpty()) return Future.failedFuture(ServiceException.notFound("Manager not found"));
+                    Row updatedRow = updatedOpt.get();
+                    OffsetDateTime startDt = startDate.atStartOfDay(ZoneOffset.UTC).toOffsetDateTime();
+                    OffsetDateTime endDt   = endDate != null ? endDate.atStartOfDay(ZoneOffset.UTC).toOffsetDateTime() : null;
+                    return managerRepo.hasCareerHistory(existingId)
+                        .compose(hasHistory -> {
+                            Future<Void> histFuture = hasHistory
+                                ? Future.succeededFuture()
+                                : managerRepo.insertCareerEntry(existingId, company, title, startDt, endDt);
+                            return histFuture
+                                .compose(v -> validateAndInsertReview(reviewBody, existingId, userId, author, logoUrl))
+                                .map(ignored -> updatedRow);
+                        });
+                });
+        } else {
+            // approved or pending_approval — attach review without touching manager data
+            return managerRepo.findByIdFlat(existingId)
+                .compose(opt -> {
+                    if (opt.isEmpty()) return Future.failedFuture(ServiceException.notFound("Manager not found"));
+                    Row existingRow = opt.get();
+                    return validateAndInsertReview(reviewBody, existingId, userId, author, logoUrl)
+                        .map(ignored -> existingRow);
+                });
+        }
     }
 
     // ── UPDATE manager ────────────────────────────────────────────────────────

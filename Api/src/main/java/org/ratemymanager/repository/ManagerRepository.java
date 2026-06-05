@@ -466,4 +466,51 @@ public class ManagerRepository {
             .execute(Tuple.of(name, company.trim(), title.trim(), country.trim(), logoUrl))
             .map(rows -> rows.iterator().next());
     }
+
+    // ── Find-or-attach helpers ────────────────────────────────────────────────
+
+    /** Returns all non-rejected managers for an exact company name (case-insensitive). */
+    public Future<RowSet<Row>> findByCompanyExact(String company) {
+        return db.preparedQuery("""
+                SELECT id, name, approval_status
+                FROM managers
+                WHERE LOWER(TRIM(company)) = LOWER(TRIM($1))
+                  AND approval_status NOT IN ('rejected')
+                ORDER BY reviews_count DESC NULLS LAST
+                LIMIT 50
+                """)
+            .execute(Tuple.of(company));
+    }
+
+    /** Updates a ghost manager with richer data from the add-manager form. */
+    public Future<Optional<Row>> updateForAttach(long id, String name, String title,
+                                                  String status, String country,
+                                                  String linkedinUrl, String logoUrl) {
+        return db.preparedQuery("""
+                UPDATE managers
+                SET name = $1, title = $2, status = $3, country = $4,
+                    linkedin_url = $5, company_logo_url = $6, updated_at = now()
+                WHERE id = $7
+                RETURNING *
+                """)
+            .execute(Tuple.of(name, title, status, country, linkedinUrl, logoUrl, id))
+            .map(rows -> rows.iterator().hasNext()
+                ? Optional.of(rows.iterator().next())
+                : Optional.empty());
+    }
+
+    /** Simple flat SELECT for returning manager data to the handler after an attach. */
+    public Future<Optional<Row>> findByIdFlat(long id) {
+        return db.preparedQuery("SELECT * FROM managers WHERE id = $1")
+            .execute(Tuple.of(id))
+            .map(rows -> rows.iterator().hasNext()
+                ? Optional.of(rows.iterator().next())
+                : Optional.empty());
+    }
+
+    public Future<Boolean> hasCareerHistory(long managerId) {
+        return db.preparedQuery("SELECT COUNT(*) FROM career_history WHERE manager_id = $1")
+            .execute(Tuple.of(managerId))
+            .map(rows -> rows.iterator().next().getLong(0) > 0);
+    }
 }
