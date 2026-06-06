@@ -203,14 +203,20 @@ public class ManagerService {
     // ── GET stats ─────────────────────────────────────────────────────────────
 
     public Future<JsonObject> getStats() {
-        Future<Long> managersFuture = managerRepo.countApproved();
-        Future<Long> reviewsFuture = db.query("SELECT COUNT(*) FROM reviews r JOIN managers m ON r.manager_id = m.id WHERE m.approval_status IN ('approved', 'ghost')")
-            .execute()
-            .map(rows -> rows.iterator().next().getLong(0));
-        return Future.all(managersFuture, reviewsFuture)
+        Future<Long> realManagersFuture = db.query("SELECT COUNT(*) FROM managers WHERE approval_status IN ('approved','ghost') AND external_id IS NULL")
+            .execute().map(rows -> rows.iterator().next().getLong(0));
+        Future<Long> realReviewsFuture = db.query("SELECT COUNT(*) FROM reviews r JOIN managers m ON r.manager_id = m.id WHERE m.approval_status IN ('approved','ghost') AND m.external_id IS NULL")
+            .execute().map(rows -> rows.iterator().next().getLong(0));
+        Future<Long> seededManagersFuture = db.query("SELECT COUNT(*) FROM managers WHERE approval_status IN ('approved','ghost') AND external_id IS NOT NULL")
+            .execute().map(rows -> rows.iterator().next().getLong(0));
+        Future<Long> totalManagersFuture = db.query("SELECT COUNT(*) FROM managers WHERE approval_status IN ('approved','ghost')")
+            .execute().map(rows -> rows.iterator().next().getLong(0));
+        return Future.all(realManagersFuture, realReviewsFuture, seededManagersFuture, totalManagersFuture)
             .map(cf -> new JsonObject()
-                .put("totalManagers", managersFuture.result())
-                .put("totalReviews",  reviewsFuture.result())
+                .put("realManagers",   realManagersFuture.result())
+                .put("realReviews",    realReviewsFuture.result())
+                .put("seededManagers", seededManagersFuture.result())
+                .put("totalManagers",  totalManagersFuture.result())
             );
     }
 
@@ -387,7 +393,10 @@ public class ManagerService {
                                                 ))
                                                 .map(ignored -> managerRow);
                                         })
-                                ).onSuccess(managerRow -> managerRepo.recalculateInBackground(managerRow.getLong("id")));
+                                ).onSuccess(managerRow -> {
+                                    managerRepo.recalculateInBackground(managerRow.getLong("id"));
+                                    managerRepo.deleteOneSeededInBackground();
+                                });
                             });
                     });
             });
@@ -447,7 +456,10 @@ public class ManagerService {
                             return histFuture
                                 .compose(v -> validateAndInsertReview(reviewBody, existingId, userId, author, logoUrl))
                                 .compose(ignored -> managerRepo.promoteGhostToPending(existingId))
-                                .map(promotedOpt -> promotedOpt.orElse(updatedRow));
+                                .map(promotedOpt -> {
+                                    if (promotedOpt.isPresent()) managerRepo.deleteOneSeededInBackground();
+                                    return promotedOpt.orElse(updatedRow);
+                                });
                         });
                 });
         } else {

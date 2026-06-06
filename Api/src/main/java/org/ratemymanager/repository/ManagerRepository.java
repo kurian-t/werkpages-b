@@ -519,6 +519,26 @@ public class ManagerRepository {
             .map(rows -> rows.iterator().next().getLong(0) > 0);
     }
 
+    /** Deletes the lowest-value seeded manager (fewest reviews, oldest) and all its cascaded data. */
+    public void deleteOneSeededInBackground() {
+        db.query("""
+                SELECT id FROM managers
+                WHERE external_id IS NOT NULL
+                  AND approval_status IN ('approved', 'ghost')
+                ORDER BY COALESCE(reviews_count, 0) ASC, created_at ASC
+                LIMIT 1
+                """)
+            .execute()
+            .compose(rows -> {
+                if (!rows.iterator().hasNext()) return Future.succeededFuture();
+                long id = rows.iterator().next().getLong("id");
+                return db.preparedQuery("DELETE FROM managers WHERE id = $1")
+                    .execute(Tuple.of(id))
+                    .mapEmpty();
+            })
+            .onFailure(err -> System.err.println("Seeded cleanup failed: " + err.getMessage()));
+    }
+
     /** Promotes a ghost to pending_approval once a real user has attached a rated review. */
     public Future<Optional<Row>> promoteGhostToPending(long id) {
         return db.preparedQuery("""
