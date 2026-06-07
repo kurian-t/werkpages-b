@@ -330,6 +330,32 @@ paths:
                     items:
                       type: string
 
+  /api/companies/suggest:
+    get:
+      operationId: suggestCompanies
+      summary: Suggest company names matching a query (public)
+      tags:
+        - Managers
+      security: []
+      parameters:
+        - in: query
+          name: query
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: List of matching company suggestions
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    name:
+                      type: string
+
   /api/managers/similar:
     get:
       operationId: getSimilarManagers

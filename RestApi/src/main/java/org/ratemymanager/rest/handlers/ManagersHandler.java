@@ -153,6 +153,15 @@ public class ManagersHandler {
             .onFailure(err -> handleError(ctx, err));
     }
 
+    // ── GET /api/companies/suggest ────────────────────────────────────────────
+
+    public void handleSuggestCompanies(RoutingContext ctx) {
+        String query = ctx.queryParam("query").stream().findFirst().orElse("");
+        service.suggestCompanies(query)
+            .onSuccess(arr -> ctx.response().putHeader("Content-Type", "application/json").end(arr.encode()))
+            .onFailure(err -> handleError(ctx, err));
+    }
+
     // ── GET /api/stats ────────────────────────────────────────────────────────
 
     public void handleGetStats(RoutingContext ctx) {

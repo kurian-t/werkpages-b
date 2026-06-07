@@ -177,6 +177,17 @@ public class ManagerRepository {
             .execute();
     }
 
+    public Future<RowSet<Row>> findCompaniesByQuery(String query) {
+        return db.preparedQuery("""
+                SELECT DISTINCT company FROM managers
+                WHERE approval_status IN ('approved','ghost')
+                  AND company ILIKE $1
+                ORDER BY company
+                LIMIT 6
+                """)
+            .execute(Tuple.of("%" + query + "%"));
+    }
+
     public Future<RowSet<Row>> findSimilar(String nameLike, String companyLike) {
         return db.preparedQuery("""
                 SELECT id, name, company, title, overall_rating, company_logo_url, approval_status

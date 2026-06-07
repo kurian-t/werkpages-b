@@ -174,6 +174,23 @@ public class ManagerService {
             });
     }
 
+    // ── GET company suggestions ───────────────────────────────────────────────
+
+    public Future<JsonArray> suggestCompanies(String query) {
+        if (query == null || query.isBlank()) return Future.succeededFuture(new JsonArray());
+        return managerRepo.findCompaniesByQuery(query.trim())
+            .map(rows -> {
+                JsonArray result = new JsonArray();
+                for (Row row : rows) {
+                    String name = row.getString("company");
+                    if (name != null && !name.isBlank()) {
+                        result.add(new JsonObject().put("name", name));
+                    }
+                }
+                return result;
+            });
+    }
+
     // ── GET similar managers ──────────────────────────────────────────────────
 
     public Future<JsonObject> getSimilarManagers(String name, String company) {
