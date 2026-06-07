@@ -323,6 +323,16 @@ public class ManagerRepository {
             .map(RowSet::rowCount);
     }
 
+    /** Updates the open (current) career entry in place — used for typo/spelling corrections. */
+    public Future<Void> updateOpenCareerEntry(long managerId, String company, String title) {
+        return db.preparedQuery("""
+                UPDATE career_history SET company = $2, title = $3
+                WHERE manager_id = $1 AND end_date IS NULL
+                """)
+            .execute(Tuple.of(managerId, company, title))
+            .mapEmpty();
+    }
+
     // ── Stats recalculation ───────────────────────────────────────────────────
 
     /** Fire-and-forget: recalculates and persists rating stats without blocking. */
@@ -519,11 +529,11 @@ public class ManagerRepository {
             .map(rows -> rows.iterator().next().getLong(0) > 0);
     }
 
-    /** Deletes the lowest-value seeded manager (fewest reviews, oldest) and all its cascaded data. */
-    public void deleteOneSeededInBackground() {
+    /** Deletes one fake (seed_*) manager — fewest reviews first — and all its cascaded data. */
+    public void deleteFakeManagerInBackground() {
         db.query("""
                 SELECT id FROM managers
-                WHERE external_id IS NOT NULL
+                WHERE external_id LIKE 'seed_%'
                   AND approval_status IN ('approved', 'ghost')
                 ORDER BY COALESCE(reviews_count, 0) ASC, created_at ASC
                 LIMIT 1
@@ -536,7 +546,7 @@ public class ManagerRepository {
                     .execute(Tuple.of(id))
                     .mapEmpty();
             })
-            .onFailure(err -> System.err.println("Seeded cleanup failed: " + err.getMessage()));
+            .onFailure(err -> System.err.println("Fake manager cleanup failed: " + err.getMessage()));
     }
 
     /** Promotes a ghost to pending_approval once a real user has attached a rated review. */

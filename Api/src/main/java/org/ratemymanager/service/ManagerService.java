@@ -207,7 +207,7 @@ public class ManagerService {
             .execute().map(rows -> rows.iterator().next().getLong(0));
         Future<Long> realReviewsFuture = db.query("SELECT COUNT(*) FROM reviews r JOIN managers m ON r.manager_id = m.id WHERE m.approval_status IN ('approved','ghost') AND m.external_id IS NULL")
             .execute().map(rows -> rows.iterator().next().getLong(0));
-        Future<Long> seededManagersFuture = db.query("SELECT COUNT(*) FROM managers WHERE approval_status IN ('approved','ghost') AND external_id IS NOT NULL")
+        Future<Long> seededManagersFuture = db.query("SELECT COUNT(*) FROM managers WHERE approval_status IN ('approved','ghost') AND external_id LIKE 'seed_%'")
             .execute().map(rows -> rows.iterator().next().getLong(0));
         Future<Long> totalManagersFuture = db.query("SELECT COUNT(*) FROM managers WHERE approval_status IN ('approved','ghost')")
             .execute().map(rows -> rows.iterator().next().getLong(0));
@@ -244,6 +244,7 @@ public class ManagerService {
             return Future.failedFuture(ServiceException.badRequest("Missing required fields"));
         }
         if (name.length() > 100)    return Future.failedFuture(ServiceException.badRequest("Manager name must be at most 100 characters"));
+        if (company.length() < 2)   return Future.failedFuture(ServiceException.badRequest("Company name must be at least 2 characters"));
         if (company.length() > 100) return Future.failedFuture(ServiceException.badRequest("Company must be at most 100 characters"));
         if (title.length() > 100)   return Future.failedFuture(ServiceException.badRequest("Title must be at most 100 characters"));
 
@@ -395,7 +396,7 @@ public class ManagerService {
                                         })
                                 ).onSuccess(managerRow -> {
                                     managerRepo.recalculateInBackground(managerRow.getLong("id"));
-                                    managerRepo.deleteOneSeededInBackground();
+                                    managerRepo.deleteFakeManagerInBackground();
                                 });
                             });
                     });
@@ -457,7 +458,7 @@ public class ManagerService {
                                 .compose(v -> validateAndInsertReview(reviewBody, existingId, userId, author, logoUrl))
                                 .compose(ignored -> managerRepo.promoteGhostToPending(existingId))
                                 .map(promotedOpt -> {
-                                    if (promotedOpt.isPresent()) managerRepo.deleteOneSeededInBackground();
+                                    if (promotedOpt.isPresent()) managerRepo.deleteFakeManagerInBackground();
                                     return promotedOpt.orElse(updatedRow);
                                 });
                         });
@@ -492,7 +493,7 @@ public class ManagerService {
         if (newCompany == null && newTitle == null && newImage == null && newBio == null && newStatus == null && newCountry == null && newLinkedinUrl == null) {
             return Future.failedFuture(ServiceException.badRequest("Nothing to update"));
         }
-        if (newCompany != null && (newCompany.isBlank() || newCompany.length() > 100)) return Future.failedFuture(ServiceException.badRequest("Company must be between 1 and 100 characters"));
+        if (newCompany != null && (newCompany.isBlank() || newCompany.length() < 2 || newCompany.length() > 100)) return Future.failedFuture(ServiceException.badRequest("Company must be between 2 and 100 characters"));
         if (newTitle   != null && (newTitle.isBlank()   || newTitle.length()   > 100)) return Future.failedFuture(ServiceException.badRequest("Title must be between 1 and 100 characters"));
         if (newBio     != null && newBio.length() > 1000) return Future.failedFuture(ServiceException.badRequest("Bio must be at most 1000 characters"));
         if (newStatus  != null && !newStatus.equals("active") && !newStatus.equals("retired")) return Future.failedFuture(ServiceException.badRequest("Status must be 'active' or 'retired'"));
@@ -516,21 +517,26 @@ public class ManagerService {
                 boolean titleChanged   = newTitle   != null && !newTitle.equals(currentTitle);
 
                 if (companyChanged || titleChanged) {
-                    // Update career history, then update manager
-                    OffsetDateTime now = OffsetDateTime.now(ZoneOffset.UTC);
                     String effectiveCo  = newCompany != null ? newCompany : currentCompany;
                     String effectiveTit = newTitle   != null ? newTitle   : currentTitle;
                     LocalDate oldStartLocal = parseYearMonth(startDateStr);
-                    OffsetDateTime newPosStart = oldStartLocal != null
-                        ? oldStartLocal.atStartOfDay(ZoneOffset.UTC).toOffsetDateTime() : now;
+
+                    if (oldStartLocal == null) {
+                        // No start date provided — treat as a spelling/typo correction.
+                        // Update the existing open career entry in place; don't fork a new segment.
+                        return managerRepo.updateOpenCareerEntry(managerId, effectiveCo, effectiveTit)
+                            .compose(v -> doUpdate(managerId, newCompany, newTitle, newImage, newBio, newStatus, newCountry, newLinkedinUrl, newLogoUrl));
+                    }
+
+                    // Start date provided — genuine role change: close old segment, open a new one.
+                    OffsetDateTime now = OffsetDateTime.now(ZoneOffset.UTC);
+                    OffsetDateTime newPosStart = oldStartLocal.atStartOfDay(ZoneOffset.UTC).toOffsetDateTime();
 
                     return managerRepo.closeOpenCareerEntry(managerId, now)
                         .compose(closedRows -> {
                             Future<Void> archiveOld;
                             if (closedRows == 0) {
-                                OffsetDateTime oldStart = oldStartLocal != null
-                                    ? oldStartLocal.atStartOfDay(ZoneOffset.UTC).toOffsetDateTime()
-                                    : current.getOffsetDateTime("created_at");
+                                OffsetDateTime oldStart = current.getOffsetDateTime("created_at");
                                 archiveOld = managerRepo.insertCareerEntry(managerId, currentCompany, currentTitle, oldStart, now);
                             } else {
                                 archiveOld = Future.succeededFuture();
@@ -634,6 +640,7 @@ public class ManagerService {
         }
 
         if (overallRating == null || ratings == null || isBlank(managerCompany) || isBlank(managerTitle)) return Future.failedFuture(ServiceException.badRequest("Missing required fields"));
+        if (managerCompany.length() < 2)   return Future.failedFuture(ServiceException.badRequest("Company name must be at least 2 characters"));
         if (managerCompany.length() > 100) return Future.failedFuture(ServiceException.badRequest("Manager company must be at most 100 characters"));
         if (managerTitle.length()   > 100) return Future.failedFuture(ServiceException.badRequest("Manager title must be at most 100 characters"));
         if (text != null && text.length() > 2000) return Future.failedFuture(ServiceException.badRequest("Review text must be at most 2000 characters"));
