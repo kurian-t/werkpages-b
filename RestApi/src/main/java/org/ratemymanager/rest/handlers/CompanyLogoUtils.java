@@ -165,11 +165,8 @@ public class CompanyLogoUtils {
     }
 
     /**
-     * Returns a Clearbit logo URL for known companies, or null for unknown ones.
-     * Null means the frontend should fall back to a Google favicon or show nothing.
+     * Returns a Clearbit logo URL for the given company name.
      */
-    private static final String LOGO_DEV_TOKEN = "pk_MXSjJV-uTC6-L5D_FbXZUA";
-
     private static final java.util.regex.Pattern CORP_SUFFIX_RE = java.util.regex.Pattern.compile(
         "[\\s,]+(?:inc\\.?|incorporated|corp\\.?|corporation|llc\\.?|ltd\\.?|limited|" +
         "co\\.?|plc\\.?|lp\\.?|l\\.p\\.|l\\.l\\.c\\.|companies|company|group|holdings|" +
@@ -192,6 +189,6 @@ public class CompanyLogoUtils {
         String key = company.toLowerCase().trim();
         String domain = DOMAIN_MAP.get(key);
         if (domain == null) domain = companyDomain(company);
-        return "https://img.logo.dev/" + domain + "?token=" + LOGO_DEV_TOKEN;
+        return "https://logo.clearbit.com/" + domain;
     }
 }

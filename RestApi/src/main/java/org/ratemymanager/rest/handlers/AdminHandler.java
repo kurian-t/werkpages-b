@@ -176,6 +176,27 @@ public class AdminHandler {
             .onFailure(err -> ManagersHandler.handleError(ctx, err));
     }
 
+    // ── PUT /api/admin/managers/:managerId ───────────────────────────────────
+
+    public void handleAdminEditManager(RoutingContext ctx) {
+        String auth0Id = ctx.get("auth0Id");
+        long managerId;
+        try {
+            managerId = Long.parseLong(ctx.pathParam("managerId"));
+        } catch (Exception e) {
+            bad(ctx, "Invalid manager ID"); return;
+        }
+        JsonObject body = ctx.getBodyAsJson();
+        if (body == null) { bad(ctx, "Request body required"); return; }
+        String name        = body.getString("name");
+        String title       = body.getString("title");
+        String company     = body.getString("company");
+        String linkedinUrl = body.getString("linkedinUrl");
+        service.adminEditManager(auth0Id, managerId, name, title, company, linkedinUrl)
+            .onSuccess(json -> ok(ctx, json))
+            .onFailure(err -> ManagersHandler.handleError(ctx, err));
+    }
+
     // ── POST /api/admin/managers/:keepId/merge/:mergeId ───────────────────────
 
     public void handleMergeManagers(RoutingContext ctx) {

@@ -184,7 +184,15 @@ public class ManagerService {
                 for (Row row : rows) {
                     String name = row.getString("company");
                     if (name != null && !name.isBlank()) {
-                        result.add(new JsonObject().put("name", name));
+                        JsonObject suggestion = new JsonObject().put("name", name);
+                        String logoUrl = logoResolver.apply(name);
+                        if (logoUrl == null || logoUrl.isBlank()) {
+                            logoUrl = row.getString("company_logo_url");
+                        }
+                        if (logoUrl != null && !logoUrl.isBlank()) {
+                            suggestion.put("logoUrl", logoUrl);
+                        }
+                        result.add(suggestion);
                     }
                 }
                 return result;
@@ -266,10 +274,16 @@ public class ManagerService {
         if (title.length() > 100)   return Future.failedFuture(ServiceException.badRequest("Title must be at most 100 characters"));
 
         String country     = body.getString("country")     != null ? body.getString("country").trim()     : null;
+        String state       = body.getString("state")       != null ? body.getString("state").trim()       : null;
+        String city        = body.getString("city")        != null ? body.getString("city").trim()        : null;
         String bio         = body.getString("bio")         != null ? body.getString("bio").trim()         : null;
         String linkedinUrl = body.getString("linkedinUrl") != null ? body.getString("linkedinUrl").trim() : null;
         if (isBlank(country)) return Future.failedFuture(ServiceException.badRequest("Country is required"));
         if (country.length() > 100) return Future.failedFuture(ServiceException.badRequest("Country must be at most 100 characters"));
+        if (isBlank(state)) state = null;
+        if (isBlank(city))  city  = null;
+        if (state != null && state.length() > 100) return Future.failedFuture(ServiceException.badRequest("State must be at most 100 characters"));
+        if (city  != null && city.length()  > 100) return Future.failedFuture(ServiceException.badRequest("City must be at most 100 characters"));
         if (bio != null && bio.length() > 1000) return Future.failedFuture(ServiceException.badRequest("Bio must be at most 1000 characters"));
         if (!isBlank(linkedinUrl)) {
             if (linkedinUrl.length() > 500) return Future.failedFuture(ServiceException.badRequest("LinkedIn URL must be at most 500 characters"));
@@ -336,6 +350,8 @@ public class ManagerService {
         final String   fReviewClientAuthor   = reviewBody.getString("author", "").trim();
         final LocalDate fEndDate      = endDateLocal;
         final String   fCountry       = country;
+        final String   fState         = state;
+        final String   fCity          = city;
         final String   fBio           = bio;
         final String   fLinkedinUrl   = linkedinUrl;
         final String   fReviewText    = reviewText;
@@ -378,12 +394,12 @@ public class ManagerService {
                                 return ((Pool) db).withTransaction(conn ->
                                     conn.preparedQuery("""
                                         INSERT INTO managers
-                                        (name, company, title, image, bio, status, approval_status, country, linkedin_url,
+                                        (name, company, title, image, bio, status, approval_status, country, state, city, linkedin_url,
                                          company_logo_url, overall_rating, reviews_count, category_averages, created_at, submitted_by)
-                                        VALUES ($1,$2,$3,$4,$5,$6,'pending_approval',$7,$8,$9,0,0,'{}'::jsonb,now(),$10)
+                                        VALUES ($1,$2,$3,$4,$5,$6,'pending_approval',$7,$8,$9,$10,$11,0,0,'{}'::jsonb,now(),$12)
                                         RETURNING *
                                         """)
-                                        .execute(Tuple.of(name, company, title, image, fBio, fStatus, fCountry, fLinkedinUrl, resolvedLogoUrl, userId))
+                                        .execute(Tuple.of(name, company, title, image, fBio, fStatus, fCountry, fState, fCity, fLinkedinUrl, resolvedLogoUrl, userId))
                                         .compose(managerResult -> {
                                             Row managerRow = managerResult.iterator().next();
                                             long managerId = managerRow.getLong("id");
@@ -1389,6 +1405,7 @@ public class ManagerService {
     public Future<JsonObject> findOrCreate(String auth0Id,
                                            String firstName, String lastName,
                                            String title, String company, String country,
+                                           String state, String city,
                                            String resolvedLogoUrl) {
         NameValidator.ValidationResult validation =
             NameValidator.validate(firstName, lastName, title, company, country);
@@ -1435,7 +1452,9 @@ public class ManagerService {
 
                     // Create the ghost first, then mark the flag. If the insert fails the flag
                     // is never set, so the user gets another chance on their next search.
-                    return managerRepo.createAutoApproved(fullName, company, title, country, userId, resolvedLogoUrl)
+                    return managerRepo.createAutoApproved(fullName, company, title, country,
+                            isBlank(state) ? null : state.trim(), isBlank(city) ? null : city.trim(),
+                            userId, resolvedLogoUrl)
                         .compose(row -> userRepo.markAutoCreatedManager(userId).map(v -> row))
                         .map(row -> {
                             JsonArray data = new JsonArray().add(rowToManagerJson(row));
@@ -1460,6 +1479,8 @@ public class ManagerService {
         String company = body.getString("company") != null ? body.getString("company").trim() : null;
         String title   = body.getString("title")   != null ? body.getString("title").trim()   : null;
         String country = body.getString("country") != null ? body.getString("country").trim() : null;
+        String state   = body.getString("state")   != null ? body.getString("state").trim()   : null;
+        String city    = body.getString("city")    != null ? body.getString("city").trim()    : null;
         if (isBlank(name) || isBlank(company) || isBlank(title) || isBlank(country)) {
             return Future.failedFuture(ServiceException.badRequest("Missing required fields"));
         }
@@ -1467,6 +1488,12 @@ public class ManagerService {
         if (company.length() > 100) return Future.failedFuture(ServiceException.badRequest("Company too long"));
         if (title.length()   > 100) return Future.failedFuture(ServiceException.badRequest("Title too long"));
         if (country.length() > 100) return Future.failedFuture(ServiceException.badRequest("Country too long"));
+        if (isBlank(state)) state = null;
+        if (isBlank(city))  city  = null;
+        if (state != null && state.length() > 100) return Future.failedFuture(ServiceException.badRequest("State too long"));
+        if (city  != null && city.length()  > 100) return Future.failedFuture(ServiceException.badRequest("City too long"));
+        final String fState = state;
+        final String fCity  = city;
 
         return managerRepo.findByNameAndCompany(name, company)
             .compose(rows -> {
@@ -1479,7 +1506,7 @@ public class ManagerService {
                             .put("created", false)
                     );
                 }
-                return managerRepo.createGhost(name, company, title, country, resolvedLogoUrl)
+                return managerRepo.createGhost(name, company, title, country, fState, fCity, resolvedLogoUrl)
                     .map(row -> new JsonObject()
                         .put("id", row.getLong("id"))
                         .put("name", row.getString("name"))

@@ -355,6 +355,33 @@ paths:
                   properties:
                     name:
                       type: string
+                    logoUrl:
+                      type: string
+
+  /api/geo:
+    get:
+      operationId: getGeo
+      summary: Resolve the visitor's country/state/city from Cloudflare headers (public)
+      tags:
+        - Managers
+      security: []
+      responses:
+        '200':
+          description: Visitor geo (any field may be null off Cloudflare)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  country:
+                    type: string
+                    nullable: true
+                  state:
+                    type: string
+                    nullable: true
+                  city:
+                    type: string
+                    nullable: true
 
   /api/managers/similar:
     get:
@@ -411,6 +438,10 @@ paths:
                   type: string
                 country:
                   type: string
+                state:
+                  type: string
+                city:
+                  type: string
       responses:
         '200':
           description: Search results (may include a newly created manager)
@@ -452,6 +483,10 @@ paths:
                 title:
                   type: string
                 country:
+                  type: string
+                state:
+                  type: string
+                city:
                   type: string
       responses:
         '200':
@@ -563,6 +598,12 @@ paths:
                   enum: [active, retired]
                 country:
                   type: string
+                state:
+                  type: string
+                  nullable: true
+                city:
+                  type: string
+                  nullable: true
                 linkedinUrl:
                   type: string
                   nullable: true
@@ -1173,6 +1214,43 @@ paths:
           description: Forbidden
         '404':
           description: Pending manager not found
+
+  /api/admin/managers/{managerId}:
+    put:
+      operationId: adminEditManager
+      summary: Admin-only direct edit of name, title, company, and LinkedIn with cascade to reviews and career history
+      tags:
+        - Admin
+      parameters:
+        - in: path
+          name: managerId
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name:
+                  type: string
+                title:
+                  type: string
+                company:
+                  type: string
+                linkedinUrl:
+                  type: string
+      responses:
+        '200':
+          description: Manager updated
+        '400':
+          description: Invalid request
+        '403':
+          description: Forbidden
+        '404':
+          description: Manager not found
 
   /api/admin/managers/{keepId}/merge/{mergeId}:
     post:

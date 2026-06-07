@@ -87,7 +87,7 @@ public class MainVerticle extends AbstractVerticle {
                         ReportService       reportService  = new ReportService(userRepo, reportRepo);
 
                         // ── Handlers ──────────────────────────────────────────────────────────
-                        ManagersHandler      managersHandler      = new ManagersHandler(managerService);
+                        ManagersHandler      managersHandler      = new ManagersHandler(managerService, vertx);
                         ReportsHandler       reportsHandler       = new ReportsHandler(reportService);
                         AdminHandler         adminHandler         = new AdminHandler(adminService);
                         NotificationsHandler notificationsHandler = new NotificationsHandler(notifService);
@@ -109,6 +109,7 @@ public class MainVerticle extends AbstractVerticle {
                         routerFactory.addHandlerByOperationId("getStats",               managersHandler::handleGetStats);
                         routerFactory.addHandlerByOperationId("getCompanies",           managersHandler::handleGetCompanies);
                         routerFactory.addHandlerByOperationId("suggestCompanies",       managersHandler::handleSuggestCompanies);
+                        routerFactory.addHandlerByOperationId("getGeo",                 managersHandler::handleGetGeo);
                         routerFactory.addHandlerByOperationId("getSimilarManagers",     managersHandler::handleGetSimilarManagers);
                         routerFactory.addHandlerByOperationId("findOrCreateManager",    managersHandler::handleFindOrCreate);
                         routerFactory.addHandlerByOperationId("createGhostManager",     managersHandler::handleCreateGhostManager);
@@ -124,6 +125,7 @@ public class MainVerticle extends AbstractVerticle {
                         routerFactory.addHandlerByOperationId("getAdminPendingManagers",  adminHandler::handleGetPendingManagers);
                         routerFactory.addHandlerByOperationId("approvePendingManager",    adminHandler::handleApprovePendingManager);
                         routerFactory.addHandlerByOperationId("rejectPendingManager",     adminHandler::handleRejectPendingManager);
+                        routerFactory.addHandlerByOperationId("adminEditManager",          adminHandler::handleAdminEditManager);
                         routerFactory.addHandlerByOperationId("mergeManagers",            adminHandler::handleMergeManagers);
                         routerFactory.addHandlerByOperationId("getNotifications",             notificationsHandler::handleGetNotifications);
                         routerFactory.addHandlerByOperationId("getNotificationsUnreadCount",  notificationsHandler::handleGetUnreadCount);

@@ -129,6 +129,27 @@ class CompanySuggestIntegrationTest {
     }
 
     @Test
+    void suggestCompanies_includesLogoUrlWhenPresent() throws Exception {
+        insertManager("Jane J", "Logoland", "Manager", "approved", "https://img.logo.dev/logoland.com?token=x");
+
+        JsonArray results = await(service.suggestCompanies("logoland"));
+
+        assertEquals(1, results.size());
+        assertEquals("Logoland", results.getJsonObject(0).getString("name"));
+        assertEquals("https://img.logo.dev/logoland.com?token=x", results.getJsonObject(0).getString("logoUrl"));
+    }
+
+    @Test
+    void suggestCompanies_omitsLogoUrlWhenAbsent() throws Exception {
+        insertManagerWithStatus("Kyle K", "Nologo Inc", "Manager", "approved");
+
+        JsonArray results = await(service.suggestCompanies("nologo"));
+
+        assertEquals(1, results.size());
+        assertFalse(results.getJsonObject(0).containsKey("logoUrl"));
+    }
+
+    @Test
     void suggestCompanies_deduplicatesCompanyNames() throws Exception {
         insertManagerWithStatus("Hank H", "Initech", "Manager", "approved");
         insertManagerWithStatus("Iris I",  "Initech", "Director", "approved");
@@ -144,6 +165,14 @@ class CompanySuggestIntegrationTest {
             .preparedQuery("INSERT INTO managers(name,company,title,image,status,approval_status,overall_rating,reviews_count,category_averages) " +
                            "VALUES ($1,$2,$3,'img','active',$4,0,0,'{}') RETURNING id")
             .execute(Tuple.of(name, company, title, status))
+            .map(rs -> rs.iterator().next().getLong("id")));
+    }
+
+    private long insertManager(String name, String company, String title, String status, String logoUrl) throws Exception {
+        return await(pool
+            .preparedQuery("INSERT INTO managers(name,company,title,image,status,approval_status,overall_rating,reviews_count,category_averages,company_logo_url) " +
+                           "VALUES ($1,$2,$3,'img','active',$4,0,0,'{}',$5) RETURNING id")
+            .execute(Tuple.of(name, company, title, status, logoUrl))
             .map(rs -> rs.iterator().next().getLong("id")));
     }
 

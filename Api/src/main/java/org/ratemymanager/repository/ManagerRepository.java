@@ -178,14 +178,23 @@ public class ManagerRepository {
     }
 
     public Future<RowSet<Row>> findCompaniesByQuery(String query) {
+        // Match the query as a prefix of the company name ($1) or of any later word
+        // within it ($2) — so "face" → "Facebook", "morgan" → "JP Morgan", but never
+        // "Interface". Starts-with matches are ranked ahead of mid-name word matches.
+        String prefix    = query + "%";
+        String wordStart = "% " + query + "%";
         return db.preparedQuery("""
-                SELECT DISTINCT company FROM managers
+                SELECT company,
+                       MIN(company_logo_url) AS company_logo_url,
+                       bool_or(company ILIKE $1) AS starts_with
+                FROM managers
                 WHERE approval_status IN ('approved','ghost')
-                  AND company ILIKE $1
-                ORDER BY company
+                  AND (company ILIKE $1 OR company ILIKE $2)
+                GROUP BY company
+                ORDER BY starts_with DESC, company
                 LIMIT 6
                 """)
-            .execute(Tuple.of("%" + query + "%"));
+            .execute(Tuple.of(prefix, wordStart));
     }
 
     public Future<RowSet<Row>> findSimilar(String nameLike, String companyLike) {
@@ -444,6 +453,75 @@ public class ManagerRepository {
         return db.preparedQuery(sql).execute(Tuple.of(keepId)).mapEmpty();
     }
 
+    // ── Admin direct edit (cascading) ─────────────────────────────────────────
+
+    /**
+     * Atomically updates name/title/company/linkedinUrl on the manager and cascades
+     * title/company corrections to reviews and career_history where old values match.
+     * Pass null for any field that should not change.
+     */
+    public Future<Optional<io.vertx.core.json.JsonObject>> adminEdit(long managerId, String newName, String newTitle,
+                                                                      String newCompany, String newLinkedinUrl) {
+        return ((Pool) db).withTransaction(conn ->
+            conn.preparedQuery("SELECT name, title, company FROM managers WHERE id = $1")
+                .execute(Tuple.of(managerId))
+                .compose(rows -> {
+                    if (!rows.iterator().hasNext())
+                        return Future.succeededFuture(Optional.empty());
+                    Row cur       = rows.iterator().next();
+                    String oldName    = cur.getString("name");
+                    String oldTitle   = cur.getString("title");
+                    String oldCompany = cur.getString("company");
+                    String effName    = newName    != null ? newName    : oldName;
+                    String effTitle   = newTitle   != null ? newTitle   : oldTitle;
+                    String effCompany = newCompany != null ? newCompany : oldCompany;
+
+                    List<Object> params = new ArrayList<>();
+                    params.add(effName); params.add(effTitle); params.add(effCompany);
+                    int idx = 4;
+                    StringBuilder sql = new StringBuilder(
+                        "UPDATE managers SET updated_at = now(), name = $1, title = $2, company = $3");
+                    if (newLinkedinUrl != null) {
+                        sql.append(", linkedin_url = $").append(idx++);
+                        params.add(newLinkedinUrl);
+                    }
+                    params.add(managerId);
+                    sql.append(" WHERE id = $").append(idx).append(" RETURNING id");
+
+                    boolean titleChanged   = newTitle   != null && !newTitle.equals(oldTitle);
+                    boolean companyChanged = newCompany != null && !newCompany.equals(oldCompany);
+
+                    return conn.preparedQuery(sql.toString()).execute(Tuple.from(params))
+                        .compose(v -> {
+                            Future<Void> cascade = Future.succeededFuture();
+                            if (titleChanged) {
+                                cascade = cascade.compose(x ->
+                                    conn.preparedQuery(
+                                        "UPDATE reviews SET manager_title = $1 WHERE manager_id = $2 AND manager_title = $3")
+                                        .execute(Tuple.of(effTitle, managerId, oldTitle)).mapEmpty());
+                            }
+                            if (companyChanged) {
+                                cascade = cascade.compose(x ->
+                                    conn.preparedQuery(
+                                        "UPDATE reviews SET manager_company = $1 WHERE manager_id = $2 AND manager_company = $3")
+                                        .execute(Tuple.of(effCompany, managerId, oldCompany)).mapEmpty());
+                            }
+                            if (titleChanged || companyChanged) {
+                                cascade = cascade.compose(x ->
+                                    conn.preparedQuery(
+                                        "UPDATE career_history SET title = $1, company = $2 WHERE manager_id = $3 AND title = $4 AND company = $5")
+                                        .execute(Tuple.of(effTitle, effCompany, managerId, oldTitle, oldCompany)).mapEmpty());
+                            }
+                            return cascade.map(x -> Optional.of(new io.vertx.core.json.JsonObject()
+                                .put("success", true)
+                                .put("name", effName)
+                                .put("title", effTitle)
+                                .put("company", effCompany)));
+                        });
+                })
+        );
+    }
+
     // ── Find-or-create ────────────────────────────────────────────────────────
 
     public Future<RowSet<Row>> findByNameAndCompany(String fullName, String company) {
@@ -459,34 +537,35 @@ public class ManagerRepository {
     }
 
     public Future<Row> createAutoApproved(String name, String company, String title,
-                                          String country, UUID submittedBy, String logoUrl) {
+                                          String country, String state, String city,
+                                          UUID submittedBy, String logoUrl) {
         return db.preparedQuery("""
                 INSERT INTO managers
-                (name, company, title, status, approval_status, country,
+                (name, company, title, status, approval_status, country, state, city,
                  overall_rating, reviews_count, category_averages, submitted_by,
                  company_logo_url, created_at, updated_at)
-                VALUES ($1,$2,$3,'active','ghost',$4,
-                        0,0,'{}'::jsonb,$5,
-                        $6,now(),now())
+                VALUES ($1,$2,$3,'active','ghost',$4,$5,$6,
+                        0,0,'{}'::jsonb,$7,
+                        $8,now(),now())
                 RETURNING *
                 """)
-            .execute(Tuple.of(name, company.trim(), title.trim(), country.trim(), submittedBy, logoUrl))
+            .execute(Tuple.of(name, company.trim(), title.trim(), country.trim(), state, city, submittedBy, logoUrl))
             .map(rows -> rows.iterator().next());
     }
 
     public Future<Row> createGhost(String name, String company, String title,
-                                   String country, String logoUrl) {
+                                   String country, String state, String city, String logoUrl) {
         return db.preparedQuery("""
                 INSERT INTO managers
-                (name, company, title, status, approval_status, country,
+                (name, company, title, status, approval_status, country, state, city,
                  overall_rating, reviews_count, category_averages,
                  company_logo_url, created_at, updated_at)
-                VALUES ($1,$2,$3,'active','ghost',$4,
+                VALUES ($1,$2,$3,'active','ghost',$4,$5,$6,
                         0,0,'{}'::jsonb,
-                        $5,now(),now())
+                        $7,now(),now())
                 RETURNING *
                 """)
-            .execute(Tuple.of(name, company.trim(), title.trim(), country.trim(), logoUrl))
+            .execute(Tuple.of(name, company.trim(), title.trim(), country.trim(), state, city, logoUrl))
             .map(rows -> rows.iterator().next());
     }
 

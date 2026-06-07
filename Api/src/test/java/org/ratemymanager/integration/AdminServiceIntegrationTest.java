@@ -572,6 +572,132 @@ class AdminServiceIntegrationTest {
     }
 
     // ══════════════════════════════════════════════════════════════════════════
+    // adminEditManager
+    // ══════════════════════════════════════════════════════════════════════════
+
+    @Test
+    void adminEditManager_nonAdmin_returns403() throws Exception {
+        String userAuth   = insertUser("auth0|edit-user01", "EditUser01", "user");
+        long managerId    = insertApprovedManager("Edit Target", "OldCorp", "OldTitle");
+        ServiceException ex = assertServiceException(service.adminEditManager(userAuth, managerId, "New Name", null, null, null));
+        assertEquals(403, ex.getStatusCode());
+    }
+
+    @Test
+    void adminEditManager_notFound_returns404() throws Exception {
+        String adminAuth = insertUser("auth0|edit-admin01", "EditAdmin01", "admin");
+        ServiceException ex = assertServiceException(service.adminEditManager(adminAuth, 999999L, "Name", null, null, null));
+        assertEquals(404, ex.getStatusCode());
+    }
+
+    @Test
+    void adminEditManager_blankName_returns400() throws Exception {
+        String adminAuth = insertUser("auth0|edit-admin02", "EditAdmin02", "admin");
+        long managerId   = insertApprovedManager("Test", "Corp", "Title");
+        ServiceException ex = assertServiceException(service.adminEditManager(adminAuth, managerId, "   ", null, null, null));
+        assertEquals(400, ex.getStatusCode());
+    }
+
+    @Test
+    void adminEditManager_updatesName() throws Exception {
+        String adminAuth = insertUser("auth0|edit-admin03", "EditAdmin03", "admin");
+        long managerId   = insertApprovedManager("Old Name", "Corp", "Title");
+
+        JsonObject result = await(service.adminEditManager(adminAuth, managerId, "New Name", null, null, null));
+        assertTrue(result.getBoolean("success"));
+        assertEquals("New Name", result.getString("name"));
+
+        String name = await(pool.preparedQuery("SELECT name FROM managers WHERE id = $1")
+            .execute(Tuple.of(managerId))
+            .map(rs -> rs.iterator().next().getString("name")));
+        assertEquals("New Name", name);
+    }
+
+    @Test
+    void adminEditManager_updatesTitle_cascadesToReviews() throws Exception {
+        String adminAuth = insertUser("auth0|edit-admin04", "EditAdmin04", "admin");
+        String userAuth  = insertUser("auth0|edit-rev01",   "EditRev01",   "user");
+        UUID   userId    = findUserId(userAuth);
+        long managerId   = insertApprovedManager("Manager A", "Corp", "OldTitle");
+        insertReviewWithValues(managerId, userId, "Corp", "OldTitle");
+
+        await(service.adminEditManager(adminAuth, managerId, null, "NewTitle", null, null));
+
+        String reviewTitle = await(pool.preparedQuery(
+            "SELECT manager_title FROM reviews WHERE manager_id = $1")
+            .execute(Tuple.of(managerId))
+            .map(rs -> rs.iterator().next().getString("manager_title")));
+        assertEquals("NewTitle", reviewTitle);
+    }
+
+    @Test
+    void adminEditManager_updatesCompany_cascadesToReviews() throws Exception {
+        String adminAuth = insertUser("auth0|edit-admin05", "EditAdmin05", "admin");
+        String userAuth  = insertUser("auth0|edit-rev02",   "EditRev02",   "user");
+        UUID   userId    = findUserId(userAuth);
+        long managerId   = insertApprovedManager("Manager B", "OldCorp", "Title");
+        insertReviewWithValues(managerId, userId, "OldCorp", "Title");
+
+        await(service.adminEditManager(adminAuth, managerId, null, null, "NewCorp", null));
+
+        String reviewCompany = await(pool.preparedQuery(
+            "SELECT manager_company FROM reviews WHERE manager_id = $1")
+            .execute(Tuple.of(managerId))
+            .map(rs -> rs.iterator().next().getString("manager_company")));
+        assertEquals("NewCorp", reviewCompany);
+    }
+
+    @Test
+    void adminEditManager_updatesTitleAndCompany_cascadesToCareerHistory() throws Exception {
+        String adminAuth = insertUser("auth0|edit-admin06", "EditAdmin06", "admin");
+        long managerId   = insertApprovedManager("Manager C", "OldCorp", "OldTitle");
+        // Insert a career_history entry with the old values
+        await(pool.preparedQuery(
+            "INSERT INTO career_history(manager_id, company, title, start_date) VALUES ($1,$2,$3,now())")
+            .execute(Tuple.of(managerId, "OldCorp", "OldTitle")));
+
+        await(service.adminEditManager(adminAuth, managerId, null, "NewTitle", "NewCorp", null));
+
+        io.vertx.sqlclient.Row hist = await(pool.preparedQuery(
+            "SELECT title, company FROM career_history WHERE manager_id = $1")
+            .execute(Tuple.of(managerId))
+            .map(rs -> rs.iterator().next()));
+        assertEquals("NewTitle", hist.getString("title"));
+        assertEquals("NewCorp",  hist.getString("company"));
+    }
+
+    @Test
+    void adminEditManager_titleChangeDoesNotCascadeToMismatchedReviews() throws Exception {
+        String adminAuth  = insertUser("auth0|edit-admin07", "EditAdmin07", "admin");
+        String userAuth1  = insertUser("auth0|edit-rev03",   "EditRev03",   "user");
+        String userAuth2  = insertUser("auth0|edit-rev04",   "EditRev04",   "user");
+        UUID   userId1    = findUserId(userAuth1);
+        UUID   userId2    = findUserId(userAuth2);
+        long managerId    = insertApprovedManager("Manager D", "Corp", "OldTitle");
+        insertReview(managerId, userId1); // manager_title = "Title" (from insertReview helper)
+        // Insert a review with a custom (different) title
+        await(pool.preparedQuery("""
+            INSERT INTO reviews(manager_id, user_id, author, overall_rating,
+                communication_style, perceived_approachability, perceived_clarity_of_expectations,
+                feedback_style, perceived_supportiveness, decision_making_style,
+                organization_and_planning_style, delegation_style, perceived_professional_demeanor,
+                overall_working_experience, manager_company, manager_title, text, verified, helpful_count)
+            VALUES ($1,$2,'Test',3.0,3.0,3.0,3.0,3.0,3.0,3.0,3.0,3.0,3.0,3.0,'Corp','DifferentTitle','text',false,0)
+            """).execute(Tuple.of(managerId, userId2)));
+
+        // Change title from OldTitle to NewTitle — should only affect the review that had OldTitle
+        // Note: insertReview uses "Title" not "OldTitle", so neither review matches "OldTitle"
+        await(service.adminEditManager(adminAuth, managerId, null, "NewTitle", null, null));
+
+        // The review with "DifferentTitle" should be unchanged
+        long unchangedCount = await(pool.preparedQuery(
+            "SELECT COUNT(*) FROM reviews WHERE manager_id = $1 AND manager_title = 'DifferentTitle'")
+            .execute(Tuple.of(managerId))
+            .map(rs -> rs.iterator().next().getLong(0)));
+        assertEquals(1L, unchangedCount);
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
     // Helpers
     // ══════════════════════════════════════════════════════════════════════════
 
@@ -616,14 +742,18 @@ class AdminServiceIntegrationTest {
     }
 
     private void insertReview(long managerId, UUID userId) throws Exception {
+        insertReviewWithValues(managerId, userId, "Corp", "Title");
+    }
+
+    private void insertReviewWithValues(long managerId, UUID userId, String company, String title) throws Exception {
         await(pool.preparedQuery("""
             INSERT INTO reviews(manager_id, user_id, author, overall_rating,
                 communication_style, perceived_approachability, perceived_clarity_of_expectations,
                 feedback_style, perceived_supportiveness, decision_making_style,
                 organization_and_planning_style, delegation_style, perceived_professional_demeanor,
                 overall_working_experience, manager_company, manager_title, text, verified, helpful_count)
-            VALUES ($1,$2,'Test',3.0,3.0,3.0,3.0,3.0,3.0,3.0,3.0,3.0,3.0,3.0,'Corp','Title','text',false,0)
-            """).execute(Tuple.of(managerId, userId)));
+            VALUES ($1,$2,'Test',3.0,3.0,3.0,3.0,3.0,3.0,3.0,3.0,3.0,3.0,3.0,$3,$4,'text',false,0)
+            """).execute(Tuple.of(managerId, userId, company, title)));
     }
 
     private static ServiceException assertServiceException(Future<?> future) {

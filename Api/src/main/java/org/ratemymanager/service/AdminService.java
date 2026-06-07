@@ -311,6 +311,25 @@ public class AdminService {
             });
     }
 
+    // ── Admin direct edit ────────────────────────────────────────────────────
+
+    public Future<JsonObject> adminEditManager(String auth0Id, long managerId,
+                                               String name, String title,
+                                               String company, String linkedinUrl) {
+        if (name        != null && name.isBlank())        return Future.failedFuture(ServiceException.badRequest("Name cannot be blank"));
+        if (title       != null && title.isBlank())       return Future.failedFuture(ServiceException.badRequest("Title cannot be blank"));
+        if (company     != null && company.isBlank())     return Future.failedFuture(ServiceException.badRequest("Company cannot be blank"));
+        return requireAdmin(auth0Id)
+            .compose(adminId -> managerRepo.adminEdit(managerId,
+                name        != null ? name.trim()        : null,
+                title       != null ? title.trim()       : null,
+                company     != null ? company.trim()     : null,
+                linkedinUrl != null ? linkedinUrl.trim() : null))
+            .compose(opt -> opt.isPresent()
+                ? Future.succeededFuture(opt.get())
+                : Future.failedFuture(ServiceException.notFound("Manager not found")));
+    }
+
     // ── Merge managers ────────────────────────────────────────────────────────
 
     public Future<JsonObject> mergeManagers(String auth0Id, long keepId, long mergeId) {

@@ -4,9 +4,11 @@ import com.auth0.jwt.JWT;
 import com.auth0.jwt.exceptions.JWTDecodeException;
 import com.auth0.jwt.interfaces.DecodedJWT;
 import io.vertx.core.Future;
+import io.vertx.core.Vertx;
 import io.vertx.core.json.JsonArray;
 import io.vertx.core.json.JsonObject;
 import io.vertx.ext.web.RoutingContext;
+import io.vertx.ext.web.client.WebClient;
 import io.vertx.sqlclient.Row;
 import io.vertx.sqlclient.RowSet;
 import org.ratemymanager.service.ManagerService;
@@ -21,9 +23,11 @@ import java.util.UUID;
 public class ManagersHandler {
 
     private final ManagerService service;
+    private final WebClient      httpClient;
 
-    public ManagersHandler(ManagerService service) {
-        this.service = service;
+    public ManagersHandler(ManagerService service, Vertx vertx) {
+        this.service    = service;
+        this.httpClient = WebClient.create(vertx);
     }
 
     // ── GET /api/managers ─────────────────────────────────────────────────────
@@ -156,8 +160,38 @@ public class ManagersHandler {
     // ── GET /api/companies/suggest ────────────────────────────────────────────
 
     public void handleSuggestCompanies(RoutingContext ctx) {
-        String query = ctx.queryParam("query").stream().findFirst().orElse("");
-        service.suggestCompanies(query)
+        String query = ctx.queryParam("query").stream().findFirst().orElse("").trim();
+        if (query.isBlank()) {
+            ctx.response().putHeader("Content-Type", "application/json").end("[]");
+            return;
+        }
+
+        // Proxy Clearbit autocomplete server-side to bypass browser CORS restrictions.
+        // Returns { name, domain } pairs so the client can render logo.dev logos and
+        // show the domain. Falls back to our own DB search if Clearbit is unavailable.
+        httpClient.get(443, "autocomplete.clearbit.com", "/v1/companies/suggest")
+            .ssl(true)
+            .addQueryParam("query", query)
+            .timeout(3000)
+            .send()
+            .compose(res -> {
+                if (res.statusCode() == 200) {
+                    JsonArray raw = res.bodyAsJsonArray();
+                    JsonArray out = new JsonArray();
+                    for (Object obj : raw) {
+                        JsonObject item = (JsonObject) obj;
+                        String name   = item.getString("name");
+                        String domain = item.getString("domain");
+                        if (name != null && !name.isBlank() && domain != null && !domain.isBlank()) {
+                            out.add(new JsonObject().put("name", name).put("domain", domain));
+                        }
+                        if (out.size() >= 6) break;
+                    }
+                    if (!out.isEmpty()) return Future.succeededFuture(out);
+                }
+                return service.suggestCompanies(query);
+            })
+            .recover(err -> service.suggestCompanies(query))
             .onSuccess(arr -> ctx.response().putHeader("Content-Type", "application/json").end(arr.encode()))
             .onFailure(err -> handleError(ctx, err));
     }
@@ -211,6 +245,7 @@ public class ManagersHandler {
         String auth0Id = ctx.get("auth0Id");
         if (auth0Id == null) { respond(ctx, 401, new JsonObject().put("error", "Unauthorized")); return; }
         JsonObject body = ctx.getBodyAsJson();
+        GeoUtils.stampGeo(ctx, body);
         String company = body != null ? body.getString("company") : null;
         String logoUrl = CompanyLogoUtils.resolveLogoUrl(company);
 
@@ -230,6 +265,8 @@ public class ManagersHandler {
                     .put("categoryAverages", row.getJsonObject("category_averages"))
                     .put("linkedinUrl", row.getString("linkedin_url"))
                     .put("country", row.getString("country"))
+                    .put("state", row.getString("state"))
+                    .put("city", row.getString("city"))
                     .put("createdAt", row.getOffsetDateTime("created_at").toString())
                     .put("careerHistory", new JsonArray());
                 ctx.response().setStatusCode(201).putHeader("Content-Type", "application/json").end(response.encode());
@@ -460,6 +497,7 @@ public class ManagersHandler {
 
     public void handleCreateGhostManager(RoutingContext ctx) {
         JsonObject body = ctx.getBodyAsJson();
+        GeoUtils.stampGeo(ctx, body);
         String company = body != null ? body.getString("company") : null;
         String logoUrl = CompanyLogoUtils.resolveLogoUrl(company);
         service.createGhostManager(body, logoUrl)
@@ -480,15 +518,18 @@ public class ManagersHandler {
         }
         JsonObject body = ctx.getBodyAsJson();
         if (body == null) { respond(ctx, 400, new JsonObject().put("message", "Request body required")); return; }
+        GeoUtils.stampGeo(ctx, body);
 
         String firstName = body.getString("firstName", "").trim();
         String lastName  = body.getString("lastName",  "").trim();
         String title     = body.getString("title",     "").trim();
         String company   = body.getString("company",   "").trim();
         String country   = body.getString("country",   "").trim();
+        String state     = body.getString("state",     "").trim();
+        String city      = body.getString("city",      "").trim();
 
         String logoUrl = CompanyLogoUtils.resolveLogoUrl(company);
-        service.findOrCreate(auth0Id, firstName, lastName, title, company, country, logoUrl)
+        service.findOrCreate(auth0Id, firstName, lastName, title, company, country, state, city, logoUrl)
             .onSuccess(json -> {
                 // Back-fill logo on any rows that don't already have one (existing managers)
                 io.vertx.core.json.JsonArray data = json.getJsonArray("data");
@@ -504,6 +545,14 @@ public class ManagersHandler {
                 respond(ctx, 200, json);
             })
             .onFailure(err -> handleError(ctx, err));
+    }
+
+    // ── Visitor geo (no auth) ─────────────────────────────────────────────────
+
+    /** Echoes the visitor's {country, state, city} as resolved from Cloudflare headers.
+     *  Used by the frontend to pre-fill the Add Manager form. Values are null off Cloudflare. */
+    public void handleGetGeo(RoutingContext ctx) {
+        ctx.response().putHeader("Content-Type", "application/json").end(GeoUtils.geoJson(ctx).encode());
     }
 
     // ── Shared helpers ────────────────────────────────────────────────────────
