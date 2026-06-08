@@ -257,6 +257,30 @@ class CompanyListingIntegrationTest {
     }
 
     @Test
+    void getCompanyListing_managerCountIncludesReviewBasedAssociation() throws Exception {
+        // Ensure Acme Corp exists in the companies table (normally happens on first profile view)
+        await(companyRepo.findOrCreate("Acme Corp", null, null));
+        // Bob's company_id points to Skynet, but he has a review at Acme Corp
+        insertManager("Bob B", "Skynet Inc", "Director", "approved", 4.0, 1);
+        Long bobId = await(pool
+            .preparedQuery("SELECT id FROM managers WHERE name = 'Bob B'")
+            .execute()
+            .map(rs -> rs.iterator().next().getLong("id")));
+        insertReview(bobId, "Acme Corp", "VP");
+
+        JsonObject result = await(service.getCompanyListing());
+        JsonArray data = result.getJsonArray("data");
+
+        // Both Acme Corp and Skynet Inc should appear
+        long acmeCount = data.stream()
+            .map(o -> (JsonObject) o)
+            .filter(o -> "Acme Corp".equals(o.getString("name")))
+            .mapToLong(o -> o.getLong("managerCount"))
+            .findFirst().orElse(0);
+        assertEquals(1, acmeCount, "Acme Corp should count Bob via his review there");
+    }
+
+    @Test
     void getCompanyProfile_excludesSeedManagers() throws Exception {
         insertManager("Alice A", "Acme Corp", "Manager", "approved", 4.0, 2);
         insertManagerWithExternalId("Seed Sam", "Acme Corp", "Fake Lead", "approved", null, 0, "seed_003");

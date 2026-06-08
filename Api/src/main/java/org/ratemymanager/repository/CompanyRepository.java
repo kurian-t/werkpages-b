@@ -47,12 +47,25 @@ public class CompanyRepository {
                 SELECT
                     c.id,
                     c.name,
-                    c.logo_url,
+                    COALESCE(c.logo_url, MIN(m.company_logo_url) FILTER (WHERE m.company_logo_url IS NOT NULL)) AS logo_url,
                     COUNT(DISTINCT m.id)                                                              AS manager_count,
                     COALESCE(SUM(m.reviews_count), 0)                                                 AS total_reviews,
                     ROUND(AVG(m.overall_rating) FILTER (WHERE m.overall_rating IS NOT NULL AND m.reviews_count > 0)::NUMERIC, 1) AS avg_rating
                 FROM companies c
-                JOIN managers m ON m.company_id = c.id
+                JOIN managers m ON (
+                    m.company_id = c.id
+                    OR EXISTS (
+                        SELECT 1 FROM career_history ch
+                        WHERE ch.manager_id = m.id
+                          AND (ch.company_id = c.id
+                               OR (ch.company_id IS NULL AND LOWER(TRIM(ch.company)) = LOWER(TRIM(c.name))))
+                    )
+                    OR EXISTS (
+                        SELECT 1 FROM reviews r
+                        WHERE r.manager_id = m.id
+                          AND LOWER(TRIM(r.manager_company)) = LOWER(TRIM(c.name))
+                    )
+                )
                 WHERE m.approval_status IN ('approved', 'ghost')
                   AND (m.external_id IS NULL OR m.external_id NOT LIKE 'seed_%')
                 GROUP BY c.id, c.name, c.logo_url
