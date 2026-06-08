@@ -8,6 +8,7 @@ import io.vertx.sqlclient.RowIterator;
 import io.vertx.sqlclient.RowSet;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.ratemymanager.repository.CompanyRepository;
 import org.ratemymanager.repository.EditRepository;
 import org.ratemymanager.repository.ManagerRepository;
 import org.ratemymanager.repository.NotificationRepository;
@@ -41,6 +42,7 @@ class AdminServiceTest {
     private ReviewRepository       reviewRepo;
     private EditRepository         editRepo;
     private NotificationRepository notifRepo;
+    private CompanyRepository      companyRepo;
     private AdminService           service;
 
     @BeforeEach
@@ -50,7 +52,8 @@ class AdminServiceTest {
         reviewRepo  = mock(ReviewRepository.class);
         editRepo    = mock(EditRepository.class);
         notifRepo   = mock(NotificationRepository.class);
-        service     = new AdminService(userRepo, managerRepo, reviewRepo, editRepo, notifRepo);
+        companyRepo = mock(CompanyRepository.class);
+        service     = new AdminService(userRepo, managerRepo, reviewRepo, editRepo, notifRepo, companyRepo);
 
         Row adminRow = adminUserRow(ADMIN_ID);
         when(userRepo.findByAuth0IdWithBan(ADMIN_AUTH0_ID))
@@ -291,13 +294,16 @@ class AdminServiceTest {
         UUID proposedBy = UUID.randomUUID();
         Row editRow = editRowForApprove(editId, MANAGER_ID, "pending", "Acme", "Dir",
             "NewCorp", "VP", null, null, proposedBy, "Alice Smith", OffsetDateTime.now(ZoneOffset.UTC));
+        Row companyRow = companyRowWithId(42L);
         when(editRepo.findByIdWithManager(editId))
             .thenReturn(Future.succeededFuture(Optional.of(editRow)));
+        when(companyRepo.findOrCreate(anyString(), isNull(), isNull()))
+            .thenReturn(Future.succeededFuture(companyRow));
         when(managerRepo.closeOpenCareerEntry(eq(MANAGER_ID), any()))
             .thenReturn(Future.succeededFuture(1));
-        when(managerRepo.insertCareerEntry(eq(MANAGER_ID), anyString(), anyString(), any(), isNull()))
+        when(managerRepo.insertCareerEntry(eq(MANAGER_ID), anyString(), anyString(), any(), isNull(), any()))
             .thenReturn(Future.succeededFuture());
-        when(managerRepo.update(eq(MANAGER_ID), anyString(), anyString(), isNull(), isNull(), isNull(), isNull(), isNull(), isNull()))
+        when(managerRepo.update(eq(MANAGER_ID), anyString(), anyString(), isNull(), isNull(), isNull(), isNull(), isNull(), isNull(), any()))
             .thenReturn(Future.succeededFuture(Optional.empty()));
         when(editRepo.approve(eq(editId), eq(ADMIN_ID), any()))
             .thenReturn(Future.succeededFuture());
@@ -308,7 +314,7 @@ class AdminServiceTest {
         assertEquals("NewCorp", result.getString("newCompany"));
         verify(notifRepo).sendAsync(eq(proposedBy), eq("review_accepted"), anyString(), anyString(), eq(MANAGER_ID));
         // Only one insertCareerEntry: the new career entry (open entry was closed by closeOpenCareerEntry)
-        verify(managerRepo, times(1)).insertCareerEntry(eq(MANAGER_ID), anyString(), anyString(), any(), isNull());
+        verify(managerRepo, times(1)).insertCareerEntry(eq(MANAGER_ID), anyString(), anyString(), any(), isNull(), any());
     }
 
     @Test
@@ -316,13 +322,16 @@ class AdminServiceTest {
         UUID editId = UUID.randomUUID();
         Row editRow = editRowForApprove(editId, MANAGER_ID, "pending", "Acme", "Dir",
             "NewCorp", "VP", null, null, null, "Alice Smith", OffsetDateTime.now(ZoneOffset.UTC));
+        Row companyRow = companyRowWithId(42L);
         when(editRepo.findByIdWithManager(editId))
             .thenReturn(Future.succeededFuture(Optional.of(editRow)));
+        when(companyRepo.findOrCreate(anyString(), isNull(), isNull()))
+            .thenReturn(Future.succeededFuture(companyRow));
         when(managerRepo.closeOpenCareerEntry(eq(MANAGER_ID), any()))
             .thenReturn(Future.succeededFuture(0));
-        when(managerRepo.insertCareerEntry(eq(MANAGER_ID), anyString(), anyString(), any(), any()))
+        when(managerRepo.insertCareerEntry(eq(MANAGER_ID), anyString(), anyString(), any(), any(), any()))
             .thenReturn(Future.succeededFuture());
-        when(managerRepo.update(eq(MANAGER_ID), anyString(), anyString(), isNull(), isNull(), isNull(), isNull(), isNull(), isNull()))
+        when(managerRepo.update(eq(MANAGER_ID), anyString(), anyString(), isNull(), isNull(), isNull(), isNull(), isNull(), isNull(), any()))
             .thenReturn(Future.succeededFuture(Optional.empty()));
         when(editRepo.approve(eq(editId), eq(ADMIN_ID), any()))
             .thenReturn(Future.succeededFuture());
@@ -330,7 +339,7 @@ class AdminServiceTest {
         JsonObject result = await(service.approveEdit(ADMIN_AUTH0_ID, editId));
         assertTrue(result.getBoolean("success"));
         // Two insertCareerEntry calls: archive old, then insert new
-        verify(managerRepo, times(2)).insertCareerEntry(eq(MANAGER_ID), anyString(), anyString(), any(), any());
+        verify(managerRepo, times(2)).insertCareerEntry(eq(MANAGER_ID), anyString(), anyString(), any(), any(), any());
         verify(notifRepo, never()).sendAsync(any(UUID.class), anyString(), anyString(), anyString(), any());
     }
 
@@ -339,13 +348,16 @@ class AdminServiceTest {
         UUID editId = UUID.randomUUID();
         Row editRow = editRowForApprove(editId, MANAGER_ID, "pending", "Acme", "Dir",
             "NewCorp", "VP", null, null, null, "Alice", OffsetDateTime.now(ZoneOffset.UTC));
+        Row companyRow = companyRowWithId(42L);
         when(editRepo.findByIdWithManager(editId))
             .thenReturn(Future.succeededFuture(Optional.of(editRow)));
+        when(companyRepo.findOrCreate(anyString(), isNull(), isNull()))
+            .thenReturn(Future.succeededFuture(companyRow));
         when(managerRepo.closeOpenCareerEntry(eq(MANAGER_ID), any()))
             .thenReturn(Future.succeededFuture(1));
-        when(managerRepo.insertCareerEntry(eq(MANAGER_ID), anyString(), anyString(), any(), isNull()))
+        when(managerRepo.insertCareerEntry(eq(MANAGER_ID), anyString(), anyString(), any(), isNull(), any()))
             .thenReturn(Future.succeededFuture());
-        when(managerRepo.update(eq(MANAGER_ID), anyString(), anyString(), isNull(), isNull(), isNull(), isNull(), isNull(), isNull()))
+        when(managerRepo.update(eq(MANAGER_ID), anyString(), anyString(), isNull(), isNull(), isNull(), isNull(), isNull(), isNull(), any()))
             .thenReturn(Future.succeededFuture(Optional.empty()));
         when(editRepo.approve(eq(editId), eq(ADMIN_ID), any()))
             .thenReturn(Future.succeededFuture());
@@ -711,6 +723,7 @@ class AdminServiceTest {
         when(row.getString("status")).thenReturn(status);
         when(row.getString("current_company")).thenReturn(currentCompany);
         when(row.getString("current_title")).thenReturn(currentTitle);
+        when(row.getLong("current_company_id")).thenReturn(null);
         when(row.getString("new_company")).thenReturn(newCompany);
         when(row.getString("new_title")).thenReturn(newTitle);
         when(row.getString("new_status")).thenReturn(newStatus);
@@ -718,6 +731,12 @@ class AdminServiceTest {
         when(row.getUUID("proposed_by")).thenReturn(proposedBy);
         when(row.getString("manager_name")).thenReturn(managerName);
         when(row.getOffsetDateTime("manager_created_at")).thenReturn(managerCreatedAt);
+        return row;
+    }
+
+    private static Row companyRowWithId(long id) {
+        Row row = mock(Row.class);
+        when(row.getLong("id")).thenReturn(id);
         return row;
     }
 

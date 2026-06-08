@@ -367,6 +367,7 @@ class ManagerServiceValidationTest {
 
         stubConnInsert(conn, insertedRow);
         stubConnSelectCurrent(conn, currentRow);
+        stubConnCompany(conn);
         RowSet<Row> updateRs = rowSetOf();
         when(updatePq.execute(any(Tuple.class))).thenReturn(Future.succeededFuture(updateRs));
         when(conn.preparedQuery(argThat(s -> s != null && s.contains("UPDATE managers")))).thenReturn(updatePq);
@@ -396,6 +397,7 @@ class ManagerServiceValidationTest {
 
         stubConnInsert(conn, insertedRow);
         stubConnSelectCurrent(conn, currentRow);
+        stubConnCompany(conn);
         when(conn.preparedQuery(argThat(s -> s != null && s.contains("UPDATE managers")))).thenReturn(updatePq);
 
         when(pool.withTransaction(any())).thenAnswer(inv -> {
@@ -417,6 +419,7 @@ class ManagerServiceValidationTest {
 
         stubConnInsert(conn, insertedReviewRow(newId, MANAGER_ID, "Acme Corp", "Engineering Manager"));
         stubConnSelectCurrent(conn, mostCurrentRow(newId));
+        stubConnCompany(conn);
         when(updatePq.execute(any(Tuple.class)))
             .thenReturn(Future.failedFuture(new RuntimeException("simulated DB error")));
         when(conn.preparedQuery(argThat(s -> s != null && s.contains("UPDATE managers")))).thenReturn(updatePq);
@@ -551,6 +554,7 @@ class ManagerServiceValidationTest {
 
         stubConnInsert(conn, insertedReviewRow(newId, MANAGER_ID, "Acme Corp", "Engineering Manager"));
         stubConnSelectCurrent(conn, mostCurrentRow(newId));
+        stubConnCompany(conn);
 
         when(pool.withTransaction(any())).thenAnswer(inv -> {
             Function<SqlConnection, Future<Row>> fn = inv.getArgument(0);
@@ -563,6 +567,16 @@ class ManagerServiceValidationTest {
         PreparedQuery<RowSet<Row>> pq = mock(PreparedQuery.class);
         when(pq.execute(any(Tuple.class))).thenReturn(Future.succeededFuture(rs));
         when(conn.preparedQuery(argThat(s -> s != null && s.contains("INSERT INTO reviews"))))
+            .thenReturn(pq);
+    }
+
+    private void stubConnCompany(SqlConnection conn) {
+        Row companyRow = mock(Row.class);
+        when(companyRow.getLong("id")).thenReturn(1L);
+        RowSet<Row> rs = rowSetOf(companyRow);
+        PreparedQuery<RowSet<Row>> pq = mock(PreparedQuery.class);
+        when(pq.execute(any(Tuple.class))).thenReturn(Future.succeededFuture(rs));
+        when(conn.preparedQuery(argThat(s -> s != null && s.contains("INSERT INTO companies"))))
             .thenReturn(pq);
     }
 

@@ -172,35 +172,41 @@ public class AdminService {
                     Row row = opt.get();
                     if (!"pending".equals(row.getString("status"))) return Future.failedFuture(ServiceException.conflict("Edit request is not pending"));
 
-                    long   managerId     = row.getLong("manager_id");
-                    String currentCompany= row.getString("current_company");
-                    String currentTitle  = row.getString("current_title");
-                    String newCompany    = row.getString("new_company");
-                    String newTitle      = row.getString("new_title");
-                    String newStatus     = row.getString("new_status");
-                    String newCountry    = row.getString("new_country");
-                    String newLinkedinUrl= row.getString("new_linkedin_url");
-                    String effectiveCo   = newCompany != null ? newCompany : currentCompany;
-                    String effectiveTit  = newTitle   != null ? newTitle   : currentTitle;
-                    UUID   proposedBy    = row.getUUID("proposed_by");
-                    String managerName   = row.getString("manager_name");
-                    OffsetDateTime now   = OffsetDateTime.now(ZoneOffset.UTC);
+                    long   managerId        = row.getLong("manager_id");
+                    String currentCompany   = row.getString("current_company");
+                    String currentTitle     = row.getString("current_title");
+                    Long   currentCompanyId = row.getLong("current_company_id");
+                    String newCompany       = row.getString("new_company");
+                    String newTitle         = row.getString("new_title");
+                    String newStatus        = row.getString("new_status");
+                    String newCountry       = row.getString("new_country");
+                    String newLinkedinUrl   = row.getString("new_linkedin_url");
+                    String effectiveCo      = newCompany != null ? newCompany : currentCompany;
+                    String effectiveTit     = newTitle   != null ? newTitle   : currentTitle;
+                    UUID   proposedBy       = row.getUUID("proposed_by");
+                    String managerName      = row.getString("manager_name");
+                    OffsetDateTime now      = OffsetDateTime.now(ZoneOffset.UTC);
 
-                    // Close the open career_history entry
-                    return managerRepo.closeOpenCareerEntry(managerId, now)
-                        .compose(closed -> {
-                            Future<Void> archiveOld;
-                            if (closed == 0) {
-                                OffsetDateTime oldStart = row.getOffsetDateTime("manager_created_at");
-                                archiveOld = managerRepo.insertCareerEntry(managerId, currentCompany, currentTitle, oldStart, now);
-                            } else {
-                                archiveOld = Future.succeededFuture();
-                            }
-                            return archiveOld.compose(v ->
-                                managerRepo.insertCareerEntry(managerId, effectiveCo, effectiveTit, now, null)
-                            );
-                        })
-                        .compose(v -> applyEditAndApprove(managerId, editId, newCompany, newTitle, newStatus, newCountry, newLinkedinUrl, effectiveCo, effectiveTit, adminId, now, proposedBy, managerName));
+                    Future<Long> newCompanyIdFuture = (companyRepo != null)
+                        ? companyRepo.findOrCreate(effectiveCo, null, null).map(r -> r.getLong("id"))
+                        : Future.succeededFuture(currentCompanyId);
+
+                    return newCompanyIdFuture.compose(newCompanyId ->
+                        managerRepo.closeOpenCareerEntry(managerId, now)
+                            .compose(closed -> {
+                                Future<Void> archiveOld;
+                                if (closed == 0) {
+                                    OffsetDateTime oldStart = row.getOffsetDateTime("manager_created_at");
+                                    archiveOld = managerRepo.insertCareerEntry(managerId, currentCompany, currentTitle, oldStart, now, currentCompanyId);
+                                } else {
+                                    archiveOld = Future.succeededFuture();
+                                }
+                                return archiveOld.compose(v ->
+                                    managerRepo.insertCareerEntry(managerId, effectiveCo, effectiveTit, now, null, newCompanyId)
+                                );
+                            })
+                            .compose(v -> applyEditAndApprove(managerId, editId, newCompany, newTitle, newStatus, newCountry, newLinkedinUrl, effectiveCo, effectiveTit, adminId, now, proposedBy, managerName, newCompanyId))
+                    );
                 })
             );
     }
@@ -209,8 +215,8 @@ public class AdminService {
                                                      String newCompany, String newTitle, String newStatus, String newCountry,
                                                      String newLinkedinUrl, String effectiveCo, String effectiveTit,
                                                      UUID adminId, OffsetDateTime reviewedAt,
-                                                     UUID proposedBy, String managerName) {
-        return managerRepo.update(managerId, newCompany, newTitle, null, null, newStatus, newCountry, newLinkedinUrl, null)
+                                                     UUID proposedBy, String managerName, Long newCompanyId) {
+        return managerRepo.update(managerId, newCompany, newTitle, null, null, newStatus, newCountry, newLinkedinUrl, null, newCompanyId)
             .compose(opt -> editRepo.approve(editId, adminId, reviewedAt))
             .compose(v -> {
                 if (proposedBy != null) {

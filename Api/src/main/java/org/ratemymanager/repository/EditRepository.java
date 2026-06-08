@@ -81,6 +81,7 @@ public class EditRepository {
                 SELECT pe.id, pe.manager_id, pe.new_company, pe.new_title, pe.new_status,
                        pe.new_country, pe.new_linkedin_url, pe.status, pe.proposed_by,
                        m.company AS current_company, m.title AS current_title,
+                       m.company_id AS current_company_id,
                        m.created_at AS manager_created_at, m.name AS manager_name
                 FROM manager_edits pe
                 JOIN managers m ON m.id = pe.manager_id

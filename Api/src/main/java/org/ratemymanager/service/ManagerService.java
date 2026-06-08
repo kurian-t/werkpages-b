@@ -526,8 +526,8 @@ public class ManagerService {
                                         .compose(managerResult -> {
                                             Row managerRow = managerResult.iterator().next();
                                             long managerId = managerRow.getLong("id");
-                                            conn.preparedQuery("INSERT INTO career_history(manager_id, company, title, start_date, end_date) VALUES ($1,$2,$3,$4,$5)")
-                                                .execute(Tuple.of(managerId, company, title, startDt, endDt), ignored -> {});
+                                            conn.preparedQuery("INSERT INTO career_history(manager_id, company, title, start_date, end_date, company_id) VALUES ($1,$2,$3,$4,$5,$6)")
+                                                .execute(Tuple.of(managerId, company, title, startDt, endDt, companyId), ignored -> {});
                                             return conn.preparedQuery("""
                                                 INSERT INTO reviews (
                                                     manager_id, user_id, author, overall_rating,
@@ -610,7 +610,8 @@ public class ManagerService {
                         .compose(hasHistory -> {
                             Future<Void> histFuture = hasHistory
                                 ? Future.succeededFuture()
-                                : managerRepo.insertCareerEntry(existingId, company, title, startDt, endDt);
+                                : companyRepo.findOrCreate(company, null, logoUrl)
+                                    .compose(cRow -> managerRepo.insertCareerEntry(existingId, company, title, startDt, endDt, cRow.getLong("id")));
                             return histFuture
                                 .compose(v -> validateAndInsertReview(reviewBody, existingId, userId, author, logoUrl))
                                 .compose(ignored -> managerRepo.promoteGhostToPending(existingId))
@@ -676,43 +677,50 @@ public class ManagerService {
                 if (companyChanged || titleChanged) {
                     String effectiveCo  = newCompany != null ? newCompany : currentCompany;
                     String effectiveTit = newTitle   != null ? newTitle   : currentTitle;
-                    LocalDate oldStartLocal = parseYearMonth(startDateStr);
+                    Long   oldCompanyId = current.getLong("company_id");
 
-                    if (oldStartLocal == null) {
-                        // No start date provided — treat as a spelling/typo correction.
-                        // Update the existing open career entry in place; don't fork a new segment.
-                        return managerRepo.updateOpenCareerEntry(managerId, effectiveCo, effectiveTit)
-                            .compose(v -> doUpdate(managerId, newCompany, newTitle, newImage, newBio, newStatus, newCountry, newLinkedinUrl, newLogoUrl));
-                    }
+                    // Resolve the company row (and company_id) for the new effective company.
+                    return companyRepo.findOrCreate(effectiveCo, null, logoResolver.apply(effectiveCo))
+                        .compose(effectiveCoRow -> {
+                            long newCompanyId = effectiveCoRow.getLong("id");
+                            LocalDate oldStartLocal = parseYearMonth(startDateStr);
 
-                    // Start date provided — genuine role change: close old segment, open a new one.
-                    OffsetDateTime now = OffsetDateTime.now(ZoneOffset.UTC);
-                    OffsetDateTime newPosStart = oldStartLocal.atStartOfDay(ZoneOffset.UTC).toOffsetDateTime();
-
-                    return managerRepo.closeOpenCareerEntry(managerId, now)
-                        .compose(closedRows -> {
-                            Future<Void> archiveOld;
-                            if (closedRows == 0) {
-                                OffsetDateTime oldStart = current.getOffsetDateTime("created_at");
-                                archiveOld = managerRepo.insertCareerEntry(managerId, currentCompany, currentTitle, oldStart, now);
-                            } else {
-                                archiveOld = Future.succeededFuture();
+                            if (oldStartLocal == null) {
+                                // No start date provided — treat as a spelling/typo correction.
+                                // Update the existing open career entry in place; don't fork a new segment.
+                                return managerRepo.updateOpenCareerEntry(managerId, effectiveCo, effectiveTit)
+                                    .compose(v -> doUpdate(managerId, newCompany, newTitle, newImage, newBio, newStatus, newCountry, newLinkedinUrl, newLogoUrl, newCompanyId));
                             }
-                            return archiveOld.compose(v ->
-                                managerRepo.insertCareerEntry(managerId, effectiveCo, effectiveTit, newPosStart, null)
-                            );
-                        })
-                        .compose(v -> doUpdate(managerId, newCompany, newTitle, newImage, newBio, newStatus, newCountry, newLinkedinUrl, newLogoUrl));
+
+                            // Start date provided — genuine role change: close old segment, open a new one.
+                            OffsetDateTime now = OffsetDateTime.now(ZoneOffset.UTC);
+                            OffsetDateTime newPosStart = oldStartLocal.atStartOfDay(ZoneOffset.UTC).toOffsetDateTime();
+
+                            return managerRepo.closeOpenCareerEntry(managerId, now)
+                                .compose(closedRows -> {
+                                    Future<Void> archiveOld;
+                                    if (closedRows == 0) {
+                                        OffsetDateTime oldStart = current.getOffsetDateTime("created_at");
+                                        archiveOld = managerRepo.insertCareerEntry(managerId, currentCompany, currentTitle, oldStart, now, oldCompanyId);
+                                    } else {
+                                        archiveOld = Future.succeededFuture();
+                                    }
+                                    return archiveOld.compose(v ->
+                                        managerRepo.insertCareerEntry(managerId, effectiveCo, effectiveTit, newPosStart, null, newCompanyId)
+                                    );
+                                })
+                                .compose(v -> doUpdate(managerId, newCompany, newTitle, newImage, newBio, newStatus, newCountry, newLinkedinUrl, newLogoUrl, newCompanyId));
+                        });
                 } else {
-                    return doUpdate(managerId, newCompany, newTitle, newImage, newBio, newStatus, newCountry, newLinkedinUrl, newLogoUrl);
+                    return doUpdate(managerId, newCompany, newTitle, newImage, newBio, newStatus, newCountry, newLinkedinUrl, newLogoUrl, null);
                 }
             });
     }
 
     private Future<JsonObject> doUpdate(long managerId, String newCompany, String newTitle,
                                          String newImage, String newBio, String newStatus, String newCountry,
-                                         String newLinkedinUrl, String newLogoUrl) {
-        return managerRepo.update(managerId, newCompany, newTitle, newImage, newBio, newStatus, newCountry, newLinkedinUrl, newLogoUrl)
+                                         String newLinkedinUrl, String newLogoUrl, Long newCompanyId) {
+        return managerRepo.update(managerId, newCompany, newTitle, newImage, newBio, newStatus, newCountry, newLinkedinUrl, newLogoUrl, newCompanyId)
             .compose(opt -> {
                 if (opt.isEmpty()) return Future.failedFuture(ServiceException.notFound("Manager not found"));
                 Row row = opt.get();
@@ -930,9 +938,19 @@ public class ManagerService {
                             String currentLogo = newId.equals(mostCurrent.getUUID("id"))
                                 ? resolvedLogoUrl
                                 : logoResolver.apply(currentCompany);
-                            return conn.preparedQuery(
-                                    "UPDATE managers SET updated_at = now(), company = $1, title = $2, company_logo_url = $3 WHERE id = $4")
-                                .execute(Tuple.of(currentCompany, currentTitle, currentLogo, managerId))
+                            return conn.preparedQuery("""
+                                        INSERT INTO companies (name, status, created_at, updated_at)
+                                        VALUES ($1, 'ghost', now(), now())
+                                        ON CONFLICT ((LOWER(TRIM(name)))) DO UPDATE SET updated_at = now()
+                                        RETURNING id
+                                        """)
+                                .execute(Tuple.of(currentCompany))
+                                .compose(cmpResult -> {
+                                    long cmpId = cmpResult.iterator().next().getLong("id");
+                                    return conn.preparedQuery(
+                                            "UPDATE managers SET updated_at = now(), company = $1, title = $2, company_logo_url = $3, company_id = $4 WHERE id = $5")
+                                        .execute(Tuple.of(currentCompany, currentTitle, currentLogo, cmpId, managerId));
+                                })
                                 .map(ignored -> reviewRow);
                         });
                 })

@@ -87,9 +87,8 @@ public class CompanyRepository {
                     m.company_id = $1
                     OR EXISTS (
                         SELECT 1 FROM career_history ch
-                        JOIN companies c ON c.id = $1
                         WHERE ch.manager_id = m.id
-                          AND LOWER(TRIM(ch.company)) = LOWER(TRIM(c.name))
+                          AND ch.company_id = $1
                     )
                   )
                 ORDER BY m.reviews_count DESC NULLS LAST, m.overall_rating DESC NULLS LAST, m.name ASC

@@ -71,7 +71,7 @@ public class ManagerRepository {
                 m.id, m.name, m.company, m.title, m.image, m.overall_rating,
                 m.reviews_count, m.bio, m.status, m.approval_status,
                 m.category_averages, m.linkedin_url, m.company_logo_url, m.country, m.created_at,
-                m.submitted_by, m.external_id,
+                m.submitted_by, m.external_id, m.company_id,
                 COALESCE(
                     json_agg(json_build_object(
                         'company', ch.company, 'title', ch.title,
@@ -254,7 +254,8 @@ public class ManagerRepository {
 
     public Future<Optional<Row>> update(long id, String newCompany, String newTitle,
                                          String newImage, String newBio, String newStatus,
-                                         String newCountry, String newLinkedinUrl, String newLogoUrl) {
+                                         String newCountry, String newLinkedinUrl, String newLogoUrl,
+                                         Long newCompanyId) {
         StringBuilder sql = new StringBuilder("UPDATE managers SET updated_at = now()");
         List<Object> params = new ArrayList<>();
         int idx = 1;
@@ -266,6 +267,7 @@ public class ManagerRepository {
         if (newCountry     != null) { sql.append(", country = $").append(idx++);           params.add(newCountry); }
         if (newLinkedinUrl != null) { sql.append(", linkedin_url = $").append(idx++);      params.add(newLinkedinUrl); }
         if (newLogoUrl     != null) { sql.append(", company_logo_url = $").append(idx++);  params.add(newLogoUrl); }
+        if (newCompanyId   != null) { sql.append(", company_id = $").append(idx++);        params.add(newCompanyId); }
         sql.append(" WHERE id = $").append(idx).append(" RETURNING *");
         params.add(id);
         return db.preparedQuery(sql.toString())
@@ -328,12 +330,12 @@ public class ManagerRepository {
     }
 
     public Future<Void> insertCareerEntry(long managerId, String company, String title,
-                                           OffsetDateTime startDate, OffsetDateTime endDate) {
+                                           OffsetDateTime startDate, OffsetDateTime endDate, Long companyId) {
         return db.preparedQuery("""
-                INSERT INTO career_history(manager_id, company, title, start_date, end_date)
-                VALUES ($1, $2, $3, $4, $5)
+                INSERT INTO career_history(manager_id, company, title, start_date, end_date, company_id)
+                VALUES ($1, $2, $3, $4, $5, $6)
                 """)
-            .execute(Tuple.of(managerId, company, title, startDate, endDate))
+            .execute(Tuple.of(managerId, company, title, startDate, endDate, companyId))
             .mapEmpty();
     }
 

@@ -391,12 +391,13 @@ class CompanyListingIntegrationTest {
     }
 
     private void insertCareerHistory(long managerId, String company, String title) throws Exception {
+        Long companyId = await(companyRepo.findOrCreate(company, null, null)).getLong("id");
         await(pool
             .preparedQuery("""
-                INSERT INTO career_history(manager_id, company, title, start_date)
-                VALUES ($1, $2, $3, '2020-01-01 00:00:00+00')
+                INSERT INTO career_history(manager_id, company, title, start_date, company_id)
+                VALUES ($1, $2, $3, '2020-01-01 00:00:00+00', $4)
                 """)
-            .execute(Tuple.of(managerId, company, title)));
+            .execute(Tuple.of(managerId, company, title, companyId)));
     }
 
     private static <T> T await(Future<T> future) throws Exception {
