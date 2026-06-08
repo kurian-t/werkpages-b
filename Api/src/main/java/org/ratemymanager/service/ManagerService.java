@@ -195,8 +195,10 @@ public class ManagerService {
                 for (Row row : rows) {
                     String name = row.getString("name");
                     if (name == null || name.isBlank()) continue;
-                    String logoUrl = logoResolver.apply(name);
-                    if (logoUrl == null || logoUrl.isBlank()) logoUrl = row.getString("logo_url");
+                    String storedLogoUrl = row.getString("logo_url");
+                    String logoUrl = (storedLogoUrl != null && storedLogoUrl.contains("logo.dev"))
+                        ? storedLogoUrl
+                        : logoResolver.apply(name);
                     JsonObject co = new JsonObject()
                         .put("name",         name)
                         .put("managerCount", row.getLong("manager_count"))
