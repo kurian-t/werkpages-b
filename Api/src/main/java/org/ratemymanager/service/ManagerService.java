@@ -8,6 +8,7 @@ import io.vertx.sqlclient.Row;
 import io.vertx.sqlclient.RowSet;
 import io.vertx.sqlclient.SqlClient;
 import io.vertx.sqlclient.Tuple;
+import org.ratemymanager.repository.CompanyRepository;
 import org.ratemymanager.repository.EditRepository;
 import org.ratemymanager.repository.ManagerRepository;
 import org.ratemymanager.repository.ReportRepository;
@@ -21,7 +22,9 @@ import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
 import java.time.format.DateTimeParseException;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
 import java.util.function.Function;
@@ -50,24 +53,33 @@ public class ManagerService {
     private final UserRepository             userRepo;
     private final EditRepository             editRepo;
     private final ReportRepository           reportRepo;
+    private final CompanyRepository          companyRepo;
     private final SqlClient                  db; // needed for transactions
     private final Function<String, String>   logoResolver;
 
     public ManagerService(ManagerRepository managerRepo, ReviewRepository reviewRepo,
                           UserRepository userRepo, EditRepository editRepo,
                           ReportRepository reportRepo, SqlClient db) {
-        this(managerRepo, reviewRepo, userRepo, editRepo, reportRepo, db, company -> null);
+        this(managerRepo, reviewRepo, userRepo, editRepo, reportRepo, new CompanyRepository(db), db, company -> null);
     }
 
     public ManagerService(ManagerRepository managerRepo, ReviewRepository reviewRepo,
                           UserRepository userRepo, EditRepository editRepo,
                           ReportRepository reportRepo, SqlClient db,
                           Function<String, String> logoResolver) {
+        this(managerRepo, reviewRepo, userRepo, editRepo, reportRepo, new CompanyRepository(db), db, logoResolver);
+    }
+
+    public ManagerService(ManagerRepository managerRepo, ReviewRepository reviewRepo,
+                          UserRepository userRepo, EditRepository editRepo,
+                          ReportRepository reportRepo, CompanyRepository companyRepo,
+                          SqlClient db, Function<String, String> logoResolver) {
         this.managerRepo  = managerRepo;
         this.reviewRepo   = reviewRepo;
         this.userRepo     = userRepo;
         this.editRepo     = editRepo;
         this.reportRepo   = reportRepo;
+        this.companyRepo  = companyRepo;
         this.db           = db;
         this.logoResolver = logoResolver;
     }
@@ -171,6 +183,111 @@ public class ManagerService {
                     if (c != null && !c.isBlank()) companies.add(c);
                 }
                 return new JsonObject().put("data", companies);
+            });
+    }
+
+    // ── Company listing (for Companies tab) ───────────────────────────────────
+
+    public Future<JsonObject> getCompanyListing() {
+        return companyRepo.findCompanyListing()
+            .map(rows -> {
+                JsonArray companies = new JsonArray();
+                for (Row row : rows) {
+                    String name = row.getString("name");
+                    if (name == null || name.isBlank()) continue;
+                    String logoUrl = logoResolver.apply(name);
+                    if (logoUrl == null || logoUrl.isBlank()) logoUrl = row.getString("logo_url");
+                    JsonObject co = new JsonObject()
+                        .put("name",         name)
+                        .put("managerCount", row.getLong("manager_count"))
+                        .put("totalReviews", row.getLong("total_reviews"))
+                        .put("avgRating",    row.getBigDecimal("avg_rating"));
+                    if (logoUrl != null && !logoUrl.isBlank()) co.put("logoUrl", logoUrl);
+                    companies.add(co);
+                }
+                return new JsonObject().put("data", companies);
+            });
+    }
+
+    public Future<JsonObject> getCompanyProfile(String company) {
+        if (company == null || company.isBlank())
+            return Future.failedFuture(ServiceException.badRequest("company parameter is required"));
+        final String companyName = company.trim();
+        String resolvedLogoUrl = logoResolver.apply(companyName);
+        // findOrCreate auto-creates a ghost company entry on first profile view
+        return companyRepo.findOrCreate(companyName, null, resolvedLogoUrl)
+            .compose(companyRow -> {
+                long companyId = companyRow.getLong("id");
+                String canonicalName = companyRow.getString("name");
+                String storedLogoUrl = companyRow.getString("logo_url");
+                String logoUrl = (resolvedLogoUrl != null && !resolvedLogoUrl.isBlank())
+                    ? resolvedLogoUrl : storedLogoUrl;
+                return companyRepo.findManagersByCompanyId(companyId)
+                    .map(rows -> {
+                        if (!rows.iterator().hasNext()) {
+                            JsonObject empty = new JsonObject()
+                                .put("name",            canonicalName)
+                                .put("managerCount",    0)
+                                .put("totalReviews",    0)
+                                .put("avgRating",       (Object) null)
+                                .put("categoryAverages", new JsonObject())
+                                .put("managers",        new JsonArray());
+                            if (logoUrl != null && !logoUrl.isBlank()) empty.put("logoUrl", logoUrl);
+                            return empty;
+                        }
+                        JsonArray managers   = new JsonArray();
+                        long   totalReviews  = 0;
+                        double ratingSum     = 0.0;
+                        int    ratingCount   = 0;
+                        Map<String, Double>  catSum   = new LinkedHashMap<>();
+                        Map<String, Integer> catCount = new LinkedHashMap<>();
+                        for (Row row : rows) {
+                            String mgrLogoUrl = (logoUrl != null && !logoUrl.isBlank())
+                                ? logoUrl : row.getString("company_logo_url");
+                            Integer reviews = row.getInteger("reviews_count");
+                            totalReviews += (reviews != null ? reviews : 0);
+                            BigDecimal rating = row.getBigDecimal("overall_rating");
+                            if (rating != null) { ratingSum += rating.doubleValue(); ratingCount++; }
+                            Object catObj = row.getValue("category_averages");
+                            if (catObj != null) {
+                                JsonObject cats = catObj instanceof JsonObject
+                                    ? (JsonObject) catObj : new JsonObject(catObj.toString());
+                                for (String key : cats.fieldNames()) {
+                                    Object val = cats.getValue(key);
+                                    if (val instanceof Number) {
+                                        double v = ((Number) val).doubleValue();
+                                        catSum.merge(key, v, Double::sum);
+                                        catCount.merge(key, 1, Integer::sum);
+                                    }
+                                }
+                            }
+                            JsonObject mgr = new JsonObject()
+                                .put("id",           row.getLong("id"))
+                                .put("name",         row.getString("name"))
+                                .put("title",        row.getString("title"))
+                                .put("image",        row.getString("image"))
+                                .put("overallRating", rating)
+                                .put("reviewsCount", reviews != null ? reviews : 0)
+                                .put("company",      row.getString("company"));
+                            if (mgrLogoUrl != null && !mgrLogoUrl.isBlank()) mgr.put("companyLogoUrl", mgrLogoUrl);
+                            managers.add(mgr);
+                        }
+                        JsonObject categoryAverages = new JsonObject();
+                        for (Map.Entry<String, Double> e : catSum.entrySet()) {
+                            int cnt = catCount.get(e.getKey());
+                            categoryAverages.put(e.getKey(), Math.round(e.getValue() / cnt * 10.0) / 10.0);
+                        }
+                        JsonObject result = new JsonObject()
+                            .put("name",            canonicalName)
+                            .put("managerCount",    managers.size())
+                            .put("totalReviews",    totalReviews)
+                            .put("avgRating",       ratingCount > 0
+                                ? Math.round(ratingSum / ratingCount * 10.0) / 10.0 : null)
+                            .put("categoryAverages", categoryAverages)
+                            .put("managers",        managers);
+                        if (logoUrl != null && !logoUrl.isBlank()) result.put("logoUrl", logoUrl);
+                        return result;
+                    });
             });
     }
 
@@ -388,18 +505,23 @@ public class ManagerService {
                                         fStartDate, fEndDate, fOverallRating, fRatings,
                                         fMgrCompany, fMgrTitle, fReviewText, fWorkedFrom, fWorkedUntil);
                                 }
-                                // No match — create a new pending_approval manager with its first review
+                                // No match — create a new pending_approval manager with its first review.
+                                // Resolve (or create) the company row first so we can link company_id.
                                 OffsetDateTime startDt = fStartDate.atStartOfDay(ZoneOffset.UTC).toOffsetDateTime();
                                 OffsetDateTime endDt   = fEndDate != null ? fEndDate.atStartOfDay(ZoneOffset.UTC).toOffsetDateTime() : null;
+                                final String fCompany = company;
+                                return companyRepo.findOrCreate(company, null, resolvedLogoUrl)
+                                    .compose(companyRow -> {
+                                long companyId = companyRow.getLong("id");
                                 return ((Pool) db).withTransaction(conn ->
                                     conn.preparedQuery("""
                                         INSERT INTO managers
                                         (name, company, title, image, bio, status, approval_status, country, state, city, linkedin_url,
-                                         company_logo_url, overall_rating, reviews_count, category_averages, created_at, submitted_by)
-                                        VALUES ($1,$2,$3,$4,$5,$6,'pending_approval',$7,$8,$9,$10,$11,0,0,'{}'::jsonb,now(),$12)
+                                         company_logo_url, company_id, overall_rating, reviews_count, category_averages, created_at, submitted_by)
+                                        VALUES ($1,$2,$3,$4,$5,$6,'pending_approval',$7,$8,$9,$10,$11,$12,0,0,'{}'::jsonb,now(),$13)
                                         RETURNING *
                                         """)
-                                        .execute(Tuple.of(name, company, title, image, fBio, fStatus, fCountry, fState, fCity, fLinkedinUrl, resolvedLogoUrl, userId))
+                                        .execute(Tuple.of(name, fCompany, title, image, fBio, fStatus, fCountry, fState, fCity, fLinkedinUrl, resolvedLogoUrl, companyId, userId))
                                         .compose(managerResult -> {
                                             Row managerRow = managerResult.iterator().next();
                                             long managerId = managerRow.getLong("id");
@@ -431,6 +553,7 @@ public class ManagerService {
                                     managerRepo.recalculateInBackground(managerRow.getLong("id"));
                                     managerRepo.deleteFakeManagerInBackground();
                                 });
+                            }); // compose(companyRow -> {
                             });
                     });
             });
@@ -1452,9 +1575,11 @@ public class ManagerService {
 
                     // Create the ghost first, then mark the flag. If the insert fails the flag
                     // is never set, so the user gets another chance on their next search.
-                    return managerRepo.createAutoApproved(fullName, company, title, country,
-                            isBlank(state) ? null : state.trim(), isBlank(city) ? null : city.trim(),
-                            userId, resolvedLogoUrl)
+                    final String trimmedState = isBlank(state) ? null : state.trim();
+                    final String trimmedCity  = isBlank(city)  ? null : city.trim();
+                    return companyRepo.findOrCreate(company, null, resolvedLogoUrl)
+                        .compose(companyRow -> managerRepo.createAutoApproved(fullName, company, title, country,
+                            trimmedState, trimmedCity, userId, resolvedLogoUrl, companyRow.getLong("id")))
                         .compose(row -> userRepo.markAutoCreatedManager(userId).map(v -> row))
                         .map(row -> {
                             JsonArray data = new JsonArray().add(rowToManagerJson(row));
@@ -1506,7 +1631,8 @@ public class ManagerService {
                             .put("created", false)
                     );
                 }
-                return managerRepo.createGhost(name, company, title, country, fState, fCity, resolvedLogoUrl)
+                return companyRepo.findOrCreate(company, null, resolvedLogoUrl)
+                    .compose(companyRow -> managerRepo.createGhost(name, company, title, country, fState, fCity, resolvedLogoUrl, companyRow.getLong("id")))
                     .map(row -> new JsonObject()
                         .put("id", row.getLong("id"))
                         .put("name", row.getString("name"))

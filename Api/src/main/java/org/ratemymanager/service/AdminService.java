@@ -4,6 +4,7 @@ import io.vertx.core.Future;
 import io.vertx.core.json.JsonArray;
 import io.vertx.core.json.JsonObject;
 import io.vertx.sqlclient.Row;
+import org.ratemymanager.repository.CompanyRepository;
 import org.ratemymanager.repository.EditRepository;
 import org.ratemymanager.repository.ManagerRepository;
 import org.ratemymanager.repository.NotificationRepository;
@@ -23,20 +24,28 @@ import java.util.function.Consumer;
  */
 public class AdminService {
 
-    private final UserRepository     userRepo;
-    private final ManagerRepository  managerRepo;
-    private final ReviewRepository   reviewRepo;
-    private final EditRepository     editRepo;
+    private final UserRepository         userRepo;
+    private final ManagerRepository      managerRepo;
+    private final ReviewRepository       reviewRepo;
+    private final EditRepository         editRepo;
     private final NotificationRepository notifRepo;
+    private final CompanyRepository      companyRepo;
 
     public AdminService(UserRepository userRepo, ManagerRepository managerRepo,
                         ReviewRepository reviewRepo, EditRepository editRepo,
                         NotificationRepository notifRepo) {
+        this(userRepo, managerRepo, reviewRepo, editRepo, notifRepo, null);
+    }
+
+    public AdminService(UserRepository userRepo, ManagerRepository managerRepo,
+                        ReviewRepository reviewRepo, EditRepository editRepo,
+                        NotificationRepository notifRepo, CompanyRepository companyRepo) {
         this.userRepo    = userRepo;
         this.managerRepo = managerRepo;
         this.reviewRepo  = reviewRepo;
         this.editRepo    = editRepo;
         this.notifRepo   = notifRepo;
+        this.companyRepo = companyRepo;
     }
 
     // ── Guard: verify admin ───────────────────────────────────────────────────
@@ -319,18 +328,33 @@ public class AdminService {
         if (name        != null && name.isBlank())        return Future.failedFuture(ServiceException.badRequest("Name cannot be blank"));
         if (title       != null && title.isBlank())       return Future.failedFuture(ServiceException.badRequest("Title cannot be blank"));
         if (company     != null && company.isBlank())     return Future.failedFuture(ServiceException.badRequest("Company cannot be blank"));
+        final String effCompany     = company     != null ? company.trim()     : null;
+        final String effName        = name        != null ? name.trim()        : null;
+        final String effTitle       = title       != null ? title.trim()       : null;
+        final String effLinkedinUrl = linkedinUrl != null ? linkedinUrl.trim() : null;
+        // When company changes, ensure a companies row exists and link company_id
+        Future<Long> companyIdFuture = (effCompany != null && companyRepo != null)
+            ? companyRepo.findOrCreate(effCompany, null, null).map(row -> row.getLong("id"))
+            : Future.succeededFuture(null);
         return requireAdmin(auth0Id)
-            .compose(adminId -> managerRepo.adminEdit(managerId,
-                name        != null ? name.trim()        : null,
-                title       != null ? title.trim()       : null,
-                company     != null ? company.trim()     : null,
-                linkedinUrl != null ? linkedinUrl.trim() : null))
+            .compose(adminId -> companyIdFuture)
+            .compose(newCompanyId -> managerRepo.adminEdit(managerId, effName, effTitle, effCompany, effLinkedinUrl, newCompanyId))
             .compose(opt -> opt.isPresent()
                 ? Future.succeededFuture(opt.get())
                 : Future.failedFuture(ServiceException.notFound("Manager not found")));
     }
 
     // ── Merge managers ────────────────────────────────────────────────────────
+
+    public Future<Void> deleteManager(String auth0Id, long managerId) {
+        return requireAdmin(auth0Id)
+            .compose(adminId -> managerRepo.countExistingById(new Long[]{managerId}))
+            .compose(count -> {
+                if (count < 1) return Future.failedFuture(ServiceException.notFound("Manager not found"));
+                return reviewRepo.deleteByManager(managerId);
+            })
+            .compose(v -> managerRepo.delete(managerId));
+    }
 
     public Future<JsonObject> mergeManagers(String auth0Id, long keepId, long mergeId) {
         if (keepId == mergeId) return Future.failedFuture(ServiceException.badRequest("Cannot merge a manager into itself"));

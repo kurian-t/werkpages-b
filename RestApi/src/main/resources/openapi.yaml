@@ -310,6 +310,79 @@ paths:
                   totalReviews:
                     type: integer
 
+  /api/companies/listing:
+    get:
+      operationId: getCompanyListing
+      summary: Get company listing with stats (public)
+      tags:
+        - Managers
+      security: []
+      responses:
+        '200':
+          description: List of companies with manager count, review count, and avg rating
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        name:
+                          type: string
+                        logoUrl:
+                          type: string
+                        managerCount:
+                          type: integer
+                        totalReviews:
+                          type: integer
+                        avgRating:
+                          type: number
+
+  /api/companies/by-name:
+    get:
+      operationId: getCompanyProfile
+      summary: Get company profile with aggregated stats and manager list (public)
+      tags:
+        - Managers
+      security: []
+      parameters:
+        - in: query
+          name: company
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Company profile
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  name:
+                    type: string
+                  logoUrl:
+                    type: string
+                  managerCount:
+                    type: integer
+                  totalReviews:
+                    type: integer
+                  avgRating:
+                    type: number
+                  categoryAverages:
+                    type: object
+                  managers:
+                    type: array
+                    items:
+                      type: object
+        '400':
+          description: company parameter missing
+        '404':
+          description: Company not found
+
   /api/companies:
     get:
       operationId: getCompanies
@@ -1216,6 +1289,24 @@ paths:
           description: Pending manager not found
 
   /api/admin/managers/{managerId}:
+    delete:
+      operationId: adminDeleteManager
+      summary: Permanently delete a manager and all their reviews (admin only)
+      tags:
+        - Admin
+      parameters:
+        - in: path
+          name: managerId
+          required: true
+          schema:
+            type: integer
+      responses:
+        '204':
+          description: Manager deleted
+        '403':
+          description: Forbidden
+        '404':
+          description: Manager not found
     put:
       operationId: adminEditManager
       summary: Admin-only direct edit of name, title, company, and LinkedIn with cascade to reviews and career history

@@ -69,7 +69,7 @@ class GeoPersistenceIntegrationTest {
 
     @BeforeEach
     void cleanDb() throws Exception {
-        await(pool.query("TRUNCATE managers, users CASCADE").execute());
+        await(pool.query("TRUNCATE managers, users, companies CASCADE").execute());
     }
 
     @AfterAll
@@ -122,7 +122,7 @@ class GeoPersistenceIntegrationTest {
 
         Row row = await(managerRepo.createAutoApproved(
             "Sam Auto", "Auto Corp", "Director", "United States", "California", "San Francisco",
-            userId, null));
+            userId, null, (Long) null));
 
         assertEquals("California",    row.getString("state"));
         assertEquals("San Francisco", row.getString("city"));

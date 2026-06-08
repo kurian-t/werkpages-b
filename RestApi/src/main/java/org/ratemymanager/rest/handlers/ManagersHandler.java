@@ -149,6 +149,23 @@ public class ManagersHandler {
             .onFailure(err -> handleError(ctx, err));
     }
 
+    // ── GET /api/companies/listing ────────────────────────────────────────────
+
+    public void handleGetCompanyListing(RoutingContext ctx) {
+        service.getCompanyListing()
+            .onSuccess(json -> ctx.response().putHeader("Content-Type", "application/json").end(json.encode()))
+            .onFailure(err -> handleError(ctx, err));
+    }
+
+    // ── GET /api/companies/by-name ────────────────────────────────────────────
+
+    public void handleGetCompanyProfile(RoutingContext ctx) {
+        String company = ctx.queryParam("company").stream().findFirst().orElse(null);
+        service.getCompanyProfile(company)
+            .onSuccess(json -> ctx.response().putHeader("Content-Type", "application/json").end(json.encode()))
+            .onFailure(err -> handleError(ctx, err));
+    }
+
     // ── GET /api/companies ────────────────────────────────────────────────────
 
     public void handleGetCompanies(RoutingContext ctx) {

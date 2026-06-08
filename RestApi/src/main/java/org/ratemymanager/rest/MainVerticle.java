@@ -6,6 +6,7 @@ import java.util.Set;
 
 import org.ratemymanager.config.SecretsConfig;
 import org.ratemymanager.db.Database;
+import org.ratemymanager.repository.CompanyRepository;
 import org.ratemymanager.repository.EditRepository;
 import org.ratemymanager.repository.ManagerRepository;
 import org.ratemymanager.repository.NotificationRepository;
@@ -79,10 +80,11 @@ public class MainVerticle extends AbstractVerticle {
                         NotificationRepository notifRepo   = new NotificationRepository(Database.getClient());
                         ReportRepository       reportRepo  = new ReportRepository(Database.getClient());
                         EditRepository         editRepo    = new EditRepository(Database.getClient());
+                        CompanyRepository      companyRepo = new CompanyRepository(Database.getClient());
 
                         // ── Services ──────────────────────────────────────────────────────────
-                        ManagerService      managerService = new ManagerService(managerRepo, reviewRepo, userRepo, editRepo, reportRepo, Database.getClient(), CompanyLogoUtils::resolveLogoUrl);
-                        AdminService        adminService   = new AdminService(userRepo, managerRepo, reviewRepo, editRepo, notifRepo);
+                        ManagerService      managerService = new ManagerService(managerRepo, reviewRepo, userRepo, editRepo, reportRepo, companyRepo, Database.getClient(), CompanyLogoUtils::resolveLogoUrl);
+                        AdminService        adminService   = new AdminService(userRepo, managerRepo, reviewRepo, editRepo, notifRepo, companyRepo);
                         NotificationService notifService   = new NotificationService(userRepo, notifRepo);
                         ReportService       reportService  = new ReportService(userRepo, reportRepo);
 
@@ -107,6 +109,8 @@ public class MainVerticle extends AbstractVerticle {
                         routerFactory.addHandlerByOperationId("hasContributed",         managersHandler::handleHasContributed);
                         routerFactory.addHandlerByOperationId("reportManager",         reportsHandler::handleReportManager);
                         routerFactory.addHandlerByOperationId("getStats",               managersHandler::handleGetStats);
+                        routerFactory.addHandlerByOperationId("getCompanyListing",      managersHandler::handleGetCompanyListing);
+                        routerFactory.addHandlerByOperationId("getCompanyProfile",      managersHandler::handleGetCompanyProfile);
                         routerFactory.addHandlerByOperationId("getCompanies",           managersHandler::handleGetCompanies);
                         routerFactory.addHandlerByOperationId("suggestCompanies",       managersHandler::handleSuggestCompanies);
                         routerFactory.addHandlerByOperationId("getGeo",                 managersHandler::handleGetGeo);
@@ -126,6 +130,7 @@ public class MainVerticle extends AbstractVerticle {
                         routerFactory.addHandlerByOperationId("approvePendingManager",    adminHandler::handleApprovePendingManager);
                         routerFactory.addHandlerByOperationId("rejectPendingManager",     adminHandler::handleRejectPendingManager);
                         routerFactory.addHandlerByOperationId("adminEditManager",          adminHandler::handleAdminEditManager);
+                        routerFactory.addHandlerByOperationId("adminDeleteManager",       adminHandler::handleDeleteManager);
                         routerFactory.addHandlerByOperationId("mergeManagers",            adminHandler::handleMergeManagers);
                         routerFactory.addHandlerByOperationId("getNotifications",             notificationsHandler::handleGetNotifications);
                         routerFactory.addHandlerByOperationId("getNotificationsUnreadCount",  notificationsHandler::handleGetUnreadCount);

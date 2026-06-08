@@ -188,12 +188,36 @@ public class AdminHandler {
         }
         JsonObject body = ctx.getBodyAsJson();
         if (body == null) { bad(ctx, "Request body required"); return; }
-        String name        = body.getString("name");
-        String title       = body.getString("title");
-        String company     = body.getString("company");
-        String linkedinUrl = body.getString("linkedinUrl");
+        String name           = body.getString("name");
+        String title          = body.getString("title");
+        String company        = body.getString("company");
+        String linkedinUrl    = body.getString("linkedinUrl");
+        String companyLogoUrl = body.getString("companyLogoUrl");
         service.adminEditManager(auth0Id, managerId, name, title, company, linkedinUrl)
-            .onSuccess(json -> ok(ctx, json))
+            .onSuccess(json -> {
+                if (company != null && !company.isBlank()) {
+                    String logoUrl = (companyLogoUrl != null && !companyLogoUrl.isBlank())
+                        ? companyLogoUrl
+                        : CompanyLogoUtils.resolveLogoUrl(company);
+                    if (logoUrl != null) service.updateManagerLogo(managerId, logoUrl);
+                }
+                ok(ctx, json);
+            })
+            .onFailure(err -> ManagersHandler.handleError(ctx, err));
+    }
+
+    // ── DELETE /api/admin/managers/:managerId ─────────────────────────────────
+
+    public void handleDeleteManager(RoutingContext ctx) {
+        String auth0Id = ctx.get("auth0Id");
+        long managerId;
+        try {
+            managerId = Long.parseLong(ctx.pathParam("managerId"));
+        } catch (NumberFormatException e) {
+            bad(ctx, "Invalid manager ID"); return;
+        }
+        service.deleteManager(auth0Id, managerId)
+            .onSuccess(v -> ctx.response().setStatusCode(204).end())
             .onFailure(err -> ManagersHandler.handleError(ctx, err));
     }
 

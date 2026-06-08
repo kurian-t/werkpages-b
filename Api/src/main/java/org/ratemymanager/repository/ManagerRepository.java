@@ -461,7 +461,8 @@ public class ManagerRepository {
      * Pass null for any field that should not change.
      */
     public Future<Optional<io.vertx.core.json.JsonObject>> adminEdit(long managerId, String newName, String newTitle,
-                                                                      String newCompany, String newLinkedinUrl) {
+                                                                      String newCompany, String newLinkedinUrl,
+                                                                      Long newCompanyId) {
         return ((Pool) db).withTransaction(conn ->
             conn.preparedQuery("SELECT name, title, company FROM managers WHERE id = $1")
                 .execute(Tuple.of(managerId))
@@ -484,6 +485,10 @@ public class ManagerRepository {
                     if (newLinkedinUrl != null) {
                         sql.append(", linkedin_url = $").append(idx++);
                         params.add(newLinkedinUrl);
+                    }
+                    if (newCompanyId != null) {
+                        sql.append(", company_id = $").append(idx++);
+                        params.add(newCompanyId);
                     }
                     params.add(managerId);
                     sql.append(" WHERE id = $").append(idx).append(" RETURNING id");
@@ -538,34 +543,34 @@ public class ManagerRepository {
 
     public Future<Row> createAutoApproved(String name, String company, String title,
                                           String country, String state, String city,
-                                          UUID submittedBy, String logoUrl) {
+                                          UUID submittedBy, String logoUrl, Long companyId) {
         return db.preparedQuery("""
                 INSERT INTO managers
                 (name, company, title, status, approval_status, country, state, city,
                  overall_rating, reviews_count, category_averages, submitted_by,
-                 company_logo_url, created_at, updated_at)
+                 company_logo_url, company_id, created_at, updated_at)
                 VALUES ($1,$2,$3,'active','ghost',$4,$5,$6,
                         0,0,'{}'::jsonb,$7,
-                        $8,now(),now())
+                        $8,$9,now(),now())
                 RETURNING *
                 """)
-            .execute(Tuple.of(name, company.trim(), title.trim(), country.trim(), state, city, submittedBy, logoUrl))
+            .execute(Tuple.of(name, company.trim(), title.trim(), country.trim(), state, city, submittedBy, logoUrl, companyId))
             .map(rows -> rows.iterator().next());
     }
 
     public Future<Row> createGhost(String name, String company, String title,
-                                   String country, String state, String city, String logoUrl) {
+                                   String country, String state, String city, String logoUrl, Long companyId) {
         return db.preparedQuery("""
                 INSERT INTO managers
                 (name, company, title, status, approval_status, country, state, city,
                  overall_rating, reviews_count, category_averages,
-                 company_logo_url, created_at, updated_at)
+                 company_logo_url, company_id, created_at, updated_at)
                 VALUES ($1,$2,$3,'active','ghost',$4,$5,$6,
                         0,0,'{}'::jsonb,
-                        $7,now(),now())
+                        $7,$8,now(),now())
                 RETURNING *
                 """)
-            .execute(Tuple.of(name, company.trim(), title.trim(), country.trim(), state, city, logoUrl))
+            .execute(Tuple.of(name, company.trim(), title.trim(), country.trim(), state, city, logoUrl, companyId))
             .map(rows -> rows.iterator().next());
     }
 

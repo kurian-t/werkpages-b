@@ -572,6 +572,47 @@ class AdminServiceIntegrationTest {
     }
 
     // ══════════════════════════════════════════════════════════════════════════
+    // deleteManager
+    // ══════════════════════════════════════════════════════════════════════════
+
+    @Test
+    void deleteManager_nonAdmin_returns403() throws Exception {
+        String userAuth  = insertUser("auth0|del-user01", "DelUser01", "user");
+        long managerId   = insertApprovedManager("Del Target", "Corp", "Title");
+        ServiceException ex = assertServiceException(service.deleteManager(userAuth, managerId));
+        assertEquals(403, ex.getStatusCode());
+    }
+
+    @Test
+    void deleteManager_notFound_returns404() throws Exception {
+        String adminAuth = insertUser("auth0|del-admin01", "DelAdmin01", "admin");
+        ServiceException ex = assertServiceException(service.deleteManager(adminAuth, 999999L));
+        assertEquals(404, ex.getStatusCode());
+    }
+
+    @Test
+    void deleteManager_removesManagerAndReviews() throws Exception {
+        String adminAuth = insertUser("auth0|del-admin02", "DelAdmin02", "admin");
+        String userAuth  = insertUser("auth0|del-user02", "DelUser02", "user");
+        UUID   userId    = findUserId(userAuth);
+        long managerId   = insertApprovedManager("Gone Manager", "Corp", "Title");
+        insertReview(managerId, userId);
+
+        await(service.deleteManager(adminAuth, managerId));
+
+        long managerExists = await(pool
+            .preparedQuery("SELECT COUNT(*) FROM managers WHERE id = $1")
+            .execute(Tuple.of(managerId))
+            .map(rs -> rs.iterator().next().getLong(0)));
+        assertEquals(0L, managerExists);
+
+        long reviewsExist = await(pool
+            .preparedQuery("SELECT COUNT(*) FROM reviews WHERE manager_id = $1")
+            .execute(Tuple.of(managerId))
+            .map(rs -> rs.iterator().next().getLong(0)));
+        assertEquals(0L, reviewsExist);
+    }
+
     // adminEditManager
     // ══════════════════════════════════════════════════════════════════════════
 
