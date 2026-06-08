@@ -151,6 +151,33 @@ class CompanyListingIntegrationTest {
         assertEquals(0, data.size());
     }
 
+    @Test
+    void getCompanyListing_avgRatingIgnoresZeroReviewManagers() throws Exception {
+        insertManager("Rated",   "Acme Corp", "Manager",  "approved", 4.0, 2);
+        insertManager("Unrated", "Acme Corp", "Director", "approved", 0.0, 0);
+
+        JsonObject result = await(service.getCompanyListing());
+        JsonArray data = result.getJsonArray("data");
+
+        assertEquals(1, data.size());
+        // Only the rated manager should contribute — avg must be 4.0, not (4.0 + 0.0) / 2
+        Object avg = data.getJsonObject(0).getValue("avgRating");
+        assertNotNull(avg, "avgRating should not be null when at least one manager has reviews");
+        assertEquals(4.0, ((Number) avg).doubleValue(), 0.05);
+    }
+
+    @Test
+    void getCompanyListing_avgRatingIsNullWhenAllManagersHaveZeroReviews() throws Exception {
+        insertManager("Unrated", "Acme Corp", "Manager", "approved", 0.0, 0);
+
+        JsonObject result = await(service.getCompanyListing());
+        JsonArray data = result.getJsonArray("data");
+
+        assertEquals(1, data.size());
+        assertNull(data.getJsonObject(0).getValue("avgRating"),
+            "avgRating must be null when all managers have 0 reviews");
+    }
+
     // ── getCompanyProfile ────────────────────────────────────────────────────
 
     @Test
@@ -302,6 +329,44 @@ class CompanyListingIntegrationTest {
         assertEquals("Few Reviews",  managers.getJsonObject(1).getString("name"));
     }
 
+    @Test
+    void getCompanyProfile_includesManagersWithCareerHistoryAtCompany() throws Exception {
+        // Alice currently works at Skynet Inc (company_id points to Skynet)
+        insertManager("Alice A", "Skynet Inc", "Director", "approved", 4.0, 3);
+
+        // Insert career_history row linking Alice to Acme Corp
+        Long aliceId = await(pool
+            .preparedQuery("SELECT id FROM managers WHERE name = 'Alice A'")
+            .execute()
+            .map(rs -> rs.iterator().next().getLong("id")));
+        insertCareerHistory(aliceId, "Acme Corp", "Manager");
+
+        // Acme Corp profile should show Alice even though her company_id is Skynet
+        JsonObject acmeProfile = await(service.getCompanyProfile("Acme Corp"));
+        assertEquals(1, acmeProfile.getInteger("managerCount"),
+            "Manager with career_history at Acme Corp must appear on Acme Corp profile");
+        assertEquals("Alice A", acmeProfile.getJsonArray("managers").getJsonObject(0).getString("name"));
+
+        // Skynet profile should also still show Alice (her current company)
+        JsonObject skynetProfile = await(service.getCompanyProfile("Skynet Inc"));
+        assertEquals(1, skynetProfile.getInteger("managerCount"));
+        assertEquals("Alice A", skynetProfile.getJsonArray("managers").getJsonObject(0).getString("name"));
+    }
+
+    @Test
+    void getCompanyProfile_managerNotDuplicatedWhenCurrentAndHistoricalMatch() throws Exception {
+        // Alice currently works at Acme Corp AND has a career_history entry there (rejoined)
+        insertManager("Alice A", "Acme Corp", "Director", "approved", 4.0, 3);
+        Long aliceId = await(pool
+            .preparedQuery("SELECT id FROM managers WHERE name = 'Alice A'")
+            .execute()
+            .map(rs -> rs.iterator().next().getLong("id")));
+        insertCareerHistory(aliceId, "Acme Corp", "Manager");
+
+        JsonObject profile = await(service.getCompanyProfile("Acme Corp"));
+        assertEquals(1, profile.getInteger("managerCount"), "Manager must appear exactly once, not duplicated");
+    }
+
     // ── helpers ──────────────────────────────────────────────────────────────
 
     private void insertManager(String name, String company, String title, String status,
@@ -323,6 +388,15 @@ class CompanyListingIntegrationTest {
                 VALUES ($1,$2,$3,'img','active',$4,$5,$6,'{}', $7, $8) RETURNING id
                 """)
             .execute(Tuple.of(name, company, title, status, overallRating, reviewsCount, companyId, externalId)));
+    }
+
+    private void insertCareerHistory(long managerId, String company, String title) throws Exception {
+        await(pool
+            .preparedQuery("""
+                INSERT INTO career_history(manager_id, company, title, start_date)
+                VALUES ($1, $2, $3, '2020-01-01 00:00:00+00')
+                """)
+            .execute(Tuple.of(managerId, company, title)));
     }
 
     private static <T> T await(Future<T> future) throws Exception {

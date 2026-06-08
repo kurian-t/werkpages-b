@@ -50,7 +50,7 @@ public class CompanyRepository {
                     c.logo_url,
                     COUNT(DISTINCT m.id)                                                              AS manager_count,
                     COALESCE(SUM(m.reviews_count), 0)                                                 AS total_reviews,
-                    ROUND(AVG(m.overall_rating) FILTER (WHERE m.overall_rating IS NOT NULL)::NUMERIC, 1) AS avg_rating
+                    ROUND(AVG(m.overall_rating) FILTER (WHERE m.overall_rating IS NOT NULL AND m.reviews_count > 0)::NUMERIC, 1) AS avg_rating
                 FROM companies c
                 JOIN managers m ON m.company_id = c.id
                 WHERE m.approval_status IN ('approved', 'ghost')
@@ -78,12 +78,20 @@ public class CompanyRepository {
     /** All approved/ghost managers belonging to this company, ordered by review count. */
     public Future<RowSet<Row>> findManagersByCompanyId(long companyId) {
         return db.preparedQuery("""
-                SELECT m.id, m.name, m.title, m.image, m.overall_rating, m.reviews_count,
+                SELECT DISTINCT m.id, m.name, m.title, m.image, m.overall_rating, m.reviews_count,
                        m.company_logo_url, m.category_averages, m.company
                 FROM managers m
-                WHERE m.company_id = $1
-                  AND m.approval_status IN ('approved', 'ghost')
+                WHERE m.approval_status IN ('approved', 'ghost')
                   AND (m.external_id IS NULL OR m.external_id NOT LIKE 'seed_%')
+                  AND (
+                    m.company_id = $1
+                    OR EXISTS (
+                        SELECT 1 FROM career_history ch
+                        JOIN companies c ON c.id = $1
+                        WHERE ch.manager_id = m.id
+                          AND LOWER(TRIM(ch.company)) = LOWER(TRIM(c.name))
+                    )
+                  )
                 ORDER BY m.reviews_count DESC NULLS LAST, m.overall_rating DESC NULLS LAST, m.name ASC
                 """)
             .execute(Tuple.of(companyId));
