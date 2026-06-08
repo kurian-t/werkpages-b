@@ -247,7 +247,8 @@ public class ManagerService {
                             Integer reviews = row.getInteger("reviews_count");
                             totalReviews += (reviews != null ? reviews : 0);
                             BigDecimal rating = row.getBigDecimal("overall_rating");
-                            if (rating != null) { ratingSum += rating.doubleValue(); ratingCount++; }
+                            boolean hasRating = rating != null && (reviews != null && reviews > 0);
+                            if (hasRating) { ratingSum += rating.doubleValue(); ratingCount++; }
                             Object catObj = row.getValue("category_averages");
                             if (catObj != null) {
                                 JsonObject cats = catObj instanceof JsonObject
@@ -266,7 +267,7 @@ public class ManagerService {
                                 .put("name",         row.getString("name"))
                                 .put("title",        row.getString("title"))
                                 .put("image",        row.getString("image"))
-                                .put("overallRating", rating)
+                                .put("overallRating", hasRating ? rating : (Object) null)
                                 .put("reviewsCount", reviews != null ? reviews : 0)
                                 .put("company",      row.getString("company"));
                             if (mgrLogoUrl != null && !mgrLogoUrl.isBlank()) mgr.put("companyLogoUrl", mgrLogoUrl);
@@ -1617,6 +1618,15 @@ public class ManagerService {
         if (isBlank(city))  city  = null;
         if (state != null && state.length() > 100) return Future.failedFuture(ServiceException.badRequest("State too long"));
         if (city  != null && city.length()  > 100) return Future.failedFuture(ServiceException.badRequest("City too long"));
+
+        String[] nameParts = name.trim().split("\\s+", 2);
+        String firstName = nameParts[0];
+        String lastName  = nameParts.length > 1 ? nameParts[1] : "";
+        NameValidator.ValidationResult nameValidation =
+            NameValidator.validate(firstName, lastName, title, company, country);
+        if (!nameValidation.valid())
+            return Future.failedFuture(ServiceException.badRequest(nameValidation.reason()));
+
         final String fState = state;
         final String fCity  = city;
 

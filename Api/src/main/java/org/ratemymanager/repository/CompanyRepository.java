@@ -54,6 +54,7 @@ public class CompanyRepository {
                 FROM companies c
                 JOIN managers m ON m.company_id = c.id
                 WHERE m.approval_status IN ('approved', 'ghost')
+                  AND (m.external_id IS NULL OR m.external_id NOT LIKE 'seed_%')
                 GROUP BY c.id, c.name, c.logo_url
                 ORDER BY total_reviews DESC, manager_count DESC, c.name ASC
                 """)
@@ -82,6 +83,7 @@ public class CompanyRepository {
                 FROM managers m
                 WHERE m.company_id = $1
                   AND m.approval_status IN ('approved', 'ghost')
+                  AND (m.external_id IS NULL OR m.external_id NOT LIKE 'seed_%')
                 ORDER BY m.reviews_count DESC NULLS LAST, m.overall_rating DESC NULLS LAST, m.name ASC
                 """)
             .execute(Tuple.of(companyId));

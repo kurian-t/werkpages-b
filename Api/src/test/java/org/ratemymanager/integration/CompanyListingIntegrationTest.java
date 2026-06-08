@@ -206,6 +206,53 @@ class CompanyListingIntegrationTest {
     }
 
     @Test
+    void getCompanyListing_excludesSeedManagers() throws Exception {
+        insertManager("Alice A", "Acme Corp", "Manager", "approved", 4.0, 2);
+        insertManagerWithExternalId("Seed Sam", "Acme Corp", "Fake Lead", "approved", null, 0, "seed_001");
+
+        JsonObject result = await(service.getCompanyListing());
+        JsonArray data = result.getJsonArray("data");
+
+        assertEquals(1, data.size());
+        JsonObject acme = data.getJsonObject(0);
+        assertEquals(1L, acme.getLong("managerCount"), "seed_ manager must not count toward managerCount");
+        assertEquals(2L, acme.getLong("totalReviews"));
+    }
+
+    @Test
+    void getCompanyListing_companyWithOnlySeedManagers_hiddenFromListing() throws Exception {
+        insertManagerWithExternalId("Seed Sam", "Bootstrap Corp", "Fake Lead", "approved", null, 0, "seed_002");
+
+        JsonObject result = await(service.getCompanyListing());
+        JsonArray data = result.getJsonArray("data");
+
+        assertEquals(0, data.size(), "Company with only seed_ managers must not appear in listing");
+    }
+
+    @Test
+    void getCompanyProfile_excludesSeedManagers() throws Exception {
+        insertManager("Alice A", "Acme Corp", "Manager", "approved", 4.0, 2);
+        insertManagerWithExternalId("Seed Sam", "Acme Corp", "Fake Lead", "approved", null, 0, "seed_003");
+
+        JsonObject profile = await(service.getCompanyProfile("Acme Corp"));
+
+        assertEquals(1, profile.getInteger("managerCount"), "seed_ manager must not count toward managerCount");
+        JsonArray managers = profile.getJsonArray("managers");
+        assertEquals(1, managers.size());
+        assertEquals("Alice A", managers.getJsonObject(0).getString("name"));
+    }
+
+    @Test
+    void getCompanyProfile_scrapedDef14aManagersAreNotExcluded() throws Exception {
+        insertManagerWithExternalId("Scraped Sarah", "Acme Corp", "VP", "approved", 4.0, 3, "DEF14A_001");
+
+        JsonObject profile = await(service.getCompanyProfile("Acme Corp"));
+
+        assertEquals(1, profile.getInteger("managerCount"), "DEF14A_ scraped managers must remain visible");
+        assertEquals("Scraped Sarah", profile.getJsonArray("managers").getJsonObject(0).getString("name"));
+    }
+
+    @Test
     void getCompanyProfile_avgRatingComputedAcrossManagers() throws Exception {
         insertManager("Alice A", "Acme Corp", "Manager",  "approved", 4.0, 1);
         insertManager("Bob B",   "Acme Corp", "Director", "approved", 2.0, 1);
@@ -216,6 +263,31 @@ class CompanyListingIntegrationTest {
         assertNotNull(profile.getValue("avgRating"));
         double avg = ((Number) profile.getValue("avgRating")).doubleValue();
         assertEquals(3.0, avg, 0.05);
+    }
+
+    @Test
+    void getCompanyProfile_managerWithZeroReviews_overallRatingIsNull() throws Exception {
+        insertManager("Alice A", "Acme Corp", "Manager", "approved", 0.0, 0);
+
+        JsonObject profile = await(service.getCompanyProfile("Acme Corp"));
+
+        // Manager exists but has no reviews — rating must be null, not 0.0
+        assertNull(profile.getValue("avgRating"), "avgRating must be null when all managers have 0 reviews");
+        JsonObject manager = profile.getJsonArray("managers").getJsonObject(0);
+        assertNull(manager.getValue("overallRating"), "manager overallRating must be null when reviews_count is 0");
+    }
+
+    @Test
+    void getCompanyProfile_avgRatingIgnoresZeroReviewManagers() throws Exception {
+        insertManager("Rated",   "Acme Corp", "Manager",  "approved", 4.0, 2);
+        insertManager("Unrated", "Acme Corp", "Director", "approved", 0.0, 0);
+
+        JsonObject profile = await(service.getCompanyProfile("Acme Corp"));
+
+        // Only the rated manager should contribute — avg must be 4.0, not (4.0 + 0.0) / 2
+        assertNotNull(profile.getValue("avgRating"));
+        double avg = ((Number) profile.getValue("avgRating")).doubleValue();
+        assertEquals(4.0, avg, 0.05);
     }
 
     @Test
@@ -234,7 +306,11 @@ class CompanyListingIntegrationTest {
 
     private void insertManager(String name, String company, String title, String status,
                                Double overallRating, int reviewsCount) throws Exception {
-        // Ensure a companies row exists first, then insert the manager linked to it
+        insertManagerWithExternalId(name, company, title, status, overallRating, reviewsCount, null);
+    }
+
+    private void insertManagerWithExternalId(String name, String company, String title, String status,
+                                              Double overallRating, int reviewsCount, String externalId) throws Exception {
         Long companyId = null;
         if (status.equals("approved") || status.equals("ghost")) {
             Row companyRow = await(companyRepo.findOrCreate(company, null, null));
@@ -243,10 +319,10 @@ class CompanyListingIntegrationTest {
         await(pool
             .preparedQuery("""
                 INSERT INTO managers(name,company,title,image,status,approval_status,
-                                     overall_rating,reviews_count,category_averages,company_id)
-                VALUES ($1,$2,$3,'img','active',$4,$5,$6,'{}', $7) RETURNING id
+                                     overall_rating,reviews_count,category_averages,company_id,external_id)
+                VALUES ($1,$2,$3,'img','active',$4,$5,$6,'{}', $7, $8) RETURNING id
                 """)
-            .execute(Tuple.of(name, company, title, status, overallRating, reviewsCount, companyId)));
+            .execute(Tuple.of(name, company, title, status, overallRating, reviewsCount, companyId, externalId)));
     }
 
     private static <T> T await(Future<T> future) throws Exception {
