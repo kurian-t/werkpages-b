@@ -354,6 +354,26 @@ class CompanyListingIntegrationTest {
     }
 
     @Test
+    void getCompanyProfile_includesManagersWithReviewAtCompany() throws Exception {
+        // Bob currently works at Skynet Inc but has a review where manager_company = "Acme Corp"
+        insertManager("Bob B", "Skynet Inc", "Director", "approved", 3.5, 1);
+        Long bobId = await(pool
+            .preparedQuery("SELECT id FROM managers WHERE name = 'Bob B'")
+            .execute()
+            .map(rs -> rs.iterator().next().getLong("id")));
+        insertReview(bobId, "Acme Corp", "VP");
+
+        // Acme Corp profile should include Bob because of the review
+        JsonObject acmeProfile = await(service.getCompanyProfile("Acme Corp"));
+        assertEquals(1, acmeProfile.getInteger("managerCount"),
+            "Manager with a review at Acme Corp must appear on Acme Corp profile");
+
+        // Skynet profile should also show Bob (his current company)
+        JsonObject skynetProfile = await(service.getCompanyProfile("Skynet Inc"));
+        assertEquals(1, skynetProfile.getInteger("managerCount"));
+    }
+
+    @Test
     void getCompanyProfile_managerNotDuplicatedWhenCurrentAndHistoricalMatch() throws Exception {
         // Alice currently works at Acme Corp AND has a career_history entry there (rejoined)
         insertManager("Alice A", "Acme Corp", "Director", "approved", 4.0, 3);
@@ -388,6 +408,16 @@ class CompanyListingIntegrationTest {
                 VALUES ($1,$2,$3,'img','active',$4,$5,$6,'{}', $7, $8) RETURNING id
                 """)
             .execute(Tuple.of(name, company, title, status, overallRating, reviewsCount, companyId, externalId)));
+    }
+
+    private void insertReview(long managerId, String managerCompany, String managerTitle) throws Exception {
+        await(pool
+            .preparedQuery("""
+                INSERT INTO reviews(manager_id, author, overall_rating, manager_company, manager_title,
+                                    verified, helpful_count, created_at, updated_at)
+                VALUES ($1, 'anon', 4.0, $2, $3, true, 0, now(), now())
+                """)
+            .execute(Tuple.of(managerId, managerCompany, managerTitle)));
     }
 
     private void insertCareerHistory(long managerId, String company, String title) throws Exception {

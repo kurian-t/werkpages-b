@@ -78,9 +78,10 @@ public class CompanyRepository {
     /** All approved/ghost managers belonging to this company, ordered by review count. */
     public Future<RowSet<Row>> findManagersByCompanyId(long companyId) {
         return db.preparedQuery("""
+                WITH target AS (SELECT LOWER(TRIM(name)) AS lname FROM companies WHERE id = $1)
                 SELECT DISTINCT m.id, m.name, m.title, m.image, m.overall_rating, m.reviews_count,
                        m.company_logo_url, m.category_averages, m.company
-                FROM managers m
+                FROM managers m, target
                 WHERE m.approval_status IN ('approved', 'ghost')
                   AND (m.external_id IS NULL OR m.external_id NOT LIKE 'seed_%')
                   AND (
@@ -88,7 +89,13 @@ public class CompanyRepository {
                     OR EXISTS (
                         SELECT 1 FROM career_history ch
                         WHERE ch.manager_id = m.id
-                          AND ch.company_id = $1
+                          AND (ch.company_id = $1
+                               OR (ch.company_id IS NULL AND LOWER(TRIM(ch.company)) = target.lname))
+                    )
+                    OR EXISTS (
+                        SELECT 1 FROM reviews r
+                        WHERE r.manager_id = m.id
+                          AND LOWER(TRIM(r.manager_company)) = target.lname
                     )
                   )
                 ORDER BY m.reviews_count DESC NULLS LAST, m.overall_rating DESC NULLS LAST, m.name ASC
