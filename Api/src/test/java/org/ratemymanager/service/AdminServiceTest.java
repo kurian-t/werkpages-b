@@ -53,6 +53,7 @@ class AdminServiceTest {
         editRepo    = mock(EditRepository.class);
         notifRepo   = mock(NotificationRepository.class);
         companyRepo = mock(CompanyRepository.class);
+        when(companyRepo.refreshCompanyStats()).thenReturn(Future.succeededFuture());
         service     = new AdminService(userRepo, managerRepo, reviewRepo, editRepo, notifRepo, companyRepo);
 
         Row adminRow = adminUserRow(ADMIN_ID);

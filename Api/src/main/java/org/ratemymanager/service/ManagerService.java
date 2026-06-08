@@ -954,7 +954,11 @@ public class ManagerService {
                                 .map(ignored -> reviewRow);
                         });
                 })
-        ).onSuccess(row -> managerRepo.recalculateInBackground(managerId));
+        ).onSuccess(row -> {
+            managerRepo.recalculateInBackground(managerId);
+            companyRepo.refreshCompanyStats()
+                .onFailure(err -> System.err.println("company_stats refresh failed: " + err.getMessage()));
+        });
     }
 
     // ── GET manager reviews ───────────────────────────────────────────────────
@@ -1601,6 +1605,8 @@ public class ManagerService {
                             trimmedState, trimmedCity, userId, resolvedLogoUrl, companyRow.getLong("id")))
                         .compose(row -> userRepo.markAutoCreatedManager(userId).map(v -> row))
                         .map(row -> {
+                            companyRepo.refreshCompanyStats()
+                                .onFailure(err -> System.err.println("company_stats refresh failed: " + err.getMessage()));
                             JsonArray data = new JsonArray().add(rowToManagerJson(row));
                             return new JsonObject()
                                 .put("data", data)
@@ -1661,11 +1667,14 @@ public class ManagerService {
                 }
                 return companyRepo.findOrCreate(company, null, resolvedLogoUrl)
                     .compose(companyRow -> managerRepo.createGhost(name, company, title, country, fState, fCity, resolvedLogoUrl, companyRow.getLong("id")))
-                    .map(row -> new JsonObject()
-                        .put("id", row.getLong("id"))
-                        .put("name", row.getString("name"))
-                        .put("created", true)
-                    );
+                    .map(row -> {
+                        companyRepo.refreshCompanyStats()
+                            .onFailure(err -> System.err.println("company_stats refresh failed: " + err.getMessage()));
+                        return new JsonObject()
+                            .put("id", row.getLong("id"))
+                            .put("name", row.getString("name"))
+                            .put("created", true);
+                    });
             });
     }
 

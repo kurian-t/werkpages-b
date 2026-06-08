@@ -108,6 +108,8 @@ public class AdminService {
                         " has been approved and is now live on the platform.",
                         managerId);
                 }
+                if (companyRepo != null) companyRepo.refreshCompanyStats()
+                    .onFailure(err -> System.err.println("company_stats refresh failed: " + err.getMessage()));
                 return Future.succeededFuture(new JsonObject()
                     .put("success", true)
                     .put("message", "Manager approved")
@@ -225,6 +227,8 @@ public class AdminService {
                         "Your edit request for " + managerName + " has been approved. The manager's profile has been updated.",
                         managerId);
                 }
+                if (companyRepo != null) companyRepo.refreshCompanyStats()
+                    .onFailure(err -> System.err.println("company_stats refresh failed: " + err.getMessage()));
                 JsonObject result = new JsonObject().put("success", true).put("message", "Edit approved and applied")
                     .put("managerId", managerId);
                 if (newCompany != null) result.put("newCompany", newCompany);

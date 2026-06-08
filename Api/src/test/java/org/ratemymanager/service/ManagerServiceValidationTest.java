@@ -12,6 +12,7 @@ import io.vertx.sqlclient.SqlConnection;
 import io.vertx.sqlclient.Tuple;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.ratemymanager.repository.CompanyRepository;
 import org.ratemymanager.repository.EditRepository;
 import org.ratemymanager.repository.ManagerRepository;
 import org.ratemymanager.repository.ReportRepository;
@@ -55,6 +56,7 @@ class ManagerServiceValidationTest {
     private ManagerRepository managerRepo;
     private EditRepository    editRepo;
     private ReportRepository  reportRepo;
+    private CompanyRepository companyRepo;
     private Pool              pool;
     private ManagerService    service;
 
@@ -65,8 +67,10 @@ class ManagerServiceValidationTest {
         managerRepo = mock(ManagerRepository.class);
         editRepo    = mock(EditRepository.class);
         reportRepo  = mock(ReportRepository.class);
+        companyRepo = mock(CompanyRepository.class);
         pool        = mock(Pool.class);
-        service     = new ManagerService(managerRepo, reviewRepo, userRepo, editRepo, reportRepo, pool);
+        when(companyRepo.refreshCompanyStats()).thenReturn(Future.succeededFuture());
+        service     = new ManagerService(managerRepo, reviewRepo, userRepo, editRepo, reportRepo, companyRepo, pool, company -> null);
 
         // Build mock data BEFORE any when() chains to avoid nested stubbing
         Row defaultUser        = userRow(USER_ID, USERNAME, false);

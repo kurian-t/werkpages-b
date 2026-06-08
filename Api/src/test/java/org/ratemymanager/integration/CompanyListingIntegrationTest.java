@@ -89,7 +89,7 @@ class CompanyListingIntegrationTest {
         insertManager("Carol C", "Skynet Inc",   "VP",       "ghost",    5.0, 3);
         insertManager("Dave D",  "Pending Corp", "Lead",     "pending_approval", null, 0);
 
-        JsonObject result = await(service.getCompanyListing());
+        JsonObject result = refreshAndGetListing();
         JsonArray data = result.getJsonArray("data");
 
         // Pending corp should be excluded (no approved/ghost managers)
@@ -109,7 +109,7 @@ class CompanyListingIntegrationTest {
         insertManager("M2", "Alpha Co", "Manager", "approved", 3.0, 1);
         insertManager("M3", "Alpha Co", "Director","ghost",    4.0, 2);
 
-        JsonObject result = await(service.getCompanyListing());
+        JsonObject result = refreshAndGetListing();
         JsonArray data = result.getJsonArray("data");
 
         // Alpha Co: 3 total reviews; Zeta Co: 1 — Alpha Co should be first
@@ -122,7 +122,7 @@ class CompanyListingIntegrationTest {
         insertManager("M1", "No Reviews Co", "Manager", "ghost",    null, 0);
         insertManager("M2", "Has Reviews Co","Manager", "approved", 4.0, 5);
 
-        JsonObject result = await(service.getCompanyListing());
+        JsonObject result = refreshAndGetListing();
         JsonArray data = result.getJsonArray("data");
 
         // Company with reviews must be listed before company with none
@@ -135,7 +135,7 @@ class CompanyListingIntegrationTest {
         insertManager("M1", "Acme Corp", "Manager",  "approved", 4.0, 3);
         insertManager("M2", "Acme Corp", "Director", "ghost",    3.0, 1);
 
-        JsonObject result = await(service.getCompanyListing());
+        JsonObject result = refreshAndGetListing();
         JsonArray data = result.getJsonArray("data");
 
         assertEquals(1, data.size());
@@ -146,7 +146,7 @@ class CompanyListingIntegrationTest {
 
     @Test
     void getCompanyListing_emptyWhenNoManagers() throws Exception {
-        JsonObject result = await(service.getCompanyListing());
+        JsonObject result = refreshAndGetListing();
         JsonArray data = result.getJsonArray("data");
         assertEquals(0, data.size());
     }
@@ -156,7 +156,7 @@ class CompanyListingIntegrationTest {
         insertManager("Rated",   "Acme Corp", "Manager",  "approved", 4.0, 2);
         insertManager("Unrated", "Acme Corp", "Director", "approved", 0.0, 0);
 
-        JsonObject result = await(service.getCompanyListing());
+        JsonObject result = refreshAndGetListing();
         JsonArray data = result.getJsonArray("data");
 
         assertEquals(1, data.size());
@@ -170,7 +170,7 @@ class CompanyListingIntegrationTest {
     void getCompanyListing_avgRatingIsNullWhenAllManagersHaveZeroReviews() throws Exception {
         insertManager("Unrated", "Acme Corp", "Manager", "approved", 0.0, 0);
 
-        JsonObject result = await(service.getCompanyListing());
+        JsonObject result = refreshAndGetListing();
         JsonArray data = result.getJsonArray("data");
 
         assertEquals(1, data.size());
@@ -237,7 +237,7 @@ class CompanyListingIntegrationTest {
         insertManager("Alice A", "Acme Corp", "Manager", "approved", 4.0, 2);
         insertManagerWithExternalId("Seed Sam", "Acme Corp", "Fake Lead", "approved", null, 0, "seed_001");
 
-        JsonObject result = await(service.getCompanyListing());
+        JsonObject result = refreshAndGetListing();
         JsonArray data = result.getJsonArray("data");
 
         assertEquals(1, data.size());
@@ -250,7 +250,7 @@ class CompanyListingIntegrationTest {
     void getCompanyListing_companyWithOnlySeedManagers_hiddenFromListing() throws Exception {
         insertManagerWithExternalId("Seed Sam", "Bootstrap Corp", "Fake Lead", "approved", null, 0, "seed_002");
 
-        JsonObject result = await(service.getCompanyListing());
+        JsonObject result = refreshAndGetListing();
         JsonArray data = result.getJsonArray("data");
 
         assertEquals(0, data.size(), "Company with only seed_ managers must not appear in listing");
@@ -268,7 +268,7 @@ class CompanyListingIntegrationTest {
             .map(rs -> rs.iterator().next().getLong("id")));
         insertReview(bobId, "Acme Corp", "VP");
 
-        JsonObject result = await(service.getCompanyListing());
+        JsonObject result = refreshAndGetListing();
         JsonArray data = result.getJsonArray("data");
 
         // Both Acme Corp and Skynet Inc should appear
@@ -452,6 +452,11 @@ class CompanyListingIntegrationTest {
                 VALUES ($1, $2, $3, '2020-01-01 00:00:00+00', $4)
                 """)
             .execute(Tuple.of(managerId, company, title, companyId)));
+    }
+
+    private JsonObject refreshAndGetListing() throws Exception {
+        await(companyRepo.refreshCompanyStats());
+        return await(service.getCompanyListing());
     }
 
     private static <T> T await(Future<T> future) throws Exception {
