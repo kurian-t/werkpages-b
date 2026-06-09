@@ -196,7 +196,7 @@ public class ManagerService {
                     String name = row.getString("name");
                     if (name == null || name.isBlank()) continue;
                     String storedLogoUrl = row.getString("logo_url");
-                    String logoUrl = (storedLogoUrl != null && storedLogoUrl.contains("logo.dev"))
+                    String logoUrl = (storedLogoUrl != null && !storedLogoUrl.isBlank())
                         ? storedLogoUrl
                         : logoResolver.apply(name);
                     JsonObject co = new JsonObject()
@@ -237,6 +237,17 @@ public class ManagerService {
                             if (logoUrl != null && !logoUrl.isBlank()) empty.put("logoUrl", logoUrl);
                             return empty;
                         }
+                        // Prefer a logo.dev URL from managers — it was set via autocomplete
+                        // and uses the real domain (e.g. stchas.edu, not a guessed one).
+                        String bestLogoUrl = logoUrl;
+                        for (Row row : rows) {
+                            String mgrLogo = row.getString("company_logo_url");
+                            if (mgrLogo != null && mgrLogo.contains("logo.dev")) {
+                                bestLogoUrl = mgrLogo;
+                                break;
+                            }
+                        }
+                        final String finalLogoUrl = bestLogoUrl;
                         JsonArray managers   = new JsonArray();
                         long   totalReviews  = 0;
                         double ratingSum     = 0.0;
@@ -244,8 +255,8 @@ public class ManagerService {
                         Map<String, Double>  catSum   = new LinkedHashMap<>();
                         Map<String, Integer> catCount = new LinkedHashMap<>();
                         for (Row row : rows) {
-                            String mgrLogoUrl = (logoUrl != null && !logoUrl.isBlank())
-                                ? logoUrl : row.getString("company_logo_url");
+                            String mgrLogoUrl = (finalLogoUrl != null && !finalLogoUrl.isBlank())
+                                ? finalLogoUrl : row.getString("company_logo_url");
                             Integer reviews = row.getInteger("reviews_count");
                             totalReviews += (reviews != null ? reviews : 0);
                             BigDecimal rating = row.getBigDecimal("overall_rating");
@@ -288,7 +299,7 @@ public class ManagerService {
                                 ? Math.round(ratingSum / ratingCount * 10.0) / 10.0 : null)
                             .put("categoryAverages", categoryAverages)
                             .put("managers",        managers);
-                        if (logoUrl != null && !logoUrl.isBlank()) result.put("logoUrl", logoUrl);
+                        if (finalLogoUrl != null && !finalLogoUrl.isBlank()) result.put("logoUrl", finalLogoUrl);
                         return result;
                     });
             });

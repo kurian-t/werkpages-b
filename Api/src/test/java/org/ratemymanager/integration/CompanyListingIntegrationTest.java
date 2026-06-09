@@ -411,6 +411,39 @@ class CompanyListingIntegrationTest {
         assertEquals(1, profile.getInteger("managerCount"), "Manager must appear exactly once, not duplicated");
     }
 
+    // ── logo priority tests ──────────────────────────────────────────────────
+
+    @Test
+    void getCompanyListing_prefersLogoDevUrlFromManagerOverCompanyStoredUrl() throws Exception {
+        // Company row has a Clearbit URL stored; manager has a logo.dev URL with the real domain.
+        // After V21 the matview must surface the logo.dev URL.
+        Row company = await(companyRepo.findOrCreate("Acme Corp", "acmecorp.com",
+            "https://logo.clearbit.com/acmecorp.com"));
+        insertManagerWithLogoUrl("Alice A", "Acme Corp", "Manager", "approved", 4.0, 2,
+            company.getLong("id"), "https://img.logo.dev/acme.io?token=pk_test");
+
+        JsonObject result = refreshAndGetListing();
+        JsonArray data = result.getJsonArray("data");
+
+        assertEquals(1, data.size());
+        assertEquals("https://img.logo.dev/acme.io?token=pk_test",
+            data.getJsonObject(0).getString("logoUrl"),
+            "Company listing must prefer logo.dev URL from manager over Clearbit URL stored in companies");
+    }
+
+    @Test
+    void getCompanyProfile_prefersLogoDevUrlFromManagerOverResolvedUrl() throws Exception {
+        // logoResolver in test returns null; manager has the correct logo.dev URL.
+        Row company = await(companyRepo.findOrCreate("Acme Corp", null, null));
+        insertManagerWithLogoUrl("Alice A", "Acme Corp", "Manager", "approved", 4.0, 2,
+            company.getLong("id"), "https://img.logo.dev/acme.io?token=pk_test");
+
+        JsonObject profile = await(service.getCompanyProfile("Acme Corp"));
+
+        assertEquals("https://img.logo.dev/acme.io?token=pk_test", profile.getString("logoUrl"),
+            "Company profile must prefer logo.dev URL from manager rows");
+    }
+
     // ── helpers ──────────────────────────────────────────────────────────────
 
     private void insertManager(String name, String company, String title, String status,
@@ -432,6 +465,18 @@ class CompanyListingIntegrationTest {
                 VALUES ($1,$2,$3,'img','active',$4,$5,$6,'{}', $7, $8) RETURNING id
                 """)
             .execute(Tuple.of(name, company, title, status, overallRating, reviewsCount, companyId, externalId)));
+    }
+
+    private void insertManagerWithLogoUrl(String name, String company, String title, String status,
+                                          Double overallRating, int reviewsCount,
+                                          Long companyId, String companyLogoUrl) throws Exception {
+        await(pool
+            .preparedQuery("""
+                INSERT INTO managers(name,company,title,image,status,approval_status,
+                                     overall_rating,reviews_count,category_averages,company_id,company_logo_url)
+                VALUES ($1,$2,$3,'img','active',$4,$5,$6,'{}', $7, $8) RETURNING id
+                """)
+            .execute(Tuple.of(name, company, title, status, overallRating, reviewsCount, companyId, companyLogoUrl)));
     }
 
     private void insertReview(long managerId, String managerCompany, String managerTitle) throws Exception {
