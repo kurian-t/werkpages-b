@@ -359,20 +359,20 @@ public class ManagerService {
     // ── GET stats ─────────────────────────────────────────────────────────────
 
     public Future<JsonObject> getStats() {
-        Future<Long> realManagersFuture = db.query("SELECT COUNT(*) FROM managers WHERE approval_status IN ('approved','ghost') AND external_id IS NULL")
+        Future<Long> userSubmittedFuture = db.query("SELECT COUNT(*) FROM managers WHERE approval_status IN ('approved','ghost') AND external_id IS NULL")
             .execute().map(rows -> rows.iterator().next().getLong(0));
         Future<Long> realReviewsFuture = db.query("SELECT COUNT(*) FROM reviews r JOIN managers m ON r.manager_id = m.id WHERE m.approval_status IN ('approved','ghost') AND m.external_id IS NULL")
             .execute().map(rows -> rows.iterator().next().getLong(0));
         Future<Long> seededManagersFuture = db.query("SELECT COUNT(*) FROM managers WHERE approval_status IN ('approved','ghost') AND external_id LIKE 'seed_%'")
             .execute().map(rows -> rows.iterator().next().getLong(0));
-        Future<Long> totalManagersFuture = db.query("SELECT COUNT(*) FROM managers WHERE approval_status IN ('approved','ghost')")
+        Future<Long> scrapedManagersFuture = db.query("SELECT COUNT(*) FROM managers WHERE approval_status IN ('approved','ghost') AND external_id IS NOT NULL AND external_id NOT LIKE 'seed_%'")
             .execute().map(rows -> rows.iterator().next().getLong(0));
-        return Future.all(realManagersFuture, realReviewsFuture, seededManagersFuture, totalManagersFuture)
+        return Future.all(userSubmittedFuture, realReviewsFuture, seededManagersFuture, scrapedManagersFuture)
             .map(cf -> new JsonObject()
-                .put("realManagers",   realManagersFuture.result())
-                .put("realReviews",    realReviewsFuture.result())
-                .put("seededManagers", seededManagersFuture.result())
-                .put("totalManagers",  totalManagersFuture.result())
+                .put("realManagers",    userSubmittedFuture.result())
+                .put("realReviews",     realReviewsFuture.result())
+                .put("seededManagers",  seededManagersFuture.result())
+                .put("scrapedManagers", scrapedManagersFuture.result())
             );
     }
 

@@ -83,6 +83,7 @@ public class CompanyRepository {
                   AND (m.external_id IS NULL OR m.external_id NOT LIKE 'seed_%')
                   AND (
                     m.company_id = $1
+                    OR LOWER(TRIM(m.company)) = target.lname
                     OR EXISTS (
                         SELECT 1 FROM career_history ch
                         WHERE ch.manager_id = m.id

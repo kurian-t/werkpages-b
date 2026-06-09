@@ -411,6 +411,26 @@ class CompanyListingIntegrationTest {
         assertEquals(1, profile.getInteger("managerCount"), "Manager must appear exactly once, not duplicated");
     }
 
+    @Test
+    void getCompanyProfile_findsManagerByCompanyNameWhenCompanyIdIsNull() throws Exception {
+        // Simulate a manager that has no company_id set (e.g. created before companies table was
+        // fully wired, or via a code path that didn't link the FK). The m.company field must be
+        // enough to find them on the company profile page.
+        await(pool
+            .preparedQuery("""
+                INSERT INTO managers(name,company,title,image,status,approval_status,
+                                     overall_rating,reviews_count,category_averages,company_id)
+                VALUES ('Unlinked Alice','Acme Corp','Manager','img','active','approved',4.0,1,'{}',NULL)
+                """)
+            .execute());
+
+        JsonObject profile = await(service.getCompanyProfile("Acme Corp"));
+
+        assertEquals(1, profile.getInteger("managerCount"),
+            "Manager must be found via m.company name even when company_id is null");
+        assertEquals("Unlinked Alice", profile.getJsonArray("managers").getJsonObject(0).getString("name"));
+    }
+
     // ── logo priority tests ──────────────────────────────────────────────────
 
     @Test
