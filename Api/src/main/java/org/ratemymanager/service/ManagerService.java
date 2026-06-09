@@ -222,8 +222,8 @@ public class ManagerService {
                 long companyId = companyRow.getLong("id");
                 String canonicalName = companyRow.getString("name");
                 String storedLogoUrl = companyRow.getString("logo_url");
-                String logoUrl = (resolvedLogoUrl != null && !resolvedLogoUrl.isBlank())
-                    ? resolvedLogoUrl : storedLogoUrl;
+                String logoUrl = (storedLogoUrl != null && storedLogoUrl.contains("logo.dev"))
+                    ? storedLogoUrl : resolvedLogoUrl;
                 return companyRepo.findManagersByCompanyId(companyId)
                     .map(rows -> {
                         if (!rows.iterator().hasNext()) {
