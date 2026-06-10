@@ -658,4 +658,35 @@ public class ManagerRepository {
                 ? Optional.of(rows.iterator().next())
                 : Optional.empty());
     }
+
+    /**
+     * Returns true if any approved/ghost manager is linked to this company name via their
+     * current company, career history, or a review snapshot. Mirrors the lookup logic of
+     * {@link CompanyRepository#findManagersByCompanyId}. Used to decide whether to
+     * auto-create a ghost company row on a profile visit.
+     */
+    public Future<Boolean> existsManagerWithCompanyName(String name) {
+        return db.preparedQuery("""
+                SELECT EXISTS(
+                    SELECT 1 FROM managers
+                    WHERE LOWER(TRIM(company)) = LOWER(TRIM($1))
+                      AND approval_status IN ('approved', 'ghost')
+                      AND (external_id IS NULL OR external_id NOT LIKE 'seed_%')
+                    UNION ALL
+                    SELECT 1 FROM career_history ch
+                    JOIN managers m ON m.id = ch.manager_id
+                    WHERE LOWER(TRIM(ch.company)) = LOWER(TRIM($2))
+                      AND m.approval_status IN ('approved', 'ghost')
+                      AND (m.external_id IS NULL OR m.external_id NOT LIKE 'seed_%')
+                    UNION ALL
+                    SELECT 1 FROM reviews r
+                    JOIN managers m ON m.id = r.manager_id
+                    WHERE LOWER(TRIM(r.manager_company)) = LOWER(TRIM($3))
+                      AND m.approval_status IN ('approved', 'ghost')
+                      AND (m.external_id IS NULL OR m.external_id NOT LIKE 'seed_%')
+                )
+                """)
+            .execute(Tuple.of(name, name, name))
+            .map(rows -> rows.iterator().next().getBoolean(0));
+    }
 }

@@ -18,9 +18,11 @@ import org.ratemymanager.repository.CompanyRepository;
 import org.ratemymanager.repository.EditRepository;
 import org.ratemymanager.repository.ManagerRepository;
 import org.ratemymanager.repository.NotificationRepository;
+import org.ratemymanager.repository.ReportRepository;
 import org.ratemymanager.repository.ReviewRepository;
 import org.ratemymanager.repository.UserRepository;
 import org.ratemymanager.service.AdminService;
+import org.ratemymanager.service.ManagerService;
 import org.ratemymanager.service.ServiceException;
 import org.testcontainers.containers.PostgreSQLContainer;
 import org.testcontainers.junit.jupiter.Container;
@@ -42,6 +44,7 @@ class CompanyAdminIntegrationTest {
 
     static Pool              pool;
     static AdminService      service;
+    static ManagerService    managerService;
     static CompanyRepository companyRepo;
 
     @BeforeAll
@@ -65,8 +68,10 @@ class CompanyAdminIntegrationTest {
         ManagerRepository managerRepo = new ManagerRepository(pool);
         ReviewRepository  reviewRepo  = new ReviewRepository(pool);
         EditRepository    editRepo    = new EditRepository(pool);
+        ReportRepository  reportRepo  = new ReportRepository(pool);
         NotificationRepository notifRepo = new NotificationRepository(pool);
         service = new AdminService(userRepo, managerRepo, reviewRepo, editRepo, notifRepo, companyRepo);
+        managerService = new ManagerService(managerRepo, reviewRepo, userRepo, editRepo, reportRepo, companyRepo, pool, name -> null);
     }
 
     @BeforeEach
@@ -189,6 +194,23 @@ class CompanyAdminIntegrationTest {
             .execute(Tuple.of(managerId))
             .map(rs -> rs.iterator().next().getString("company")));
         assertEquals("NewCorp", chCompany);
+    }
+
+    @Test
+    void getCompanyProfile_afterRename_oldNameReturns404() throws Exception {
+        String adminAuth = insertUser("auth0|co-admin-cp01", "CpAdmin01", "admin");
+        long companyId   = insertCompany("Acme Corp");
+        insertManagerForCompany("Alice A", "Acme Corp", "Manager", "approved", companyId);
+
+        await(service.adminRenameCompany(adminAuth, companyId, "Acme Corporation"));
+
+        // Old URL must 404 — not recreate a ghost company
+        ServiceException ex = assertServiceException(managerService.getCompanyProfile("Acme Corp"));
+        assertEquals(404, ex.getStatusCode());
+
+        // New name must resolve correctly
+        io.vertx.core.json.JsonObject result = await(managerService.getCompanyProfile("Acme Corporation"));
+        assertEquals("Acme Corporation", result.getString("name"));
     }
 
     @Test

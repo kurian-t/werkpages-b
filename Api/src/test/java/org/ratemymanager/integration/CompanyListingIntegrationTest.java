@@ -217,14 +217,16 @@ class CompanyListingIntegrationTest {
     }
 
     @Test
-    void getCompanyProfile_returnsEmptyProfileForUnknownCompany() throws Exception {
-        JsonObject profile = await(service.getCompanyProfile("NonexistentCorp"));
-
-        assertEquals("NonexistentCorp", profile.getString("name"));
-        assertEquals(0, profile.getInteger("managerCount"));
-        assertEquals(0, profile.getLong("totalReviews"));
-        assertNull(profile.getValue("avgRating"));
-        assertEquals(0, profile.getJsonArray("managers").size());
+    void getCompanyProfile_returns404ForUnknownCompany() {
+        // Company names with no managers, career history, or reviews return 404
+        // rather than auto-creating a ghost entry (prevents old renamed-company URLs
+        // from recreating stale rows).
+        java.util.concurrent.ExecutionException ex = assertThrows(
+            java.util.concurrent.ExecutionException.class,
+            () -> await(service.getCompanyProfile("NonexistentCorp"))
+        );
+        assertTrue(ex.getCause() instanceof org.ratemymanager.service.ServiceException);
+        assertEquals(404, ((org.ratemymanager.service.ServiceException) ex.getCause()).getStatusCode());
     }
 
     @Test

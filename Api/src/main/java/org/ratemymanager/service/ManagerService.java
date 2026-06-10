@@ -216,8 +216,16 @@ public class ManagerService {
             return Future.failedFuture(ServiceException.badRequest("company parameter is required"));
         final String companyName = company.trim();
         String resolvedLogoUrl = logoResolver.apply(companyName);
-        // findOrCreate auto-creates a ghost company entry on first profile view
-        return companyRepo.findOrCreate(companyName, null, resolvedLogoUrl)
+        // Find the company first; only auto-create a ghost entry if live managers still
+        // reference this name (handles legacy data). After a rename, no managers reference
+        // the old name, so the old URL correctly returns 404 instead of recreating the row.
+        return companyRepo.findByName(companyName)
+            .compose(opt -> opt.isPresent()
+                ? io.vertx.core.Future.succeededFuture(opt.get())
+                : managerRepo.existsManagerWithCompanyName(companyName)
+                    .compose(has -> has
+                        ? companyRepo.findOrCreate(companyName, null, resolvedLogoUrl)
+                        : io.vertx.core.Future.failedFuture(ServiceException.notFound("Company not found"))))
             .compose(companyRow -> {
                 long companyId = companyRow.getLong("id");
                 String canonicalName = companyRow.getString("name");
