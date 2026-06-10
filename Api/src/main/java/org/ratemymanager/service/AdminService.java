@@ -379,4 +379,52 @@ public class AdminService {
             .compose(v -> managerRepo.mergeInlineRecalculate(keepId))
             .map(v -> new JsonObject().put("success", true).put("keepId", keepId));
     }
+
+    // ── Company admin operations ──────────────────────────────────────────────
+
+    public Future<JsonObject> adminListCompanies(String auth0Id) {
+        return requireAdmin(auth0Id)
+            .compose(adminId -> companyRepo.findAllForAdmin())
+            .map(rows -> {
+                JsonArray data = new JsonArray();
+                for (Row row : rows) {
+                    data.add(new JsonObject()
+                        .put("id",           row.getLong("id"))
+                        .put("name",         row.getString("name"))
+                        .put("status",       row.getString("status"))
+                        .put("managerCount", row.getLong("manager_count")));
+                }
+                return new JsonObject().put("data", data);
+            });
+    }
+
+    public Future<JsonObject> adminRenameCompany(String auth0Id, long companyId, String newName) {
+        if (newName == null || newName.isBlank())
+            return Future.failedFuture(ServiceException.badRequest("Company name is required"));
+        return requireAdmin(auth0Id)
+            .compose(adminId -> companyRepo.findByName(newName))
+            .compose(existing -> {
+                if (existing.isPresent() && existing.get().getLong("id") != companyId)
+                    return Future.failedFuture(ServiceException.conflict(
+                        "A company named \"" + newName.trim() + "\" already exists — use the merge tool instead"));
+                return companyRepo.renameCompany(companyId, newName);
+            })
+            .compose(v -> {
+                companyRepo.refreshCompanyStats()
+                    .onFailure(err -> System.err.println("company_stats refresh failed: " + err.getMessage()));
+                return Future.succeededFuture(new JsonObject().put("success", true));
+            });
+    }
+
+    public Future<JsonObject> adminMergeCompanies(String auth0Id, long keepId, long mergeId) {
+        if (keepId == mergeId)
+            return Future.failedFuture(ServiceException.badRequest("Cannot merge a company into itself"));
+        return requireAdmin(auth0Id)
+            .compose(adminId -> companyRepo.mergeCompanies(keepId, mergeId))
+            .compose(v -> {
+                companyRepo.refreshCompanyStats()
+                    .onFailure(err -> System.err.println("company_stats refresh failed: " + err.getMessage()));
+                return Future.succeededFuture(new JsonObject().put("success", true).put("keepId", keepId));
+            });
+    }
 }

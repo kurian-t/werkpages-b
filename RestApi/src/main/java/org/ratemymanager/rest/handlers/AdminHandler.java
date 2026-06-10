@@ -221,6 +221,46 @@ public class AdminHandler {
             .onFailure(err -> ManagersHandler.handleError(ctx, err));
     }
 
+    // ── GET /api/admin/companies ─────────────────────────────────────────────
+
+    public void handleListCompanies(RoutingContext ctx) {
+        String auth0Id = ctx.get("auth0Id");
+        service.adminListCompanies(auth0Id)
+            .onSuccess(json -> ok(ctx, json))
+            .onFailure(err -> ManagersHandler.handleError(ctx, err));
+    }
+
+    // ── PUT /api/admin/companies/:companyId ──────────────────────────────────
+
+    public void handleRenameCompany(RoutingContext ctx) {
+        String auth0Id = ctx.get("auth0Id");
+        long companyId;
+        try { companyId = Long.parseLong(ctx.pathParam("companyId")); }
+        catch (NumberFormatException e) { bad(ctx, "Invalid company ID"); return; }
+        JsonObject body = ctx.body().asJsonObject();
+        if (body == null) { bad(ctx, "Request body required"); return; }
+        String newName = body.getString("name");
+        service.adminRenameCompany(auth0Id, companyId, newName)
+            .onSuccess(json -> ok(ctx, json))
+            .onFailure(err -> ManagersHandler.handleError(ctx, err));
+    }
+
+    // ── POST /api/admin/companies/:keepId/merge/:mergeId ────────────────────
+
+    public void handleMergeCompanies(RoutingContext ctx) {
+        String auth0Id = ctx.get("auth0Id");
+        long keepId, mergeId;
+        try {
+            keepId  = Long.parseLong(ctx.pathParam("keepId"));
+            mergeId = Long.parseLong(ctx.pathParam("mergeId"));
+        } catch (NumberFormatException e) {
+            bad(ctx, "Invalid company ID"); return;
+        }
+        service.adminMergeCompanies(auth0Id, keepId, mergeId)
+            .onSuccess(json -> ok(ctx, json))
+            .onFailure(err -> ManagersHandler.handleError(ctx, err));
+    }
+
     // ── POST /api/admin/managers/:keepId/merge/:mergeId ───────────────────────
 
     public void handleMergeManagers(RoutingContext ctx) {

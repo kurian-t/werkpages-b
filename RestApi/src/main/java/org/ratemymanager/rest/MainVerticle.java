@@ -132,6 +132,9 @@ public class MainVerticle extends AbstractVerticle {
                         routerFactory.addHandlerByOperationId("adminEditManager",          adminHandler::handleAdminEditManager);
                         routerFactory.addHandlerByOperationId("adminDeleteManager",       adminHandler::handleDeleteManager);
                         routerFactory.addHandlerByOperationId("mergeManagers",            adminHandler::handleMergeManagers);
+                        routerFactory.addHandlerByOperationId("adminListCompanies",       adminHandler::handleListCompanies);
+                        routerFactory.addHandlerByOperationId("adminRenameCompany",       adminHandler::handleRenameCompany);
+                        routerFactory.addHandlerByOperationId("adminMergeCompanies",      adminHandler::handleMergeCompanies);
                         routerFactory.addHandlerByOperationId("getNotifications",             notificationsHandler::handleGetNotifications);
                         routerFactory.addHandlerByOperationId("getNotificationsUnreadCount",  notificationsHandler::handleGetUnreadCount);
                         routerFactory.addHandlerByOperationId("markAllNotificationsRead",     notificationsHandler::handleMarkAllAsRead);

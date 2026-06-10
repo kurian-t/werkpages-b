@@ -1343,6 +1343,78 @@ paths:
         '404':
           description: Manager not found
 
+  /api/admin/companies:
+    get:
+      operationId: adminListCompanies
+      summary: List all companies for the admin panel
+      tags:
+        - Admin
+      responses:
+        '200':
+          description: List of companies
+        '403':
+          description: Forbidden
+
+  /api/admin/companies/{companyId}:
+    put:
+      operationId: adminRenameCompany
+      summary: Rename a company and cascade to all linked records (admin only)
+      tags:
+        - Admin
+      parameters:
+        - in: path
+          name: companyId
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - name
+              properties:
+                name:
+                  type: string
+      responses:
+        '200':
+          description: Rename successful
+        '400':
+          description: Invalid request
+        '403':
+          description: Forbidden
+        '409':
+          description: Name already taken — use the merge tool
+
+  /api/admin/companies/{keepId}/merge/{mergeId}:
+    post:
+      operationId: adminMergeCompanies
+      summary: Merge a duplicate company into another (admin only)
+      tags:
+        - Admin
+      parameters:
+        - in: path
+          name: keepId
+          required: true
+          schema:
+            type: integer
+        - in: path
+          name: mergeId
+          required: true
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: Merge successful
+        '400':
+          description: Invalid request
+        '403':
+          description: Forbidden
+        '404':
+          description: Company not found
+
   /api/admin/managers/{keepId}/merge/{mergeId}:
     post:
       operationId: mergeManagers

@@ -106,4 +106,63 @@ public class CompanyRepository {
             .execute(Tuple.of(logoUrl, id))
             .map(rows -> rows.rowCount() > 0);
     }
+
+    /** All companies ordered by name, for the admin panel. */
+    public Future<RowSet<Row>> findAllForAdmin() {
+        return db.query("""
+                SELECT c.id, c.name, c.status,
+                       COUNT(m.id) FILTER (WHERE m.approval_status IN ('approved','ghost')
+                                             AND (m.external_id IS NULL OR m.external_id NOT LIKE 'seed_%')) AS manager_count
+                FROM companies c
+                LEFT JOIN managers m ON m.company_id = c.id
+                GROUP BY c.id, c.name, c.status
+                ORDER BY c.name ASC
+                """)
+            .execute();
+    }
+
+    /**
+     * Renames a company and cascades the new name to all linked managers, career history,
+     * and review snapshots. Blocked at the service layer if the new name already exists.
+     */
+    public Future<Void> renameCompany(long companyId, String newName) {
+        String trimmed = newName.trim();
+        return db.preparedQuery("UPDATE companies SET name = $1, updated_at = now() WHERE id = $2")
+            .execute(Tuple.of(trimmed, companyId))
+            .compose(v -> db.preparedQuery("UPDATE managers SET company = $1 WHERE company_id = $2")
+                .execute(Tuple.of(trimmed, companyId)))
+            .compose(v -> db.preparedQuery("UPDATE career_history SET company = $1 WHERE company_id = $2")
+                .execute(Tuple.of(trimmed, companyId)))
+            .compose(v -> db.preparedQuery("""
+                    UPDATE reviews SET manager_company = $1
+                    WHERE manager_id IN (SELECT id FROM managers WHERE company_id = $2)
+                    """)
+                .execute(Tuple.of(trimmed, companyId)))
+            .mapEmpty();
+    }
+
+    /**
+     * Merges {@code mergeId} into {@code keepId}: reassigns all managers, career history
+     * entries, and review snapshots, then deletes the source company row.
+     */
+    public Future<Void> mergeCompanies(long keepId, long mergeId) {
+        return db.preparedQuery("SELECT name FROM companies WHERE id = $1").execute(Tuple.of(keepId))
+            .compose(rows -> {
+                if (!rows.iterator().hasNext())
+                    return Future.failedFuture("Target company not found");
+                String keepName = rows.iterator().next().getString("name");
+                return db.preparedQuery("UPDATE managers SET company_id = $1, company = $2 WHERE company_id = $3")
+                    .execute(Tuple.of(keepId, keepName, mergeId))
+                    .compose(v -> db.preparedQuery("UPDATE career_history SET company_id = $1, company = $2 WHERE company_id = $3")
+                        .execute(Tuple.of(keepId, keepName, mergeId)))
+                    .compose(v -> db.preparedQuery("""
+                            UPDATE reviews SET manager_company = $1
+                            WHERE manager_id IN (SELECT id FROM managers WHERE company_id = $2)
+                            """)
+                        .execute(Tuple.of(keepName, keepId)))
+                    .compose(v -> db.preparedQuery("DELETE FROM companies WHERE id = $1")
+                        .execute(Tuple.of(mergeId)))
+                    .mapEmpty();
+            });
+    }
 }
