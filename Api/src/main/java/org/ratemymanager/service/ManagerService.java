@@ -236,6 +236,7 @@ public class ManagerService {
                     .map(rows -> {
                         if (!rows.iterator().hasNext()) {
                             JsonObject empty = new JsonObject()
+                                .put("id",              companyId)
                                 .put("name",            canonicalName)
                                 .put("managerCount",    0)
                                 .put("totalReviews",    0)
@@ -300,6 +301,7 @@ public class ManagerService {
                             categoryAverages.put(e.getKey(), Math.round(e.getValue() / cnt * 10.0) / 10.0);
                         }
                         JsonObject result = new JsonObject()
+                            .put("id",              companyId)
                             .put("name",            canonicalName)
                             .put("managerCount",    managers.size())
                             .put("totalReviews",    totalReviews)

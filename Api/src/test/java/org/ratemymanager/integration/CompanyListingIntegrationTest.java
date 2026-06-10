@@ -433,6 +433,28 @@ class CompanyListingIntegrationTest {
         assertEquals("Unlinked Alice", profile.getJsonArray("managers").getJsonObject(0).getString("name"));
     }
 
+    @Test
+    void getCompanyProfile_responseIncludesCompanyId() throws Exception {
+        insertManager("Alice A", "Acme Corp", "Manager", "approved", 4.0, 1);
+
+        JsonObject profile = await(service.getCompanyProfile("Acme Corp"));
+
+        assertNotNull(profile.getValue("id"), "getCompanyProfile must include the company id");
+        assertTrue(profile.getLong("id") > 0, "id must be a positive long");
+    }
+
+    @Test
+    void getCompanyProfile_emptyCompany_responseIncludesCompanyId() throws Exception {
+        // Company row exists (ghost) but has no linked managers — triggers empty-profile path
+        await(companyRepo.findOrCreate("Empty Corp", null, null));
+
+        JsonObject profile = await(service.getCompanyProfile("Empty Corp"));
+
+        assertNotNull(profile.getValue("id"), "empty company profile must include id");
+        assertTrue(profile.getLong("id") > 0);
+        assertEquals(0, profile.getInteger("managerCount"));
+    }
+
     // ── logo priority tests ──────────────────────────────────────────────────
 
     @Test
