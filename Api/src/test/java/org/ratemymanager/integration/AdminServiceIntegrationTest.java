@@ -1,6 +1,7 @@
 package org.ratemymanager.integration;
 
 import io.vertx.core.Future;
+import io.vertx.core.json.JsonArray;
 import io.vertx.core.json.JsonObject;
 import io.vertx.pgclient.PgConnectOptions;
 import io.vertx.pgclient.PgPool;
@@ -121,6 +122,39 @@ class AdminServiceIntegrationTest {
         assertEquals("Alice Smith", result.getJsonArray("data").getJsonObject(0).getString("name"));
         assertEquals(10, result.getInteger("limit"));
         assertEquals(0, result.getInteger("offset"));
+    }
+
+    @Test
+    void getPendingManagers_isAutoCreated_trueForSearchCreatedManagers() throws Exception {
+        String adminAuth0 = insertUser("auth0|admin-ac01", "AdminAc01", "admin");
+        String userAuth0  = insertUser("auth0|user-ac01",  "UserAc01",  "user");
+        UUID userId = findUserId(userAuth0);
+
+        // Regular pending (user submitted)
+        insertPendingManager("Regular Pending", "Corp", "Title", userId);
+
+        // Auto-created search pending (has search_created_by_user_id set)
+        await(pool.preparedQuery(
+            "INSERT INTO managers(name,company,title,status,approval_status,overall_rating,reviews_count,category_averages,submitted_by,search_created_by_user_id) " +
+            "VALUES ('Auto Created','Corp','Title','active','pending_approval',0,0,'{}',$1,$1)")
+            .execute(Tuple.of(userId)));
+
+        JsonObject result = await(service.getPendingManagers(adminAuth0, 10, 0));
+        JsonArray data = result.getJsonArray("data");
+        assertEquals(2, data.size());
+
+        boolean foundRegular = false, foundAuto = false;
+        for (int i = 0; i < data.size(); i++) {
+            JsonObject m = data.getJsonObject(i);
+            if ("Regular Pending".equals(m.getString("name"))) {
+                assertFalse(m.getBoolean("isAutoCreated"), "regular pending should not be auto-created");
+                foundRegular = true;
+            } else if ("Auto Created".equals(m.getString("name"))) {
+                assertTrue(m.getBoolean("isAutoCreated"), "search-created manager should be auto-created");
+                foundAuto = true;
+            }
+        }
+        assertTrue(foundRegular && foundAuto);
     }
 
     @Test

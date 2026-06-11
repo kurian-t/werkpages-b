@@ -1592,15 +1592,20 @@ public class ManagerService {
                 return Future.all(
                     userRepo.hasContributed(userId),
                     userRepo.hasAutoCreatedManager(userId),
-                    managerRepo.findByNameAndCompany(fullName, company)
+                    managerRepo.search(5, 0, "%" + fullName + "%", "%" + company.trim() + "%", "featured", userId)
                 ).compose(cf -> {
                     boolean     contributed    = cf.resultAt(0);
                     boolean     alreadyCreated = cf.resultAt(1);
                     RowSet<Row> rows           = cf.resultAt(2);
 
-                    if (rows.size() > 0) {
+                    List<Row> matched = new ArrayList<>();
+                    for (Row row : rows) {
+                        if (row.getString("name").equalsIgnoreCase(fullName.trim())) matched.add(row);
+                    }
+
+                    if (!matched.isEmpty()) {
                         JsonArray data = new JsonArray();
-                        for (Row row : rows) data.add(rowToManagerJson(row));
+                        for (Row row : matched) data.add(rowToManagerJson(row));
                         return Future.succeededFuture(
                             new JsonObject()
                                 .put("data", data)
@@ -1608,34 +1613,43 @@ public class ManagerService {
                                 .put("hasContributed", contributed));
                     }
 
-                    // Manager not found — only create a ghost the very first time this user
-                    // searches for someone not in the DB. All subsequent not-found searches
-                    // return empty results so the user can use the "Add manager" flow.
-                    if (alreadyCreated) {
-                        return Future.succeededFuture(
-                            new JsonObject()
-                                .put("data", new JsonArray())
-                                .put("created", false)
-                                .put("hasContributed", contributed));
-                    }
-
-                    // Create the ghost first, then mark the flag. If the insert fails the flag
-                    // is never set, so the user gets another chance on their next search.
                     final String trimmedState = isBlank(state) ? null : state.trim();
                     final String trimmedCity  = isBlank(city)  ? null : city.trim();
-                    return companyRepo.findOrCreate(company, null, resolvedLogoUrl)
-                        .compose(companyRow -> managerRepo.createAutoApproved(fullName, company, title, country,
-                            trimmedState, trimmedCity, userId, resolvedLogoUrl, companyRow.getLong("id")))
-                        .compose(row -> userRepo.markAutoCreatedManager(userId).map(v -> row))
-                        .map(row -> {
-                            companyRepo.refreshCompanyStats()
-                                .onFailure(err -> System.err.println("company_stats refresh failed: " + err.getMessage()));
-                            JsonArray data = new JsonArray().add(rowToManagerJson(row));
-                            return new JsonObject()
-                                .put("data", data)
-                                .put("created", true)
-                                .put("hasContributed", contributed);
-                        });
+
+                    // Short names → pending_approval (don't consume the ghost slot)
+                    // Long names + first time → ghost
+                    // Long names + ghost already used → pending_approval
+                    boolean shortNames = fullName.trim().length() < 4 || company.trim().length() < 4;
+
+                    if (!shortNames && !alreadyCreated) {
+                        // Create ghost first, then mark the flag. If insert fails, flag is never
+                        // set so the user gets another chance on their next search.
+                        return companyRepo.findOrCreate(company, null, resolvedLogoUrl)
+                            .compose(companyRow -> managerRepo.createAutoApproved(fullName, company, title, country,
+                                trimmedState, trimmedCity, userId, resolvedLogoUrl, companyRow.getLong("id")))
+                            .compose(row -> userRepo.markAutoCreatedManager(userId).map(v -> row))
+                            .map(row -> {
+                                companyRepo.refreshCompanyStats()
+                                    .onFailure(err -> System.err.println("company_stats refresh failed: " + err.getMessage()));
+                                JsonArray data = new JsonArray().add(rowToManagerJson(row));
+                                return new JsonObject()
+                                    .put("data", data)
+                                    .put("created", true)
+                                    .put("hasContributed", contributed);
+                            });
+                    } else {
+                        // Short name or second+ search → pending_approval, visible only to this user
+                        return companyRepo.findOrCreate(company, null, resolvedLogoUrl)
+                            .compose(companyRow -> managerRepo.createSearchPending(fullName, company, title, country,
+                                trimmedState, trimmedCity, resolvedLogoUrl, companyRow.getLong("id"), userId))
+                            .map(row -> {
+                                JsonArray data = new JsonArray().add(rowToManagerJson(row));
+                                return new JsonObject()
+                                    .put("data", data)
+                                    .put("created", true)
+                                    .put("hasContributed", contributed);
+                            });
+                    }
                 });
             });
     }

@@ -81,6 +81,7 @@ public class AdminService {
                         .put("image", row.getString("image"))
                         .put("submittedBy", row.getString("submitted_by_username"))
                         .put("createdAt", row.getOffsetDateTime("created_at").toString())
+                        .put("isAutoCreated", row.getBoolean("is_auto_created") == Boolean.TRUE)
                     );
                 }
                 return new JsonObject().put("data", result).put("limit", limit).put("offset", offset);

@@ -101,25 +101,45 @@ public class ManagerRepository {
     }
 
     public Future<RowSet<Row>> search(int limit, int offset, String searchPattern, String companyPattern, String sortBy) {
+        return search(limit, offset, searchPattern, companyPattern, sortBy, null);
+    }
+
+    public Future<RowSet<Row>> search(int limit, int offset, String searchPattern, String companyPattern, String sortBy, UUID userId) {
         boolean hasSearch  = searchPattern  != null;
         boolean hasCompany = companyPattern != null;
-        String orderBy = buildOrderBy(sortBy);
+        String  orderBy    = buildOrderBy(sortBy);
 
         String sql;
-        Tuple tuple;
+        Tuple  tuple;
 
-        if (hasSearch && hasCompany) {
-            sql   = SELECT_BODY + "WHERE (m.name ILIKE $3 OR m.company ILIKE $3 OR m.title ILIKE $3) AND m.company ILIKE $4 AND m.approval_status IN ('approved','ghost') GROUP BY m.id " + orderBy + " LIMIT $1 OFFSET $2";
-            tuple = Tuple.of(limit, offset, searchPattern, companyPattern);
-        } else if (hasSearch) {
-            sql   = SELECT_BODY + "WHERE (m.name ILIKE $3 OR m.company ILIKE $3 OR m.title ILIKE $3) AND m.approval_status IN ('approved','ghost') GROUP BY m.id " + orderBy + " LIMIT $1 OFFSET $2";
-            tuple = Tuple.of(limit, offset, searchPattern);
-        } else if (hasCompany) {
-            sql   = SELECT_BODY + "WHERE m.company ILIKE $3 AND m.approval_status IN ('approved','ghost') GROUP BY m.id " + orderBy + " LIMIT $1 OFFSET $2";
-            tuple = Tuple.of(limit, offset, companyPattern);
+        if (userId != null) {
+            if (hasSearch && hasCompany) {
+                sql   = SELECT_BODY + "WHERE (m.name ILIKE $3 OR m.company ILIKE $3 OR m.title ILIKE $3) AND m.company ILIKE $4 AND (m.approval_status IN ('approved','ghost') OR (m.approval_status = 'pending_approval' AND m.search_created_by_user_id = $5)) GROUP BY m.id " + orderBy + " LIMIT $1 OFFSET $2";
+                tuple = Tuple.of(limit, offset, searchPattern, companyPattern, userId);
+            } else if (hasSearch) {
+                sql   = SELECT_BODY + "WHERE (m.name ILIKE $3 OR m.company ILIKE $3 OR m.title ILIKE $3) AND (m.approval_status IN ('approved','ghost') OR (m.approval_status = 'pending_approval' AND m.search_created_by_user_id = $4)) GROUP BY m.id " + orderBy + " LIMIT $1 OFFSET $2";
+                tuple = Tuple.of(limit, offset, searchPattern, userId);
+            } else if (hasCompany) {
+                sql   = SELECT_BODY + "WHERE m.company ILIKE $3 AND (m.approval_status IN ('approved','ghost') OR (m.approval_status = 'pending_approval' AND m.search_created_by_user_id = $4)) GROUP BY m.id " + orderBy + " LIMIT $1 OFFSET $2";
+                tuple = Tuple.of(limit, offset, companyPattern, userId);
+            } else {
+                sql   = SELECT_BODY + "WHERE (m.approval_status IN ('approved','ghost') OR (m.approval_status = 'pending_approval' AND m.search_created_by_user_id = $3)) GROUP BY m.id " + orderBy + " LIMIT $1 OFFSET $2";
+                tuple = Tuple.of(limit, offset, userId);
+            }
         } else {
-            sql   = SELECT_BODY + "WHERE m.approval_status IN ('approved','ghost') GROUP BY m.id " + orderBy + " LIMIT $1 OFFSET $2";
-            tuple = Tuple.of(limit, offset);
+            if (hasSearch && hasCompany) {
+                sql   = SELECT_BODY + "WHERE (m.name ILIKE $3 OR m.company ILIKE $3 OR m.title ILIKE $3) AND m.company ILIKE $4 AND m.approval_status IN ('approved','ghost') GROUP BY m.id " + orderBy + " LIMIT $1 OFFSET $2";
+                tuple = Tuple.of(limit, offset, searchPattern, companyPattern);
+            } else if (hasSearch) {
+                sql   = SELECT_BODY + "WHERE (m.name ILIKE $3 OR m.company ILIKE $3 OR m.title ILIKE $3) AND m.approval_status IN ('approved','ghost') GROUP BY m.id " + orderBy + " LIMIT $1 OFFSET $2";
+                tuple = Tuple.of(limit, offset, searchPattern);
+            } else if (hasCompany) {
+                sql   = SELECT_BODY + "WHERE m.company ILIKE $3 AND m.approval_status IN ('approved','ghost') GROUP BY m.id " + orderBy + " LIMIT $1 OFFSET $2";
+                tuple = Tuple.of(limit, offset, companyPattern);
+            } else {
+                sql   = SELECT_BODY + "WHERE m.approval_status IN ('approved','ghost') GROUP BY m.id " + orderBy + " LIMIT $1 OFFSET $2";
+                tuple = Tuple.of(limit, offset);
+            }
         }
 
         return db.preparedQuery(sql).execute(tuple);
@@ -218,6 +238,7 @@ public class ManagerRepository {
                        bio, status, approval_status, linkedin_url, company_logo_url, country, created_at
                 FROM managers
                 WHERE submitted_by = $1 AND approval_status IN ('pending_approval', 'rejected')
+                  AND search_created_by_user_id IS NULL
                 ORDER BY created_at DESC LIMIT 200
                 """)
             .execute(Tuple.of(userId));
@@ -226,7 +247,8 @@ public class ManagerRepository {
     public Future<RowSet<Row>> findPendingForAdmin(int limit, int offset) {
         return db.preparedQuery("""
                 SELECT m.id, m.name, m.company, m.title, m.image, m.created_at,
-                       u.username AS submitted_by_username
+                       u.username AS submitted_by_username,
+                       m.search_created_by_user_id IS NOT NULL AS is_auto_created
                 FROM managers m
                 LEFT JOIN users u ON u.id = m.submitted_by
                 WHERE m.approval_status = 'pending_approval'
@@ -541,6 +563,25 @@ public class ManagerRepository {
                 LIMIT 5
                 """)
             .execute(Tuple.of(fullName, "%" + company.trim() + "%"));
+    }
+
+    public Future<Row> createSearchPending(String name, String company, String title,
+                                           String country, String state, String city,
+                                           String logoUrl, Long companyId, UUID searchCreatedByUserId) {
+        return db.preparedQuery("""
+                INSERT INTO managers
+                (name, company, title, status, approval_status, country, state, city,
+                 overall_rating, reviews_count, category_averages,
+                 company_logo_url, company_id, search_created_by_user_id, submitted_by, created_at, updated_at)
+                VALUES ($1,$2,$3,'active','pending_approval',$4,$5,$6,
+                        0,0,'{}'::jsonb,
+                        $7,$8,$9,$9,now(),now())
+                RETURNING *
+                """)
+            .execute(Tuple.of(name, company.trim(), title.trim(),
+                              country != null ? country.trim() : null,
+                              state, city, logoUrl, companyId, searchCreatedByUserId))
+            .map(rows -> rows.iterator().next());
     }
 
     public Future<Row> createAutoApproved(String name, String company, String title,
