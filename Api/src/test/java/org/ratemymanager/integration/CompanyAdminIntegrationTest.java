@@ -318,6 +318,34 @@ class CompanyAdminIntegrationTest {
     }
 
     // ══════════════════════════════════════════════════════════════════════════
+    // mergeManagers — company_stats matview refresh
+    // ══════════════════════════════════════════════════════════════════════════
+
+    @Test
+    void mergeManagers_afterMerge_companyListingReflectsReducedCount() throws Exception {
+        String adminAuth = insertUser("auth0|mg-admin01", "MgAdmin01", "admin");
+        long companyId   = insertCompany("Acme Corp");
+        long keepId      = insertManagerForCompany("Alice A", "Acme Corp", "Manager",  "approved", companyId);
+        long mergeId     = insertManagerForCompany("Bob B",   "Acme Corp", "Director", "approved", companyId);
+
+        // Populate the matview before the merge so it shows 2 managers
+        await(companyRepo.refreshCompanyStats());
+        JsonObject before = await(managerService.getCompanyListing());
+        assertEquals(2L, before.getJsonArray("data").getJsonObject(0).getLong("managerCount"),
+            "Pre-condition: listing must show 2 managers before merge");
+
+        // Merge — internally fires refreshCompanyStats (fire-and-forget)
+        await(service.mergeManagers(adminAuth, keepId, mergeId));
+
+        // Explicitly refresh to ensure the matview is up-to-date for this assertion
+        // (fire-and-forget timing is non-deterministic; the DB state after merge is what we test here)
+        await(companyRepo.refreshCompanyStats());
+        JsonObject after = await(managerService.getCompanyListing());
+        assertEquals(1L, after.getJsonArray("data").getJsonObject(0).getLong("managerCount"),
+            "After merge, company listing must show 1 manager (merged manager was deleted)");
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
     // Helpers
     // ══════════════════════════════════════════════════════════════════════════
 

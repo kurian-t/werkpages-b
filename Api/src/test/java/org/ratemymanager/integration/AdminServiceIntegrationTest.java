@@ -571,6 +571,41 @@ class AdminServiceIntegrationTest {
         assertEquals(1L, keepReviews);
     }
 
+    @Test
+    void mergeManagers_anonymousReviews_areMovedNotDeleted() throws Exception {
+        // Anonymous reviews (user_id IS NULL) were silently lost because
+        // "NULL NOT IN (...)" evaluates to NULL (falsy) in SQL, preventing the move.
+        // After the fix, anonymous reviews are always moved to the kept manager.
+        String adminAuth0 = insertUser("auth0|admin-anon01", "AdminAnon01", "admin");
+        long keepId  = insertApprovedManager("Keep Manager Anon", "Corp", "Title");
+        long mergeId = insertApprovedManager("Merge Manager Anon", "Corp", "Title");
+
+        // Insert an anonymous review (no user_id) on the merge manager
+        await(pool.preparedQuery("""
+            INSERT INTO reviews(manager_id, user_id, author, overall_rating,
+                communication_style, perceived_approachability, perceived_clarity_of_expectations,
+                feedback_style, perceived_supportiveness, decision_making_style,
+                organization_and_planning_style, delegation_style, perceived_professional_demeanor,
+                overall_working_experience, manager_company, manager_title, text, verified, helpful_count)
+            VALUES ($1, NULL, 'anon', 4.0,4.0,4.0,4.0,4.0,4.0,4.0,4.0,4.0,4.0,4.0,'Corp','Title','anon text',false,0)
+            """).execute(Tuple.of(mergeId)));
+
+        await(service.mergeManagers(adminAuth0, keepId, mergeId));
+
+        // The anonymous review must appear on the kept manager, not be deleted
+        long keepReviews = await(pool
+            .preparedQuery("SELECT COUNT(*) FROM reviews WHERE manager_id = $1")
+            .execute(Tuple.of(keepId))
+            .map(rs -> rs.iterator().next().getLong(0)));
+        assertEquals(1L, keepReviews, "Anonymous review must be moved to kept manager, not deleted");
+
+        long mergeReviews = await(pool
+            .preparedQuery("SELECT COUNT(*) FROM reviews WHERE manager_id = $1")
+            .execute(Tuple.of(mergeId))
+            .map(rs -> rs.iterator().next().getLong(0)));
+        assertEquals(0L, mergeReviews, "No reviews must remain on the deleted manager");
+    }
+
     // ══════════════════════════════════════════════════════════════════════════
     // deleteManager
     // ══════════════════════════════════════════════════════════════════════════

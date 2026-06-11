@@ -269,7 +269,11 @@ public class ReviewRepository {
         return db.preparedQuery("""
                 UPDATE reviews SET manager_id = $1
                 WHERE manager_id = $2
-                  AND user_id NOT IN (SELECT user_id FROM reviews WHERE manager_id = $1)
+                  AND (user_id IS NULL
+                       OR user_id NOT IN (
+                           SELECT user_id FROM reviews
+                           WHERE manager_id = $1 AND user_id IS NOT NULL
+                       ))
                 """)
             .execute(Tuple.of(toManagerId, fromManagerId))
             .map(RowSet::rowCount);

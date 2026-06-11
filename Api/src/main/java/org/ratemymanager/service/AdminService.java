@@ -377,7 +377,11 @@ public class AdminService {
             .compose(moved -> reviewRepo.deleteByManager(mergeId))
             .compose(v -> managerRepo.delete(mergeId))
             .compose(v -> managerRepo.mergeInlineRecalculate(keepId))
-            .map(v -> new JsonObject().put("success", true).put("keepId", keepId));
+            .compose(v -> {
+                if (companyRepo != null) companyRepo.refreshCompanyStats()
+                    .onFailure(err -> System.err.println("company_stats refresh failed: " + err.getMessage()));
+                return Future.succeededFuture(new JsonObject().put("success", true).put("keepId", keepId));
+            });
     }
 
     // ── Company admin operations ──────────────────────────────────────────────
