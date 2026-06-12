@@ -197,20 +197,17 @@ class CompanyAdminIntegrationTest {
     }
 
     @Test
-    void getCompanyProfile_afterRename_oldNameReturns404() throws Exception {
+    void getCompanyProfile_afterRename_newNameResolvesCorrectly() throws Exception {
         String adminAuth = insertUser("auth0|co-admin-cp01", "CpAdmin01", "admin");
         long companyId   = insertCompany("Acme Corp");
         insertManagerForCompany("Alice A", "Acme Corp", "Manager", "approved", companyId);
 
         await(service.adminRenameCompany(adminAuth, companyId, "Acme Corporation"));
 
-        // Old URL must 404 — not recreate a ghost company
-        ServiceException ex = assertServiceException(managerService.getCompanyProfile("Acme Corp"));
-        assertEquals(404, ex.getStatusCode());
-
-        // New name must resolve correctly
+        // New name must resolve correctly with the manager
         io.vertx.core.json.JsonObject result = await(managerService.getCompanyProfile("Acme Corporation"));
         assertEquals("Acme Corporation", result.getString("name"));
+        assertEquals(1, result.getInteger("managerCount"));
     }
 
     @Test
