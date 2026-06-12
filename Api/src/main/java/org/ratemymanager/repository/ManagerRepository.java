@@ -617,6 +617,24 @@ public class ManagerRepository {
             .map(rows -> rows.iterator().next());
     }
 
+    /** Creates a pending_approval manager record (no auth required) for drop-off draft capture. */
+    public Future<Row> createPending(String name, String company, String title,
+                                      String status, String country, String state,
+                                      String logoUrl, Long companyId) {
+        return db.preparedQuery("""
+                INSERT INTO managers
+                (name, company, title, status, approval_status, country, state,
+                 overall_rating, reviews_count, category_averages,
+                 company_logo_url, company_id, created_at, updated_at)
+                VALUES ($1,$2,$3,$4,'pending_approval',$5,$6,
+                        0,0,'{}'::jsonb,
+                        $7,$8,now(),now())
+                RETURNING *
+                """)
+            .execute(Tuple.of(name, company.trim(), title.trim(), status, country.trim(), state, logoUrl, companyId))
+            .map(rows -> rows.iterator().next());
+    }
+
     // ── Find-or-attach helpers ────────────────────────────────────────────────
 
     /** Returns all non-rejected managers for an exact company name (case-insensitive). */

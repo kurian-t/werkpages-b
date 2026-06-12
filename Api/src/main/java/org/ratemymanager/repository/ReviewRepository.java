@@ -285,6 +285,12 @@ public class ReviewRepository {
             .mapEmpty();
     }
 
+    public Future<Void> deleteByDraftToken(UUID draftToken) {
+        return db.preparedQuery("DELETE FROM reviews WHERE draft_token = $1 AND user_id IS NULL")
+            .execute(Tuple.of(draftToken))
+            .mapEmpty();
+    }
+
     /**
      * Returns the single most current review for a manager: a review with
      * {@code worked_until IS NULL} (still working there) takes precedence;

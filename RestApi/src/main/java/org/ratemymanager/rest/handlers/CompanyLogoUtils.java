@@ -181,11 +181,13 @@ public class CompanyLogoUtils {
         return cleaned.toLowerCase().replaceAll("[^a-z0-9]", "") + ".com";
     }
 
+    private static final String LOGO_DEV_TOKEN = "pk_MXSjJV-uTC6-L5D_FbXZUA";
+
     public static String resolveLogoUrl(String company) {
         if (company == null || company.isBlank()) return null;
         String key = company.toLowerCase().trim();
         String domain = DOMAIN_MAP.get(key);
         if (domain == null) domain = companyDomain(company);
-        return "https://logo.clearbit.com/" + domain;
+        return "https://img.logo.dev/" + domain + "?token=" + LOGO_DEV_TOKEN;
     }
 }

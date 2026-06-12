@@ -479,6 +479,12 @@ public class ManagerService {
             if (!isValidRating(v)) return Future.failedFuture(ServiceException.badRequest("Rating for '" + RATING_KEYS[i] + "' must be between 1 and 5"));
         }
 
+        UUID draftTokenParsed = null;
+        String draftTokenStr = body.getString("draftToken");
+        if (draftTokenStr != null && !draftTokenStr.isBlank()) {
+            try { draftTokenParsed = UUID.fromString(draftTokenStr); } catch (IllegalArgumentException ignored) {}
+        }
+
         final String   fStatus               = submittedStatus;
         final LocalDate fStartDate           = startDateLocal;
         final String   fReviewAuthorType     = reviewBody.getString("authorType", "username");
@@ -496,6 +502,7 @@ public class ManagerService {
         final String   fMgrTitle      = managerTitle;
         final LocalDate fWorkedFrom   = workedFrom;
         final LocalDate fWorkedUntil  = workedUntil;
+        final UUID     fDraftToken    = draftTokenParsed;
 
         return userRepo.findByAuth0IdWithBan(auth0Id)
             .compose(opt -> {
@@ -521,7 +528,7 @@ public class ManagerService {
                                     return doAttachToExisting(fuzzyMatch, userId, author,
                                         name, company, title, fStatus, fCountry, fLinkedinUrl, resolvedLogoUrl,
                                         fStartDate, fEndDate, fOverallRating, fRatings,
-                                        fMgrCompany, fMgrTitle, fReviewText, fWorkedFrom, fWorkedUntil);
+                                        fMgrCompany, fMgrTitle, fReviewText, fWorkedFrom, fWorkedUntil, fDraftToken);
                                 }
                                 // No match — create a new pending_approval manager with its first review.
                                 // Resolve (or create) the company row first so we can link company_id.
@@ -545,27 +552,34 @@ public class ManagerService {
                                             long managerId = managerRow.getLong("id");
                                             conn.preparedQuery("INSERT INTO career_history(manager_id, company, title, start_date, end_date, company_id) VALUES ($1,$2,$3,$4,$5,$6)")
                                                 .execute(Tuple.of(managerId, company, title, startDt, endDt, companyId), ignored -> {});
-                                            return conn.preparedQuery("""
-                                                INSERT INTO reviews (
-                                                    manager_id, user_id, author, overall_rating,
-                                                    communication_style, perceived_approachability, perceived_clarity_of_expectations,
-                                                    feedback_style, perceived_supportiveness, decision_making_style,
-                                                    organization_and_planning_style, delegation_style, perceived_professional_demeanor,
-                                                    overall_working_experience, manager_company, manager_title, text,
-                                                    worked_from, worked_until, verified, helpful_count, created_at, updated_at
-                                                )
-                                                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,true,0,now(),now())
-                                                RETURNING id
-                                                """)
-                                                .execute(Tuple.of(
-                                                    managerId, userId, author, fOverallRating,
-                                                    getRating(fRatings, 0), getRating(fRatings, 1), getRating(fRatings, 2),
-                                                    getRating(fRatings, 3), getRating(fRatings, 4), getRating(fRatings, 5),
-                                                    getRating(fRatings, 6), getRating(fRatings, 7), getRating(fRatings, 8),
-                                                    getRating(fRatings, 9), fMgrCompany, fMgrTitle, fReviewText,
-                                                    fWorkedFrom, fWorkedUntil
-                                                ))
-                                                .map(ignored -> managerRow);
+                                            Future<Void> deleteDraft = (fDraftToken != null)
+                                                ? conn.preparedQuery("DELETE FROM reviews WHERE draft_token = $1 AND user_id IS NULL")
+                                                      .execute(Tuple.of(fDraftToken))
+                                                      .mapEmpty()
+                                                : Future.succeededFuture();
+                                            return deleteDraft.compose(v ->
+                                                conn.preparedQuery("""
+                                                    INSERT INTO reviews (
+                                                        manager_id, user_id, author, overall_rating,
+                                                        communication_style, perceived_approachability, perceived_clarity_of_expectations,
+                                                        feedback_style, perceived_supportiveness, decision_making_style,
+                                                        organization_and_planning_style, delegation_style, perceived_professional_demeanor,
+                                                        overall_working_experience, manager_company, manager_title, text,
+                                                        worked_from, worked_until, verified, helpful_count, created_at, updated_at
+                                                    )
+                                                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,true,0,now(),now())
+                                                    RETURNING id
+                                                    """)
+                                                    .execute(Tuple.of(
+                                                        managerId, userId, author, fOverallRating,
+                                                        getRating(fRatings, 0), getRating(fRatings, 1), getRating(fRatings, 2),
+                                                        getRating(fRatings, 3), getRating(fRatings, 4), getRating(fRatings, 5),
+                                                        getRating(fRatings, 6), getRating(fRatings, 7), getRating(fRatings, 8),
+                                                        getRating(fRatings, 9), fMgrCompany, fMgrTitle, fReviewText,
+                                                        fWorkedFrom, fWorkedUntil
+                                                    ))
+                                                    .map(ignored -> managerRow)
+                                            );
                                         })
                                 ).onSuccess(managerRow -> {
                                     managerRepo.recalculateInBackground(managerRow.getLong("id"));
@@ -598,7 +612,7 @@ public class ManagerService {
             LocalDate startDate, LocalDate endDate,
             double overallRating, JsonObject ratings,
             String mgrCompany, String mgrTitle, String reviewText,
-            LocalDate workedFrom, LocalDate workedUntil) {
+            LocalDate workedFrom, LocalDate workedUntil, UUID draftToken) {
 
         long existingId      = match.getLong("id");
         String approvalStatus = match.getString("approval_status");
@@ -630,7 +644,7 @@ public class ManagerService {
                                 : companyRepo.findOrCreate(company, null, logoUrl)
                                     .compose(cRow -> managerRepo.insertCareerEntry(existingId, company, title, startDt, endDt, cRow.getLong("id")));
                             return histFuture
-                                .compose(v -> validateAndInsertReview(reviewBody, existingId, userId, author, logoUrl))
+                                .compose(v -> validateAndInsertReview(reviewBody, existingId, userId, author, logoUrl, draftToken))
                                 .compose(ignored -> managerRepo.promoteGhostToPending(existingId))
                                 .map(promotedOpt -> {
                                     if (promotedOpt.isPresent()) managerRepo.deleteFakeManagerInBackground();
@@ -644,7 +658,7 @@ public class ManagerService {
                 .compose(opt -> {
                     if (opt.isEmpty()) return Future.failedFuture(ServiceException.notFound("Manager not found"));
                     Row existingRow = opt.get();
-                    return validateAndInsertReview(reviewBody, existingId, userId, author, logoUrl)
+                    return validateAndInsertReview(reviewBody, existingId, userId, author, logoUrl, draftToken)
                         .map(ignored -> existingRow);
                 });
         }
@@ -782,12 +796,12 @@ public class ManagerService {
                                 return Future.failedFuture(ServiceException.conflict("review_cooldown:" + cooldownEndStr));
                             }
                         }
-                        return validateAndInsertReview(body, managerId, userId, author, resolvedLogoUrl);
+                        return validateAndInsertReview(body, managerId, userId, author, resolvedLogoUrl, null);
                     });
             });
     }
 
-    private Future<Row> validateAndInsertReview(JsonObject body, long managerId, UUID userId, String author, String resolvedLogoUrl) {
+    private Future<Row> validateAndInsertReview(JsonObject body, long managerId, UUID userId, String author, String resolvedLogoUrl, UUID draftToken) {
         Double overallRating      = body.getDouble("overallRating");
         JsonObject ratings        = body.getJsonObject("ratings");
         String managerCompany     = body.getString("managerCompany") != null ? body.getString("managerCompany").trim() : null;
@@ -866,7 +880,7 @@ public class ManagerService {
                 if (managerRoleStart == null) {
                     return insertReviewTransactionally(managerId, userId, author, overallRating,
                             ratings, managerCompany, managerTitle, text,
-                            workedFrom, workedUntil, null, null, resolvedLogoUrl);
+                            workedFrom, workedUntil, null, null, resolvedLogoUrl, draftToken);
                 }
                 return reviewRepo.findRolePeriodsForManager(managerId)
                     .compose(allRoleRows -> {
@@ -887,7 +901,7 @@ public class ManagerService {
 
                         return insertReviewTransactionally(managerId, userId, author, overallRating,
                                 ratings, managerCompany, managerTitle, text,
-                                workedFrom, workedUntil, managerRoleStart, managerRoleEnd, resolvedLogoUrl);
+                                workedFrom, workedUntil, managerRoleStart, managerRoleEnd, resolvedLogoUrl, draftToken);
                     });  // closes allRoleRows compose
             });  // closes existingRows compose
     }
@@ -902,30 +916,42 @@ public class ManagerService {
             JsonObject ratings, String managerCompany, String managerTitle, String text,
             LocalDate workedFrom, LocalDate workedUntil,
             LocalDate managerRoleStart, LocalDate managerRoleEnd,
-            String resolvedLogoUrl) {
+            String resolvedLogoUrl, UUID draftToken) {
 
-        return ((Pool) db).withTransaction(conn ->
-            conn.preparedQuery("""
-                    INSERT INTO reviews (
-                        manager_id, user_id, author, overall_rating,
-                        communication_style, perceived_approachability, perceived_clarity_of_expectations,
-                        feedback_style, perceived_supportiveness, decision_making_style,
-                        organization_and_planning_style, delegation_style, perceived_professional_demeanor,
-                        overall_working_experience, manager_company, manager_title, text,
-                        worked_from, worked_until, manager_role_start, manager_role_end,
-                        verified, helpful_count, created_at, updated_at
-                    )
-                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,true,0,now(),now())
-                    RETURNING *
-                    """)
-                .execute(Tuple.of(
-                    managerId, userId, author, overallRating,
-                    getRating(ratings, 0), getRating(ratings, 1), getRating(ratings, 2),
-                    getRating(ratings, 3), getRating(ratings, 4), getRating(ratings, 5),
-                    getRating(ratings, 6), getRating(ratings, 7), getRating(ratings, 8),
-                    getRating(ratings, 9), managerCompany, managerTitle, text,
-                    workedFrom, workedUntil, managerRoleStart, managerRoleEnd
-                ))
+        return ((Pool) db).withTransaction(conn -> {
+            // Authenticated submit with a token: delete the matching anonymous drop-off draft first.
+            Future<Void> deleteDraft = (userId != null && draftToken != null)
+                ? conn.preparedQuery("DELETE FROM reviews WHERE draft_token = $1 AND user_id IS NULL")
+                      .execute(Tuple.of(draftToken))
+                      .mapEmpty()
+                : Future.succeededFuture();
+
+            // draft_token is stored only on anonymous drop-off inserts; authenticated reviews get null.
+            UUID tokenToStore = (userId == null) ? draftToken : null;
+
+            return deleteDraft.compose(v ->
+                conn.preparedQuery("""
+                        INSERT INTO reviews (
+                            manager_id, user_id, author, overall_rating,
+                            communication_style, perceived_approachability, perceived_clarity_of_expectations,
+                            feedback_style, perceived_supportiveness, decision_making_style,
+                            organization_and_planning_style, delegation_style, perceived_professional_demeanor,
+                            overall_working_experience, manager_company, manager_title, text,
+                            worked_from, worked_until, manager_role_start, manager_role_end,
+                            draft_token, verified, helpful_count, created_at, updated_at
+                        )
+                        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,true,0,now(),now())
+                        RETURNING *
+                        """)
+                    .execute(Tuple.of(
+                        managerId, userId, author, overallRating,
+                        getRating(ratings, 0), getRating(ratings, 1), getRating(ratings, 2),
+                        getRating(ratings, 3), getRating(ratings, 4), getRating(ratings, 5),
+                        getRating(ratings, 6), getRating(ratings, 7), getRating(ratings, 8),
+                        getRating(ratings, 9), managerCompany, managerTitle, text,
+                        workedFrom, workedUntil, managerRoleStart, managerRoleEnd, tokenToStore
+                    ))
+            )
                 .compose(reviewResult -> {
                     Row reviewRow = reviewResult.iterator().next();
                     UUID newId = reviewRow.getUUID("id");
@@ -970,8 +996,8 @@ public class ManagerService {
                                 })
                                 .map(ignored -> reviewRow);
                         });
-                })
-        ).onSuccess(row -> {
+                });
+        }).onSuccess(row -> {
             managerRepo.recalculateInBackground(managerId);
             companyRepo.refreshCompanyStats()
                 .onFailure(err -> System.err.println("company_stats refresh failed: " + err.getMessage()));
@@ -1226,7 +1252,7 @@ public class ManagerService {
                         if (!ownerOpt.get().equals(userId)) return Future.failedFuture(ServiceException.forbidden("Forbidden"));
                         // Delete without recording cooldown, then create new review
                         return reviewRepo.delete(oldReviewId, managerId)
-                            .compose(v -> validateAndInsertReview(body, managerId, userId, author, resolvedLogoUrl));
+                            .compose(v -> validateAndInsertReview(body, managerId, userId, author, resolvedLogoUrl, null));
                     });
             });
     }
@@ -1706,6 +1732,80 @@ public class ManagerService {
                             .put("name", row.getString("name"))
                             .put("created", true);
                     });
+            });
+    }
+
+    /**
+     * Captures a full drop-off form submission (manager + review) with no authentication.
+     * Used when a non-logged-in user fills the add-manager form and is shown the auth modal.
+     * Creates a pending_approval manager with an anonymous review — goes to the admin queue.
+     */
+    public Future<JsonObject> createDropOffDraft(JsonObject body, String resolvedLogoUrl) {
+        if (body == null) return Future.failedFuture(ServiceException.badRequest("Missing request body"));
+
+        String name    = toProperNameCase(body.getString("name"));
+        String company = body.getString("company") != null ? body.getString("company").trim() : null;
+        String title   = body.getString("title")   != null ? body.getString("title").trim()   : null;
+        String country = body.getString("country") != null ? body.getString("country").trim() : null;
+        String state   = body.getString("state")   != null ? body.getString("state").trim()   : null;
+        String status  = "retired".equals(body.getString("status")) ? "retired" : "active";
+
+        if (isBlank(name) || isBlank(company) || isBlank(title) || isBlank(country))
+            return Future.failedFuture(ServiceException.badRequest("Missing required fields: name, company, title, country"));
+        if (name.length()    > 100) return Future.failedFuture(ServiceException.badRequest("Name too long"));
+        if (company.length() > 100) return Future.failedFuture(ServiceException.badRequest("Company too long"));
+        if (title.length()   > 100) return Future.failedFuture(ServiceException.badRequest("Title too long"));
+        if (country.length() > 100) return Future.failedFuture(ServiceException.badRequest("Country too long"));
+        if (isBlank(state)) state = null;
+        if (state != null && state.length() > 100) return Future.failedFuture(ServiceException.badRequest("State too long"));
+
+        JsonObject review = body.getJsonObject("review");
+        if (review == null) return Future.failedFuture(ServiceException.badRequest("Missing review data"));
+
+        String author = review.getString("author");
+        if (isBlank(author)) author = "Anonymous";
+
+        String[] nameParts = name.trim().split("\\s+", 2);
+        String firstName = nameParts[0];
+        String lastName  = nameParts.length > 1 ? nameParts[1] : "";
+        NameValidator.ValidationResult nameValidation = NameValidator.validate(firstName, lastName, title, company, country);
+        if (!nameValidation.valid()) return Future.failedFuture(ServiceException.badRequest(nameValidation.reason()));
+
+        UUID dropOffToken = null;
+        String dropOffTokenStr = body.getString("draftToken");
+        if (dropOffTokenStr != null && !dropOffTokenStr.isBlank()) {
+            try { dropOffToken = UUID.fromString(dropOffTokenStr); } catch (IllegalArgumentException ignored) {}
+        }
+
+        final String fState  = state;
+        final String fStatus = status;
+        final String fAuthor = author;
+        final UUID   fDropOffToken = dropOffToken;
+
+        return managerRepo.findByNameAndCompany(name, company)
+            .compose(rows -> {
+                if (rows.iterator().hasNext()) {
+                    Row existing = rows.iterator().next();
+                    long existingId = existing.getLong("id");
+                    String approvalStatus = existing.getString("approval_status");
+
+                    if ("ghost".equals(approvalStatus)) {
+                        return managerRepo.promoteGhostToPending(existingId)
+                            .compose(ignored -> validateAndInsertReview(review, existingId, null, fAuthor, resolvedLogoUrl, fDropOffToken))
+                            .map(ignored -> new JsonObject().put("id", existingId).put("created", false));
+                    } else {
+                        return validateAndInsertReview(review, existingId, null, fAuthor, resolvedLogoUrl, fDropOffToken)
+                            .map(ignored -> new JsonObject().put("id", existingId).put("created", false));
+                    }
+                } else {
+                    return companyRepo.findOrCreate(company, null, resolvedLogoUrl)
+                        .compose(companyRow -> managerRepo.createPending(name, company, title, fStatus, country, fState, resolvedLogoUrl, companyRow.getLong("id")))
+                        .compose(managerRow -> {
+                            long managerId = managerRow.getLong("id");
+                            return validateAndInsertReview(review, managerId, null, fAuthor, resolvedLogoUrl, fDropOffToken)
+                                .map(ignored -> new JsonObject().put("id", managerId).put("created", true));
+                        });
+                }
             });
     }
 

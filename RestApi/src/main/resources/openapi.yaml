@@ -589,6 +589,91 @@ paths:
                   created:
                     type: boolean
 
+  /api/managers/drop-off:
+    post:
+      operationId: createDropOffDraft
+      summary: Capture full drop-off form data (manager + review) without authentication
+      tags:
+        - Managers
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - name
+                - company
+                - title
+                - country
+                - review
+              properties:
+                name:
+                  type: string
+                company:
+                  type: string
+                title:
+                  type: string
+                country:
+                  type: string
+                state:
+                  type: string
+                status:
+                  type: string
+                  enum: [active, retired]
+                draftToken:
+                  type: string
+                  format: uuid
+                  description: Client-generated UUID linking this drop-off draft to a future authenticated submit for deduplication
+                review:
+                  type: object
+                  required:
+                    - author
+                    - overallRating
+                    - ratings
+                    - workedFrom
+                    - managerCompany
+                    - managerTitle
+                  properties:
+                    author:
+                      type: string
+                    overallRating:
+                      type: number
+                    ratings:
+                      type: object
+                    workedFrom:
+                      type: string
+                    workedUntil:
+                      type: string
+                    managerCompany:
+                      type: string
+                    managerTitle:
+                      type: string
+      responses:
+        '200':
+          description: Manager already existed — review attached
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id:
+                    type: integer
+                  created:
+                    type: boolean
+        '201':
+          description: New pending manager created with review
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id:
+                    type: integer
+                  created:
+                    type: boolean
+
   /api/managers:
     get:
       operationId: getManagers
@@ -680,6 +765,10 @@ paths:
                 linkedinUrl:
                   type: string
                   nullable: true
+                draftToken:
+                  type: string
+                  format: uuid
+                  description: Client-generated UUID from drop-off draft; matching anonymous review is deleted before inserting the authenticated one
       responses:
         '201':
           description: Manager created successfully

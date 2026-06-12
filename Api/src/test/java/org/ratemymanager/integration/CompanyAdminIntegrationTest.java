@@ -211,6 +211,31 @@ class CompanyAdminIntegrationTest {
     }
 
     @Test
+    void adminRenameCompany_canBeRenamedMultipleTimes() throws Exception {
+        String adminAuth = insertUser("auth0|co-admin-seq01", "CoAdminSeq01", "admin");
+        long companyId   = insertCompany("OriginalName");
+        insertManagerForCompany("Alice A", "OriginalName", "Manager", "approved", companyId);
+
+        await(service.adminRenameCompany(adminAuth, companyId, "FirstRename"));
+
+        // Second rename must succeed immediately after the first
+        JsonObject result = await(service.adminRenameCompany(adminAuth, companyId, "SecondRename"));
+        assertTrue(result.getBoolean("success"), "Second rename must succeed");
+
+        // Company profile must resolve by the second name
+        JsonObject profile = await(managerService.getCompanyProfile("SecondRename"));
+        assertEquals("SecondRename", profile.getString("name"));
+        assertEquals(1, profile.getInteger("managerCount"));
+
+        // Old names must no longer exist in the companies table
+        long oldCount = await(pool.preparedQuery(
+            "SELECT COUNT(*) FROM companies WHERE LOWER(TRIM(name)) IN ('originalname', 'firstrename')")
+            .execute()
+            .map(rs -> rs.iterator().next().getLong(0)));
+        assertEquals(0L, oldCount, "Previous names must not exist after successive renames");
+    }
+
+    @Test
     void adminRenameCompany_cascadesToReviews() throws Exception {
         String adminAuth = insertUser("auth0|co-admin09", "CoAdmin09", "admin");
         long companyId   = insertCompany("OldCorp");
@@ -312,6 +337,38 @@ class CompanyAdminIntegrationTest {
             .execute(Tuple.of(managerId))
             .map(rs -> rs.iterator().next().getString("manager_company")));
         assertEquals("Keep Corp", reviewCompany, "Review manager_company must update to keep company name");
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // adminMergeCompanies — company_stats matview refresh (synchronous)
+    // ══════════════════════════════════════════════════════════════════════════
+
+    @Test
+    void adminMergeCompanies_afterMerge_companyListingNoLongerShowsMergedCompany() throws Exception {
+        String adminAuth = insertUser("auth0|co-admin20", "CoAdmin20", "admin");
+        long keepId      = insertCompany("Keep Corp");
+        long mergeId     = insertCompany("Merge Corp");
+        insertManagerForCompany("Alice A", "Keep Corp",  "Manager",  "approved", keepId);
+        insertManagerForCompany("Bob B",   "Merge Corp", "Director", "approved", mergeId);
+
+        // Populate the matview so both companies appear before the merge
+        await(companyRepo.refreshCompanyStats());
+        JsonObject before = await(managerService.getCompanyListing());
+        assertEquals(2, before.getJsonArray("data").size(), "Pre-condition: both companies must appear in listing");
+
+        // Merge — refreshCompanyStats is awaited synchronously in adminMergeCompanies
+        await(service.adminMergeCompanies(adminAuth, keepId, mergeId));
+
+        // Company listing must immediately reflect the merge (no manual refresh needed)
+        JsonObject after = await(managerService.getCompanyListing());
+        long keepCount  = after.getJsonArray("data").stream()
+            .filter(o -> "Keep Corp".equals(((io.vertx.core.json.JsonObject) o).getString("name")))
+            .count();
+        long mergeCount = after.getJsonArray("data").stream()
+            .filter(o -> "Merge Corp".equals(((io.vertx.core.json.JsonObject) o).getString("name")))
+            .count();
+        assertEquals(1L, keepCount,  "Keep company must appear in listing after merge");
+        assertEquals(0L, mergeCount, "Merged company must not appear in listing after merge");
     }
 
     // ══════════════════════════════════════════════════════════════════════════

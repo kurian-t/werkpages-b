@@ -414,11 +414,8 @@ public class AdminService {
                         "A company named \"" + newName.trim() + "\" already exists — use the merge tool instead"));
                 return companyRepo.renameCompany(companyId, newName);
             })
-            .compose(v -> {
-                companyRepo.refreshCompanyStats()
-                    .onFailure(err -> System.err.println("company_stats refresh failed: " + err.getMessage()));
-                return Future.succeededFuture(new JsonObject().put("success", true));
-            });
+            .compose(v -> companyRepo.refreshCompanyStats())
+            .map(v -> new JsonObject().put("success", true));
     }
 
     public Future<JsonObject> adminMergeCompanies(String auth0Id, long keepId, long mergeId) {
@@ -426,10 +423,7 @@ public class AdminService {
             return Future.failedFuture(ServiceException.badRequest("Cannot merge a company into itself"));
         return requireAdmin(auth0Id)
             .compose(adminId -> companyRepo.mergeCompanies(keepId, mergeId))
-            .compose(v -> {
-                companyRepo.refreshCompanyStats()
-                    .onFailure(err -> System.err.println("company_stats refresh failed: " + err.getMessage()));
-                return Future.succeededFuture(new JsonObject().put("success", true).put("keepId", keepId));
-            });
+            .compose(v -> companyRepo.refreshCompanyStats())
+            .map(v -> new JsonObject().put("success", true).put("keepId", keepId));
     }
 }
