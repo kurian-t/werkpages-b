@@ -310,6 +310,101 @@ class DropOffDraftIntegrationTest {
         assertEquals(1L, userAReviews, "Authenticated review must not be deleted by draft token cleanup");
     }
 
+    // ── createDropOffReview tests (existing manager, no auth) ─────────────────
+
+    @Test
+    void createDropOffReview_approvedManager_createsAnonymousReview() throws Exception {
+        var companyRows = await(pool.query(
+            "INSERT INTO companies (name, status, created_at, updated_at) " +
+            "VALUES ('Review Corp', 'ghost', now(), now()) RETURNING id").execute());
+        long companyId = companyRows.iterator().next().getLong("id");
+        var mgRows = await(pool.preparedQuery(
+            "INSERT INTO managers (name, company, title, status, approval_status, country, " +
+            "overall_rating, reviews_count, category_averages, company_id, created_at, updated_at) " +
+            "VALUES ('Frank Lee', 'Review Corp', 'VP', 'active', 'approved', " +
+            "'United States', 0, 0, '{}'::jsonb, $1, now(), now()) RETURNING id")
+            .execute(Tuple.of(companyId)));
+        long managerId = mgRows.iterator().next().getLong("id");
+
+        JsonObject body = reviewData()
+            .put("managerCompany", "Review Corp")
+            .put("managerTitle", "VP");
+        await(service.createDropOffReview(managerId, body, null));
+
+        long count = await(pool.preparedQuery("SELECT COUNT(*) FROM reviews WHERE manager_id = $1 AND user_id IS NULL")
+            .execute(Tuple.of(managerId))
+            .map(rs -> rs.iterator().next().getLong(0)));
+        assertEquals(1L, count);
+    }
+
+    @Test
+    void createDropOffReview_withDraftToken_storesToken() throws Exception {
+        var companyRows = await(pool.query(
+            "INSERT INTO companies (name, status, created_at, updated_at) " +
+            "VALUES ('Token Review Corp', 'ghost', now(), now()) RETURNING id").execute());
+        long companyId = companyRows.iterator().next().getLong("id");
+        var mgRows = await(pool.preparedQuery(
+            "INSERT INTO managers (name, company, title, status, approval_status, country, " +
+            "overall_rating, reviews_count, category_averages, company_id, created_at, updated_at) " +
+            "VALUES ('Gina Ross', 'Token Review Corp', 'Director', 'active', 'ghost', " +
+            "'Canada', 0, 0, '{}'::jsonb, $1, now(), now()) RETURNING id")
+            .execute(Tuple.of(companyId)));
+        long managerId = mgRows.iterator().next().getLong("id");
+
+        String token = "aaaabbbb-1111-2222-3333-ccccddddeeee";
+        JsonObject body = reviewData()
+            .put("managerCompany", "Token Review Corp")
+            .put("managerTitle", "Director")
+            .put("draftToken", token);
+        await(service.createDropOffReview(managerId, body, null));
+
+        var rows = await(pool.preparedQuery("SELECT draft_token FROM reviews WHERE manager_id = $1")
+            .execute(Tuple.of(managerId)));
+        assertTrue(rows.iterator().hasNext());
+        assertEquals(token, rows.iterator().next().getUUID("draft_token").toString());
+    }
+
+    @Test
+    void createReview_withMatchingDropOffToken_deletesDraftReview() throws Exception {
+        var companyRows = await(pool.query(
+            "INSERT INTO companies (name, status, created_at, updated_at) " +
+            "VALUES ('Dedup2 Corp', 'ghost', now(), now()) RETURNING id").execute());
+        long companyId = companyRows.iterator().next().getLong("id");
+        var mgRows = await(pool.preparedQuery(
+            "INSERT INTO managers (name, company, title, status, approval_status, country, " +
+            "overall_rating, reviews_count, category_averages, company_id, created_at, updated_at) " +
+            "VALUES ('Hank Wu', 'Dedup2 Corp', 'Manager', 'active', 'approved', " +
+            "'United States', 0, 0, '{}'::jsonb, $1, now(), now()) RETURNING id")
+            .execute(Tuple.of(companyId)));
+        long managerId = mgRows.iterator().next().getLong("id");
+
+        // 1. Anonymous drop-off for this existing manager
+        String token = "12345678-1234-1234-1234-123456789012";
+        JsonObject dropOff = reviewData().put("managerCompany", "Dedup2 Corp").put("managerTitle", "Manager").put("draftToken", token);
+        await(service.createDropOffReview(managerId, dropOff, null));
+        var draftCountRows = await(pool.preparedQuery("SELECT COUNT(*) FROM reviews WHERE manager_id = $1 AND user_id IS NULL")
+            .execute(Tuple.of(managerId)));
+        assertEquals(1L, draftCountRows.iterator().next().getLong(0));
+
+        // 2. Authenticated user submits for real with same token
+        String auth0Id = insertUser("auth0|dedup2-user", "Dedup2User");
+        JsonObject authBody = reviewData()
+            .put("managerCompany", "Dedup2 Corp")
+            .put("managerTitle", "Manager")
+            .put("authorType", "username")
+            .put("draftToken", token);
+        await(service.createReview(auth0Id, managerId, authBody, null));
+
+        // Draft deleted; exactly 1 authenticated review remains
+        var totalRows = await(pool.preparedQuery("SELECT COUNT(*) FROM reviews WHERE manager_id = $1")
+            .execute(Tuple.of(managerId)));
+        assertEquals(1L, totalRows.iterator().next().getLong(0));
+        var authRow = await(pool.preparedQuery("SELECT user_id, draft_token FROM reviews WHERE manager_id = $1")
+            .execute(Tuple.of(managerId))).iterator().next();
+        assertNotNull(authRow.getUUID("user_id"));
+        assertNull(authRow.getUUID("draft_token"));
+    }
+
     // ── Helpers ───────────────────────────────────────────────────────────────
 
     private String insertUser(String auth0Id, String username) throws Exception {

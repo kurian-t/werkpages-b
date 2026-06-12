@@ -525,6 +525,22 @@ public class ManagersHandler {
             .onFailure(err -> handleError(ctx, err));
     }
 
+    // ── Drop-off review for existing manager (no auth) ───────────────────────
+
+    public void handleDropOffReview(RoutingContext ctx) {
+        long managerId;
+        try {
+            managerId = Long.parseLong(ctx.pathParam("id"));
+        } catch (NumberFormatException e) {
+            respond(ctx, 400, new JsonObject().put("error", "Invalid manager ID format")); return;
+        }
+        JsonObject body = ctx.getBodyAsJson();
+        String resolvedLogoUrl = CompanyLogoUtils.resolveLogoUrl(body != null ? body.getString("managerCompany") : null);
+        service.createDropOffReview(managerId, body, resolvedLogoUrl)
+            .onSuccess(v -> ctx.response().setStatusCode(200).end())
+            .onFailure(err -> handleError(ctx, err));
+    }
+
     // ── Drop-off draft (no auth) ─────────────────────────────────────────────
 
     public void handleDropOffDraft(RoutingContext ctx) {

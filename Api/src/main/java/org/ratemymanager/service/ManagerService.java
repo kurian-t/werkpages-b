@@ -796,9 +796,32 @@ public class ManagerService {
                                 return Future.failedFuture(ServiceException.conflict("review_cooldown:" + cooldownEndStr));
                             }
                         }
-                        return validateAndInsertReview(body, managerId, userId, author, resolvedLogoUrl, null);
+                        UUID draftToken = null;
+                        String draftTokenStr = body.getString("draftToken");
+                        if (draftTokenStr != null && !draftTokenStr.isBlank()) {
+                            try { draftToken = UUID.fromString(draftTokenStr); } catch (IllegalArgumentException ignored) {}
+                        }
+                        return validateAndInsertReview(body, managerId, userId, author, resolvedLogoUrl, draftToken);
                     });
             });
+    }
+
+    public Future<Void> createDropOffReview(long managerId, JsonObject body, String resolvedLogoUrl) {
+        if (body == null) return Future.failedFuture(ServiceException.badRequest("Missing request body"));
+
+        String author = body.getString("author");
+        if (isBlank(author)) author = "Anonymous";
+        final String fAuthor = author;
+
+        UUID draftToken = null;
+        String draftTokenStr = body.getString("draftToken");
+        if (draftTokenStr != null && !draftTokenStr.isBlank()) {
+            try { draftToken = UUID.fromString(draftTokenStr); } catch (IllegalArgumentException ignored) {}
+        }
+        final UUID fDraftToken = draftToken;
+
+        return validateAndInsertReview(body, managerId, null, fAuthor, resolvedLogoUrl, fDraftToken)
+            .mapEmpty();
     }
 
     private Future<Row> validateAndInsertReview(JsonObject body, long managerId, UUID userId, String author, String resolvedLogoUrl, UUID draftToken) {

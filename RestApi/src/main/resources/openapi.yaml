@@ -996,6 +996,56 @@ paths:
                   error:
                     type: string
 
+  /api/managers/{id}/reviews/drop-off:
+    post:
+      operationId: createDropOffReview
+      summary: Capture a review drop-off for an existing manager without authentication
+      tags:
+        - Managers
+      security: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - ratings
+                - managerCompany
+                - managerTitle
+                - workedFrom
+              properties:
+                author:
+                  type: string
+                overallRating:
+                  type: number
+                ratings:
+                  type: object
+                managerCompany:
+                  type: string
+                managerTitle:
+                  type: string
+                workedFrom:
+                  type: string
+                workedUntil:
+                  type: string
+                  nullable: true
+                draftToken:
+                  type: string
+                  format: uuid
+                  description: Client-generated UUID linking this drop-off draft to a future authenticated submit for deduplication
+      responses:
+        '200':
+          description: Drop-off review recorded
+        '400':
+          description: Invalid request
+
   /api/managers/{id}/career-segments:
     get:
       operationId: getManagerCareerSegments
@@ -1883,6 +1933,10 @@ components:
           type: string
           nullable: true
           description: "YYYY-MM date the manager left this role (null = still in role)"
+        draftToken:
+          type: string
+          format: uuid
+          description: Client-generated UUID from a previous drop-off; matching anonymous review is deleted before inserting this one
 
     ManagerReviewUpdate:
       type: object
