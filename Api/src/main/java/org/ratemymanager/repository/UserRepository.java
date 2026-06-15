@@ -179,17 +179,21 @@ public class UserRepository {
 
     // ── Auto-create tracking ──────────────────────────────────────────────────
 
-    public Future<Boolean> hasAutoCreatedManager(UUID userId) {
-        return db.preparedQuery("SELECT has_auto_created_manager FROM users WHERE id = $1")
+    /**
+     * Atomically claims the one-time ghost-creation slot for this user.
+     * Returns true if the slot was successfully claimed (row updated from FALSE to TRUE),
+     * false if it was already claimed (by this request or a concurrent one).
+     * Using UPDATE...WHERE...RETURNING eliminates the TOCTOU race between read and write.
+     */
+    public Future<Boolean> claimAutoCreatedManagerSlot(UUID userId) {
+        return db.preparedQuery(
+                "UPDATE users SET has_auto_created_manager = TRUE WHERE id = $1 AND has_auto_created_manager = FALSE RETURNING id")
             .execute(Tuple.of(userId))
-            .map(rows -> {
-                if (!rows.iterator().hasNext()) return true; // user not found — treat as used
-                return rows.iterator().next().getBoolean("has_auto_created_manager");
-            });
+            .map(rows -> rows.iterator().hasNext());
     }
 
-    public Future<Void> markAutoCreatedManager(UUID userId) {
-        return db.preparedQuery("UPDATE users SET has_auto_created_manager = TRUE WHERE id = $1")
+    public Future<Void> resetAutoCreatedManagerSlot(UUID userId) {
+        return db.preparedQuery("UPDATE users SET has_auto_created_manager = FALSE WHERE id = $1")
             .execute(Tuple.of(userId))
             .mapEmpty();
     }

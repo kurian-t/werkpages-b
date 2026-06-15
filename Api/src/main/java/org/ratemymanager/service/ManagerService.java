@@ -1639,12 +1639,10 @@ public class ManagerService {
 
                 return Future.all(
                     userRepo.hasContributed(userId),
-                    userRepo.hasAutoCreatedManager(userId),
                     managerRepo.search(5, 0, "%" + fullName + "%", "%" + company.trim() + "%", "featured", userId)
                 ).compose(cf -> {
-                    boolean     contributed    = cf.resultAt(0);
-                    boolean     alreadyCreated = cf.resultAt(1);
-                    RowSet<Row> rows           = cf.resultAt(2);
+                    boolean     contributed = cf.resultAt(0);
+                    RowSet<Row> rows        = cf.resultAt(1);
 
                     List<Row> matched = new ArrayList<>();
                     for (Row row : rows) {
@@ -1664,18 +1662,44 @@ public class ManagerService {
                     final String trimmedState = isBlank(state) ? null : state.trim();
                     final String trimmedCity  = isBlank(city)  ? null : city.trim();
 
-                    // Short names → pending_approval (don't consume the ghost slot)
-                    // Long names + first time → ghost
-                    // Long names + ghost already used → pending_approval
                     boolean shortNames = fullName.trim().length() < 4 || company.trim().length() < 4;
 
-                    if (!shortNames && !alreadyCreated) {
-                        // Create ghost first, then mark the flag. If insert fails, flag is never
-                        // set so the user gets another chance on their next search.
+                    if (shortNames) {
+                        // Short name → pending_approval, visible only to this user
+                        return companyRepo.findOrCreate(company, null, resolvedLogoUrl)
+                            .compose(companyRow -> managerRepo.createSearchPending(fullName, company, title, country,
+                                trimmedState, trimmedCity, resolvedLogoUrl, companyRow.getLong("id"), userId))
+                            .map(row -> {
+                                JsonArray data = new JsonArray().add(rowToManagerJson(row));
+                                return new JsonObject()
+                                    .put("data", data)
+                                    .put("created", true)
+                                    .put("hasContributed", contributed);
+                            });
+                    }
+
+                    // Atomically claim the one-time ghost slot. Only one concurrent request wins;
+                    // the loser falls through to pending_approval.
+                    return userRepo.claimAutoCreatedManagerSlot(userId).compose(claimed -> {
+                        if (!claimed) {
+                            // Slot already taken (prior search or concurrent request) → pending_approval
+                            return companyRepo.findOrCreate(company, null, resolvedLogoUrl)
+                                .compose(companyRow -> managerRepo.createSearchPending(fullName, company, title, country,
+                                    trimmedState, trimmedCity, resolvedLogoUrl, companyRow.getLong("id"), userId))
+                                .map(row -> {
+                                    JsonArray data = new JsonArray().add(rowToManagerJson(row));
+                                    return new JsonObject()
+                                        .put("data", data)
+                                        .put("created", true)
+                                        .put("hasContributed", contributed);
+                                });
+                        }
+
+                        // Slot claimed — create ghost. If the insert fails, release the slot so
+                        // the user can try again on their next search.
                         return companyRepo.findOrCreate(company, null, resolvedLogoUrl)
                             .compose(companyRow -> managerRepo.createAutoApproved(fullName, company, title, country,
                                 trimmedState, trimmedCity, userId, resolvedLogoUrl, companyRow.getLong("id")))
-                            .compose(row -> userRepo.markAutoCreatedManager(userId).map(v -> row))
                             .compose(row -> {
                                 long newId = row.getLong("id");
                                 return reviewRepo.createSeedReview(newId, company, title)
@@ -1688,28 +1712,21 @@ public class ManagerService {
                                         return Future.succeededFuture(row);
                                     });
                             })
+                            .recover(err -> {
+                                // Ghost insert failed — release slot so user gets another chance
+                                return userRepo.resetAutoCreatedManagerSlot(userId)
+                                    .compose(v -> Future.failedFuture(err));
+                            })
                             .map(row -> {
                                 companyRepo.refreshCompanyStats()
-                                    .onFailure(err -> System.err.println("company_stats refresh failed: " + err.getMessage()));
+                                    .onFailure(e -> System.err.println("company_stats refresh failed: " + e.getMessage()));
                                 JsonArray data = new JsonArray().add(rowToManagerJson(row));
                                 return new JsonObject()
                                     .put("data", data)
                                     .put("created", true)
                                     .put("hasContributed", contributed);
                             });
-                    } else {
-                        // Short name or second+ search → pending_approval, visible only to this user
-                        return companyRepo.findOrCreate(company, null, resolvedLogoUrl)
-                            .compose(companyRow -> managerRepo.createSearchPending(fullName, company, title, country,
-                                trimmedState, trimmedCity, resolvedLogoUrl, companyRow.getLong("id"), userId))
-                            .map(row -> {
-                                JsonArray data = new JsonArray().add(rowToManagerJson(row));
-                                return new JsonObject()
-                                    .put("data", data)
-                                    .put("created", true)
-                                    .put("hasContributed", contributed);
-                            });
-                    }
+                    });
                 });
             });
     }

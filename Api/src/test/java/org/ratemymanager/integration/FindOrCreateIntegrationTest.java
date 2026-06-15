@@ -1,5 +1,6 @@
 package org.ratemymanager.integration;
 
+import io.vertx.core.CompositeFuture;
 import io.vertx.core.Future;
 import io.vertx.core.json.JsonArray;
 import io.vertx.core.json.JsonObject;
@@ -23,8 +24,8 @@ import org.testcontainers.containers.PostgreSQLContainer;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
 
+import java.util.List;
 import java.util.UUID;
-import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -91,7 +92,7 @@ class FindOrCreateIntegrationTest {
         assertEquals(1, data.size());
         assertEquals("ghost", data.getJsonObject(0).getString("approvalStatus"));
 
-        boolean flagSet = await(userRepo.hasAutoCreatedManager(findUserId(auth0Id)));
+        boolean flagSet = ghostSlotClaimed(findUserId(auth0Id));
         assertTrue(flagSet);
     }
 
@@ -130,7 +131,7 @@ class FindOrCreateIntegrationTest {
         assertEquals("pending_approval", data.getJsonObject(0).getString("approvalStatus"));
 
         // Ghost slot should NOT be consumed for short-name searches
-        boolean flagSet = await(userRepo.hasAutoCreatedManager(findUserId(auth0Id)));
+        boolean flagSet = ghostSlotClaimed(findUserId(auth0Id));
         assertFalse(flagSet);
     }
 
@@ -234,7 +235,48 @@ class FindOrCreateIntegrationTest {
         assertEquals("Submitted Manager", rows.iterator().next().getString("name"));
     }
 
+    // ── Concurrent searches by same user: only one ghost created ─────────────
+
+    @Test
+    void findOrCreate_concurrentSearches_onlyOneGhostCreated() throws Exception {
+        String auth0Id = insertUser("auth0|u9", "user9");
+
+        // Fire two simultaneous searches for different manager names
+        Future<JsonObject> f1 = service.findOrCreate(
+            auth0Id, "Anna", "Brown", "Engineer", "Acme Corp", "US", null, null, null);
+        Future<JsonObject> f2 = service.findOrCreate(
+            auth0Id, "Ben", "Green", "Manager", "Beta Corp", "US", null, null, null);
+
+        List<JsonObject> results = await(Future.all(f1, f2)
+            .map(cf -> List.of((JsonObject) cf.resultAt(0), (JsonObject) cf.resultAt(1))));
+
+        long ghostCount = results.stream()
+            .filter(r -> r.getBoolean("created"))
+            .flatMap(r -> r.getJsonArray("data").stream())
+            .filter(o -> "ghost".equals(((JsonObject) o).getString("approvalStatus")))
+            .count();
+        long pendingCount = results.stream()
+            .filter(r -> r.getBoolean("created"))
+            .flatMap(r -> r.getJsonArray("data").stream())
+            .filter(o -> "pending_approval".equals(((JsonObject) o).getString("approvalStatus")))
+            .count();
+
+        // Exactly one ghost and one pending — never two ghosts
+        assertEquals(1, ghostCount, "Expected exactly 1 ghost; race condition may have created 2");
+        assertEquals(1, pendingCount, "Expected exactly 1 pending_approval");
+
+        long totalManagers = await(pool.query("SELECT COUNT(*) FROM managers")
+            .execute().map(rs -> rs.iterator().next().getLong(0)));
+        assertEquals(2, totalManagers);
+    }
+
     // ── Helpers ───────────────────────────────────────────────────────────────
+
+    private boolean ghostSlotClaimed(UUID userId) throws Exception {
+        return await(pool.preparedQuery("SELECT has_auto_created_manager FROM users WHERE id = $1")
+            .execute(Tuple.of(userId))
+            .map(rs -> rs.iterator().next().getBoolean("has_auto_created_manager")));
+    }
 
     private String insertUser(String auth0Id, String username) throws Exception {
         await(pool.preparedQuery(
