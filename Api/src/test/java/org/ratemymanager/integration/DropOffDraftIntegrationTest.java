@@ -73,7 +73,12 @@ class DropOffDraftIntegrationTest {
 
     @BeforeEach
     void cleanDb() throws Exception {
-        await(pool.query("TRUNCATE managers, companies, users, reviews CASCADE").execute());
+        // Delete in FK order (child → parent) to avoid deadlock with background recalculate/scheduleSeedExpiry queries
+        await(pool.query("DELETE FROM reviews").execute());
+        await(pool.query("DELETE FROM review_deletions").execute());
+        await(pool.query("DELETE FROM managers").execute());
+        await(pool.query("DELETE FROM companies").execute());
+        await(pool.query("DELETE FROM users").execute());
     }
 
     @AfterAll
@@ -133,8 +138,8 @@ class DropOffDraftIntegrationTest {
             .execute(Tuple.of(managerId)));
         assertEquals("pending_approval", after.iterator().next().getString("approval_status"));
 
-        // Verify review was attached
-        var reviewRows = await(pool.preparedQuery("SELECT COUNT(*) FROM reviews WHERE manager_id = $1")
+        // Verify drop-off review was attached (seed review is weight=true; drop-off is weight=false)
+        var reviewRows = await(pool.preparedQuery("SELECT COUNT(*) FROM reviews WHERE manager_id = $1 AND weight = FALSE")
             .execute(Tuple.of(managerId)));
         assertEquals(1L, reviewRows.iterator().next().getLong(0));
     }

@@ -953,4 +953,56 @@ class ReviewIntegrationTest {
     private static <T> T await(Future<T> future) throws Exception {
         return future.toCompletionStage().toCompletableFuture().get(10, TimeUnit.SECONDS);
     }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // getStats — realReviews excludes weight=true; weightedOpinions counts them
+    // ══════════════════════════════════════════════════════════════════════════
+
+    @Test
+    void getStats_realReviews_excludesWeightedReviews() throws Exception {
+        long managerId = insertManager("Stats Manager", "StatsCorp", "Title");
+        String auth0Id = insertUser("auth0|stats-user", "StatsUser01");
+
+        // Insert one real review and one weighted (seed) review
+        await(service.createReview(auth0Id, managerId, validBody("StatsCorp", "Title", "2022-01", null), null));
+        await(pool.preparedQuery(
+                "INSERT INTO reviews (manager_id, author, overall_rating, " +
+                "communication_style, perceived_approachability, perceived_clarity_of_expectations, " +
+                "feedback_style, perceived_supportiveness, decision_making_style, " +
+                "organization_and_planning_style, delegation_style, perceived_professional_demeanor, " +
+                "overall_working_experience, manager_company, manager_title, worked_from, " +
+                "verified, helpful_count, weight, created_at, updated_at) " +
+                "VALUES ($1, 'Anonymous', 4.0, 4.0,4.0,4.0,4.0,4.0,4.0,4.0,4.0,4.0,4.0, " +
+                "'StatsCorp', 'Title', '2022-01-01', true, 0, true, now(), now())")
+            .execute(Tuple.of(managerId)));
+
+        JsonObject stats = await(service.getStats());
+
+        assertEquals(1L, stats.getLong("realReviews"),
+            "realReviews must exclude weight=true reviews");
+        assertEquals(1L, stats.getLong("weightedOpinions"),
+            "weightedOpinions must count active weight=true reviews");
+    }
+
+    @Test
+    void getStats_weightedOpinions_excludesExpiredSeeds() throws Exception {
+        long managerId = insertManager("Expired Stats Mgr", "ExpiredCorp", "Title");
+
+        // Insert an expired seed (weight=true, weight_expires_on in the past)
+        await(pool.preparedQuery(
+                "INSERT INTO reviews (manager_id, author, overall_rating, " +
+                "communication_style, perceived_approachability, perceived_clarity_of_expectations, " +
+                "feedback_style, perceived_supportiveness, decision_making_style, " +
+                "organization_and_planning_style, delegation_style, perceived_professional_demeanor, " +
+                "overall_working_experience, manager_company, manager_title, worked_from, " +
+                "verified, helpful_count, weight, weight_expires_on, created_at, updated_at) " +
+                "VALUES ($1, 'Anonymous', 4.0, 4.0,4.0,4.0,4.0,4.0,4.0,4.0,4.0,4.0,4.0, " +
+                "'ExpiredCorp', 'Title', '2022-01-01', true, 0, true, CURRENT_DATE - 1, now(), now())")
+            .execute(Tuple.of(managerId)));
+
+        JsonObject stats = await(service.getStats());
+
+        assertEquals(0L, stats.getLong("weightedOpinions"),
+            "weightedOpinions must not count expired seeds");
+    }
 }

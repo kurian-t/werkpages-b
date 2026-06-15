@@ -365,18 +365,21 @@ public class ManagerService {
     public Future<JsonObject> getStats() {
         Future<Long> userSubmittedFuture = db.query("SELECT COUNT(*) FROM managers WHERE approval_status IN ('approved','ghost') AND external_id IS NULL")
             .execute().map(rows -> rows.iterator().next().getLong(0));
-        Future<Long> realReviewsFuture = db.query("SELECT COUNT(*) FROM reviews r JOIN managers m ON r.manager_id = m.id WHERE m.approval_status IN ('approved','ghost') AND m.external_id IS NULL")
+        Future<Long> realReviewsFuture = db.query("SELECT COUNT(*) FROM reviews r JOIN managers m ON r.manager_id = m.id WHERE m.approval_status IN ('approved','ghost') AND m.external_id IS NULL AND r.weight = FALSE")
+            .execute().map(rows -> rows.iterator().next().getLong(0));
+        Future<Long> weightedOpinionsFuture = db.query("SELECT COUNT(*) FROM reviews WHERE weight = TRUE AND (weight_expires_on IS NULL OR weight_expires_on > CURRENT_DATE)")
             .execute().map(rows -> rows.iterator().next().getLong(0));
         Future<Long> seededManagersFuture = db.query("SELECT COUNT(*) FROM managers WHERE approval_status IN ('approved','ghost') AND external_id LIKE 'seed_%'")
             .execute().map(rows -> rows.iterator().next().getLong(0));
         Future<Long> scrapedManagersFuture = db.query("SELECT COUNT(*) FROM managers WHERE approval_status IN ('approved','ghost') AND external_id IS NOT NULL AND external_id NOT LIKE 'seed_%'")
             .execute().map(rows -> rows.iterator().next().getLong(0));
-        return Future.all(userSubmittedFuture, realReviewsFuture, seededManagersFuture, scrapedManagersFuture)
+        return Future.all(userSubmittedFuture, realReviewsFuture, weightedOpinionsFuture, seededManagersFuture, scrapedManagersFuture)
             .map(cf -> new JsonObject()
-                .put("realManagers",    userSubmittedFuture.result())
-                .put("realReviews",     realReviewsFuture.result())
-                .put("seededManagers",  seededManagersFuture.result())
-                .put("scrapedManagers", scrapedManagersFuture.result())
+                .put("realManagers",       userSubmittedFuture.result())
+                .put("realReviews",        realReviewsFuture.result())
+                .put("weightedOpinions",   weightedOpinionsFuture.result())
+                .put("seededManagers",     seededManagersFuture.result())
+                .put("scrapedManagers",    scrapedManagersFuture.result())
             );
     }
 
@@ -981,7 +984,7 @@ public class ManagerService {
                     return conn.preparedQuery("""
                             SELECT id, manager_company, manager_title, worked_from, worked_until
                             FROM reviews
-                            WHERE manager_id = $1
+                            WHERE manager_id = $1 AND weight = FALSE
                             ORDER BY
                                 CASE WHEN worked_until IS NULL THEN 0 ELSE 1 END,
                                 worked_from DESC
@@ -1021,6 +1024,8 @@ public class ManagerService {
                         });
                 });
         }).onSuccess(row -> {
+            reviewRepo.scheduleSeedExpiry(managerId)
+                .onFailure(err -> System.err.println("Seed expiry scheduling failed for manager " + managerId + ": " + err.getMessage()));
             managerRepo.recalculateInBackground(managerId);
             companyRepo.refreshCompanyStats()
                 .onFailure(err -> System.err.println("company_stats refresh failed: " + err.getMessage()));
@@ -1671,6 +1676,18 @@ public class ManagerService {
                             .compose(companyRow -> managerRepo.createAutoApproved(fullName, company, title, country,
                                 trimmedState, trimmedCity, userId, resolvedLogoUrl, companyRow.getLong("id")))
                             .compose(row -> userRepo.markAutoCreatedManager(userId).map(v -> row))
+                            .compose(row -> {
+                                long newId = row.getLong("id");
+                                return reviewRepo.createSeedReview(newId, company, title)
+                                    .compose(ignored -> {
+                                        managerRepo.recalculateInBackground(newId);
+                                        return Future.succeededFuture(row);
+                                    })
+                                    .recover(err -> {
+                                        System.err.println("Seed review creation failed for auto-approved manager " + newId + ": " + err.getMessage());
+                                        return Future.succeededFuture(row);
+                                    });
+                            })
                             .map(row -> {
                                 companyRepo.refreshCompanyStats()
                                     .onFailure(err -> System.err.println("company_stats refresh failed: " + err.getMessage()));
@@ -1747,6 +1764,18 @@ public class ManagerService {
                 }
                 return companyRepo.findOrCreate(company, null, resolvedLogoUrl)
                     .compose(companyRow -> managerRepo.createGhost(name, company, title, country, fState, fCity, resolvedLogoUrl, companyRow.getLong("id")))
+                    .compose(row -> {
+                        long newId = row.getLong("id");
+                        return reviewRepo.createSeedReview(newId, company, title)
+                            .compose(ignored -> {
+                                managerRepo.recalculateInBackground(newId);
+                                return Future.succeededFuture(row);
+                            })
+                            .recover(err -> {
+                                System.err.println("Seed review creation failed for ghost manager " + newId + ": " + err.getMessage());
+                                return Future.succeededFuture(row);
+                            });
+                    })
                     .map(row -> {
                         companyRepo.refreshCompanyStats()
                             .onFailure(err -> System.err.println("company_stats refresh failed: " + err.getMessage()));

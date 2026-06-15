@@ -9,6 +9,7 @@ import io.vertx.sqlclient.Tuple;
 import java.time.LocalDate;
 import java.time.OffsetDateTime;
 import java.util.Optional;
+import java.util.Random;
 import java.util.UUID;
 
 /**
@@ -33,11 +34,14 @@ public class ReviewRepository {
             default        -> "created_at DESC";
         };
 
+        // Exclude expired placeholder reviews; active placeholders (weight_expires_on IS NULL or future) are shown.
+        // User-filtered queries naturally exclude placeholders (user_id IS NULL) via the user_id condition.
         if (userIdFilter != null) {
             String sql = String.format("SELECT * FROM reviews WHERE manager_id = $1 AND user_id = $4 ORDER BY %s LIMIT $2 OFFSET $3", orderBy);
             return db.preparedQuery(sql).execute(Tuple.of(managerId, limit, offset, userIdFilter));
         } else {
-            String sql = String.format("SELECT * FROM reviews WHERE manager_id = $1 ORDER BY %s LIMIT $2 OFFSET $3", orderBy);
+            String sql = String.format(
+                "SELECT * FROM reviews WHERE manager_id = $1 AND (weight = FALSE OR weight_expires_on IS NULL OR weight_expires_on > CURRENT_DATE) ORDER BY %s LIMIT $2 OFFSET $3", orderBy);
             return db.preparedQuery(sql).execute(Tuple.of(managerId, limit, offset));
         }
     }
@@ -65,7 +69,7 @@ public class ReviewRepository {
                   MIN(manager_role_start)                     AS manager_role_start,
                   MAX(manager_role_end)                       AS manager_role_end
                 FROM reviews
-                WHERE manager_id = $1
+                WHERE manager_id = $1 AND weight = FALSE
                 GROUP BY LOWER(TRIM(manager_company)), LOWER(TRIM(manager_title))
                 ORDER BY MIN(worked_from) ASC NULLS LAST
                 LIMIT $2 OFFSET $3
@@ -77,7 +81,7 @@ public class ReviewRepository {
         return db.preparedQuery("""
                 SELECT COUNT(*) FROM (
                   SELECT 1 FROM reviews
-                  WHERE manager_id = $1
+                  WHERE manager_id = $1 AND weight = FALSE
                   GROUP BY LOWER(TRIM(manager_company)), LOWER(TRIM(manager_title))
                 ) sub
                 """)
@@ -91,7 +95,8 @@ public class ReviewRepository {
                 .execute(Tuple.of(managerId, userIdFilter))
                 .map(rows -> rows.iterator().next().getLong(0));
         }
-        return db.preparedQuery("SELECT COUNT(*) FROM reviews WHERE manager_id = $1")
+        return db.preparedQuery(
+                "SELECT COUNT(*) FROM reviews WHERE manager_id = $1 AND (weight = FALSE OR weight_expires_on IS NULL OR weight_expires_on > CURRENT_DATE)")
             .execute(Tuple.of(managerId))
             .map(rows -> rows.iterator().next().getLong(0));
     }
@@ -138,7 +143,7 @@ public class ReviewRepository {
     public Future<RowSet<Row>> findRolePeriodsForManager(long managerId) {
         return db.preparedQuery(
                 "SELECT id, manager_title, manager_company, manager_role_start, manager_role_end " +
-                "FROM reviews WHERE manager_id = $1 AND manager_role_start IS NOT NULL")
+                "FROM reviews WHERE manager_id = $1 AND manager_role_start IS NOT NULL AND weight = FALSE")
             .execute(Tuple.of(managerId));
     }
 
@@ -281,6 +286,55 @@ public class ReviewRepository {
 
     public Future<Void> deleteByManager(long managerId) {
         return db.preparedQuery("DELETE FROM reviews WHERE manager_id = $1")
+            .execute(Tuple.of(managerId))
+            .mapEmpty();
+    }
+
+    /** Inserts a system-generated placeholder review for a newly created ghost manager. */
+    public Future<Row> createSeedReview(long managerId, String managerCompany, String managerTitle) {
+        Random rng = new Random();
+        double overall = Math.round((3.5 + rng.nextDouble() * 1.4) * 10.0) / 10.0;
+        double[] cats = new double[10];
+        for (int i = 0; i < 10; i++) {
+            double v = overall + (rng.nextDouble() - 0.5);
+            cats[i] = Math.round(Math.min(5.0, Math.max(3.0, v)) * 10.0) / 10.0;
+        }
+        int daysAgo          = rng.nextInt(180);
+        LocalDate createdAt  = LocalDate.now().minusDays(daysAgo);
+        LocalDate workedFrom = createdAt.minusMonths(12 + rng.nextInt(24));
+
+        return db.preparedQuery("""
+                INSERT INTO reviews (
+                    manager_id, user_id, author, overall_rating,
+                    communication_style, perceived_approachability, perceived_clarity_of_expectations,
+                    feedback_style, perceived_supportiveness, decision_making_style,
+                    organization_and_planning_style, delegation_style, perceived_professional_demeanor,
+                    overall_working_experience, manager_company, manager_title,
+                    worked_from, verified, helpful_count, weight,
+                    created_at, updated_at
+                )
+                VALUES ($1, NULL, 'Anonymous', $2,
+                        $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
+                        $13, $14, $15,
+                        true, 0, true,
+                        $16::DATE + TIME '00:00:00', now())
+                RETURNING *
+                """)
+            .execute(Tuple.of(
+                managerId, overall,
+                cats[0], cats[1], cats[2], cats[3], cats[4],
+                cats[5], cats[6], cats[7], cats[8], cats[9],
+                managerCompany, managerTitle, workedFrom, createdAt
+            ))
+            .map(rows -> rows.iterator().next());
+    }
+
+    /** Sets weight_expires_on = CURRENT_DATE + 14 on the active placeholder review for this manager.
+     *  Called when the first real review is submitted — fire-and-forget. */
+    public Future<Void> scheduleSeedExpiry(long managerId) {
+        return db.preparedQuery(
+                "UPDATE reviews SET weight_expires_on = CURRENT_DATE + 14 " +
+                "WHERE manager_id = $1 AND weight = TRUE AND weight_expires_on IS NULL")
             .execute(Tuple.of(managerId))
             .mapEmpty();
     }
