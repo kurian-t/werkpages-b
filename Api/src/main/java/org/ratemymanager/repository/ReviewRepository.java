@@ -293,12 +293,17 @@ public class ReviewRepository {
     /** Inserts a system-generated placeholder review for a newly created ghost manager. */
     public Future<Row> createSeedReview(long managerId, String managerCompany, String managerTitle) {
         Random rng = new Random();
-        double overall = Math.round((3.5 + rng.nextDouble() * 1.4) * 10.0) / 10.0;
-        double[] cats = new double[10];
+        // Target overall in 3.5–4.9 range; each category must be a whole number (1–5)
+        // matching what the star-rating UI produces.
+        double target = 3.5 + rng.nextDouble() * 1.4;
+        int[] cats = new int[10];
         for (int i = 0; i < 10; i++) {
-            double v = overall + (rng.nextDouble() - 0.5);
-            cats[i] = Math.round(Math.min(5.0, Math.max(3.0, v)) * 10.0) / 10.0;
+            double v = target + (rng.nextDouble() - 0.5) * 2;
+            cats[i] = Math.min(5, Math.max(3, (int) Math.round(v)));
         }
+        // overall_rating mirrors how real reviews work: average of the 10 categories
+        double overall = Math.round(
+            java.util.Arrays.stream(cats).average().orElse(4.0) * 10.0) / 10.0;
         int daysAgo          = rng.nextInt(180);
         LocalDate createdAt  = LocalDate.now().minusDays(daysAgo);
         LocalDate workedFrom = createdAt.minusMonths(12 + rng.nextInt(24));
