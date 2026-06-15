@@ -69,7 +69,7 @@ public class ReviewRepository {
                   MIN(manager_role_start)                     AS manager_role_start,
                   MAX(manager_role_end)                       AS manager_role_end
                 FROM reviews
-                WHERE manager_id = $1 AND weight = FALSE
+                WHERE manager_id = $1
                 GROUP BY LOWER(TRIM(manager_company)), LOWER(TRIM(manager_title))
                 ORDER BY MIN(worked_from) ASC NULLS LAST
                 LIMIT $2 OFFSET $3
@@ -81,7 +81,7 @@ public class ReviewRepository {
         return db.preparedQuery("""
                 SELECT COUNT(*) FROM (
                   SELECT 1 FROM reviews
-                  WHERE manager_id = $1 AND weight = FALSE
+                  WHERE manager_id = $1
                   GROUP BY LOWER(TRIM(manager_company)), LOWER(TRIM(manager_title))
                 ) sub
                 """)
@@ -143,7 +143,7 @@ public class ReviewRepository {
     public Future<RowSet<Row>> findRolePeriodsForManager(long managerId) {
         return db.preparedQuery(
                 "SELECT id, manager_title, manager_company, manager_role_start, manager_role_end " +
-                "FROM reviews WHERE manager_id = $1 AND manager_role_start IS NOT NULL AND weight = FALSE")
+                "FROM reviews WHERE manager_id = $1 AND manager_role_start IS NOT NULL")
             .execute(Tuple.of(managerId));
     }
 
