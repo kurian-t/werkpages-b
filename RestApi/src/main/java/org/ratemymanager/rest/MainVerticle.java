@@ -117,6 +117,7 @@ public class MainVerticle extends AbstractVerticle {
                         routerFactory.addHandlerByOperationId("getSimilarManagers",     managersHandler::handleGetSimilarManagers);
                         routerFactory.addHandlerByOperationId("findOrCreateManager",    managersHandler::handleFindOrCreate);
                         routerFactory.addHandlerByOperationId("createGhostManager",     managersHandler::handleCreateGhostManager);
+                        routerFactory.addHandlerByOperationId("captureAnonymousSearch", managersHandler::handleAnonymousCapture);
                         routerFactory.addHandlerByOperationId("createDropOffDraft",      managersHandler::handleDropOffDraft);
                         routerFactory.addHandlerByOperationId("createDropOffReview",     managersHandler::handleDropOffReview);
                         routerFactory.addHandlerByOperationId("createManagerEditRequest", managersHandler::handleCreateEditRequest);

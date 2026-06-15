@@ -291,6 +291,15 @@ public class ReviewRepository {
             .mapEmpty();
     }
 
+    private static final String[] SEED_ADJ    = {
+        "Brave", "Swift", "Bold", "Calm", "Keen", "Wise", "Fair", "Kind",
+        "Sharp", "Quiet", "Clear", "Warm", "Cool", "Bright", "Loyal"
+    };
+    private static final String[] SEED_ANIMAL = {
+        "Falcon", "Tiger", "Eagle", "Wolf", "Bison", "Crane", "Lynx",
+        "Otter", "Raven", "Gecko", "Heron", "Panda", "Finch", "Moose"
+    };
+
     /** Inserts a system-generated placeholder review for a newly created ghost manager. */
     public Future<Row> createSeedReview(long managerId, String managerCompany, String managerTitle) {
         Random rng = new Random();
@@ -311,6 +320,9 @@ public class ReviewRepository {
             .minusDays(daysAgo)
             .atTime(rng.nextInt(24), rng.nextInt(60), rng.nextInt(60));
         LocalDate workedFrom = createdAt.toLocalDate().minusMonths(12 + rng.nextInt(24));
+        String author = SEED_ADJ[rng.nextInt(SEED_ADJ.length)]
+            + SEED_ANIMAL[rng.nextInt(SEED_ANIMAL.length)]
+            + (10 + rng.nextInt(90));
 
         return db.preparedQuery("""
                 INSERT INTO reviews (
@@ -322,15 +334,15 @@ public class ReviewRepository {
                     worked_from, verified, helpful_count, weight,
                     created_at, updated_at
                 )
-                VALUES ($1, NULL, 'Anonymous', $2,
-                        $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
-                        $13, $14, $15,
+                VALUES ($1, NULL, $2, $3,
+                        $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
+                        $14, $15, $16,
                         true, 0, true,
-                        $16, now())
+                        $17, now())
                 RETURNING *
                 """)
             .execute(Tuple.of(
-                managerId, overall,
+                managerId, author, overall,
                 cats[0], cats[1], cats[2], cats[3], cats[4],
                 cats[5], cats[6], cats[7], cats[8], cats[9],
                 managerCompany, managerTitle, workedFrom, createdAt

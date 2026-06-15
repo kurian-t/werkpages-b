@@ -96,27 +96,30 @@ class FindOrCreateIntegrationTest {
         assertTrue(flagSet);
     }
 
-    // ── Second search, long names → pending_approval ──────────────────────────
+    // ── Second search, long names → pending queued, nothing returned to user ──
 
     @Test
-    void findOrCreate_secondSearch_longNames_createsPending() throws Exception {
+    void findOrCreate_secondSearch_longNames_createsPendingInvisibleToUser() throws Exception {
         String auth0Id = insertUser("auth0|u2", "user2");
 
-        // First search — creates ghost
+        // First search — creates ghost (user sees it)
         await(service.findOrCreate(
             auth0Id, "Alice", "Smith", "Engineer", "Acme Corp", "US", null, null, null));
 
-        // Second search (different manager) — creates pending
+        // Second search (different manager) — creates pending but returns nothing to user
         JsonObject result = await(service.findOrCreate(
             auth0Id, "David", "Lee", "Manager", "Beta Corp", "US", null, null, null));
 
-        assertTrue(result.getBoolean("created"));
-        JsonArray data = result.getJsonArray("data");
-        assertEquals(1, data.size());
-        assertEquals("pending_approval", data.getJsonObject(0).getString("approvalStatus"));
+        assertFalse(result.getBoolean("created"));
+        assertEquals(0, result.getJsonArray("data").size());
+
+        // Pending was still created in the DB for admin review
+        String status = await(pool.preparedQuery("SELECT approval_status FROM managers WHERE name ILIKE 'David Lee'")
+            .execute().map(rs -> rs.iterator().next().getString("approval_status")));
+        assertEquals("pending_approval", status);
     }
 
-    // ── Short company name → pending_approval (even on first search) ──────────
+    // ── Short company name → pending queued, nothing returned to user ─────────
 
     @Test
     void findOrCreate_shortCompanyName_createsPendingNotGhost() throws Exception {
@@ -125,10 +128,14 @@ class FindOrCreateIntegrationTest {
         JsonObject result = await(service.findOrCreate(
             auth0Id, "Carol", "Lee", "Engineer", "Go", "US", null, null, null));
 
-        assertTrue(result.getBoolean("created"));
-        JsonArray data = result.getJsonArray("data");
-        assertEquals(1, data.size());
-        assertEquals("pending_approval", data.getJsonObject(0).getString("approvalStatus"));
+        // Nothing returned to user — pending goes to admin queue
+        assertFalse(result.getBoolean("created"));
+        assertEquals(0, result.getJsonArray("data").size());
+
+        // Pending was still created in the DB
+        String status = await(pool.preparedQuery("SELECT approval_status FROM managers WHERE name ILIKE 'Carol Lee'")
+            .execute().map(rs -> rs.iterator().next().getString("approval_status")));
+        assertEquals("pending_approval", status);
 
         // Ghost slot should NOT be consumed for short-name searches
         boolean flagSet = ghostSlotClaimed(findUserId(auth0Id));
@@ -141,9 +148,11 @@ class FindOrCreateIntegrationTest {
     void findOrCreate_shortName_doesNotConsumeGhostSlot_allowsGhostOnLaterSearch() throws Exception {
         String auth0Id = insertUser("auth0|u4", "user4");
 
-        // Short-name search → pending (ghost slot not consumed)
-        await(service.findOrCreate(
+        // Short-name search → pending queued silently (ghost slot not consumed)
+        JsonObject shortResult = await(service.findOrCreate(
             auth0Id, "Dan", "Park", "Engineer", "Go", "US", null, null, null));
+        assertFalse(shortResult.getBoolean("created"));
+        assertEquals(0, shortResult.getJsonArray("data").size());
 
         // Long-name search next → should still create ghost (slot was not consumed)
         JsonObject result = await(service.findOrCreate(
@@ -153,60 +162,59 @@ class FindOrCreateIntegrationTest {
         assertEquals("ghost", result.getJsonArray("data").getJsonObject(0).getString("approvalStatus"));
     }
 
-    // ── Duplicate guard: same user, same name+company → returns existing pending ─
+    // ── Duplicate guard: searching same pending manager twice → no duplicate ──
 
     @Test
-    void findOrCreate_sameUserSearchesSamePendingManager_returnsExistingNoDuplicate() throws Exception {
+    void findOrCreate_sameUserSearchesSamePendingManager_noDuplicate() throws Exception {
         String auth0Id = insertUser("auth0|u5", "user5");
 
         // First search: creates ghost (consume slot)
         await(service.findOrCreate(
             auth0Id, "Alice", "Smith", "Engineer", "Acme Corp", "US", null, null, null));
 
-        // Second search: different name → pending
-        JsonObject first = await(service.findOrCreate(
+        // Second search: different name → pending (nothing returned)
+        await(service.findOrCreate(
             auth0Id, "David", "Lee", "Manager", "Beta Corp", "US", null, null, null));
-        long firstId = first.getJsonArray("data").getJsonObject(0).getLong("id");
 
-        // Third search: same name/company as pending → must return existing, not create duplicate
+        // Third search: same name/company → must NOT create a duplicate pending
         JsonObject second = await(service.findOrCreate(
             auth0Id, "David", "Lee", "Manager", "Beta Corp", "US", null, null, null));
-        long secondId = second.getJsonArray("data").getJsonObject(0).getLong("id");
 
-        assertEquals(firstId, secondId);
         assertFalse(second.getBoolean("created"));
+        assertEquals(0, second.getJsonArray("data").size());
 
         long count = await(pool.preparedQuery("SELECT COUNT(*) FROM managers WHERE name ILIKE 'David Lee'")
             .execute().map(rs -> rs.iterator().next().getLong(0)));
         assertEquals(1, count);
     }
 
-    // ── Pending manager not visible to other users in search ─────────────────
+    // ── Pending manager not visible to any user ───────────────────────────────
 
     @Test
-    void findOrCreate_pendingManagerNotVisibleToOtherUser() throws Exception {
+    void findOrCreate_pendingManagerNotVisibleToAnyUser() throws Exception {
         String auth0Id1 = insertUser("auth0|u6", "user6");
         String auth0Id2 = insertUser("auth0|u7", "user7");
 
-        // user1 creates ghost
+        // user1 creates ghost (Alice at Acme)
         await(service.findOrCreate(
             auth0Id1, "Alice", "Smith", "Engineer", "Acme Corp", "US", null, null, null));
 
-        // user1 creates pending for "David Lee at Beta Corp"
-        await(service.findOrCreate(
+        // user1's second search creates pending (David at Beta) — user sees nothing
+        JsonObject u1Result = await(service.findOrCreate(
             auth0Id1, "David", "Lee", "Manager", "Beta Corp", "US", null, null, null));
+        assertFalse(u1Result.getBoolean("created"));
+        assertEquals(0, u1Result.getJsonArray("data").size());
 
-        // user2 searches for same pending manager → should NOT see it (empty results, then creates its own ghost)
-        JsonObject result = await(service.findOrCreate(
+        // user2 searches same name/company — pending is hidden, user2 has their ghost slot free
+        // so they would claim it and create a second ghost (different row from user1's pending)
+        JsonObject u2Result = await(service.findOrCreate(
             auth0Id2, "David", "Lee", "Manager", "Beta Corp", "US", null, null, null));
+        assertEquals("ghost", u2Result.getJsonArray("data").getJsonObject(0).getString("approvalStatus"));
 
-        // user2 has not created a ghost yet, so they'd get a ghost too
-        assertEquals("ghost", result.getJsonArray("data").getJsonObject(0).getString("approvalStatus"));
-        // But it should be a different row from user1's pending
         long pendingId = await(pool.preparedQuery(
             "SELECT id FROM managers WHERE name ILIKE 'David Lee' AND approval_status = 'pending_approval'")
             .execute().map(rs -> rs.iterator().next().getLong("id")));
-        long ghostId = result.getJsonArray("data").getJsonObject(0).getLong("id");
+        long ghostId = u2Result.getJsonArray("data").getJsonObject(0).getLong("id");
         assertNotEquals(pendingId, ghostId);
     }
 
@@ -250,20 +258,19 @@ class FindOrCreateIntegrationTest {
         List<JsonObject> results = await(Future.all(f1, f2)
             .map(cf -> List.of((JsonObject) cf.resultAt(0), (JsonObject) cf.resultAt(1))));
 
-        long ghostCount = results.stream()
-            .filter(r -> r.getBoolean("created"))
-            .flatMap(r -> r.getJsonArray("data").stream())
-            .filter(o -> "ghost".equals(((JsonObject) o).getString("approvalStatus")))
-            .count();
-        long pendingCount = results.stream()
-            .filter(r -> r.getBoolean("created"))
-            .flatMap(r -> r.getJsonArray("data").stream())
-            .filter(o -> "pending_approval".equals(((JsonObject) o).getString("approvalStatus")))
-            .count();
+        // Pending is no longer returned in data — verify via DB
+        long ghostsInDB = await(pool.query("SELECT COUNT(*) FROM managers WHERE approval_status = 'ghost'")
+            .execute().map(rs -> rs.iterator().next().getLong(0)));
+        long pendingInDB = await(pool.query("SELECT COUNT(*) FROM managers WHERE approval_status = 'pending_approval'")
+            .execute().map(rs -> rs.iterator().next().getLong(0)));
 
         // Exactly one ghost and one pending — never two ghosts
-        assertEquals(1, ghostCount, "Expected exactly 1 ghost; race condition may have created 2");
-        assertEquals(1, pendingCount, "Expected exactly 1 pending_approval");
+        assertEquals(1, ghostsInDB, "Expected exactly 1 ghost; race condition may have created 2");
+        assertEquals(1, pendingInDB, "Expected exactly 1 pending_approval");
+
+        // Only the ghost is returned in data; pending returns empty
+        long dataWithResults = results.stream().filter(r -> r.getJsonArray("data").size() > 0).count();
+        assertEquals(1, dataWithResults, "Only the ghost response should have data");
 
         long totalManagers = await(pool.query("SELECT COUNT(*) FROM managers")
             .execute().map(rs -> rs.iterator().next().getLong(0)));

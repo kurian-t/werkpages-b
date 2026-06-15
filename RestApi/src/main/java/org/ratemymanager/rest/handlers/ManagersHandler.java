@@ -556,6 +556,19 @@ public class ManagersHandler {
             .onFailure(err -> handleError(ctx, err));
     }
 
+    // ── Anonymous intent capture (no auth, no review) ───────────────────────
+
+    public void handleAnonymousCapture(RoutingContext ctx) {
+        JsonObject body = ctx.getBodyAsJson();
+        if (body == null) { respond(ctx, 400, new JsonObject().put("message", "Request body required")); return; }
+        GeoUtils.stampGeo(ctx, body);
+        String company = body.getString("company");
+        String logoUrl = CompanyLogoUtils.resolveLogoUrl(company);
+        service.captureAnonymousSearch(body, logoUrl)
+            .onSuccess(v -> ctx.response().setStatusCode(202).end())
+            .onFailure(err -> handleError(ctx, err));
+    }
+
     // ── Find-or-create ────────────────────────────────────────────────────────
 
     public void handleFindOrCreate(RoutingContext ctx) {

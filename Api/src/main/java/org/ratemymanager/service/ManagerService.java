@@ -29,6 +29,7 @@ import java.util.Optional;
 import java.util.Random;
 import java.util.UUID;
 import java.util.function.Function;
+import java.util.stream.Collectors;
 
 /**
  * Business logic for managers and their reviews.
@@ -1667,9 +1668,15 @@ public class ManagerService {
                         if (row.getString("name").equalsIgnoreCase(fullName.trim())) matched.add(row);
                     }
 
-                    if (!matched.isEmpty()) {
+                    // Pending managers are never returned to users — they are invisible until
+                    // an admin approves them. Only approved/ghost managers are surfaced.
+                    List<Row> visibleMatched = matched.stream()
+                        .filter(r -> !"pending_approval".equals(r.getString("approval_status")))
+                        .collect(Collectors.toList());
+
+                    if (!visibleMatched.isEmpty()) {
                         JsonArray data = new JsonArray();
-                        for (Row row : matched) data.add(rowToManagerJson(row));
+                        for (Row row : visibleMatched) data.add(rowToManagerJson(row));
                         return Future.succeededFuture(
                             new JsonObject()
                                 .put("data", data)
@@ -1677,40 +1684,60 @@ public class ManagerService {
                                 .put("hasContributed", contributed));
                     }
 
+                    // visibleMatched is empty. Two sub-cases:
+                    // (a) pending rows were filtered → manager already queued, don't create a duplicate
+                    // (b) matched is completely empty → manager doesn't exist yet
+                    boolean alreadyPending = !matched.isEmpty();
+
                     final String trimmedState = isBlank(state) ? null : state.trim();
                     final String trimmedCity  = isBlank(city)  ? null : city.trim();
 
-                    boolean shortNames = fullName.trim().length() < 4 || company.trim().length() < 4;
+                    if (alreadyPending) {
+                        // Already in the admin queue — return empty, nothing to show.
+                        return Future.succeededFuture(
+                            new JsonObject()
+                                .put("data", new JsonArray())
+                                .put("created", false)
+                                .put("hasContributed", contributed));
+                    }
 
-                    if (shortNames) {
-                        // Short name → pending_approval, visible only to this user
+                    if (contributed) {
+                        // Has already rated: create pending for admin, return nothing.
                         return companyRepo.findOrCreate(company, null, resolvedLogoUrl)
                             .compose(companyRow -> managerRepo.createSearchPending(fullName, company, title, country,
                                 trimmedState, trimmedCity, resolvedLogoUrl, companyRow.getLong("id"), userId))
-                            .map(row -> {
-                                JsonArray data = new JsonArray().add(rowToManagerJson(row));
-                                return new JsonObject()
-                                    .put("data", data)
-                                    .put("created", true)
-                                    .put("hasContributed", contributed);
-                            });
+                            .map(row -> new JsonObject()
+                                .put("data", new JsonArray())
+                                .put("created", false)
+                                .put("hasContributed", contributed));
+                    }
+
+                    // First-time user, manager not found: ghost/pending flow.
+                    boolean shortNames = fullName.trim().length() < 4 || company.trim().length() < 4;
+
+                    if (shortNames) {
+                        // Short name can't take the ghost slot — pending for admin, nothing shown.
+                        return companyRepo.findOrCreate(company, null, resolvedLogoUrl)
+                            .compose(companyRow -> managerRepo.createSearchPending(fullName, company, title, country,
+                                trimmedState, trimmedCity, resolvedLogoUrl, companyRow.getLong("id"), userId))
+                            .map(row -> new JsonObject()
+                                .put("data", new JsonArray())
+                                .put("created", false)
+                                .put("hasContributed", contributed));
                     }
 
                     // Atomically claim the one-time ghost slot. Only one concurrent request wins;
                     // the loser falls through to pending_approval.
                     return userRepo.claimAutoCreatedManagerSlot(userId).compose(claimed -> {
                         if (!claimed) {
-                            // Slot already taken (prior search or concurrent request) → pending_approval
+                            // Slot already taken — pending for admin, nothing shown.
                             return companyRepo.findOrCreate(company, null, resolvedLogoUrl)
                                 .compose(companyRow -> managerRepo.createSearchPending(fullName, company, title, country,
                                     trimmedState, trimmedCity, resolvedLogoUrl, companyRow.getLong("id"), userId))
-                                .map(row -> {
-                                    JsonArray data = new JsonArray().add(rowToManagerJson(row));
-                                    return new JsonObject()
-                                        .put("data", data)
-                                        .put("created", true)
-                                        .put("hasContributed", contributed);
-                                });
+                                .map(row -> new JsonObject()
+                                    .put("data", new JsonArray())
+                                    .put("created", false)
+                                    .put("hasContributed", contributed));
                         }
 
                         // Slot claimed — create ghost. If the insert fails, release the slot so
@@ -1819,6 +1846,49 @@ public class ManagerService {
                             .put("name", row.getString("name"))
                             .put("created", true);
                     });
+            });
+    }
+
+    /**
+     * Silently creates a pending_approval manager when an anonymous user searches for a
+     * non-existent manager after their one-time ghost slot has already been used.
+     * Returns nothing useful to the caller — the record goes straight to the admin queue.
+     */
+    public Future<Void> captureAnonymousSearch(JsonObject body, String resolvedLogoUrl) {
+        if (body == null) return Future.failedFuture(ServiceException.badRequest("Missing request body"));
+        String name    = toProperNameCase(body.getString("name"));
+        String company = body.getString("company") != null ? body.getString("company").trim() : null;
+        String title   = body.getString("title")   != null ? body.getString("title").trim()   : null;
+        String country = body.getString("country") != null ? body.getString("country").trim() : null;
+        String state   = body.getString("state")   != null ? body.getString("state").trim()   : null;
+        if (isBlank(name) || isBlank(company) || isBlank(title) || isBlank(country))
+            return Future.failedFuture(ServiceException.badRequest("Missing required fields"));
+        if (name.length()    > 100) return Future.failedFuture(ServiceException.badRequest("Name too long"));
+        if (company.length() > 100) return Future.failedFuture(ServiceException.badRequest("Company too long"));
+        if (title.length()   > 100) return Future.failedFuture(ServiceException.badRequest("Title too long"));
+        if (country.length() > 100) return Future.failedFuture(ServiceException.badRequest("Country too long"));
+        if (isBlank(state)) state = null;
+        if (state != null && state.length() > 100) return Future.failedFuture(ServiceException.badRequest("State too long"));
+
+        String[] nameParts = name.trim().split("\\s+", 2);
+        String firstName = nameParts[0];
+        String lastName  = nameParts.length > 1 ? nameParts[1] : "";
+        NameValidator.ValidationResult nameValidation =
+            NameValidator.validate(firstName, lastName, title, company, country);
+        if (!nameValidation.valid())
+            return Future.failedFuture(ServiceException.badRequest(nameValidation.reason()));
+
+        final String fState = state;
+
+        // If an approved/ghost manager already exists, skip — it's already visible.
+        // If it's already pending (from a prior anonymous capture), skip — don't duplicate.
+        return managerRepo.findByNameAndCompany(name, company)
+            .compose(rows -> {
+                if (rows.iterator().hasNext()) return Future.succeededFuture(); // already exists
+                return companyRepo.findOrCreate(company, null, resolvedLogoUrl)
+                    .compose(companyRow -> managerRepo.createPending(
+                        name, company, title, "active", country, fState, resolvedLogoUrl, companyRow.getLong("id")))
+                    .mapEmpty();
             });
     }
 

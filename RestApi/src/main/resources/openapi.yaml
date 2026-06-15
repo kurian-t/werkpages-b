@@ -589,6 +589,43 @@ paths:
                   created:
                     type: boolean
 
+  /api/managers/anonymous-capture:
+    post:
+      operationId: captureAnonymousSearch
+      summary: Silently create a pending_approval manager from an anonymous search — no auth required
+      tags:
+        - Managers
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - name
+                - company
+                - title
+                - country
+              properties:
+                name:
+                  type: string
+                company:
+                  type: string
+                title:
+                  type: string
+                country:
+                  type: string
+                state:
+                  type: string
+                city:
+                  type: string
+      responses:
+        '202':
+          description: Accepted — pending manager queued for admin review (nothing returned to caller)
+        '400':
+          description: Validation error
+
   /api/managers/drop-off:
     post:
       operationId: createDropOffDraft
