@@ -7,6 +7,7 @@ import io.vertx.sqlclient.SqlClient;
 import io.vertx.sqlclient.Tuple;
 
 import java.time.LocalDate;
+import java.time.LocalDateTime;
 import java.time.OffsetDateTime;
 import java.util.Optional;
 import java.util.Random;
@@ -304,9 +305,12 @@ public class ReviewRepository {
         // overall_rating mirrors how real reviews work: average of the 10 categories
         double overall = Math.round(
             java.util.Arrays.stream(cats).average().orElse(4.0) * 10.0) / 10.0;
-        int daysAgo          = rng.nextInt(180);
-        LocalDate createdAt  = LocalDate.now().minusDays(daysAgo);
-        LocalDate workedFrom = createdAt.minusMonths(12 + rng.nextInt(24));
+        // At least 1 day ago (never today), random time-of-day so it doesn't always land at midnight
+        int daysAgo              = rng.nextInt(179) + 1;
+        LocalDateTime createdAt  = LocalDate.now()
+            .minusDays(daysAgo)
+            .atTime(rng.nextInt(24), rng.nextInt(60), rng.nextInt(60));
+        LocalDate workedFrom = createdAt.toLocalDate().minusMonths(12 + rng.nextInt(24));
 
         return db.preparedQuery("""
                 INSERT INTO reviews (
@@ -322,7 +326,7 @@ public class ReviewRepository {
                         $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
                         $13, $14, $15,
                         true, 0, true,
-                        $16::DATE + TIME '00:00:00', now())
+                        $16, now())
                 RETURNING *
                 """)
             .execute(Tuple.of(

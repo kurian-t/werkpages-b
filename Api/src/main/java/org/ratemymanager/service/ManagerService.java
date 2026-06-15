@@ -26,6 +26,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Random;
 import java.util.UUID;
 import java.util.function.Function;
 
@@ -514,9 +515,18 @@ public class ManagerService {
                 if (userRow.getBoolean("is_banned")) return Future.failedFuture(ServiceException.forbidden("account_suspended"));
                 UUID userId = userRow.getUUID("id");
                 String dbUsername = userRow.getString("username");
-                String author = ("real_name".equals(fReviewAuthorType) || "anonymous".equals(fReviewAuthorType))
-                    && !fReviewClientAuthor.isEmpty() && fReviewClientAuthor.length() <= 100
-                    ? fReviewClientAuthor : dbUsername;
+                String author;
+                if ("anonymous".equals(fReviewAuthorType)) {
+                    // Use the client-provided pseudonym (from generateUsername() on the frontend).
+                    // Never fall back to dbUsername — generate a fresh pseudonym server-side instead.
+                    author = (!fReviewClientAuthor.isEmpty() && fReviewClientAuthor.length() <= 100)
+                        ? fReviewClientAuthor : generatePseudonym();
+                } else if ("real_name".equals(fReviewAuthorType)
+                        && !fReviewClientAuthor.isEmpty() && fReviewClientAuthor.length() <= 100) {
+                    author = fReviewClientAuthor;
+                } else {
+                    author = dbUsername;
+                }
                 return managerRepo.countSubmittedTodayByUser(userId)
                     .compose(todayCount -> {
                         if (todayCount >= 6) return Future.failedFuture(ServiceException.tooManyRequests("daily_limit_reached"));
@@ -778,9 +788,12 @@ public class ManagerService {
 
                 String authorType = body.getString("authorType", "username");
                 String author;
-                if ("real_name".equals(authorType) || "anonymous".equals(authorType)) {
+                if ("anonymous".equals(authorType)) {
                     String clientAuthor = toProperNameCase(body.getString("author", ""));
-                    author = (clientAuthor.isEmpty() || clientAuthor.length() > 100) ? dbUsername : clientAuthor;
+                    author = (!clientAuthor.isEmpty() && clientAuthor.length() <= 100) ? clientAuthor : generatePseudonym();
+                } else if ("real_name".equals(authorType)) {
+                    String clientAuthor = toProperNameCase(body.getString("author", ""));
+                    author = (!clientAuthor.isEmpty() && clientAuthor.length() <= 100) ? clientAuthor : dbUsername;
                 } else {
                     author = dbUsername;
                 }
@@ -813,7 +826,7 @@ public class ManagerService {
         if (body == null) return Future.failedFuture(ServiceException.badRequest("Missing request body"));
 
         String author = body.getString("author");
-        if (isBlank(author)) author = "Anonymous";
+        if (isBlank(author)) author = generatePseudonym();
         final String fAuthor = author;
 
         UUID draftToken = null;
@@ -1161,9 +1174,14 @@ public class ManagerService {
                 if (callerRow.getBoolean("is_banned")) return Future.failedFuture(ServiceException.forbidden("account_suspended"));
                 UUID callerId = callerRow.getUUID("id");
                 String dbUsername = callerRow.getString("username");
-                String author = ("real_name".equals(authorType) || "anonymous".equals(authorType))
-                    && !clientAuthor.isEmpty() && clientAuthor.length() <= 100
-                    ? clientAuthor : dbUsername;
+                String author;
+                if ("anonymous".equals(authorType)) {
+                    author = (!clientAuthor.isEmpty() && clientAuthor.length() <= 100) ? clientAuthor : generatePseudonym();
+                } else if ("real_name".equals(authorType) && !clientAuthor.isEmpty() && clientAuthor.length() <= 100) {
+                    author = clientAuthor;
+                } else {
+                    author = dbUsername;
+                }
 
                 return reviewRepo.findByUserForValidation(callerId)
                     .compose(existingRows -> {
@@ -1832,7 +1850,7 @@ public class ManagerService {
         if (review == null) return Future.failedFuture(ServiceException.badRequest("Missing review data"));
 
         String author = review.getString("author");
-        if (isBlank(author)) author = "Anonymous";
+        if (isBlank(author)) author = generatePseudonym();
 
         String[] nameParts = name.trim().split("\\s+", 2);
         String firstName = nameParts[0];
@@ -1876,6 +1894,24 @@ public class ManagerService {
                         });
                 }
             });
+    }
+
+    private static final String[] PSEUDO_ADJ = {
+        "Brave", "Swift", "Bold", "Calm", "Keen", "Wise", "Fair", "Kind",
+        "Sharp", "Quiet", "Clear", "Warm", "Cool", "Bright", "Loyal"
+    };
+    private static final String[] PSEUDO_ANIMAL = {
+        "Falcon", "Tiger", "Eagle", "Wolf", "Bison", "Crane", "Lynx",
+        "Otter", "Raven", "Gecko", "Heron", "Panda", "Finch", "Moose"
+    };
+    private static final Random PSEUDO_RNG = new Random();
+
+    /** Mirrors the frontend generateUsername() format: AdjectiveAnimal + 10–99 */
+    static String generatePseudonym() {
+        String adj    = PSEUDO_ADJ[PSEUDO_RNG.nextInt(PSEUDO_ADJ.length)];
+        String animal = PSEUDO_ANIMAL[PSEUDO_RNG.nextInt(PSEUDO_ANIMAL.length)];
+        int    num    = 10 + PSEUDO_RNG.nextInt(90);
+        return adj + animal + num;
     }
 
     private static JsonObject rowToManagerJson(Row row) {
