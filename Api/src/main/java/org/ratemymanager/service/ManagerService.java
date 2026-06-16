@@ -1701,6 +1701,20 @@ public class ManagerService {
                                 .put("hasContributed", contributed));
                     }
 
+                    // Before creating anything, check for a Levenshtein-close name at the same
+                    // company (same guard used in createManager). A typo like "John Smyth" must
+                    // not spawn a new ghost/pending alongside the real "John Smith" at Starbucks.
+                    return managerRepo.findByCompanyExact(company.trim()).compose(candidates -> {
+                        Row fuzzyMatch = findFuzzyNameMatch(candidates, fullName.trim());
+                        if (fuzzyMatch != null && !"pending_approval".equals(fuzzyMatch.getString("approval_status"))) {
+                            JsonArray data = new JsonArray().add(rowToManagerJson(fuzzyMatch));
+                            return Future.succeededFuture(
+                                new JsonObject()
+                                    .put("data", data)
+                                    .put("created", false)
+                                    .put("hasContributed", contributed));
+                        }
+
                     if (contributed) {
                         // Has already rated: create pending for admin, return nothing.
                         return companyRepo.findOrCreate(company, null, resolvedLogoUrl)
@@ -1772,6 +1786,7 @@ public class ManagerService {
                                     .put("hasContributed", contributed);
                             });
                     });
+                    }); // findByCompanyExact fuzzy-guard
                 });
             });
     }
