@@ -37,11 +37,17 @@ public class SecretsConfig {
     // Cloudflare Turnstile (optional — null disables CAPTCHA verification)
     public final String turnstileSecretKey;
 
+    // PII encryption — base64-encoded 32-byte keys
+    // Optional in dev (null = no encryption); required in production
+    public final String encryptionKey; // AES-256 key for email / name encryption
+    public final String hmacKey;       // HMAC-SHA256 key for email blind index
+
     private SecretsConfig(
         String dbHost, int dbPort, String dbName, String dbUser, String dbPassword,
         String auth0Domain, String auth0CustomDomain,
         String auth0ClientId, String auth0ClientSecret, String auth0Audience,
-        String turnstileSecretKey
+        String turnstileSecretKey,
+        String encryptionKey, String hmacKey
     ) {
         this.dbHost              = dbHost;
         this.dbPort              = dbPort;
@@ -54,6 +60,8 @@ public class SecretsConfig {
         this.auth0ClientSecret   = auth0ClientSecret;
         this.auth0Audience       = auth0Audience;
         this.turnstileSecretKey  = turnstileSecretKey;
+        this.encryptionKey       = encryptionKey;
+        this.hmacKey             = hmacKey;
     }
 
     /**
@@ -87,6 +95,13 @@ public class SecretsConfig {
         String auth0Audience      = requireEnv("AUTH0_AUDIENCE");
         // Optional — dev can leave unset to skip CAPTCHA verification
         String turnstileSecretKey = getEnv("TURNSTILE_SECRET_KEY", null);
+        // Optional in dev — null means PII is stored unencrypted (not safe for production)
+        String encryptionKey = getEnv("ENCRYPTION_KEY", null);
+        String hmacKey       = getEnv("HMAC_KEY", null);
+
+        if (encryptionKey == null || hmacKey == null) {
+            System.out.println("⚠ ENCRYPTION_KEY / HMAC_KEY not set — PII will NOT be encrypted (dev only)");
+        }
 
         System.out.println("✓ Secrets loaded from environment variables");
 
@@ -94,7 +109,7 @@ public class SecretsConfig {
             dbHost, dbPort, dbName, dbUser, dbPassword,
             auth0Domain, auth0CustomDomain,
             auth0ClientId, auth0ClientSecret, auth0Audience,
-            turnstileSecretKey
+            turnstileSecretKey, encryptionKey, hmacKey
         );
     }
 
@@ -123,6 +138,8 @@ public class SecretsConfig {
             String auth0Audience      = auth0Secret.getString("audience");
             // Optional — absent key in the secret means CAPTCHA disabled
             String turnstileSecretKey = auth0Secret.getString("turnstile_secret_key");
+            String encryptionKey      = auth0Secret.getString("encryption_key");
+            String hmacKey            = auth0Secret.getString("hmac_key");
 
             System.out.println("✓ Secrets loaded from AWS Secrets Manager");
 
@@ -130,7 +147,7 @@ public class SecretsConfig {
                 dbHost, dbPort, dbName, dbUser, dbPassword,
                 auth0Domain, auth0CustomDomain,
                 auth0ClientId, auth0ClientSecret, auth0Audience,
-                turnstileSecretKey
+                turnstileSecretKey, encryptionKey, hmacKey
             );
         } catch (SecretsManagerException e) {
             throw new RuntimeException("Failed to load secrets from AWS Secrets Manager: " + e.getMessage(), e);

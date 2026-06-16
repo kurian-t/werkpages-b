@@ -275,8 +275,8 @@ public class AdminService {
                     result.add(new JsonObject()
                         .put("id", row.getUUID("id").toString())
                         .put("username", row.getString("username"))
-                        .put("firstName", row.getString("first_name"))
-                        .put("lastName", row.getString("last_name"))
+                        .put("firstName", userRepo.decryptField(row.getString("first_name")))
+                        .put("lastName",  userRepo.decryptField(row.getString("last_name")))
                         .put("isBanned", row.getUUID("ban_id") != null)
                     );
                 }

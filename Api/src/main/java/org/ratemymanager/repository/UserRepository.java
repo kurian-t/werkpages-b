@@ -5,6 +5,7 @@ import io.vertx.sqlclient.Row;
 import io.vertx.sqlclient.RowSet;
 import io.vertx.sqlclient.SqlClient;
 import io.vertx.sqlclient.Tuple;
+import org.ratemymanager.service.EncryptionService;
 
 import java.util.Optional;
 import java.util.UUID;
@@ -12,21 +13,54 @@ import java.util.UUID;
 /**
  * Data-access layer for the {@code users} and {@code banned_users} tables.
  * All methods return {@link Future} and perform no business logic.
+ *
+ * When an {@link EncryptionService} is supplied, email, first_name, and last_name
+ * are encrypted at rest. Callers that read those fields from a returned {@link Row}
+ * must call {@link #decryptField} before using the value.
  */
 public class UserRepository {
 
-    private final SqlClient db;
+    private final SqlClient       db;
+    private final EncryptionService enc; // nullable — null means no encryption (dev / tests)
 
+    /** No-encryption constructor — used by integration tests. */
     public UserRepository(SqlClient db) {
-        this.db = db;
+        this(db, null);
     }
+
+    public UserRepository(SqlClient db, EncryptionService enc) {
+        this.db  = db;
+        this.enc = enc;
+    }
+
+    // ── Encryption helpers ────────────────────────────────────────────────────
+
+    /** Encrypts {@code s} if encryption is enabled, otherwise returns {@code s} unchanged. */
+    private String e(String s) { return enc != null ? enc.encrypt(s) : s; }
+
+    /** Decrypts {@code s} if encryption is enabled, otherwise returns {@code s} unchanged. */
+    private String d(String s) { return enc != null ? enc.decrypt(s) : s; }
+
+    /** HMAC for blind-index lookup; returns {@code s} as-is when encryption is disabled. */
+    private String h(String s) { return enc != null ? enc.hmac(s) : s; }
+
+    /**
+     * Decrypts a field value read from a returned {@link Row}.
+     * Call this on any email / first_name / last_name value obtained via
+     * {@code row.getString(...)}, e.g. {@code userRepo.decryptField(row.getString("email"))}.
+     */
+    public String decryptField(String value) { return d(value); }
 
     // ── Queries ───────────────────────────────────────────────────────────────
 
     /** Full profile including ban status, used after JWT authentication. */
     public Future<Optional<Row>> findByAuth0IdWithBan(String auth0Id) {
         return db.preparedQuery("""
-                SELECT u.id, u.auth0_id, u.email, u.username, u.first_name, u.last_name,
+                SELECT u.id, u.auth0_id,
+                       COALESCE(u.email_encrypted, u.email)           AS email,
+                       u.username,
+                       COALESCE(u.first_name_encrypted, u.first_name) AS first_name,
+                       COALESCE(u.last_name_encrypted,  u.last_name)  AS last_name,
                        u.role, u.created_at, (b.id IS NOT NULL) AS is_banned
                 FROM users u
                 LEFT JOIN banned_users b ON b.user_id = u.id
@@ -50,8 +84,11 @@ public class UserRepository {
     /** Includes ban check — used for sign-in response. */
     public Future<Optional<Row>> findByAuth0IdForSignin(String auth0Id) {
         return db.preparedQuery("""
-                SELECT u.email, u.username, u.first_name, u.last_name, u.role,
-                       (b.id IS NOT NULL) AS is_banned
+                SELECT COALESCE(u.email_encrypted, u.email)           AS email,
+                       u.username,
+                       COALESCE(u.first_name_encrypted, u.first_name) AS first_name,
+                       COALESCE(u.last_name_encrypted,  u.last_name)  AS last_name,
+                       u.role, (b.id IS NOT NULL) AS is_banned
                 FROM users u
                 LEFT JOIN banned_users b ON b.user_id = u.id
                 WHERE u.auth0_id = $1
@@ -79,10 +116,11 @@ public class UserRepository {
     public Future<RowSet<Row>> create(String auth0Id, String email, String username,
                                       String firstName, String lastName) {
         return db.preparedQuery("""
-                INSERT INTO users (auth0_id, email, username, first_name, last_name)
-                VALUES ($1, $2, $3, $4, $5)
+                INSERT INTO users (auth0_id, email_encrypted, email_hash, username,
+                                   first_name_encrypted, last_name_encrypted)
+                VALUES ($1, $2, $3, $4, $5, $6)
                 """)
-            .execute(Tuple.of(auth0Id, email, username, firstName, lastName));
+            .execute(Tuple.of(auth0Id, e(email), h(email), username, e(firstName), e(lastName)));
     }
 
     /**
@@ -108,7 +146,10 @@ public class UserRepository {
 
     public Future<Optional<Row>> findByIdForAdmin(UUID userId) {
         return db.preparedQuery("""
-                SELECT u.id, u.username, u.first_name, u.last_name, u.role,
+                SELECT u.id, u.username,
+                       COALESCE(u.first_name_encrypted, u.first_name) AS first_name,
+                       COALESCE(u.last_name_encrypted,  u.last_name)  AS last_name,
+                       u.role,
                        (SELECT b.id FROM banned_users b WHERE b.user_id = u.id LIMIT 1) AS ban_id
                 FROM users u WHERE u.id = $1
                 """)
@@ -118,12 +159,18 @@ public class UserRepository {
                 : Optional.empty());
     }
 
-    /** Returns the email for a given username, or empty if no such user exists. */
+    /**
+     * Returns the (decrypted) email for a given username, used during sign-in
+     * to resolve a username to the email expected by Auth0.
+     */
     public Future<Optional<String>> findEmailByUsername(String username) {
-        return db.preparedQuery("SELECT email FROM users WHERE lower(username) = lower($1)")
+        return db.preparedQuery("""
+                SELECT COALESCE(email_encrypted, email) AS email
+                FROM users WHERE lower(username) = lower($1)
+                """)
             .execute(Tuple.of(username))
             .map(rows -> rows.iterator().hasNext()
-                ? Optional.of(rows.iterator().next().getString("email"))
+                ? Optional.of(d(rows.iterator().next().getString("email")))
                 : Optional.empty());
     }
 
@@ -137,7 +184,10 @@ public class UserRepository {
 
     public Future<RowSet<Row>> listNonAdminUsers(int limit, int offset) {
         return db.preparedQuery("""
-                SELECT u.id, u.username, u.first_name, u.last_name, u.role,
+                SELECT u.id, u.username,
+                       COALESCE(u.first_name_encrypted, u.first_name) AS first_name,
+                       COALESCE(u.last_name_encrypted,  u.last_name)  AS last_name,
+                       u.role,
                        (SELECT b.id FROM banned_users b WHERE b.user_id = u.id LIMIT 1) AS ban_id
                 FROM users u
                 WHERE u.role != 'admin'

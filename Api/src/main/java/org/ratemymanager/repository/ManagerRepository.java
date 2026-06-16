@@ -221,11 +221,10 @@ public class ManagerRepository {
         return db.preparedQuery("""
                 SELECT id, name, company, title, overall_rating, company_logo_url, approval_status
                 FROM managers
-                WHERE approval_status IN ('approved', 'ghost', 'pending_approval')
+                WHERE approval_status IN ('approved', 'ghost')
                   AND name ILIKE $1
                 ORDER BY
                   CASE WHEN company ILIKE $2 THEN 0 ELSE 1 END,
-                  approval_status = 'approved' DESC,
                   name
                 LIMIT 5
                 """)

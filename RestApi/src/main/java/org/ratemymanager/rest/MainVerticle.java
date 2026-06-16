@@ -21,6 +21,7 @@ import org.ratemymanager.rest.handlers.RateLimitHandler;
 import org.ratemymanager.rest.handlers.ReportsHandler;
 import org.ratemymanager.service.AdminService;
 import org.ratemymanager.rest.handlers.CompanyLogoUtils;
+import org.ratemymanager.service.EncryptionService;
 import org.ratemymanager.service.ManagerService;
 import org.ratemymanager.service.NotificationService;
 import org.ratemymanager.service.ReportService;
@@ -73,8 +74,13 @@ public class MainVerticle extends AbstractVerticle {
 
                         Database.init(vertx, secrets, () -> {
 
+                        // ── Encryption ────────────────────────────────────────────────────────
+                        EncryptionService enc = (secrets.encryptionKey != null && secrets.hmacKey != null)
+                            ? EncryptionService.from(secrets.encryptionKey, secrets.hmacKey)
+                            : null;
+
                         // ── Repositories ──────────────────────────────────────────────────────
-                        UserRepository         userRepo    = new UserRepository(Database.getClient());
+                        UserRepository         userRepo    = new UserRepository(Database.getClient(), enc);
                         ManagerRepository      managerRepo = new ManagerRepository(Database.getClient());
                         ReviewRepository       reviewRepo  = new ReviewRepository(Database.getClient());
                         NotificationRepository notifRepo   = new NotificationRepository(Database.getClient());
