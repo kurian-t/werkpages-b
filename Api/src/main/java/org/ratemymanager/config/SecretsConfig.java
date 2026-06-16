@@ -42,12 +42,19 @@ public class SecretsConfig {
     public final String encryptionKey; // AES-256 key for email / name encryption
     public final String hmacKey;       // HMAC-SHA256 key for email blind index
 
+    // Anthropic API key for AI-powered manager deduplication
+    public final String anthropicApiKey;
+
+    // Static secret for authenticating the hourly deduplication cron job
+    public final String cronSecret;
+
     private SecretsConfig(
         String dbHost, int dbPort, String dbName, String dbUser, String dbPassword,
         String auth0Domain, String auth0CustomDomain,
         String auth0ClientId, String auth0ClientSecret, String auth0Audience,
         String turnstileSecretKey,
-        String encryptionKey, String hmacKey
+        String encryptionKey, String hmacKey,
+        String anthropicApiKey, String cronSecret
     ) {
         this.dbHost              = dbHost;
         this.dbPort              = dbPort;
@@ -62,6 +69,8 @@ public class SecretsConfig {
         this.turnstileSecretKey  = turnstileSecretKey;
         this.encryptionKey       = encryptionKey;
         this.hmacKey             = hmacKey;
+        this.anthropicApiKey     = anthropicApiKey;
+        this.cronSecret          = cronSecret;
     }
 
     /**
@@ -98,6 +107,10 @@ public class SecretsConfig {
         // Optional in dev — null means PII is stored unencrypted (not safe for production)
         String encryptionKey = getEnv("ENCRYPTION_KEY", null);
         String hmacKey       = getEnv("HMAC_KEY", null);
+        // Optional in dev — null disables the AI deduplication job
+        String anthropicApiKey = getEnv("ANTHROPIC_API_KEY", null);
+        // Optional in dev — null disables cron secret authentication
+        String cronSecret = getEnv("CRON_SECRET", null);
 
         if (encryptionKey == null || hmacKey == null) {
             System.out.println("⚠ ENCRYPTION_KEY / HMAC_KEY not set — PII will NOT be encrypted (dev only)");
@@ -109,7 +122,7 @@ public class SecretsConfig {
             dbHost, dbPort, dbName, dbUser, dbPassword,
             auth0Domain, auth0CustomDomain,
             auth0ClientId, auth0ClientSecret, auth0Audience,
-            turnstileSecretKey, encryptionKey, hmacKey
+            turnstileSecretKey, encryptionKey, hmacKey, anthropicApiKey, cronSecret
         );
     }
 
@@ -140,6 +153,8 @@ public class SecretsConfig {
             String turnstileSecretKey = auth0Secret.getString("turnstile_secret_key");
             String encryptionKey      = auth0Secret.getString("encryption_key");
             String hmacKey            = auth0Secret.getString("hmac_key");
+            String anthropicApiKey    = auth0Secret.getString("anthropic_api_key");
+            String cronSecret         = auth0Secret.getString("cron_secret");
 
             System.out.println("✓ Secrets loaded from AWS Secrets Manager");
 
@@ -147,7 +162,7 @@ public class SecretsConfig {
                 dbHost, dbPort, dbName, dbUser, dbPassword,
                 auth0Domain, auth0CustomDomain,
                 auth0ClientId, auth0ClientSecret, auth0Audience,
-                turnstileSecretKey, encryptionKey, hmacKey
+                turnstileSecretKey, encryptionKey, hmacKey, anthropicApiKey, cronSecret
             );
         } catch (SecretsManagerException e) {
             throw new RuntimeException("Failed to load secrets from AWS Secrets Manager: " + e.getMessage(), e);

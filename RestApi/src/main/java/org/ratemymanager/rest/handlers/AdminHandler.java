@@ -3,6 +3,7 @@ package org.ratemymanager.rest.handlers;
 import io.vertx.core.json.JsonObject;
 import io.vertx.ext.web.RoutingContext;
 import org.ratemymanager.service.AdminService;
+import org.ratemymanager.service.DeduplicationJob;
 
 import java.util.UUID;
 
@@ -12,10 +13,16 @@ import java.util.UUID;
  */
 public class AdminHandler {
 
-    private final AdminService service;
+    private final AdminService     service;
+    private final DeduplicationJob deduplicationJob;
 
     public AdminHandler(AdminService service) {
-        this.service = service;
+        this(service, null);
+    }
+
+    public AdminHandler(AdminService service, DeduplicationJob deduplicationJob) {
+        this.service          = service;
+        this.deduplicationJob = deduplicationJob;
     }
 
     // ── GET /api/admin/pending-managers ──────────────────────────────────────
@@ -274,6 +281,54 @@ public class AdminHandler {
         }
         service.mergeManagers(auth0Id, keepId, mergeId)
             .onSuccess(json -> ctx.response().putHeader("Content-Type", "application/json").end(json.encode()))
+            .onFailure(err -> ManagersHandler.handleError(ctx, err));
+    }
+
+    // ── Deduplication job trigger ─────────────────────────────────────────────
+
+    public void handleTriggerDeduplication(RoutingContext ctx) {
+        String auth0Id = ctx.get("auth0Id");
+        if ("cron".equals(auth0Id)) {
+            fireDeduplicationJob(ctx);
+            return;
+        }
+        service.requireAdminPublic(auth0Id)
+            .onSuccess(adminId -> fireDeduplicationJob(ctx))
+            .onFailure(err -> ManagersHandler.handleError(ctx, err));
+    }
+
+    private void fireDeduplicationJob(RoutingContext ctx) {
+        if (deduplicationJob == null) {
+            ctx.response().setStatusCode(503).putHeader("Content-Type", "application/json")
+                .end(new JsonObject().put("error", "Deduplication job not configured — ANTHROPIC_API_KEY missing").encode());
+            return;
+        }
+        ctx.response().setStatusCode(202).putHeader("Content-Type", "application/json")
+            .end(new JsonObject().put("status", "started").encode());
+        deduplicationJob.run();
+    }
+
+    // ── Merge suggestions ─────────────────────────────────────────────────────
+
+    public void handleGetMergeSuggestions(RoutingContext ctx) {
+        String auth0Id = ctx.get("auth0Id");
+        int limit  = parseIntParam(ctx.queryParam("limit").stream().findFirst().orElse(null), 20, 1, 100);
+        int offset = parseIntParam(ctx.queryParam("offset").stream().findFirst().orElse(null), 0, 0, Integer.MAX_VALUE);
+        service.getMergeSuggestions(auth0Id, limit, offset)
+            .onSuccess(json -> ok(ctx, json))
+            .onFailure(err -> ManagersHandler.handleError(ctx, err));
+    }
+
+    public void handleDismissMergeSuggestion(RoutingContext ctx) {
+        String auth0Id = ctx.get("auth0Id");
+        long suggestionId;
+        try {
+            suggestionId = Long.parseLong(ctx.pathParam("id"));
+        } catch (NumberFormatException e) {
+            bad(ctx, "Invalid suggestion ID"); return;
+        }
+        service.dismissMergeSuggestion(auth0Id, suggestionId)
+            .onSuccess(json -> ok(ctx, json))
             .onFailure(err -> ManagersHandler.handleError(ctx, err));
     }
 

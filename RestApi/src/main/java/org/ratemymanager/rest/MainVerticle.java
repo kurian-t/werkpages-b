@@ -20,16 +20,21 @@ import org.ratemymanager.rest.handlers.NotificationsHandler;
 import org.ratemymanager.rest.handlers.RateLimitHandler;
 import org.ratemymanager.rest.handlers.ReportsHandler;
 import org.ratemymanager.service.AdminService;
+import org.ratemymanager.service.AnthropicClient;
 import org.ratemymanager.rest.handlers.CompanyLogoUtils;
+import org.ratemymanager.service.DeduplicationJob;
 import org.ratemymanager.service.EncryptionService;
 import org.ratemymanager.service.ManagerService;
 import org.ratemymanager.service.NotificationService;
 import org.ratemymanager.service.ReportService;
+import org.ratemymanager.repository.MergeSuggestionsRepository;
 
 import io.vertx.core.AbstractVerticle;
 import io.vertx.core.Vertx;
 import io.vertx.core.http.HttpMethod;
 import io.vertx.core.json.JsonObject;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
 import io.vertx.ext.auth.jwt.JWTAuth;
 import io.vertx.ext.auth.jwt.JWTAuthOptions;
 import io.vertx.ext.web.Router;
@@ -89,15 +94,27 @@ public class MainVerticle extends AbstractVerticle {
                         CompanyRepository      companyRepo = new CompanyRepository(Database.getClient());
 
                         // ── Services ──────────────────────────────────────────────────────────
+                        MergeSuggestionsRepository mergeSuggestionsRepo = new MergeSuggestionsRepository(Database.getClient());
                         ManagerService      managerService = new ManagerService(managerRepo, reviewRepo, userRepo, editRepo, reportRepo, companyRepo, Database.getClient(), CompanyLogoUtils::resolveLogoUrl);
-                        AdminService        adminService   = new AdminService(userRepo, managerRepo, reviewRepo, editRepo, notifRepo, companyRepo);
+                        AdminService        adminService   = new AdminService(userRepo, managerRepo, reviewRepo, editRepo, notifRepo, companyRepo, mergeSuggestionsRepo);
                         NotificationService notifService   = new NotificationService(userRepo, notifRepo);
                         ReportService       reportService  = new ReportService(userRepo, reportRepo);
+
+                        // ── AI deduplication job ───────────────────────────────────────────────
+                        DeduplicationJob deduplicationJob;
+                        if (secrets.anthropicApiKey != null && !secrets.anthropicApiKey.isBlank()) {
+                            AnthropicClient anthropicClient = new AnthropicClient(vertx, secrets.anthropicApiKey);
+                            deduplicationJob = new DeduplicationJob(mergeSuggestionsRepo, anthropicClient);
+                            System.out.println("✓ AI deduplication job ready (triggered via POST /api/admin/deduplication/run)");
+                        } else {
+                            deduplicationJob = null;
+                            System.out.println("⚠ ANTHROPIC_API_KEY not set — deduplication job disabled");
+                        }
 
                         // ── Handlers ──────────────────────────────────────────────────────────
                         ManagersHandler      managersHandler      = new ManagersHandler(managerService, vertx);
                         ReportsHandler       reportsHandler       = new ReportsHandler(reportService);
-                        AdminHandler         adminHandler         = new AdminHandler(adminService);
+                        AdminHandler         adminHandler         = new AdminHandler(adminService, deduplicationJob);
                         NotificationsHandler notificationsHandler = new NotificationsHandler(notifService);
 
                         routerFactory.addHandlerByOperationId("getManagers",           managersHandler::handleGetManagers);
@@ -144,6 +161,9 @@ public class MainVerticle extends AbstractVerticle {
                         routerFactory.addHandlerByOperationId("adminListCompanies",       adminHandler::handleListCompanies);
                         routerFactory.addHandlerByOperationId("adminRenameCompany",       adminHandler::handleRenameCompany);
                         routerFactory.addHandlerByOperationId("adminMergeCompanies",      adminHandler::handleMergeCompanies);
+                        routerFactory.addHandlerByOperationId("getMergeSuggestions",      adminHandler::handleGetMergeSuggestions);
+                        routerFactory.addHandlerByOperationId("dismissMergeSuggestion",   adminHandler::handleDismissMergeSuggestion);
+                        routerFactory.addHandlerByOperationId("triggerDeduplication",     adminHandler::handleTriggerDeduplication);
                         routerFactory.addHandlerByOperationId("getNotifications",             notificationsHandler::handleGetNotifications);
                         routerFactory.addHandlerByOperationId("getNotificationsUnreadCount",  notificationsHandler::handleGetUnreadCount);
                         routerFactory.addHandlerByOperationId("markAllNotificationsRead",     notificationsHandler::handleMarkAllAsRead);
@@ -168,6 +188,18 @@ public class MainVerticle extends AbstractVerticle {
                         routerFactory.addHandlerByOperationId("deleteMe",          authHandler::handleDeleteMe);
                         
                         routerFactory.addSecurityHandler("bearerAuth", routingContext -> {
+                            // Cron job authentication via X-Cron-Secret header (constant-time compare)
+                            String cronHeader = routingContext.request().getHeader("X-Cron-Secret");
+                            if (secrets.cronSecret != null && cronHeader != null) {
+                                byte[] expected = secrets.cronSecret.getBytes(StandardCharsets.UTF_8);
+                                byte[] received = cronHeader.getBytes(StandardCharsets.UTF_8);
+                                if (MessageDigest.isEqual(expected, received)) {
+                                    routingContext.put("auth0Id", "cron");
+                                    routingContext.next();
+                                    return;
+                                }
+                            }
+
                             // Accept token from Authorization header OR HttpOnly cookie
                             String token = null;
                             String authHeader = routingContext.request().getHeader("Authorization");

@@ -7,6 +7,7 @@ import io.vertx.sqlclient.Row;
 import org.ratemymanager.repository.CompanyRepository;
 import org.ratemymanager.repository.EditRepository;
 import org.ratemymanager.repository.ManagerRepository;
+import org.ratemymanager.repository.MergeSuggestionsRepository;
 import org.ratemymanager.repository.NotificationRepository;
 import org.ratemymanager.repository.ReviewRepository;
 import org.ratemymanager.repository.UserRepository;
@@ -24,28 +25,37 @@ import java.util.function.Consumer;
  */
 public class AdminService {
 
-    private final UserRepository         userRepo;
-    private final ManagerRepository      managerRepo;
-    private final ReviewRepository       reviewRepo;
-    private final EditRepository         editRepo;
-    private final NotificationRepository notifRepo;
-    private final CompanyRepository      companyRepo;
+    private final UserRepository              userRepo;
+    private final ManagerRepository           managerRepo;
+    private final ReviewRepository            reviewRepo;
+    private final EditRepository              editRepo;
+    private final NotificationRepository      notifRepo;
+    private final CompanyRepository           companyRepo;
+    private final MergeSuggestionsRepository  mergeSuggestionsRepo;
 
     public AdminService(UserRepository userRepo, ManagerRepository managerRepo,
                         ReviewRepository reviewRepo, EditRepository editRepo,
                         NotificationRepository notifRepo) {
-        this(userRepo, managerRepo, reviewRepo, editRepo, notifRepo, null);
+        this(userRepo, managerRepo, reviewRepo, editRepo, notifRepo, null, null);
     }
 
     public AdminService(UserRepository userRepo, ManagerRepository managerRepo,
                         ReviewRepository reviewRepo, EditRepository editRepo,
                         NotificationRepository notifRepo, CompanyRepository companyRepo) {
-        this.userRepo    = userRepo;
-        this.managerRepo = managerRepo;
-        this.reviewRepo  = reviewRepo;
-        this.editRepo    = editRepo;
-        this.notifRepo   = notifRepo;
-        this.companyRepo = companyRepo;
+        this(userRepo, managerRepo, reviewRepo, editRepo, notifRepo, companyRepo, null);
+    }
+
+    public AdminService(UserRepository userRepo, ManagerRepository managerRepo,
+                        ReviewRepository reviewRepo, EditRepository editRepo,
+                        NotificationRepository notifRepo, CompanyRepository companyRepo,
+                        MergeSuggestionsRepository mergeSuggestionsRepo) {
+        this.userRepo             = userRepo;
+        this.managerRepo          = managerRepo;
+        this.reviewRepo           = reviewRepo;
+        this.editRepo             = editRepo;
+        this.notifRepo            = notifRepo;
+        this.companyRepo          = companyRepo;
+        this.mergeSuggestionsRepo = mergeSuggestionsRepo;
     }
 
     // ── Guard: verify admin ───────────────────────────────────────────────────
@@ -54,6 +64,8 @@ public class AdminService {
      * Resolves the caller to an admin UUID or fails with 401/403.
      * All public methods call this first.
      */
+    public Future<UUID> requireAdminPublic(String auth0Id) { return requireAdmin(auth0Id); }
+
     private Future<UUID> requireAdmin(String auth0Id) {
         if (auth0Id == null) return Future.failedFuture(ServiceException.unauthorized("Unauthorized"));
         return userRepo.findByAuth0IdWithBan(auth0Id)
@@ -425,5 +437,49 @@ public class AdminService {
             .compose(adminId -> companyRepo.mergeCompanies(keepId, mergeId))
             .compose(v -> companyRepo.refreshCompanyStats())
             .map(v -> new JsonObject().put("success", true).put("keepId", keepId));
+    }
+
+    // ── Merge suggestions ─────────────────────────────────────────────────────
+
+    public Future<JsonObject> getMergeSuggestions(String auth0Id, int limit, int offset) {
+        return requireAdmin(auth0Id)
+            .compose(adminId -> Future.all(
+                mergeSuggestionsRepo.findPending(limit, offset),
+                mergeSuggestionsRepo.countPending()
+            ))
+            .map(cf -> {
+                var rows  = cf.<io.vertx.sqlclient.RowSet<io.vertx.sqlclient.Row>>resultAt(0);
+                int total = cf.<Integer>resultAt(1);
+                var data  = new JsonArray();
+                for (var row : rows) {
+                    data.add(new JsonObject()
+                        .put("id",         row.getLong("id"))
+                        .put("confidence", row.getString("confidence"))
+                        .put("reason",     row.getString("reason"))
+                        .put("status",     row.getString("status"))
+                        .put("managerA", new JsonObject()
+                            .put("id",      row.getLong("id_a"))
+                            .put("name",    row.getString("name_a"))
+                            .put("company", row.getString("company_a"))
+                            .put("title",   row.getString("title_a"))
+                            .put("country", row.getString("country_a"))
+                            .put("reviews", row.getInteger("reviews_a")))
+                        .put("managerB", new JsonObject()
+                            .put("id",      row.getLong("id_b"))
+                            .put("name",    row.getString("name_b"))
+                            .put("company", row.getString("company_b"))
+                            .put("title",   row.getString("title_b"))
+                            .put("country", row.getString("country_b"))
+                            .put("reviews", row.getInteger("reviews_b")))
+                    );
+                }
+                return new JsonObject().put("data", data).put("total", total);
+            });
+    }
+
+    public Future<JsonObject> dismissMergeSuggestion(String auth0Id, long suggestionId) {
+        return requireAdmin(auth0Id)
+            .compose(adminId -> mergeSuggestionsRepo.updateStatus(suggestionId, "dismissed"))
+            .map(v -> new JsonObject().put("success", true));
     }
 }
