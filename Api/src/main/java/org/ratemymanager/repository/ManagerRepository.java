@@ -247,7 +247,7 @@ public class ManagerRepository {
         return db.preparedQuery("""
                 SELECT m.id, m.name, m.company, m.title, m.image, m.created_at,
                        u.username AS submitted_by_username,
-                       m.search_created_by_user_id IS NOT NULL AS is_auto_created
+                       (m.search_created_by_user_id IS NOT NULL OR m.submitted_by IS NULL) AS is_auto_created
                 FROM managers m
                 LEFT JOIN users u ON u.id = m.submitted_by
                 WHERE m.approval_status = 'pending_approval'
