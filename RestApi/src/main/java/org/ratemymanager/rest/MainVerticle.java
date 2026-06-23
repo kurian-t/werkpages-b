@@ -40,7 +40,6 @@ import io.vertx.ext.auth.jwt.JWTAuthOptions;
 import io.vertx.ext.web.Router;
 import io.vertx.ext.web.api.contract.openapi3.OpenAPI3RouterFactory;
 import io.vertx.ext.web.client.WebClient;
-import io.vertx.ext.web.api.contract.RouterFactoryOptions;
 import io.vertx.ext.web.handler.BodyHandler;
 import io.vertx.ext.web.handler.CorsHandler;
 import io.vertx.ext.web.handler.StaticHandler;
@@ -238,11 +237,11 @@ public class MainVerticle extends AbstractVerticle {
                             });
                         });
 
-                        routerFactory.setOptions(new RouterFactoryOptions()
-                            .setBodyHandler(BodyHandler.create().setBodyLimit(65_536))); // 64 KB max
-
                         Router apiRouter = routerFactory.getRouter();
                         Router router    = Router.router(vertx);
+
+                        // 64 KB body size limit — applied before the API sub-router
+                        router.route().handler(BodyHandler.create().setBodyLimit(65_536L));
 
                         Set<String> allowedHeaders = new HashSet<>();
                         allowedHeaders.add("Authorization");
