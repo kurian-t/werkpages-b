@@ -314,21 +314,23 @@ public class AuthHandler {
         if (!looksLikeEmail) {
             userRepo.findEmailByUsername(identifier)
                 .onSuccess(opt -> {
-                    if (opt.isEmpty()) {
-                        ctx.response().setStatusCode(401).putHeader("Content-Type", "application/json")
-                            .end(new JsonObject().put("error", "authentication_failed").put("message", "Invalid credentials.").encode());
-                        return;
-                    }
-                    doSignin(ctx, opt.get(), password);
+                    // Always make the Auth0 call regardless — even with a dummy email when the
+                    // username is unknown — so timing is identical whether the username exists or not.
+                    String email = opt.orElse("no-such-user@timing-equalizer.invalid");
+                    doSignin(ctx, email, password, opt.isPresent());
                 })
                 .onFailure(err -> ctx.response().setStatusCode(500).end("{\"error\":\"Internal error\"}"));
             return;
         }
 
-        doSignin(ctx, identifier, password);
+        doSignin(ctx, identifier, password, true);
     }
 
     private void doSignin(RoutingContext ctx, String email, String password) {
+        doSignin(ctx, email, password, true);
+    }
+
+    private void doSignin(RoutingContext ctx, String email, String password, boolean knownUser) {
         JsonObject payload = new JsonObject()
             .put("grant_type", "password").put("username", email).put("password", password)
             .put("connection", "Username-Password-Authentication")
@@ -337,6 +339,13 @@ public class AuthHandler {
         this.webClient.post(443, auth0Domain, "/oauth/token")
             .ssl(true).timeout(10_000).putHeader("Content-Type", "application/json")
             .sendJsonObject(payload, ar -> {
+                // Username was unknown — the Auth0 call was made only for timing parity.
+                // Always return a generic 401; never process the response.
+                if (!knownUser) {
+                    ctx.response().setStatusCode(401).putHeader("Content-Type", "application/json")
+                        .end(new JsonObject().put("error", "authentication_failed").put("message", "Invalid credentials.").encode());
+                    return;
+                }
                 if (ar.failed()) {
                     System.err.println("Auth0 Connection Error: " + ar.cause().getMessage());
                     ctx.response().setStatusCode(500).end("{\"error\":\"Could not connect to Auth0\"}"); return;
@@ -361,7 +370,9 @@ public class AuthHandler {
                     userRepo.findByAuth0IdForSignin(auth0Id)
                         .onSuccess(opt -> {
                             if (opt.isEmpty()) {
-                                ctx.response().setStatusCode(401).end("{\"error\":\"User record not found in local database\"}"); return;
+                                ctx.response().setStatusCode(401).putHeader("Content-Type", "application/json")
+                                    .end(new JsonObject().put("error", "authentication_failed").put("message", "Invalid credentials.").encode());
+                                return;
                             }
                             io.vertx.sqlclient.Row row = opt.get();
                             boolean isProd = "true".equalsIgnoreCase(System.getenv("USE_AWS_SECRETS"));

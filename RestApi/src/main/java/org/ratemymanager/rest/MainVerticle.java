@@ -40,6 +40,8 @@ import io.vertx.ext.auth.jwt.JWTAuthOptions;
 import io.vertx.ext.web.Router;
 import io.vertx.ext.web.api.contract.openapi3.OpenAPI3RouterFactory;
 import io.vertx.ext.web.client.WebClient;
+import io.vertx.ext.web.api.contract.RouterFactoryOptions;
+import io.vertx.ext.web.handler.BodyHandler;
 import io.vertx.ext.web.handler.CorsHandler;
 import io.vertx.ext.web.handler.StaticHandler;
 
@@ -236,6 +238,9 @@ public class MainVerticle extends AbstractVerticle {
                             });
                         });
 
+                        routerFactory.setOptions(new RouterFactoryOptions()
+                            .setBodyHandler(BodyHandler.create().setBodyLimit(65_536))); // 64 KB max
+
                         Router apiRouter = routerFactory.getRouter();
                         Router router    = Router.router(vertx);
 
@@ -300,14 +305,17 @@ public class MainVerticle extends AbstractVerticle {
 
                         router.mountSubRouter("/", apiRouter);
 
-                        router.route("/swagger/*")
-                            .handler(StaticHandler.create().setCachingEnabled(false).setWebRoot("swagger"));
-                        router.route("/swagger/webjars/*")
-                            .handler(StaticHandler.create().setCachingEnabled(false).setWebRoot("META-INF/resources/webjars"));
-                        router.get("/")
-                            .handler(ctx -> ctx.response().putHeader("Location", "/swagger/index.html").setStatusCode(302).end());
-                        router.get("/openapi.yaml")
-                            .handler(ctx -> ctx.response().putHeader("Content-Type", "application/yaml").sendFile("openapi.yaml"));
+                        boolean isProdEnv = "true".equalsIgnoreCase(System.getenv("USE_AWS_SECRETS"));
+                        if (!isProdEnv) {
+                            router.route("/swagger/*")
+                                .handler(StaticHandler.create().setCachingEnabled(false).setWebRoot("swagger"));
+                            router.route("/swagger/webjars/*")
+                                .handler(StaticHandler.create().setCachingEnabled(false).setWebRoot("META-INF/resources/webjars"));
+                            router.get("/")
+                                .handler(ctx -> ctx.response().putHeader("Location", "/swagger/index.html").setStatusCode(302).end());
+                            router.get("/openapi.yaml")
+                                .handler(ctx -> ctx.response().putHeader("Content-Type", "application/yaml").sendFile("openapi.yaml"));
+                        }
                         router.get("/logo.png")
                             .handler(ctx -> ctx.response()
                                 .putHeader("Content-Type", "image/png")
