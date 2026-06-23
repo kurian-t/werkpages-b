@@ -58,7 +58,7 @@ public class ManagersHandler {
         Future<RowSet<Row>>  dataFuture  = service.getManagerRows(effectiveLimit, effectiveOffset, search, company, sortBy);
 
         Future.all(totalFuture, dataFuture).onComplete(ar -> {
-            if (ar.failed()) { ctx.fail(ar.cause()); return; }
+            if (ar.failed()) { handleError(ctx, ar.cause()); return; }
 
             JsonArray data = new JsonArray();
             for (Row row : dataFuture.result()) {

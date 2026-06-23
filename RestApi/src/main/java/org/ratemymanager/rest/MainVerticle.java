@@ -291,6 +291,13 @@ public class MainVerticle extends AbstractVerticle {
                             secCtx.next();
                         });
 
+                        router.errorHandler(500, ctx -> {
+                            if (!ctx.response().ended()) {
+                                ctx.response().setStatusCode(500).putHeader("Content-Type", "application/json")
+                                    .end("{\"error\":\"internal_error\",\"message\":\"An unexpected error occurred.\"}");
+                            }
+                        });
+
                         router.mountSubRouter("/", apiRouter);
 
                         router.route("/swagger/*")

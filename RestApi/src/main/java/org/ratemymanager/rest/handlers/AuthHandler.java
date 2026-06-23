@@ -215,7 +215,7 @@ public class AuthHandler {
         this.webClient.post(443, auth0Domain, "/dbconnections/signup")
             .ssl(true).timeout(10_000).putHeader("Content-Type", "application/json")
             .sendJsonObject(auth0Payload, ar -> {
-                if (ar.failed()) { ctx.fail(ar.cause()); return; }
+                if (ar.failed()) { internalError(ctx); return; }
                 HttpResponse<Buffer> response = ar.result();
                 if (response.statusCode() != 200) {
                     String rawBody = response.bodyAsString();
@@ -267,7 +267,7 @@ public class AuthHandler {
                                         .put("message", "An account with this email already exists. Please sign in instead.").encode());
                             }
                         } else {
-                            ctx.fail(err);
+                            internalError(ctx);
                         }
                     });
             });
@@ -286,7 +286,7 @@ public class AuthHandler {
         JsonObject payload = new JsonObject().put("secret", turnstileSecretKey).put("response", token);
         this.webClient.post(443, "challenges.cloudflare.com", "/turnstile/v0/siteverify")
             .ssl(true).timeout(10_000).sendJsonObject(payload, ar -> {
-                if (ar.failed()) { ctx.fail(ar.cause()); return; }
+                if (ar.failed()) { internalError(ctx); return; }
                 if (!ar.result().bodyAsJsonObject().getBoolean("success", false)) {
                     ctx.response().setStatusCode(400).putHeader("Content-Type", "application/json")
                         .end(new JsonObject().put("error", "captcha_failed")
@@ -443,7 +443,7 @@ public class AuthHandler {
         this.webClient.post(443, auth0Domain, "/oauth/token")
             .ssl(true).timeout(10_000).putHeader("Content-Type", "application/json")
             .sendJsonObject(tokenPayload, ar -> {
-                if (ar.failed()) { ctx.fail(ar.cause()); return; }
+                if (ar.failed()) { internalError(ctx); return; }
                 if (ar.result().statusCode() != 200) {
                     System.err.println("Auth0 code exchange error: " + ar.result().statusCode() + " - " + ar.result().bodyAsString());
                     ctx.response().setStatusCode(401).putHeader("Content-Type", "application/json")
@@ -474,7 +474,7 @@ public class AuthHandler {
                     .ssl(true).timeout(10_000)
                     .putHeader("Authorization", "Bearer " + accessToken)
                     .send(uiAr -> {
-                        if (uiAr.failed()) { ctx.fail(uiAr.cause()); return; }
+                        if (uiAr.failed()) { internalError(ctx); return; }
                         JsonObject info      = uiAr.result().bodyAsJsonObject();
                         String email         = info.getString("email");
                         String givenName     = info.getString("given_name", "");
@@ -533,7 +533,7 @@ public class AuthHandler {
                                         .end(new JsonObject().put("error", "email_already_registered")
                                             .put("message", "An account with this email already exists. Please sign in with your password instead.").encode());
                                 } else {
-                                    ctx.fail(err);
+                                    internalError(ctx);
                                 }
                             });
                     });
@@ -575,8 +575,13 @@ public class AuthHandler {
                     ctx.response().setStatusCode(404).putHeader("Content-Type", "application/json")
                         .end(new JsonObject().put("error", "User not found").encode());
                 } else {
-                    ctx.fail(err);
+                    internalError(ctx);
                 }
             });
+    }
+
+    private static void internalError(RoutingContext ctx) {
+        ctx.response().setStatusCode(500).putHeader("Content-Type", "application/json")
+            .end("{\"error\":\"internal_error\",\"message\":\"An unexpected error occurred. Please try again.\"}");
     }
 }

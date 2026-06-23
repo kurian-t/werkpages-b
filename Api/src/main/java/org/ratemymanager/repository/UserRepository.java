@@ -136,6 +136,10 @@ public class UserRepository {
                 """)
             .execute(Tuple.of(userId))
             .compose(ignored ->
+                db.preparedQuery("UPDATE managers SET search_created_by_user_id = NULL WHERE search_created_by_user_id = $1")
+                    .execute(Tuple.of(userId))
+            )
+            .compose(ignored ->
                 db.preparedQuery("DELETE FROM users WHERE id = $1")
                     .execute(Tuple.of(userId))
             )

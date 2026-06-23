@@ -158,6 +158,17 @@ public class CompanyLogoUtils {
         put("linamar", "linamar.com");
         put("arctic wolf", "arcticwolf.com");
         put("intero integrity", "intero-integrity.com");
+
+        // Healthcare
+        put("sickkids", "sickkids.ca"); put("sickkids_thehospital", "sickkids.ca");
+        put("the hospital for sick children", "sickkids.ca");
+        put("ohip", "ontario.ca"); put("ontario health", "ontariohealth.ca");
+        put("sunnybrook", "sunnybrook.ca"); put("sunnybrook health sciences", "sunnybrook.ca");
+        put("uhn", "uhn.ca"); put("university health network", "uhn.ca");
+        put("toronto general hospital", "uhn.ca"); put("toronto western hospital", "uhn.ca");
+        put("mount sinai hospital", "sinaihealth.ca"); put("sinai health", "sinaihealth.ca");
+        put("michael garron hospital", "tehn.ca");
+        put("trillium health partners", "trilliumhealthpartners.ca");
     }
 
     private static void put(String key, String domain) {
