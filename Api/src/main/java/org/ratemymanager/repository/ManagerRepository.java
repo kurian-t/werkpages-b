@@ -27,10 +27,12 @@ public class ManagerRepository {
                 m.id, m.name, m.company, m.title, m.image, m.overall_rating,
                 m.reviews_count, m.bio, m.status, m.approval_status,
                 m.category_averages, m.linkedin_url, m.company_logo_url, m.country,
-                m.created_at, m.submitted_by,
+                m.created_at, m.submitted_by, m.slug,
+                c.slug AS company_slug,
                 COALESCE(ch.career_history, '[]') AS career_history,
                 COALESCE(r.reviews, '[]') AS reviews
             FROM managers m
+            LEFT JOIN companies c ON c.id = m.company_id
             LEFT JOIN (
                 SELECT manager_id,
                     json_agg(jsonb_build_object(
@@ -60,7 +62,7 @@ public class ManagerRepository {
                         'text', text, 'verified', verified, 'helpfulCount', helpful_count,
                         'createdAt', created_at, 'workedFrom', worked_from, 'workedUntil', worked_until
                     ) ORDER BY created_at DESC) AS reviews
-                FROM reviews GROUP BY manager_id
+                FROM reviews WHERE deleted_at IS NULL GROUP BY manager_id
             ) r ON r.manager_id = m.id
             WHERE m.id = $1
             LIMIT 1
@@ -71,7 +73,8 @@ public class ManagerRepository {
                 m.id, m.name, m.company, m.title, m.image, m.overall_rating,
                 m.reviews_count, m.bio, m.status, m.approval_status,
                 m.category_averages, m.linkedin_url, m.company_logo_url, m.country, m.created_at,
-                m.submitted_by, m.external_id, m.company_id,
+                m.submitted_by, m.external_id, m.company_id, m.slug,
+                c.slug AS company_slug,
                 COALESCE(
                     json_agg(json_build_object(
                         'company', ch.company, 'title', ch.title,
@@ -80,6 +83,7 @@ public class ManagerRepository {
                     FILTER (WHERE ch.id IS NOT NULL), '[]'
                 ) AS career_history
             FROM managers m
+            LEFT JOIN companies c ON c.id = m.company_id
             LEFT JOIN career_history ch ON ch.manager_id = m.id
             """;
 
@@ -114,30 +118,30 @@ public class ManagerRepository {
 
         if (userId != null) {
             if (hasSearch && hasCompany) {
-                sql   = SELECT_BODY + "WHERE (m.name ILIKE $3 OR m.company ILIKE $3 OR m.title ILIKE $3) AND m.company ILIKE $4 AND (m.approval_status IN ('approved','ghost') OR (m.approval_status = 'pending_approval' AND m.search_created_by_user_id = $5)) GROUP BY m.id " + orderBy + " LIMIT $1 OFFSET $2";
+                sql   = SELECT_BODY + "WHERE (m.name ILIKE $3 OR m.company ILIKE $3 OR m.title ILIKE $3) AND m.company ILIKE $4 AND (m.approval_status IN ('approved','ghost') OR (m.approval_status = 'pending_approval' AND m.search_created_by_user_id = $5)) GROUP BY m.id, c.slug " + orderBy + " LIMIT $1 OFFSET $2";
                 tuple = Tuple.of(limit, offset, searchPattern, companyPattern, userId);
             } else if (hasSearch) {
-                sql   = SELECT_BODY + "WHERE (m.name ILIKE $3 OR m.company ILIKE $3 OR m.title ILIKE $3) AND (m.approval_status IN ('approved','ghost') OR (m.approval_status = 'pending_approval' AND m.search_created_by_user_id = $4)) GROUP BY m.id " + orderBy + " LIMIT $1 OFFSET $2";
+                sql   = SELECT_BODY + "WHERE (m.name ILIKE $3 OR m.company ILIKE $3 OR m.title ILIKE $3) AND (m.approval_status IN ('approved','ghost') OR (m.approval_status = 'pending_approval' AND m.search_created_by_user_id = $4)) GROUP BY m.id, c.slug " + orderBy + " LIMIT $1 OFFSET $2";
                 tuple = Tuple.of(limit, offset, searchPattern, userId);
             } else if (hasCompany) {
-                sql   = SELECT_BODY + "WHERE m.company ILIKE $3 AND (m.approval_status IN ('approved','ghost') OR (m.approval_status = 'pending_approval' AND m.search_created_by_user_id = $4)) GROUP BY m.id " + orderBy + " LIMIT $1 OFFSET $2";
+                sql   = SELECT_BODY + "WHERE m.company ILIKE $3 AND (m.approval_status IN ('approved','ghost') OR (m.approval_status = 'pending_approval' AND m.search_created_by_user_id = $4)) GROUP BY m.id, c.slug " + orderBy + " LIMIT $1 OFFSET $2";
                 tuple = Tuple.of(limit, offset, companyPattern, userId);
             } else {
-                sql   = SELECT_BODY + "WHERE (m.approval_status IN ('approved','ghost') OR (m.approval_status = 'pending_approval' AND m.search_created_by_user_id = $3)) GROUP BY m.id " + orderBy + " LIMIT $1 OFFSET $2";
+                sql   = SELECT_BODY + "WHERE (m.approval_status IN ('approved','ghost') OR (m.approval_status = 'pending_approval' AND m.search_created_by_user_id = $3)) GROUP BY m.id, c.slug " + orderBy + " LIMIT $1 OFFSET $2";
                 tuple = Tuple.of(limit, offset, userId);
             }
         } else {
             if (hasSearch && hasCompany) {
-                sql   = SELECT_BODY + "WHERE (m.name ILIKE $3 OR m.company ILIKE $3 OR m.title ILIKE $3) AND m.company ILIKE $4 AND m.approval_status IN ('approved','ghost') GROUP BY m.id " + orderBy + " LIMIT $1 OFFSET $2";
+                sql   = SELECT_BODY + "WHERE (m.name ILIKE $3 OR m.company ILIKE $3 OR m.title ILIKE $3) AND m.company ILIKE $4 AND m.approval_status IN ('approved','ghost') GROUP BY m.id, c.slug " + orderBy + " LIMIT $1 OFFSET $2";
                 tuple = Tuple.of(limit, offset, searchPattern, companyPattern);
             } else if (hasSearch) {
-                sql   = SELECT_BODY + "WHERE (m.name ILIKE $3 OR m.company ILIKE $3 OR m.title ILIKE $3) AND m.approval_status IN ('approved','ghost') GROUP BY m.id " + orderBy + " LIMIT $1 OFFSET $2";
+                sql   = SELECT_BODY + "WHERE (m.name ILIKE $3 OR m.company ILIKE $3 OR m.title ILIKE $3) AND m.approval_status IN ('approved','ghost') GROUP BY m.id, c.slug " + orderBy + " LIMIT $1 OFFSET $2";
                 tuple = Tuple.of(limit, offset, searchPattern);
             } else if (hasCompany) {
-                sql   = SELECT_BODY + "WHERE m.company ILIKE $3 AND m.approval_status IN ('approved','ghost') GROUP BY m.id " + orderBy + " LIMIT $1 OFFSET $2";
+                sql   = SELECT_BODY + "WHERE m.company ILIKE $3 AND m.approval_status IN ('approved','ghost') GROUP BY m.id, c.slug " + orderBy + " LIMIT $1 OFFSET $2";
                 tuple = Tuple.of(limit, offset, companyPattern);
             } else {
-                sql   = SELECT_BODY + "WHERE m.approval_status IN ('approved','ghost') GROUP BY m.id " + orderBy + " LIMIT $1 OFFSET $2";
+                sql   = SELECT_BODY + "WHERE m.approval_status IN ('approved','ghost') GROUP BY m.id, c.slug " + orderBy + " LIMIT $1 OFFSET $2";
                 tuple = Tuple.of(limit, offset);
             }
         }
@@ -400,7 +404,7 @@ public class ManagerRepository {
                 ROUND(AVG(delegation_style)::NUMERIC, 1) AS delegation_style,
                 ROUND(AVG(perceived_professional_demeanor)::NUMERIC, 1) AS perceived_professional_demeanor,
                 ROUND(AVG(overall_working_experience)::NUMERIC, 1) AS overall_working_experience
-            FROM reviews WHERE manager_id = $1
+            FROM reviews WHERE manager_id = $1 AND deleted_at IS NULL
             """;
 
         return db.preparedQuery(recalcSql)
@@ -469,7 +473,7 @@ public class ManagerRepository {
                         'Perceived Professional Demeanor',   ROUND(AVG(perceived_professional_demeanor)::NUMERIC,1),
                         'Overall Working Experience',        ROUND(AVG(overall_working_experience)::NUMERIC,1)
                     )::text AS cats
-                FROM reviews WHERE manager_id = $1
+                FROM reviews WHERE manager_id = $1 AND deleted_at IS NULL
             ) sub
             WHERE managers.id = $1
             """;
@@ -557,7 +561,7 @@ public class ManagerRepository {
                 WHERE m.name ILIKE $1
                   AND m.company ILIKE $2
                   AND m.approval_status IN ('approved', 'ghost')
-                GROUP BY m.id
+                GROUP BY m.id, c.slug
                 ORDER BY m.reviews_count DESC, m.id ASC
                 LIMIT 5
                 """)
@@ -567,71 +571,77 @@ public class ManagerRepository {
     public Future<Row> createSearchPending(String name, String company, String title,
                                            String country, String state, String city,
                                            String logoUrl, Long companyId, UUID searchCreatedByUserId) {
-        return db.preparedQuery("""
-                INSERT INTO managers
-                (name, company, title, status, approval_status, country, state, city,
-                 overall_rating, reviews_count, category_averages,
-                 company_logo_url, company_id, search_created_by_user_id, submitted_by, created_at, updated_at)
-                VALUES ($1,$2,$3,'active','pending_approval',$4,$5,$6,
-                        0,0,'{}'::jsonb,
-                        $7,$8,$9,$9,now(),now())
-                RETURNING *
-                """)
-            .execute(Tuple.of(name, company.trim(), title.trim(),
-                              country != null ? country.trim() : null,
-                              state, city, logoUrl, companyId, searchCreatedByUserId))
-            .map(rows -> rows.iterator().next());
+        return generateUniqueSlug(name, company).compose(slug ->
+            db.preparedQuery("""
+                    INSERT INTO managers
+                    (name, company, title, status, approval_status, country, state, city,
+                     overall_rating, reviews_count, category_averages,
+                     company_logo_url, company_id, search_created_by_user_id, submitted_by,
+                     slug, created_at, updated_at)
+                    VALUES ($1,$2,$3,'active','pending_approval',$4,$5,$6,
+                            0,0,'{}'::jsonb,
+                            $7,$8,$9,$9,
+                            $10,now(),now())
+                    RETURNING *
+                    """)
+                .execute(Tuple.of(name, company.trim(), title.trim(),
+                                  country != null ? country.trim() : null,
+                                  state, city, logoUrl, companyId, searchCreatedByUserId, slug))
+                .map(rows -> rows.iterator().next()));
     }
 
     public Future<Row> createAutoApproved(String name, String company, String title,
                                           String country, String state, String city,
                                           UUID submittedBy, String logoUrl, Long companyId) {
-        return db.preparedQuery("""
-                INSERT INTO managers
-                (name, company, title, status, approval_status, country, state, city,
-                 overall_rating, reviews_count, category_averages, submitted_by,
-                 company_logo_url, company_id, created_at, updated_at)
-                VALUES ($1,$2,$3,'active','ghost',$4,$5,$6,
-                        0,0,'{}'::jsonb,$7,
-                        $8,$9,now(),now())
-                RETURNING *
-                """)
-            .execute(Tuple.of(name, company.trim(), title.trim(), country.trim(), state, city, submittedBy, logoUrl, companyId))
-            .map(rows -> rows.iterator().next());
+        return generateUniqueSlug(name, company).compose(slug ->
+            db.preparedQuery("""
+                    INSERT INTO managers
+                    (name, company, title, status, approval_status, country, state, city,
+                     overall_rating, reviews_count, category_averages, submitted_by,
+                     company_logo_url, company_id, slug, created_at, updated_at)
+                    VALUES ($1,$2,$3,'active','ghost',$4,$5,$6,
+                            0,0,'{}'::jsonb,$7,
+                            $8,$9,$10,now(),now())
+                    RETURNING *
+                    """)
+                .execute(Tuple.of(name, company.trim(), title.trim(), country.trim(), state, city, submittedBy, logoUrl, companyId, slug))
+                .map(rows -> rows.iterator().next()));
     }
 
     public Future<Row> createGhost(String name, String company, String title,
                                    String country, String state, String city, String logoUrl, Long companyId) {
-        return db.preparedQuery("""
-                INSERT INTO managers
-                (name, company, title, status, approval_status, country, state, city,
-                 overall_rating, reviews_count, category_averages,
-                 company_logo_url, company_id, created_at, updated_at)
-                VALUES ($1,$2,$3,'active','ghost',$4,$5,$6,
-                        0,0,'{}'::jsonb,
-                        $7,$8,now(),now())
-                RETURNING *
-                """)
-            .execute(Tuple.of(name, company.trim(), title.trim(), country.trim(), state, city, logoUrl, companyId))
-            .map(rows -> rows.iterator().next());
+        return generateUniqueSlug(name, company).compose(slug ->
+            db.preparedQuery("""
+                    INSERT INTO managers
+                    (name, company, title, status, approval_status, country, state, city,
+                     overall_rating, reviews_count, category_averages,
+                     company_logo_url, company_id, slug, created_at, updated_at)
+                    VALUES ($1,$2,$3,'active','ghost',$4,$5,$6,
+                            0,0,'{}'::jsonb,
+                            $7,$8,$9,now(),now())
+                    RETURNING *
+                    """)
+                .execute(Tuple.of(name, company.trim(), title.trim(), country.trim(), state, city, logoUrl, companyId, slug))
+                .map(rows -> rows.iterator().next()));
     }
 
     /** Creates a pending_approval manager record (no auth required) for drop-off draft capture. */
     public Future<Row> createPending(String name, String company, String title,
                                       String status, String country, String state,
                                       String logoUrl, Long companyId) {
-        return db.preparedQuery("""
-                INSERT INTO managers
-                (name, company, title, status, approval_status, country, state,
-                 overall_rating, reviews_count, category_averages,
-                 company_logo_url, company_id, created_at, updated_at)
-                VALUES ($1,$2,$3,$4,'pending_approval',$5,$6,
-                        0,0,'{}'::jsonb,
-                        $7,$8,now(),now())
-                RETURNING *
-                """)
-            .execute(Tuple.of(name, company.trim(), title.trim(), status, country.trim(), state, logoUrl, companyId))
-            .map(rows -> rows.iterator().next());
+        return generateUniqueSlug(name, company).compose(slug ->
+            db.preparedQuery("""
+                    INSERT INTO managers
+                    (name, company, title, status, approval_status, country, state,
+                     overall_rating, reviews_count, category_averages,
+                     company_logo_url, company_id, slug, created_at, updated_at)
+                    VALUES ($1,$2,$3,$4,'pending_approval',$5,$6,
+                            0,0,'{}'::jsonb,
+                            $7,$8,$9,now(),now())
+                    RETURNING *
+                    """)
+                .execute(Tuple.of(name, company.trim(), title.trim(), status, country.trim(), state, logoUrl, companyId, slug))
+                .map(rows -> rows.iterator().next()));
     }
 
     // ── Find-or-attach helpers ────────────────────────────────────────────────
@@ -714,6 +724,79 @@ public class ManagerRepository {
             .execute(Tuple.of(id))
             .map(rows -> rows.iterator().hasNext()
                 ? Optional.of(rows.iterator().next())
+                : Optional.empty());
+    }
+
+    // ── Slug helpers ──────────────────────────────────────────────────────────
+
+    /** Converts a name to a URL-safe base slug: lowercase, hyphens, ASCII only. */
+    private static String toBaseSlug(String name) {
+        return name.toLowerCase()
+            .replaceAll("[^a-z0-9\\s-]", "")
+            .trim()
+            .replaceAll("\\s+", "-")
+            .replaceAll("-{2,}", "-");
+    }
+
+    /**
+     * Generates a globally unique manager slug.
+     * Strategy: name → name-company → name-company-2 → name-company-3 …
+     * Numbers only appear when two managers share both name and company.
+     */
+    public Future<String> generateUniqueSlug(String name, String company) {
+        String raw = toBaseSlug(name.trim());
+        final String base = raw.isEmpty() ? "manager" : raw;
+        return slugAvailable(base).compose(free -> {
+            if (free) return Future.succeededFuture(base);
+            String companyPart = toBaseSlug(company == null ? "" : company.trim());
+            String withCompany = companyPart.isEmpty() ? base : base + "-" + companyPart;
+            return trySlug(withCompany, 2);
+        });
+    }
+
+    private Future<Boolean> slugAvailable(String candidate) {
+        return db.preparedQuery("SELECT 1 FROM managers WHERE slug = $1 LIMIT 1")
+            .execute(Tuple.of(candidate))
+            .map(rows -> !rows.iterator().hasNext());
+    }
+
+    private Future<String> trySlug(String base, int attempt) {
+        String candidate = attempt == 2 ? base : base + "-" + (attempt - 1);
+        return slugAvailable(candidate).compose(free ->
+            free ? Future.succeededFuture(candidate) : trySlug(base, attempt + 1));
+    }
+
+    /** Looks up a manager by their globally unique slug.
+     *  Joins to companies so the caller can read company_slug for redirect checks. */
+    public Future<Optional<Row>> findBySlug(String slug) {
+        return db.preparedQuery(GET_BY_ID_SQL.replace("WHERE m.id = $1", "WHERE m.slug = $1"))
+            .execute(Tuple.of(slug))
+            .map(rows -> rows.iterator().hasNext()
+                ? Optional.of(rows.iterator().next())
+                : Optional.empty());
+    }
+
+    /** Records an old (company_slug, manager_slug) pair for 301 redirect lookups after company changes. */
+    public Future<Void> recordUrlHistory(long managerId, String oldCompanySlug, String managerSlug) {
+        return db.preparedQuery("""
+                INSERT INTO manager_url_history (manager_id, company_slug, manager_slug)
+                VALUES ($1, $2, $3)
+                ON CONFLICT DO NOTHING
+                """)
+            .execute(Tuple.of(managerId, oldCompanySlug, managerSlug))
+            .mapEmpty();
+    }
+
+    /** Returns the manager_id for a stale (company_slug, manager_slug) URL, or empty if not found. */
+    public Future<Optional<Long>> findByOldUrl(String companySlug, String managerSlug) {
+        return db.preparedQuery("""
+                SELECT manager_id FROM manager_url_history
+                WHERE company_slug = $1 AND manager_slug = $2
+                ORDER BY created_at DESC LIMIT 1
+                """)
+            .execute(Tuple.of(companySlug, managerSlug))
+            .map(rows -> rows.iterator().hasNext()
+                ? Optional.of(rows.iterator().next().getLong("manager_id"))
                 : Optional.empty());
     }
 

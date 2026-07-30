@@ -1846,6 +1846,85 @@ paths:
         '404':
           description: Review not found
 
+  /api/managers/by-slug/{managerSlug}:
+    get:
+      operationId: getManagerBySlug
+      summary: Get a manager profile by slug (SEO URL lookup)
+      tags:
+        - Managers
+      security: []
+      parameters:
+        - in: path
+          name: managerSlug
+          required: true
+          schema:
+            type: string
+        - in: query
+          name: expectedCompanySlug
+          required: false
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Manager profile
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ManagerDetail'
+        '301':
+          description: Manager found but company slug changed — redirect to canonical URL
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  redirect:
+                    type: string
+        '404':
+          description: Manager not found
+
+  /api/companies/by-slug/{companySlug}:
+    get:
+      operationId: getCompanyBySlug
+      summary: Get company profile by slug (SEO URL lookup)
+      tags:
+        - Managers
+      security: []
+      parameters:
+        - in: path
+          name: companySlug
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Company profile
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  name:
+                    type: string
+                  slug:
+                    type: string
+                  logoUrl:
+                    type: string
+                  managerCount:
+                    type: integer
+                  totalReviews:
+                    type: integer
+                  avgRating:
+                    type: number
+                  categoryAverages:
+                    type: object
+                  managers:
+                    type: array
+                    items:
+                      type: object
+        '404':
+          description: Company not found
+
 components:
   schemas:
     ManagerSummary:

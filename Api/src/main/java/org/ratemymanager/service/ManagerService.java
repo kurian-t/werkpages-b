@@ -174,6 +174,23 @@ public class ManagerService {
             });
     }
 
+    /** Looks up a manager by slug. Same access rules as getManagerById. */
+    public Future<Row> getManagerBySlug(String slug, String auth0Id) {
+        return managerRepo.findBySlug(slug)
+            .compose(opt -> {
+                if (opt.isEmpty()) return Future.failedFuture(ServiceException.notFound("Manager not found"));
+                Row row = opt.get();
+                String approvalStatus = row.getString("approval_status");
+                if ("pending_approval".equals(approvalStatus)) {
+                    return enforceSubmitterAccess(row, auth0Id);
+                }
+                if ("rejected".equals(approvalStatus)) {
+                    return Future.failedFuture(ServiceException.notFound("Manager not found"));
+                }
+                return Future.succeededFuture(row);
+            });
+    }
+
     // ── GET companies ─────────────────────────────────────────────────────────
 
     public Future<JsonObject> getCompanies() {
@@ -309,6 +326,105 @@ public class ManagerService {
                         return result;
                     });
             });
+    }
+
+    /** Same as getCompanyProfile but looked up by URL slug. */
+    public Future<JsonObject> getCompanyBySlug(String slug) {
+        if (slug == null || slug.isBlank())
+            return Future.failedFuture(ServiceException.badRequest("companySlug is required"));
+        return companyRepo.findBySlug(slug.trim())
+            .compose(opt -> {
+                if (opt.isEmpty()) return Future.failedFuture(ServiceException.notFound("Company not found"));
+                Row companyRow = opt.get();
+                String canonicalName    = companyRow.getString("name");
+                String companySlug      = companyRow.getString("slug");
+                String resolvedLogoUrl  = logoResolver.apply(canonicalName);
+                String storedLogoUrl    = companyRow.getString("logo_url");
+                String logoUrl = (storedLogoUrl != null && storedLogoUrl.contains("logo.dev"))
+                    ? storedLogoUrl : resolvedLogoUrl;
+                long companyId = companyRow.getLong("id");
+                return companyRepo.findManagersByCompanyId(companyId)
+                    .map(rows -> buildCompanyProfileResponse(companyId, canonicalName, companySlug, logoUrl, rows));
+            });
+    }
+
+    private JsonObject buildCompanyProfileResponse(long companyId, String canonicalName,
+                                                   String companySlug, String logoUrl,
+                                                   io.vertx.sqlclient.RowSet<Row> rows) {
+        if (!rows.iterator().hasNext()) {
+            JsonObject empty = new JsonObject()
+                .put("id",               companyId)
+                .put("name",             canonicalName)
+                .put("slug",             companySlug)
+                .put("managerCount",     0)
+                .put("totalReviews",     0)
+                .put("avgRating",        (Object) null)
+                .put("categoryAverages", new JsonObject())
+                .put("managers",         new JsonArray());
+            if (logoUrl != null && !logoUrl.isBlank()) empty.put("logoUrl", logoUrl);
+            return empty;
+        }
+        String bestLogoUrl = logoUrl;
+        for (Row row : rows) {
+            String mgrLogo = row.getString("company_logo_url");
+            if (mgrLogo != null && mgrLogo.contains("logo.dev")) { bestLogoUrl = mgrLogo; break; }
+        }
+        final String finalLogoUrl = bestLogoUrl;
+        JsonArray managers  = new JsonArray();
+        long   totalReviews = 0;
+        double ratingSum    = 0.0;
+        int    ratingCount  = 0;
+        Map<String, Double>  catSum   = new LinkedHashMap<>();
+        Map<String, Integer> catCount = new LinkedHashMap<>();
+        for (Row row : rows) {
+            String mgrLogoUrl = (finalLogoUrl != null && !finalLogoUrl.isBlank())
+                ? finalLogoUrl : row.getString("company_logo_url");
+            Integer reviews = row.getInteger("reviews_count");
+            totalReviews += (reviews != null ? reviews : 0);
+            BigDecimal rating = row.getBigDecimal("overall_rating");
+            boolean hasRating = rating != null && (reviews != null && reviews > 0);
+            if (hasRating) { ratingSum += rating.doubleValue(); ratingCount++; }
+            Object catObj = row.getValue("category_averages");
+            if (catObj != null) {
+                JsonObject cats = catObj instanceof JsonObject
+                    ? (JsonObject) catObj : new JsonObject(catObj.toString());
+                for (String key : cats.fieldNames()) {
+                    Object val = cats.getValue(key);
+                    if (val instanceof Number) {
+                        double v = ((Number) val).doubleValue();
+                        catSum.merge(key, v, Double::sum);
+                        catCount.merge(key, 1, Integer::sum);
+                    }
+                }
+            }
+            JsonObject mgr = new JsonObject()
+                .put("id",            row.getLong("id"))
+                .put("name",          row.getString("name"))
+                .put("title",         row.getString("title"))
+                .put("image",         row.getString("image"))
+                .put("overallRating", hasRating ? rating : (Object) null)
+                .put("reviewsCount",  reviews != null ? reviews : 0)
+                .put("company",       row.getString("company"))
+                .put("slug",          row.getString("slug"));
+            if (mgrLogoUrl != null && !mgrLogoUrl.isBlank()) mgr.put("companyLogoUrl", mgrLogoUrl);
+            managers.add(mgr);
+        }
+        JsonObject categoryAverages = new JsonObject();
+        for (Map.Entry<String, Double> e : catSum.entrySet()) {
+            int cnt = catCount.get(e.getKey());
+            categoryAverages.put(e.getKey(), Math.round(e.getValue() / cnt * 10.0) / 10.0);
+        }
+        JsonObject result = new JsonObject()
+            .put("id",               companyId)
+            .put("name",             canonicalName)
+            .put("slug",             companySlug)
+            .put("managerCount",     managers.size())
+            .put("totalReviews",     totalReviews)
+            .put("avgRating",        ratingCount > 0 ? Math.round(ratingSum / ratingCount * 10.0) / 10.0 : null)
+            .put("categoryAverages", categoryAverages)
+            .put("managers",         managers);
+        if (finalLogoUrl != null && !finalLogoUrl.isBlank()) result.put("logoUrl", finalLogoUrl);
+        return result;
     }
 
     // ── GET company suggestions ───────────────────────────────────────────────
@@ -552,15 +668,17 @@ public class ManagerService {
                                 return companyRepo.findOrCreate(company, null, resolvedLogoUrl)
                                     .compose(companyRow -> {
                                 long companyId = companyRow.getLong("id");
-                                return ((Pool) db).withTransaction(conn ->
+                                return managerRepo.generateUniqueSlug(name, company)
+                                    .compose(slug ->
+                                ((Pool) db).withTransaction(conn ->
                                     conn.preparedQuery("""
                                         INSERT INTO managers
                                         (name, company, title, image, bio, status, approval_status, country, state, city, linkedin_url,
-                                         company_logo_url, company_id, overall_rating, reviews_count, category_averages, created_at, submitted_by)
-                                        VALUES ($1,$2,$3,$4,$5,$6,'pending_approval',$7,$8,$9,$10,$11,$12,0,0,'{}'::jsonb,now(),$13)
+                                         company_logo_url, company_id, slug, overall_rating, reviews_count, category_averages, created_at, submitted_by)
+                                        VALUES ($1,$2,$3,$4,$5,$6,'pending_approval',$7,$8,$9,$10,$11,$12,$13,0,0,'{}'::jsonb,now(),$14)
                                         RETURNING *
                                         """)
-                                        .execute(Tuple.of(name, fCompany, title, image, fBio, fStatus, fCountry, fState, fCity, fLinkedinUrl, resolvedLogoUrl, companyId, userId))
+                                        .execute(Tuple.of(name, fCompany, title, image, fBio, fStatus, fCountry, fState, fCity, fLinkedinUrl, resolvedLogoUrl, companyId, slug, userId))
                                         .compose(managerResult -> {
                                             Row managerRow = managerResult.iterator().next();
                                             long managerId = managerRow.getLong("id");
@@ -598,7 +716,8 @@ public class ManagerService {
                                 ).onSuccess(managerRow -> {
                                     managerRepo.recalculateInBackground(managerRow.getLong("id"));
                                     managerRepo.deleteFakeManagerInBackground();
-                                });
+                                })
+                                ); // compose(slug ->
                             }); // compose(companyRow -> {
                             });
                     });
@@ -998,7 +1117,7 @@ public class ManagerService {
                     return conn.preparedQuery("""
                             SELECT id, manager_company, manager_title, worked_from, worked_until
                             FROM reviews
-                            WHERE manager_id = $1 AND weight = FALSE
+                            WHERE manager_id = $1 AND weight = FALSE AND deleted_at IS NULL
                             ORDER BY
                                 CASE WHEN worked_until IS NULL THEN 0 ELSE 1 END,
                                 worked_from DESC
@@ -1746,7 +1865,7 @@ public class ManagerService {
                         if (!claimed) {
                             // Slot already taken — pending for admin, nothing shown.
                             return companyRepo.findOrCreate(company, null, resolvedLogoUrl)
-                                .compose(companyRow -> managerRepo.createSearchPending(fullName, company, title, country,
+                                .compose(companyRow -> createSearchPendingWithSeed(fullName, company, title, country,
                                     trimmedState, trimmedCity, resolvedLogoUrl, companyRow.getLong("id"), userId))
                                 .map(row -> new JsonObject()
                                     .put("data", new JsonArray())
@@ -1768,6 +1887,7 @@ public class ManagerService {
                                     })
                                     .recover(err -> {
                                         System.err.println("Seed review creation failed for auto-approved manager " + newId + ": " + err.getMessage());
+                                        err.printStackTrace(System.err);
                                         return Future.succeededFuture(row);
                                     });
                             })
@@ -1850,6 +1970,7 @@ public class ManagerService {
                             })
                             .recover(err -> {
                                 System.err.println("Seed review creation failed for ghost manager " + newId + ": " + err.getMessage());
+                                err.printStackTrace(System.err);
                                 return Future.succeededFuture(row);
                             });
                     })
@@ -1914,6 +2035,7 @@ public class ManagerService {
                             })
                             .recover(err -> {
                                 System.err.println("Seed review creation failed for anonymous-captured manager " + newId + ": " + err.getMessage());
+                                err.printStackTrace(System.err);
                                 return Future.<Void>succeededFuture();
                             });
                     });

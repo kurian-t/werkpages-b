@@ -27,6 +27,7 @@ import org.ratemymanager.service.EncryptionService;
 import org.ratemymanager.service.ManagerService;
 import org.ratemymanager.service.NotificationService;
 import org.ratemymanager.service.ReportService;
+import org.ratemymanager.service.SitemapService;
 import org.ratemymanager.repository.MergeSuggestionsRepository;
 
 import io.vertx.core.AbstractVerticle;
@@ -101,6 +102,16 @@ public class MainVerticle extends AbstractVerticle {
                         NotificationService notifService   = new NotificationService(userRepo, notifRepo);
                         ReportService       reportService  = new ReportService(userRepo, reportRepo);
 
+                        // ── Sitemap ───────────────────────────────────────────────────────────
+                        SitemapService sitemapService = new SitemapService(Database.getClient());
+
+                        // ── Soft-delete restore job (runs daily) ──────────────────────────────
+                        vertx.setPeriodic(86_400_000L, timerId ->
+                            reviewRepo.restoreExpiredDeletions()
+                                .onSuccess(n -> { if (n > 0) System.out.println("✓ Restored " + n + " anonymised review(s)"); })
+                                .onFailure(err -> System.err.println("⚠ Review restore job failed: " + err.getMessage()))
+                        );
+
                         // ── AI deduplication job ───────────────────────────────────────────────
                         DeduplicationJob deduplicationJob;
                         if (secrets.anthropicApiKey != null && !secrets.anthropicApiKey.isBlank()) {
@@ -135,6 +146,8 @@ public class MainVerticle extends AbstractVerticle {
                         routerFactory.addHandlerByOperationId("getStats",               managersHandler::handleGetStats);
                         routerFactory.addHandlerByOperationId("getCompanyListing",      managersHandler::handleGetCompanyListing);
                         routerFactory.addHandlerByOperationId("getCompanyProfile",      managersHandler::handleGetCompanyProfile);
+                        routerFactory.addHandlerByOperationId("getCompanyBySlug",       managersHandler::handleGetCompanyBySlug);
+                        routerFactory.addHandlerByOperationId("getManagerBySlug",       managersHandler::handleGetManagerBySlug);
                         routerFactory.addHandlerByOperationId("getCompanies",           managersHandler::handleGetCompanies);
                         routerFactory.addHandlerByOperationId("suggestCompanies",       managersHandler::handleSuggestCompanies);
                         routerFactory.addHandlerByOperationId("getGeo",                 managersHandler::handleGetGeo);
@@ -320,6 +333,18 @@ public class MainVerticle extends AbstractVerticle {
                                 .putHeader("Content-Type", "image/png")
                                 .putHeader("Cache-Control", "public, max-age=86400")
                                 .sendFile("logo.png"));
+
+                        router.get("/sitemap.xml").handler(ctx ->
+                            sitemapService.generate()
+                                .onSuccess(xml -> ctx.response()
+                                    .putHeader("Content-Type", "application/xml; charset=UTF-8")
+                                    .putHeader("Cache-Control", "public, max-age=3600")
+                                    .end(xml))
+                                .onFailure(err -> {
+                                    System.err.println("Sitemap generation failed: " + err.getMessage());
+                                    ctx.fail(500);
+                                })
+                        );
 
                         vertx.createHttpServer()
                             .requestHandler(router)

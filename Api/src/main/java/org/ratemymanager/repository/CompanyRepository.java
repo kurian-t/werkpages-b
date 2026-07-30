@@ -27,9 +27,13 @@ public class CompanyRepository {
      * row is touched only to update updated_at so the RETURNING clause is always valid.
      */
     public Future<Row> findOrCreate(String name, String domain, String logoUrl) {
+        // Slug is generated from name inline. Company names are unique (case-insensitive),
+        // so slug conflicts are extremely rare and caught by the unique index.
         return db.preparedQuery("""
-                INSERT INTO companies (name, domain, logo_url, status, created_at, updated_at)
-                VALUES ($1, $2, $3, 'ghost', now(), now())
+                INSERT INTO companies (name, domain, logo_url, status, slug, created_at, updated_at)
+                VALUES ($1, $2, $3, 'ghost',
+                    lower(regexp_replace(regexp_replace(lower(trim($1)), '[^a-z0-9\\s-]', '', 'g'), '\\s+', '-', 'g')),
+                    now(), now())
                 ON CONFLICT ((LOWER(TRIM(name)))) DO UPDATE
                     SET updated_at = now()
                 RETURNING *
@@ -44,7 +48,7 @@ public class CompanyRepository {
      */
     public Future<RowSet<Row>> findCompanyListing() {
         return db.query("""
-                SELECT c.id, c.name, cs.logo_url, cs.manager_count, cs.total_reviews, cs.avg_rating
+                SELECT c.id, c.name, c.slug, cs.logo_url, cs.manager_count, cs.total_reviews, cs.avg_rating
                 FROM company_stats cs
                 JOIN companies c ON c.id = cs.company_id
                 ORDER BY cs.total_reviews DESC, cs.manager_count DESC, c.name ASC
@@ -61,7 +65,7 @@ public class CompanyRepository {
     /** Looks up a company by name (case-insensitive). */
     public Future<Optional<Row>> findByName(String name) {
         return db.preparedQuery("""
-                SELECT id, name, logo_url, status
+                SELECT id, name, slug, logo_url, status
                 FROM companies
                 WHERE LOWER(TRIM(name)) = LOWER(TRIM($1))
                 LIMIT 1
@@ -72,12 +76,26 @@ public class CompanyRepository {
                 : Optional.empty());
     }
 
+    /** Looks up a company by its URL slug. */
+    public Future<Optional<Row>> findBySlug(String slug) {
+        return db.preparedQuery("""
+                SELECT id, name, slug, logo_url, status
+                FROM companies
+                WHERE slug = $1
+                LIMIT 1
+                """)
+            .execute(Tuple.of(slug))
+            .map(rows -> rows.iterator().hasNext()
+                ? Optional.of(rows.iterator().next())
+                : Optional.empty());
+    }
+
     /** All approved/ghost managers belonging to this company, ordered by review count. */
     public Future<RowSet<Row>> findManagersByCompanyId(long companyId) {
         return db.preparedQuery("""
                 WITH target AS (SELECT LOWER(TRIM(name)) AS lname FROM companies WHERE id = $1)
                 SELECT DISTINCT m.id, m.name, m.title, m.image, m.overall_rating, m.reviews_count,
-                       m.company_logo_url, m.category_averages, m.company
+                       m.company_logo_url, m.category_averages, m.company, m.slug
                 FROM managers m, target
                 WHERE m.approval_status IN ('approved', 'ghost')
                   AND (m.external_id IS NULL OR m.external_id NOT LIKE 'seed_%')

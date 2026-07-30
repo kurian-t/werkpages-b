@@ -136,7 +136,9 @@ public class ManagersHandler {
             .put("country", row.getString("country"))
             .put("companyLogoUrl", logoUrl)
             .put("createdAt", row.getOffsetDateTime("created_at").toString())
-            .put("careerHistory", row.getJsonArray("career_history"));
+            .put("careerHistory", row.getJsonArray("career_history"))
+            .put("slug", row.getString("slug"))
+            .put("companySlug", row.getString("company_slug"));
     }
 
     // ── GET /api/managers/similar ─────────────────────────────────────────────
@@ -163,6 +165,49 @@ public class ManagersHandler {
         String company = ctx.queryParam("company").stream().findFirst().orElse(null);
         service.getCompanyProfile(company)
             .onSuccess(json -> ctx.response().putHeader("Content-Type", "application/json").end(json.encode()))
+            .onFailure(err -> handleError(ctx, err));
+    }
+
+    // ── GET /api/companies/by-slug/{companySlug} ──────────────────────────────
+
+    public void handleGetCompanyBySlug(RoutingContext ctx) {
+        String slug = ctx.pathParam("companySlug");
+        service.getCompanyBySlug(slug)
+            .onSuccess(json -> ctx.response().putHeader("Content-Type", "application/json").end(json.encode()))
+            .onFailure(err -> handleError(ctx, err));
+    }
+
+    // ── GET /api/managers/by-slug/{managerSlug} ───────────────────────────────
+
+    public void handleGetManagerBySlug(RoutingContext ctx) {
+        String managerSlug        = ctx.pathParam("managerSlug");
+        String expectedCompanySlug = ctx.queryParam("expectedCompanySlug").stream().findFirst().orElse(null);
+        String auth0Id            = extractAuth0IdFromRequest(ctx);
+
+        service.getManagerBySlug(managerSlug, auth0Id)
+            .compose(row -> service.hasReported(row.getLong("id"), auth0Id)
+                .map(hasReported -> {
+                    // If the company slug in the URL doesn't match the manager's current company, 301
+                    if (expectedCompanySlug != null && !expectedCompanySlug.isBlank()) {
+                        String currentCompanySlug = row.getString("company_slug");
+                        if (currentCompanySlug != null && !currentCompanySlug.equals(expectedCompanySlug)) {
+                            String redirectUrl = "/companies/" + currentCompanySlug + "/managers/" + row.getString("slug");
+                            return new JsonObject().put("__redirect", redirectUrl);
+                        }
+                    }
+                    return buildManagerResponse(row, hasReported);
+                })
+            )
+            .onSuccess(json -> {
+                if (json.containsKey("__redirect")) {
+                    ctx.response()
+                        .putHeader("Location", json.getString("__redirect"))
+                        .setStatusCode(301)
+                        .end(new JsonObject().put("redirect", json.getString("__redirect")).encode());
+                } else {
+                    ctx.response().putHeader("Content-Type", "application/json").end(json.encode());
+                }
+            })
             .onFailure(err -> handleError(ctx, err));
     }
 
@@ -285,7 +330,8 @@ public class ManagersHandler {
                     .put("state", row.getString("state"))
                     .put("city", row.getString("city"))
                     .put("createdAt", row.getOffsetDateTime("created_at").toString())
-                    .put("careerHistory", new JsonArray());
+                    .put("careerHistory", new JsonArray())
+                    .put("slug", row.getString("slug"));
                 ctx.response().setStatusCode(201).putHeader("Content-Type", "application/json").end(response.encode());
             })
             .onFailure(err -> handleError(ctx, err));

@@ -37,12 +37,13 @@ public class ReviewRepository {
 
         // Exclude expired placeholder reviews; active placeholders (weight_expires_on IS NULL or future) are shown.
         // User-filtered queries naturally exclude placeholders (user_id IS NULL) via the user_id condition.
+        // Soft-deleted reviews (deleted_at IS NOT NULL) are always excluded.
         if (userIdFilter != null) {
-            String sql = String.format("SELECT * FROM reviews WHERE manager_id = $1 AND user_id = $4 ORDER BY %s LIMIT $2 OFFSET $3", orderBy);
+            String sql = String.format("SELECT * FROM reviews WHERE manager_id = $1 AND user_id = $4 AND deleted_at IS NULL ORDER BY %s LIMIT $2 OFFSET $3", orderBy);
             return db.preparedQuery(sql).execute(Tuple.of(managerId, limit, offset, userIdFilter));
         } else {
             String sql = String.format(
-                "SELECT * FROM reviews WHERE manager_id = $1 AND (weight = FALSE OR weight_expires_on IS NULL OR weight_expires_on > CURRENT_DATE) ORDER BY %s LIMIT $2 OFFSET $3", orderBy);
+                "SELECT * FROM reviews WHERE manager_id = $1 AND deleted_at IS NULL AND (weight = FALSE OR weight_expires_on IS NULL OR weight_expires_on > CURRENT_DATE) ORDER BY %s LIMIT $2 OFFSET $3", orderBy);
             return db.preparedQuery(sql).execute(Tuple.of(managerId, limit, offset));
         }
     }
@@ -70,7 +71,7 @@ public class ReviewRepository {
                   MIN(manager_role_start)                     AS manager_role_start,
                   MAX(manager_role_end)                       AS manager_role_end
                 FROM reviews
-                WHERE manager_id = $1
+                WHERE manager_id = $1 AND deleted_at IS NULL
                 GROUP BY LOWER(TRIM(manager_company)), LOWER(TRIM(manager_title))
                 ORDER BY MIN(worked_from) ASC NULLS LAST
                 LIMIT $2 OFFSET $3
@@ -82,7 +83,7 @@ public class ReviewRepository {
         return db.preparedQuery("""
                 SELECT COUNT(*) FROM (
                   SELECT 1 FROM reviews
-                  WHERE manager_id = $1
+                  WHERE manager_id = $1 AND deleted_at IS NULL
                   GROUP BY LOWER(TRIM(manager_company)), LOWER(TRIM(manager_title))
                 ) sub
                 """)
@@ -92,12 +93,12 @@ public class ReviewRepository {
 
     public Future<Long> countByManager(long managerId, UUID userIdFilter) {
         if (userIdFilter != null) {
-            return db.preparedQuery("SELECT COUNT(*) FROM reviews WHERE manager_id = $1 AND user_id = $2")
+            return db.preparedQuery("SELECT COUNT(*) FROM reviews WHERE manager_id = $1 AND user_id = $2 AND deleted_at IS NULL")
                 .execute(Tuple.of(managerId, userIdFilter))
                 .map(rows -> rows.iterator().next().getLong(0));
         }
         return db.preparedQuery(
-                "SELECT COUNT(*) FROM reviews WHERE manager_id = $1 AND (weight = FALSE OR weight_expires_on IS NULL OR weight_expires_on > CURRENT_DATE)")
+                "SELECT COUNT(*) FROM reviews WHERE manager_id = $1 AND deleted_at IS NULL AND (weight = FALSE OR weight_expires_on IS NULL OR weight_expires_on > CURRENT_DATE)")
             .execute(Tuple.of(managerId))
             .map(rows -> rows.iterator().next().getLong(0));
     }
@@ -116,14 +117,14 @@ public class ReviewRepository {
                     m.name AS manager_name, m.image AS manager_image, m.status AS manager_status
                 FROM reviews r
                 JOIN managers m ON m.id = r.manager_id
-                WHERE r.user_id = $1
+                WHERE r.user_id = $1 AND r.deleted_at IS NULL
                 ORDER BY r.created_at DESC LIMIT $2 OFFSET $3
                 """)
             .execute(Tuple.of(userId, limit, offset));
     }
 
     public Future<Long> countByUser(UUID userId) {
-        return db.preparedQuery("SELECT COUNT(*) FROM reviews WHERE user_id = $1")
+        return db.preparedQuery("SELECT COUNT(*) FROM reviews WHERE user_id = $1 AND deleted_at IS NULL")
             .execute(Tuple.of(userId))
             .map(rows -> rows.iterator().next().getLong(0));
     }
@@ -136,7 +137,7 @@ public class ReviewRepository {
         return db.preparedQuery(
                 "SELECT id, manager_id, manager_title, manager_company, worked_from, worked_until, " +
                 "manager_role_start, manager_role_end " +
-                "FROM reviews WHERE user_id = $1")
+                "FROM reviews WHERE user_id = $1 AND deleted_at IS NULL")
             .execute(Tuple.of(userId));
     }
 
@@ -144,12 +145,12 @@ public class ReviewRepository {
     public Future<RowSet<Row>> findRolePeriodsForManager(long managerId) {
         return db.preparedQuery(
                 "SELECT id, manager_title, manager_company, manager_role_start, manager_role_end " +
-                "FROM reviews WHERE manager_id = $1 AND manager_role_start IS NOT NULL")
+                "FROM reviews WHERE manager_id = $1 AND manager_role_start IS NOT NULL AND deleted_at IS NULL")
             .execute(Tuple.of(managerId));
     }
 
     public Future<Long> countSubmittedTodayByUser(UUID userId) {
-        return db.preparedQuery("SELECT COUNT(*) FROM reviews WHERE user_id = $1 AND created_at >= current_date")
+        return db.preparedQuery("SELECT COUNT(*) FROM reviews WHERE user_id = $1 AND created_at >= current_date AND deleted_at IS NULL")
             .execute(Tuple.of(userId))
             .map(rows -> rows.iterator().next().getLong(0));
     }
@@ -238,10 +239,22 @@ public class ReviewRepository {
                 : Optional.empty());
     }
 
+    /** Soft-deletes a review: hides it from public queries and strips user_id immediately.
+     *  After 3 days the review resurfaces as anonymous via {@link #restoreExpiredDeletions()}. */
     public Future<Void> delete(UUID reviewId, long managerId) {
-        return db.preparedQuery("DELETE FROM reviews WHERE id = $1 AND manager_id = $2")
+        return db.preparedQuery(
+                "UPDATE reviews SET deleted_at = now(), user_id = NULL WHERE id = $1 AND manager_id = $2")
             .execute(Tuple.of(reviewId, managerId))
             .mapEmpty();
+    }
+
+    /** Restores reviews whose 3-day soft-delete window has expired, making them anonymous. */
+    public Future<Integer> restoreExpiredDeletions() {
+        return db.preparedQuery(
+                "UPDATE reviews SET deleted_at = NULL " +
+                "WHERE deleted_at IS NOT NULL AND deleted_at < now() - INTERVAL '3 days'")
+            .execute()
+            .map(RowSet::rowCount);
     }
 
     /** Records that a user deleted a review for a manager (for the 30-day re-review cooldown). */
@@ -275,6 +288,7 @@ public class ReviewRepository {
         return db.preparedQuery("""
                 UPDATE reviews SET manager_id = $1
                 WHERE manager_id = $2
+                  AND deleted_at IS NULL
                   AND (user_id IS NULL
                        OR user_id NOT IN (
                            SELECT user_id FROM reviews
@@ -376,7 +390,7 @@ public class ReviewRepository {
         return db.preparedQuery("""
                 SELECT id, manager_company, manager_title, worked_from, worked_until
                 FROM reviews
-                WHERE manager_id = $1
+                WHERE manager_id = $1 AND deleted_at IS NULL
                 ORDER BY
                     CASE WHEN worked_until IS NULL THEN 0 ELSE 1 END,
                     worked_from DESC

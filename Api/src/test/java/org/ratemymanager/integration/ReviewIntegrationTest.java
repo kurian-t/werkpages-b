@@ -419,7 +419,7 @@ class ReviewIntegrationTest {
 
     private long countReviews(long managerId) throws Exception {
         return await(pool
-            .preparedQuery("SELECT COUNT(*) FROM reviews WHERE manager_id = $1")
+            .preparedQuery("SELECT COUNT(*) FROM reviews WHERE manager_id = $1 AND deleted_at IS NULL")
             .execute(Tuple.of(managerId))
             .map(rs -> rs.iterator().next().getLong(0)));
     }
@@ -501,7 +501,7 @@ class ReviewIntegrationTest {
         assertNotEquals(oldId, replacement.getUUID("id"), "New review must have a different UUID");
 
         long total = await(pool
-            .preparedQuery("SELECT COUNT(*) FROM reviews WHERE manager_id = $1")
+            .preparedQuery("SELECT COUNT(*) FROM reviews WHERE manager_id = $1 AND deleted_at IS NULL")
             .execute(Tuple.of(managerId))
             .map(rs -> rs.iterator().next().getLong(0)));
         assertEquals(1L, total, "Exactly one review should exist after replace");
