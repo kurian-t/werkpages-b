@@ -218,8 +218,10 @@ public class ManagerService {
                     String logoUrl = (storedLogoUrl != null && !storedLogoUrl.isBlank())
                         ? storedLogoUrl
                         : logoResolver.apply(name);
+                    String slug = row.getString("slug");
                     JsonObject co = new JsonObject()
                         .put("name",         name)
+                        .put("slug",         slug)
                         .put("managerCount", row.getLong("manager_count"))
                         .put("totalReviews", row.getLong("total_reviews"))
                         .put("avgRating",    row.getBigDecimal("avg_rating"));
