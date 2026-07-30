@@ -671,6 +671,7 @@ public class ManagersHandler {
                 .putHeader("Content-Type", "application/json")
                 .end(new JsonObject().put("message", se.getMessage()).encode());
         } else {
+            System.err.println("ERROR " + ctx.request().method() + " " + ctx.request().path() + ": " + err);
             ctx.response()
                 .setStatusCode(500)
                 .putHeader("Content-Type", "application/json")
