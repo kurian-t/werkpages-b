@@ -2028,19 +2028,7 @@ public class ManagerService {
                 return companyRepo.findOrCreate(company, null, resolvedLogoUrl)
                     .compose(companyRow -> managerRepo.createPending(
                         name, fCompany, fTitle, "active", country, fState, resolvedLogoUrl, companyRow.getLong("id")))
-                    .compose(row -> {
-                        long newId = row.getLong("id");
-                        return reviewRepo.createSeedReview(newId, fCompany, fTitle)
-                            .compose(ignored -> {
-                                managerRepo.recalculateInBackground(newId);
-                                return Future.<Void>succeededFuture();
-                            })
-                            .recover(err -> {
-                                System.err.println("Seed review creation failed for anonymous-captured manager " + newId + ": " + err.getMessage());
-                                err.printStackTrace(System.err);
-                                return Future.<Void>succeededFuture();
-                            });
-                    });
+                    .mapEmpty();
             });
     }
 
@@ -2128,24 +2116,12 @@ public class ManagerService {
     };
     private static final Random PSEUDO_RNG = new Random();
 
-    /** Creates a pending_approval manager and attaches a seed review — used for all auto-added pending paths. */
+    /** Creates a pending_approval manager — goes to the admin queue with no seed review. */
     private Future<Row> createSearchPendingWithSeed(
             String fullName, String company, String title, String country,
             String state, String city, String resolvedLogoUrl, Long companyId, UUID userId) {
         return managerRepo.createSearchPending(fullName, company, title, country,
-                state, city, resolvedLogoUrl, companyId, userId)
-            .compose(row -> {
-                long newId = row.getLong("id");
-                return reviewRepo.createSeedReview(newId, company, title)
-                    .compose(ignored -> {
-                        managerRepo.recalculateInBackground(newId);
-                        return Future.succeededFuture(row);
-                    })
-                    .recover(err -> {
-                        System.err.println("Seed review creation failed for pending manager " + newId + ": " + err.getMessage());
-                        return Future.succeededFuture(row);
-                    });
-            });
+                state, city, resolvedLogoUrl, companyId, userId);
     }
 
     /** Mirrors the frontend generateUsername() format: AdjectiveAnimal + 10–99 */
