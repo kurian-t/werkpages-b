@@ -353,7 +353,7 @@ public class ReviewRepository {
                         $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
                         $14, $15, $16,
                         true, 0, true,
-                        $17, now())
+                        $17, $17)
                 RETURNING *
                 """)
             .execute(Tuple.of(
