@@ -330,9 +330,10 @@ public class ReviewRepository {
             java.util.Arrays.stream(cats).average().orElse(4.0) * 10.0) / 10.0;
         // At least 1 day ago (never today), random time-of-day so it doesn't always land at midnight
         int daysAgo              = rng.nextInt(179) + 1;
-        LocalDateTime createdAt  = LocalDate.now()
+        OffsetDateTime createdAt = LocalDate.now()
             .minusDays(daysAgo)
-            .atTime(rng.nextInt(24), rng.nextInt(60), rng.nextInt(60));
+            .atTime(rng.nextInt(24), rng.nextInt(60), rng.nextInt(60))
+            .atOffset(java.time.ZoneOffset.UTC);
         LocalDate workedFrom = createdAt.toLocalDate().minusMonths(12 + rng.nextInt(24));
         String author = SEED_ADJ[rng.nextInt(SEED_ADJ.length)]
             + SEED_ANIMAL[rng.nextInt(SEED_ANIMAL.length)]
