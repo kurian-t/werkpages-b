@@ -779,6 +779,7 @@ public class ManagerService {
                                 : companyRepo.findOrCreate(company, null, logoUrl)
                                     .compose(cRow -> managerRepo.insertCareerEntry(existingId, company, title, startDt, endDt, cRow.getLong("id")));
                             return histFuture
+                                .compose(v -> reviewRepo.scheduleSeedExpiry(existingId))
                                 .compose(v -> validateAndInsertReview(reviewBody, existingId, userId, author, logoUrl, draftToken))
                                 .compose(ignored -> managerRepo.promoteGhostToPending(existingId))
                                 .map(promotedOpt -> {
@@ -1160,7 +1161,7 @@ public class ManagerService {
                 });
         }).onSuccess(row -> {
             reviewRepo.scheduleSeedExpiry(managerId)
-                .onFailure(err -> System.err.println("Seed expiry scheduling failed for manager " + managerId + ": " + err.getMessage()));
+                .onFailure(err -> System.err.println("Seed review deletion failed for manager " + managerId + ": " + err.getMessage()));
             managerRepo.recalculateInBackground(managerId);
             companyRepo.refreshCompanyStats()
                 .onFailure(err -> System.err.println("company_stats refresh failed: " + err.getMessage()));
@@ -1839,7 +1840,7 @@ public class ManagerService {
                     if (contributed) {
                         // Has already rated: create pending for admin, return nothing.
                         return companyRepo.findOrCreate(company, null, resolvedLogoUrl)
-                            .compose(companyRow -> createSearchPendingWithSeed(fullName, company, title, country,
+                            .compose(companyRow -> createSearchPending(fullName, company, title, country,
                                 trimmedState, trimmedCity, resolvedLogoUrl, companyRow.getLong("id"), userId))
                             .map(row -> new JsonObject()
                                 .put("data", new JsonArray())
@@ -1853,7 +1854,7 @@ public class ManagerService {
                     if (shortNames) {
                         // Short name can't take the ghost slot — pending for admin, nothing shown.
                         return companyRepo.findOrCreate(company, null, resolvedLogoUrl)
-                            .compose(companyRow -> createSearchPendingWithSeed(fullName, company, title, country,
+                            .compose(companyRow -> createSearchPending(fullName, company, title, country,
                                 trimmedState, trimmedCity, resolvedLogoUrl, companyRow.getLong("id"), userId))
                             .map(row -> new JsonObject()
                                 .put("data", new JsonArray())
@@ -1867,7 +1868,7 @@ public class ManagerService {
                         if (!claimed) {
                             // Slot already taken — pending for admin, nothing shown.
                             return companyRepo.findOrCreate(company, null, resolvedLogoUrl)
-                                .compose(companyRow -> createSearchPendingWithSeed(fullName, company, title, country,
+                                .compose(companyRow -> createSearchPending(fullName, company, title, country,
                                     trimmedState, trimmedCity, resolvedLogoUrl, companyRow.getLong("id"), userId))
                                 .map(row -> new JsonObject()
                                     .put("data", new JsonArray())
@@ -1963,19 +1964,6 @@ public class ManagerService {
                 }
                 return companyRepo.findOrCreate(company, null, resolvedLogoUrl)
                     .compose(companyRow -> managerRepo.createGhost(name, company, title, country, fState, fCity, resolvedLogoUrl, companyRow.getLong("id")))
-                    .compose(row -> {
-                        long newId = row.getLong("id");
-                        return reviewRepo.createSeedReview(newId, company, title)
-                            .compose(ignored -> {
-                                managerRepo.recalculateInBackground(newId);
-                                return Future.succeededFuture(row);
-                            })
-                            .recover(err -> {
-                                System.err.println("Seed review creation failed for ghost manager " + newId + ": " + err.getMessage());
-                                err.printStackTrace(System.err);
-                                return Future.succeededFuture(row);
-                            });
-                    })
                     .map(row -> {
                         companyRepo.refreshCompanyStats()
                             .onFailure(err -> System.err.println("company_stats refresh failed: " + err.getMessage()));
@@ -2087,7 +2075,8 @@ public class ManagerService {
                     String approvalStatus = existing.getString("approval_status");
 
                     if ("ghost".equals(approvalStatus)) {
-                        return managerRepo.promoteGhostToPending(existingId)
+                        return reviewRepo.scheduleSeedExpiry(existingId)
+                            .compose(ignored -> managerRepo.promoteGhostToPending(existingId))
                             .compose(ignored -> validateAndInsertReview(review, existingId, null, fAuthor, resolvedLogoUrl, fDropOffToken))
                             .map(ignored -> new JsonObject().put("id", existingId).put("created", false));
                     } else {
@@ -2117,7 +2106,7 @@ public class ManagerService {
     private static final Random PSEUDO_RNG = new Random();
 
     /** Creates a pending_approval manager — goes to the admin queue with no seed review. */
-    private Future<Row> createSearchPendingWithSeed(
+    private Future<Row> createSearchPending(
             String fullName, String company, String title, String country,
             String state, String city, String resolvedLogoUrl, Long companyId, UUID userId) {
         return managerRepo.createSearchPending(fullName, company, title, country,

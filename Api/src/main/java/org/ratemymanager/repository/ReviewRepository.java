@@ -365,12 +365,9 @@ public class ReviewRepository {
             .map(rows -> rows.iterator().next());
     }
 
-    /** Sets weight_expires_on = CURRENT_DATE + 14 on the active placeholder review for this manager.
-     *  Called when the first real review is submitted — fire-and-forget. */
     public Future<Void> scheduleSeedExpiry(long managerId) {
         return db.preparedQuery(
-                "UPDATE reviews SET weight_expires_on = CURRENT_DATE + 14 " +
-                "WHERE manager_id = $1 AND weight = TRUE AND weight_expires_on IS NULL")
+                "UPDATE reviews SET weight_expires_on = now() + INTERVAL '14 days' WHERE manager_id = $1 AND weight = TRUE")
             .execute(Tuple.of(managerId))
             .mapEmpty();
     }
