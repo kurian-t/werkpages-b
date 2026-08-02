@@ -372,6 +372,12 @@ public class ReviewRepository {
             .mapEmpty();
     }
 
+    public Future<Void> deleteSeedReview(long managerId) {
+        return db.preparedQuery("DELETE FROM reviews WHERE manager_id = $1 AND weight = TRUE")
+            .execute(Tuple.of(managerId))
+            .mapEmpty();
+    }
+
     public Future<Void> deleteByDraftToken(UUID draftToken) {
         return db.preparedQuery("DELETE FROM reviews WHERE draft_token = $1 AND user_id IS NULL")
             .execute(Tuple.of(draftToken))

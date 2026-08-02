@@ -779,7 +779,7 @@ public class ManagerService {
                                 : companyRepo.findOrCreate(company, null, logoUrl)
                                     .compose(cRow -> managerRepo.insertCareerEntry(existingId, company, title, startDt, endDt, cRow.getLong("id")));
                             return histFuture
-                                .compose(v -> reviewRepo.scheduleSeedExpiry(existingId))
+                                .compose(v -> reviewRepo.deleteSeedReview(existingId))
                                 .compose(v -> validateAndInsertReview(reviewBody, existingId, userId, author, logoUrl, draftToken))
                                 .compose(ignored -> managerRepo.promoteGhostToPending(existingId))
                                 .map(promotedOpt -> {
@@ -2075,7 +2075,7 @@ public class ManagerService {
                     String approvalStatus = existing.getString("approval_status");
 
                     if ("ghost".equals(approvalStatus)) {
-                        return reviewRepo.scheduleSeedExpiry(existingId)
+                        return reviewRepo.deleteSeedReview(existingId)
                             .compose(ignored -> managerRepo.promoteGhostToPending(existingId))
                             .compose(ignored -> validateAndInsertReview(review, existingId, null, fAuthor, resolvedLogoUrl, fDropOffToken))
                             .map(ignored -> new JsonObject().put("id", existingId).put("created", false));
