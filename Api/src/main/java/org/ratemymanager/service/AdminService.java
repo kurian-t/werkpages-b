@@ -79,6 +79,38 @@ public class AdminService {
 
     // ── Pending managers ──────────────────────────────────────────────────────
 
+    public Future<JsonObject> getGhostManagers(String auth0Id, int limit, int offset) {
+        return requireAdmin(auth0Id)
+            .compose(adminId -> managerRepo.findGhostForAdmin(limit, offset))
+            .map(rows -> {
+                JsonArray result = new JsonArray();
+                for (Row row : rows) {
+                    result.add(new JsonObject()
+                        .put("id",           row.getLong("id"))
+                        .put("name",         row.getString("name"))
+                        .put("company",      row.getString("company"))
+                        .put("title",        row.getString("title"))
+                        .put("logoUrl",      row.getString("company_logo_url"))
+                        .put("overallRating", row.getBigDecimal("overall_rating"))
+                        .put("reviewsCount", row.getInteger("reviews_count"))
+                        .put("createdAt",    row.getOffsetDateTime("created_at").toString())
+                    );
+                }
+                return new JsonObject().put("data", result).put("limit", limit).put("offset", offset);
+            });
+    }
+
+    public Future<JsonObject> markGhostReviewed(String auth0Id, long managerId) {
+        return requireAdmin(auth0Id)
+            .compose(adminId -> managerRepo.approveGhost(managerId))
+            .map(opt -> {
+                if (opt.isEmpty()) return new JsonObject().put("success", false).put("message", "Ghost manager not found");
+                if (companyRepo != null) companyRepo.refreshCompanyStats()
+                    .onFailure(err -> System.err.println("company_stats refresh failed: " + err.getMessage()));
+                return new JsonObject().put("success", true).put("message", "Manager marked as reviewed");
+            });
+    }
+
     public Future<JsonObject> getPendingManagers(String auth0Id, int limit, int offset) {
         return requireAdmin(auth0Id)
             .compose(adminId -> managerRepo.findPendingForAdmin(limit, offset))

@@ -166,6 +166,8 @@ public class MainVerticle extends AbstractVerticle {
                         routerFactory.addHandlerByOperationId("getAdminBannedUsers",      adminHandler::handleGetBannedUsers);
                         routerFactory.addHandlerByOperationId("banUser",                  adminHandler::handleBanUser);
                         routerFactory.addHandlerByOperationId("unbanUser",                adminHandler::handleUnbanUser);
+                        routerFactory.addHandlerByOperationId("getAdminGhostManagers",    adminHandler::handleGetGhostManagers);
+                        routerFactory.addHandlerByOperationId("markGhostManagerReviewed", adminHandler::handleMarkGhostReviewed);
                         routerFactory.addHandlerByOperationId("getAdminPendingManagers",  adminHandler::handleGetPendingManagers);
                         routerFactory.addHandlerByOperationId("approvePendingManager",    adminHandler::handleApprovePendingManager);
                         routerFactory.addHandlerByOperationId("rejectPendingManager",     adminHandler::handleRejectPendingManager);

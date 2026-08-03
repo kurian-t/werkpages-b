@@ -779,22 +779,19 @@ public class ManagerService {
                                 : companyRepo.findOrCreate(company, null, logoUrl)
                                     .compose(cRow -> managerRepo.insertCareerEntry(existingId, company, title, startDt, endDt, cRow.getLong("id")));
                             return histFuture
-                                .compose(v -> reviewRepo.deleteSeedReview(existingId))
                                 .compose(v -> validateAndInsertReview(reviewBody, existingId, userId, author, logoUrl, draftToken))
-                                .compose(ignored -> managerRepo.promoteGhostToPending(existingId))
-                                .map(promotedOpt -> {
-                                    if (promotedOpt.isPresent()) managerRepo.deleteFakeManagerInBackground();
-                                    return promotedOpt.orElse(updatedRow);
-                                });
+                                .compose(ignored -> reviewRepo.scheduleSeedExpiry(existingId))
+                                .map(ignored -> updatedRow);
                         });
                 });
         } else {
-            // approved or pending_approval — attach review without touching manager data
+            // approved or pending_approval — delete any legacy seed, then attach review
             return managerRepo.findByIdFlat(existingId)
                 .compose(opt -> {
                     if (opt.isEmpty()) return Future.failedFuture(ServiceException.notFound("Manager not found"));
                     Row existingRow = opt.get();
-                    return validateAndInsertReview(reviewBody, existingId, userId, author, logoUrl, draftToken)
+                    return reviewRepo.deleteSeedReview(existingId)
+                        .compose(v -> validateAndInsertReview(reviewBody, existingId, userId, author, logoUrl, draftToken))
                         .map(ignored -> existingRow);
                 });
         }
@@ -1160,8 +1157,6 @@ public class ManagerService {
                         });
                 });
         }).onSuccess(row -> {
-            reviewRepo.scheduleSeedExpiry(managerId)
-                .onFailure(err -> System.err.println("Seed review deletion failed for manager " + managerId + ": " + err.getMessage()));
             managerRepo.recalculateInBackground(managerId);
             companyRepo.refreshCompanyStats()
                 .onFailure(err -> System.err.println("company_stats refresh failed: " + err.getMessage()));
@@ -2075,9 +2070,8 @@ public class ManagerService {
                     String approvalStatus = existing.getString("approval_status");
 
                     if ("ghost".equals(approvalStatus)) {
-                        return reviewRepo.deleteSeedReview(existingId)
-                            .compose(ignored -> managerRepo.promoteGhostToPending(existingId))
-                            .compose(ignored -> validateAndInsertReview(review, existingId, null, fAuthor, resolvedLogoUrl, fDropOffToken))
+                        return validateAndInsertReview(review, existingId, null, fAuthor, resolvedLogoUrl, fDropOffToken)
+                            .compose(ignored -> reviewRepo.scheduleSeedExpiry(existingId))
                             .map(ignored -> new JsonObject().put("id", existingId).put("created", false));
                     } else {
                         return validateAndInsertReview(review, existingId, null, fAuthor, resolvedLogoUrl, fDropOffToken)

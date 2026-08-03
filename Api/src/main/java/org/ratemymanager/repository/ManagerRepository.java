@@ -247,6 +247,30 @@ public class ManagerRepository {
             .execute(Tuple.of(userId));
     }
 
+    public Future<RowSet<Row>> findGhostForAdmin(int limit, int offset) {
+        return db.preparedQuery("""
+                SELECT m.id, m.name, m.company, m.title, m.image, m.overall_rating,
+                       m.reviews_count, m.created_at, m.company_logo_url
+                FROM managers m
+                WHERE m.approval_status = 'ghost'
+                ORDER BY m.created_at DESC
+                LIMIT $1 OFFSET $2
+                """)
+            .execute(Tuple.of(limit, offset));
+    }
+
+    public Future<Optional<Row>> approveGhost(long managerId) {
+        return db.preparedQuery("""
+                UPDATE managers SET approval_status = 'approved', updated_at = now()
+                WHERE id = $1 AND approval_status = 'ghost'
+                RETURNING id, name, company
+                """)
+            .execute(Tuple.of(managerId))
+            .map(rows -> rows.iterator().hasNext()
+                ? Optional.of(rows.iterator().next())
+                : Optional.empty());
+    }
+
     public Future<RowSet<Row>> findPendingForAdmin(int limit, int offset) {
         return db.preparedQuery("""
                 SELECT m.id, m.name, m.company, m.title, m.image, m.created_at,

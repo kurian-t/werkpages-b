@@ -85,7 +85,6 @@ class ManagerServiceValidationTest {
         when(reviewRepo.findByUserForValidation(USER_ID))
             .thenReturn(Future.succeededFuture(emptyRs));
         doNothing().when(managerRepo).recalculateInBackground(anyLong());
-        when(reviewRepo.scheduleSeedExpiry(anyLong())).thenReturn(Future.succeededFuture());
         when(reviewRepo.deleteSeedReview(anyLong())).thenReturn(Future.succeededFuture());
     }
 

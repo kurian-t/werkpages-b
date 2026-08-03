@@ -25,6 +25,32 @@ public class AdminHandler {
         this.deduplicationJob = deduplicationJob;
     }
 
+    // ── GET /api/admin/ghost-managers ────────────────────────────────────────
+
+    public void handleGetGhostManagers(RoutingContext ctx) {
+        String auth0Id = ctx.get("auth0Id");
+        int limit  = parseIntParam(ctx.request().getParam("limit"),  50, 1, 200);
+        int offset = parseIntParam(ctx.request().getParam("offset"), 0,  0, Integer.MAX_VALUE);
+        service.getGhostManagers(auth0Id, limit, offset)
+            .onSuccess(json -> ok(ctx, json))
+            .onFailure(err -> ManagersHandler.handleError(ctx, err));
+    }
+
+    // ── POST /api/admin/ghost-managers/:managerId/mark-reviewed ──────────────
+
+    public void handleMarkGhostReviewed(RoutingContext ctx) {
+        String auth0Id = ctx.get("auth0Id");
+        long managerId;
+        try {
+            managerId = Long.parseLong(ctx.pathParam("managerId"));
+        } catch (Exception e) {
+            bad(ctx, "Invalid manager ID"); return;
+        }
+        service.markGhostReviewed(auth0Id, managerId)
+            .onSuccess(json -> ok(ctx, json))
+            .onFailure(err -> ManagersHandler.handleError(ctx, err));
+    }
+
     // ── GET /api/admin/pending-managers ──────────────────────────────────────
 
     public void handleGetPendingManagers(RoutingContext ctx) {

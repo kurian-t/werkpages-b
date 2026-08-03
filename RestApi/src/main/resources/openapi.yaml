@@ -1394,6 +1394,47 @@ paths:
         '404':
           description: Ban not found
 
+  /api/admin/ghost-managers:
+    get:
+      operationId: getAdminGhostManagers
+      summary: Get all live ghost managers for admin review
+      tags:
+        - Admin
+      responses:
+        '200':
+          description: List of ghost managers
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items:
+                      type: object
+        '403':
+          description: Forbidden
+
+  /api/admin/ghost-managers/{managerId}/mark-reviewed:
+    post:
+      operationId: markGhostManagerReviewed
+      summary: Mark a ghost manager as reviewed (promotes to approved)
+      tags:
+        - Admin
+      parameters:
+        - in: path
+          name: managerId
+          required: true
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: Manager marked as reviewed
+        '403':
+          description: Forbidden
+        '404':
+          description: Ghost manager not found
+
   /api/admin/pending-managers:
     get:
       operationId: getAdminPendingManagers

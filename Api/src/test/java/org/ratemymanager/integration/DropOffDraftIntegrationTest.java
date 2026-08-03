@@ -110,7 +110,7 @@ class DropOffDraftIntegrationTest {
     }
 
     @Test
-    void createDropOffDraft_ghostManagerExists_promotesToPendingAndAddsReview() throws Exception {
+    void createDropOffDraft_ghostManagerExists_staysGhostAndAddsReview() throws Exception {
         // First create a ghost manager via the ghost endpoint
         JsonObject ghostBody = new JsonObject()
             .put("name",    "Alice Smith")
@@ -133,10 +133,10 @@ class DropOffDraftIntegrationTest {
         assertFalse(result.getBoolean("created"));
         assertEquals(managerId, result.getLong("id"));
 
-        // Verify manager is now pending_approval
+        // Ghost stays ghost — it is already live and should not enter the admin queue
         var after = await(pool.preparedQuery("SELECT approval_status FROM managers WHERE id = $1")
             .execute(Tuple.of(managerId)));
-        assertEquals("pending_approval", after.iterator().next().getString("approval_status"));
+        assertEquals("ghost", after.iterator().next().getString("approval_status"));
 
         // Verify drop-off review was attached (seed review is weight=true; drop-off is weight=false)
         var reviewRows = await(pool.preparedQuery("SELECT COUNT(*) FROM reviews WHERE manager_id = $1 AND weight = FALSE")
