@@ -36,6 +36,7 @@ import io.vertx.core.http.HttpMethod;
 import io.vertx.core.json.JsonObject;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
+import java.util.concurrent.atomic.AtomicBoolean;
 import io.vertx.ext.auth.jwt.JWTAuth;
 import io.vertx.ext.auth.jwt.JWTAuthOptions;
 import io.vertx.ext.web.Router;
@@ -111,6 +112,19 @@ public class MainVerticle extends AbstractVerticle {
                                 .onSuccess(n -> { if (n > 0) System.out.println("✓ Restored " + n + " anonymised review(s)"); })
                                 .onFailure(err -> System.err.println("⚠ Review restore job failed: " + err.getMessage()))
                         );
+
+                        // ── company_stats matview refresh (safety net — primary updates go through
+                        //    updateCompanyStatsForManager/Company on each mutation) ──────────────
+                        final CompanyRepository companyRepoForScheduler = companyRepo;
+                        final AtomicBoolean statsRefreshRunning = new AtomicBoolean(false);
+                        vertx.setPeriodic(6 * 3_600_000L, timerId -> {
+                            if (statsRefreshRunning.compareAndSet(false, true)) {
+                                companyRepoForScheduler.refreshCompanyStats()
+                                    .onSuccess(v -> System.out.println("✓ company_stats matview refreshed"))
+                                    .onFailure(err -> System.err.println("⚠ company_stats matview refresh failed: " + err.getMessage()))
+                                    .onComplete(ar -> statsRefreshRunning.set(false));
+                            }
+                        });
 
                         // ── AI deduplication job ───────────────────────────────────────────────
                         DeduplicationJob deduplicationJob;
@@ -311,6 +325,11 @@ public class MainVerticle extends AbstractVerticle {
                         });
 
                         router.errorHandler(500, ctx -> {
+                            Throwable t = ctx.failure();
+                            if (t != null) {
+                                System.err.println("Unhandled 500 on " + ctx.request().method() + " " + ctx.request().path());
+                                t.printStackTrace(System.err);
+                            }
                             if (!ctx.response().ended()) {
                                 ctx.response().setStatusCode(500).putHeader("Content-Type", "application/json")
                                     .end("{\"error\":\"internal_error\",\"message\":\"An unexpected error occurred.\"}");

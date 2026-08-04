@@ -105,8 +105,10 @@ public class AdminService {
             .compose(adminId -> managerRepo.approveGhost(managerId))
             .map(opt -> {
                 if (opt.isEmpty()) return new JsonObject().put("success", false).put("message", "Ghost manager not found");
-                if (companyRepo != null) companyRepo.refreshCompanyStats()
-                    .onFailure(err -> System.err.println("company_stats refresh failed: " + err.getMessage()));
+                Long companyId = opt.get().getLong("company_id");
+                if (companyId != null && companyRepo != null)
+                    companyRepo.updateCompanyStatsForManager(managerId)
+                        .onFailure(err -> System.err.println("company_stats_live update failed: " + err.getMessage()));
                 return new JsonObject().put("success", true).put("message", "Manager marked as reviewed");
             });
     }
@@ -153,8 +155,9 @@ public class AdminService {
                         " has been approved and is now live on the platform.",
                         managerId);
                 }
-                if (companyRepo != null) companyRepo.refreshCompanyStats()
-                    .onFailure(err -> System.err.println("company_stats refresh failed: " + err.getMessage()));
+                if (companyRepo != null)
+                    companyRepo.updateCompanyStatsForManager(managerId)
+                        .onFailure(err -> System.err.println("company_stats_live update failed: " + err.getMessage()));
                 return Future.succeededFuture(new JsonObject()
                     .put("success", true)
                     .put("message", "Manager approved")
@@ -272,8 +275,9 @@ public class AdminService {
                         "Your edit request for " + managerName + " has been approved. The manager's profile has been updated.",
                         managerId);
                 }
-                if (companyRepo != null) companyRepo.refreshCompanyStats()
-                    .onFailure(err -> System.err.println("company_stats refresh failed: " + err.getMessage()));
+                if (companyRepo != null)
+                    companyRepo.updateCompanyStatsForManager(managerId)
+                        .onFailure(err -> System.err.println("company_stats_live update failed: " + err.getMessage()));
                 JsonObject result = new JsonObject().put("success", true).put("message", "Edit approved and applied")
                     .put("managerId", managerId);
                 if (newCompany != null) result.put("newCompany", newCompany);
@@ -423,8 +427,9 @@ public class AdminService {
             .compose(v -> managerRepo.delete(mergeId))
             .compose(v -> managerRepo.mergeInlineRecalculate(keepId))
             .compose(v -> {
-                if (companyRepo != null) companyRepo.refreshCompanyStats()
-                    .onFailure(err -> System.err.println("company_stats refresh failed: " + err.getMessage()));
+                if (companyRepo != null)
+                    companyRepo.updateCompanyStatsForManager(keepId)
+                        .onFailure(err -> System.err.println("company_stats_live update failed: " + err.getMessage()));
                 return Future.succeededFuture(new JsonObject().put("success", true).put("keepId", keepId));
             });
     }
@@ -458,7 +463,7 @@ public class AdminService {
                         "A company named \"" + newName.trim() + "\" already exists — use the merge tool instead"));
                 return companyRepo.renameCompany(companyId, newName);
             })
-            .compose(v -> companyRepo.refreshCompanyStats())
+            .compose(v -> companyRepo.updateCompanyStatsForCompany(companyId))
             .map(v -> new JsonObject().put("success", true));
     }
 
@@ -467,7 +472,7 @@ public class AdminService {
             return Future.failedFuture(ServiceException.badRequest("Cannot merge a company into itself"));
         return requireAdmin(auth0Id)
             .compose(adminId -> companyRepo.mergeCompanies(keepId, mergeId))
-            .compose(v -> companyRepo.refreshCompanyStats())
+            .compose(v -> companyRepo.updateCompanyStatsForCompany(keepId))
             .map(v -> new JsonObject().put("success", true).put("keepId", keepId));
     }
 

@@ -1005,8 +1005,8 @@ public class ManagerService {
             if (!isValidRating(v)) return Future.failedFuture(ServiceException.badRequest("Rating for '" + RATING_KEYS[i] + "' must be between 1 and 5"));
         }
 
-        // Fetch all existing reviews by this user (lightweight — no JOINs)
-        return reviewRepo.findByUserForValidation(userId)
+        // Fetch all existing reviews by this user (or anonymous reviews with the same author name)
+        return reviewRepo.findByUserForValidation(userId != null ? userId : UUID.fromString("00000000-0000-0000-0000-000000000000"), author)
             .compose(existingRows -> {
                 List<Row> existing = new ArrayList<>();
                 for (Row r : existingRows) existing.add(r);
@@ -1158,8 +1158,8 @@ public class ManagerService {
                 });
         }).onSuccess(row -> {
             managerRepo.recalculateInBackground(managerId);
-            companyRepo.refreshCompanyStats()
-                .onFailure(err -> System.err.println("company_stats refresh failed: " + err.getMessage()));
+            companyRepo.updateCompanyStatsForManager(managerId)
+                .onFailure(err -> System.err.println("company_stats_live update failed: " + err.getMessage()));
         });
     }
 
@@ -1301,7 +1301,7 @@ public class ManagerService {
                     author = dbUsername;
                 }
 
-                return reviewRepo.findByUserForValidation(callerId)
+                return reviewRepo.findByUserForValidation(callerId, author)
                     .compose(existingRows -> {
                         List<Row> existing = new ArrayList<>();
                         for (Row r : existingRows) existing.add(r);
@@ -1895,8 +1895,6 @@ public class ManagerService {
                                     .compose(v -> Future.failedFuture(err));
                             })
                             .map(row -> {
-                                companyRepo.refreshCompanyStats()
-                                    .onFailure(e -> System.err.println("company_stats refresh failed: " + e.getMessage()));
                                 JsonArray data = new JsonArray().add(rowToManagerJson(row));
                                 return new JsonObject()
                                     .put("data", data)
@@ -1960,8 +1958,6 @@ public class ManagerService {
                 return companyRepo.findOrCreate(company, null, resolvedLogoUrl)
                     .compose(companyRow -> managerRepo.createGhost(name, company, title, country, fState, fCity, resolvedLogoUrl, companyRow.getLong("id")))
                     .map(row -> {
-                        companyRepo.refreshCompanyStats()
-                            .onFailure(err -> System.err.println("company_stats refresh failed: " + err.getMessage()));
                         return new JsonObject()
                             .put("id", row.getLong("id"))
                             .put("name", row.getString("name"))

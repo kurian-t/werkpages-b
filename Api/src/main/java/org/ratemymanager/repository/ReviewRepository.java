@@ -133,12 +133,12 @@ public class ReviewRepository {
      * Lightweight query — returns just the fields needed for cap / overlap / role-duplicate checks.
      * No JOIN, no large text columns.
      */
-    public Future<RowSet<Row>> findByUserForValidation(UUID userId) {
+    public Future<RowSet<Row>> findByUserForValidation(UUID userId, String author) {
         return db.preparedQuery(
                 "SELECT id, manager_id, manager_title, manager_company, worked_from, worked_until, " +
                 "manager_role_start, manager_role_end " +
-                "FROM reviews WHERE user_id = $1 AND deleted_at IS NULL")
-            .execute(Tuple.of(userId));
+                "FROM reviews WHERE (user_id = $1 OR (author = $2 AND user_id IS NULL)) AND deleted_at IS NULL AND weight = FALSE")
+            .execute(Tuple.of(userId, author));
     }
 
     /** Returns role-period rows for all reviews of a manager (any user). Used to detect concurrent-role conflicts. */

@@ -263,7 +263,7 @@ public class ManagerRepository {
         return db.preparedQuery("""
                 UPDATE managers SET approval_status = 'approved', updated_at = now()
                 WHERE id = $1 AND approval_status = 'ghost'
-                RETURNING id, name, company
+                RETURNING id, name, company, company_id
                 """)
             .execute(Tuple.of(managerId))
             .map(rows -> rows.iterator().hasNext()
@@ -330,7 +330,7 @@ public class ManagerRepository {
         return db.preparedQuery("""
                 UPDATE managers SET approval_status = 'approved', updated_at = now()
                 WHERE id = $1 AND approval_status = 'pending_approval'
-                RETURNING id, name, company, company_logo_url, submitted_by
+                RETURNING id, name, company, company_logo_url, submitted_by, company_id
                 """)
             .execute(Tuple.of(managerId))
             .map(rows -> rows.iterator().hasNext()

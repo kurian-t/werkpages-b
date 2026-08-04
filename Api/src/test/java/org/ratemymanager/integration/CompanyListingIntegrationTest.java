@@ -255,10 +255,10 @@ class CompanyListingIntegrationTest {
     }
 
     @Test
-    void getCompanyListing_managerCountIncludesReviewBasedAssociation() throws Exception {
-        // Ensure Acme Corp exists in the companies table (normally happens on first profile view)
+    void getCompanyListing_managerCountUsesCompanyIdFkOnly() throws Exception {
+        // V38 dropped the OR EXISTS on reviews — only the company_id FK determines association.
+        // Bob's company_id points to Skynet; a review at Acme Corp does NOT pull him into Acme.
         await(companyRepo.findOrCreate("Acme Corp", null, null));
-        // Bob's company_id points to Skynet, but he has a review at Acme Corp
         insertManager("Bob B", "Skynet Inc", "Director", "approved", 4.0, 1);
         Long bobId = await(pool
             .preparedQuery("SELECT id FROM managers WHERE name = 'Bob B'")
@@ -269,13 +269,20 @@ class CompanyListingIntegrationTest {
         JsonObject result = refreshAndGetListing();
         JsonArray data = result.getJsonArray("data");
 
-        // Both Acme Corp and Skynet Inc should appear
+        // Acme Corp has no managers with company_id pointing to it, so it does not appear.
         long acmeCount = data.stream()
             .map(o -> (JsonObject) o)
             .filter(o -> "Acme Corp".equals(o.getString("name")))
+            .count();
+        assertEquals(0, acmeCount, "Acme Corp must not appear — no manager has company_id pointing to it");
+
+        // Skynet Inc should appear with Bob counted.
+        long skynetManagerCount = data.stream()
+            .map(o -> (JsonObject) o)
+            .filter(o -> "Skynet Inc".equals(o.getString("name")))
             .mapToLong(o -> o.getLong("managerCount"))
             .findFirst().orElse(0);
-        assertEquals(1, acmeCount, "Acme Corp should count Bob via his review there");
+        assertEquals(1, skynetManagerCount, "Skynet Inc should have Bob as its one manager");
     }
 
     @Test

@@ -70,6 +70,7 @@ class ManagerServiceValidationTest {
         companyRepo = mock(CompanyRepository.class);
         pool        = mock(Pool.class);
         when(companyRepo.refreshCompanyStats()).thenReturn(Future.succeededFuture());
+        when(companyRepo.updateCompanyStatsForManager(anyLong())).thenReturn(Future.succeededFuture());
         service     = new ManagerService(managerRepo, reviewRepo, userRepo, editRepo, reportRepo, companyRepo, pool, company -> null);
 
         // Build mock data BEFORE any when() chains to avoid nested stubbing
@@ -82,7 +83,7 @@ class ManagerServiceValidationTest {
             .thenReturn(Future.succeededFuture(0L));
         when(reviewRepo.findRecentDeletion(USER_ID, MANAGER_ID))
             .thenReturn(Future.succeededFuture(Optional.empty()));
-        when(reviewRepo.findByUserForValidation(USER_ID))
+        when(reviewRepo.findByUserForValidation(eq(USER_ID), anyString()))
             .thenReturn(Future.succeededFuture(emptyRs));
         doNothing().when(managerRepo).recalculateInBackground(anyLong());
         when(reviewRepo.deleteSeedReview(anyLong())).thenReturn(Future.succeededFuture());
@@ -281,7 +282,7 @@ class ManagerServiceValidationTest {
         for (int i = 0; i < 5; i++) rows.add(reviewRow(MANAGER_ID, "Role " + i, "Corp"));
         RowSet<Row> capRs = rowSetOf(rows.toArray(new Row[0]));
 
-        when(reviewRepo.findByUserForValidation(USER_ID))
+        when(reviewRepo.findByUserForValidation(eq(USER_ID), anyString()))
             .thenReturn(Future.succeededFuture(capRs));
 
         ServiceException ex = assertServiceFails(service.createReview(AUTH0_ID, MANAGER_ID, validBody(), null));
@@ -294,7 +295,7 @@ class ManagerServiceValidationTest {
         Row existing = reviewRow(MANAGER_ID, "Engineering Manager", "Acme Corp");
         RowSet<Row> dupRs = rowSetOf(existing);
 
-        when(reviewRepo.findByUserForValidation(USER_ID))
+        when(reviewRepo.findByUserForValidation(eq(USER_ID), anyString()))
             .thenReturn(Future.succeededFuture(dupRs));
 
         ServiceException ex = assertServiceFails(service.createReview(AUTH0_ID, MANAGER_ID, validBody(), null));
@@ -307,7 +308,7 @@ class ManagerServiceValidationTest {
         Row existing = reviewRow(MANAGER_ID, "ENGINEERING MANAGER", "ACME CORP");
         RowSet<Row> dupRs = rowSetOf(existing);
 
-        when(reviewRepo.findByUserForValidation(USER_ID))
+        when(reviewRepo.findByUserForValidation(eq(USER_ID), anyString()))
             .thenReturn(Future.succeededFuture(dupRs));
 
         ServiceException ex = assertServiceFails(service.createReview(AUTH0_ID, MANAGER_ID, validBody(), null));
@@ -320,7 +321,7 @@ class ManagerServiceValidationTest {
         Row existing  = reviewRow(MANAGER_ID, "Engineering Manager", "Other Corp");
         RowSet<Row> rs = rowSetOf(existing);
 
-        when(reviewRepo.findByUserForValidation(USER_ID))
+        when(reviewRepo.findByUserForValidation(eq(USER_ID), anyString()))
             .thenReturn(Future.succeededFuture(rs));
         stubHappyPathTransaction();
 
@@ -335,7 +336,7 @@ class ManagerServiceValidationTest {
             LocalDate.of(2021, 1, 1), LocalDate.of(2023, 12, 31));
         RowSet<Row> rolePeriodRs = rowSetOf(overlapRow);
 
-        when(reviewRepo.findByUserForValidation(USER_ID))
+        when(reviewRepo.findByUserForValidation(eq(USER_ID), anyString()))
             .thenReturn(Future.succeededFuture(emptyUserRs));
         when(reviewRepo.findRolePeriodsForManager(MANAGER_ID))
             .thenReturn(Future.succeededFuture(rolePeriodRs));
@@ -742,7 +743,7 @@ class ManagerServiceValidationTest {
         List<Row> rows = new ArrayList<>();
         for (int i = 0; i < 5; i++) rows.add(reviewRow(OTHER_MANAGER, "Role " + i, "Corp"));
         RowSet<Row> rs = rowSetOf(rows.toArray(new Row[0]));
-        when(reviewRepo.findByUserForValidation(USER_ID)).thenReturn(Future.succeededFuture(rs));
+        when(reviewRepo.findByUserForValidation(eq(USER_ID), anyString())).thenReturn(Future.succeededFuture(rs));
         stubHappyPathTransaction();
         assertDoesNotThrow(() -> await(service.createReview(AUTH0_ID, MANAGER_ID, validBody(), null)));
     }
@@ -752,7 +753,7 @@ class ManagerServiceValidationTest {
         Row openRole = rolePeriodRow("Current Role", "Corp", LocalDate.of(2020, 1, 1), null);
         RowSet<Row> emptyRs    = rowSetOf();           // pre-create before when/thenReturn
         RowSet<Row> openRoleRs = rowSetOf(openRole);   // pre-create before when/thenReturn
-        when(reviewRepo.findByUserForValidation(USER_ID)).thenReturn(Future.succeededFuture(emptyRs));
+        when(reviewRepo.findByUserForValidation(eq(USER_ID), anyString())).thenReturn(Future.succeededFuture(emptyRs));
         when(reviewRepo.findRolePeriodsForManager(MANAGER_ID)).thenReturn(Future.succeededFuture(openRoleRs));
 
         JsonObject body = validBody().put("managerRoleStart", "2022-01").put("managerRoleEnd", "2023-12");
@@ -767,7 +768,7 @@ class ManagerServiceValidationTest {
         Row adjacent = rolePeriodRow("Old Role", "Corp", LocalDate.of(2020, 1, 1), LocalDate.of(2021, 12, 31));
         RowSet<Row> emptyRs    = rowSetOf();            // pre-create before when/thenReturn
         RowSet<Row> adjacentRs = rowSetOf(adjacent);    // pre-create before when/thenReturn
-        when(reviewRepo.findByUserForValidation(USER_ID)).thenReturn(Future.succeededFuture(emptyRs));
+        when(reviewRepo.findByUserForValidation(eq(USER_ID), anyString())).thenReturn(Future.succeededFuture(emptyRs));
         when(reviewRepo.findRolePeriodsForManager(MANAGER_ID)).thenReturn(Future.succeededFuture(adjacentRs));
         stubHappyPathTransaction();
 
@@ -913,7 +914,7 @@ class ManagerServiceValidationTest {
         UUID otherId     = UUID.randomUUID();
         Row existing     = validationReviewRow(otherId, MANAGER_ID, "Engineering Manager", "Acme Corp");
         RowSet<Row> rs   = rowSetOf(existing); // pre-create before when/thenReturn
-        when(reviewRepo.findByUserForValidation(USER_ID)).thenReturn(Future.succeededFuture(rs));
+        when(reviewRepo.findByUserForValidation(eq(USER_ID), anyString())).thenReturn(Future.succeededFuture(rs));
 
         ServiceException ex = assertServiceFails(service.updateReview(AUTH0_ID, MANAGER_ID, reviewId, validBody()));
         assertEquals(409, ex.getStatusCode());
@@ -925,7 +926,7 @@ class ManagerServiceValidationTest {
         UUID reviewId  = UUID.randomUUID();
         Row existing   = validationReviewRow(reviewId, MANAGER_ID, "Engineering Manager", "Acme Corp");
         RowSet<Row> rs = rowSetOf(existing); // pre-create before when/thenReturn
-        when(reviewRepo.findByUserForValidation(USER_ID)).thenReturn(Future.succeededFuture(rs));
+        when(reviewRepo.findByUserForValidation(eq(USER_ID), anyString())).thenReturn(Future.succeededFuture(rs));
 
         Row updatedRow = mock(Row.class);
         when(reviewRepo.update(
