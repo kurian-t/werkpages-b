@@ -122,7 +122,7 @@ public class MainVerticle extends AbstractVerticle {
                                 companyRepoForScheduler.refreshCompanyStats()
                                     .onSuccess(v -> System.out.println("✓ company_stats matview refreshed"))
                                     .onFailure(err -> System.err.println("⚠ company_stats matview refresh failed: " + err.getMessage()))
-                                    .onComplete(ar -> statsRefreshRunning.set(false));
+                                    .onComplete(ignored -> statsRefreshRunning.set(false));
                             }
                         });
 
