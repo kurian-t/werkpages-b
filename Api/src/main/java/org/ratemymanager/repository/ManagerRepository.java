@@ -800,6 +800,20 @@ public class ManagerRepository {
                 : Optional.empty());
     }
 
+    /** Returns the manager's own slug and current company slug — used to snapshot URL before a company change. */
+    public Future<Optional<Row>> findSlugs(long managerId) {
+        return db.preparedQuery("""
+                SELECT m.slug, c.slug AS company_slug
+                FROM managers m
+                LEFT JOIN companies c ON c.id = m.company_id
+                WHERE m.id = $1
+                """)
+            .execute(Tuple.of(managerId))
+            .map(rows -> rows.iterator().hasNext()
+                ? Optional.of(rows.iterator().next())
+                : Optional.empty());
+    }
+
     /** Records an old (company_slug, manager_slug) pair for 301 redirect lookups after company changes. */
     public Future<Void> recordUrlHistory(long managerId, String oldCompanySlug, String managerSlug) {
         return db.preparedQuery("""

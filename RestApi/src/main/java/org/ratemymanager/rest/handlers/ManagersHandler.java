@@ -187,27 +187,19 @@ public class ManagersHandler {
         service.getManagerBySlug(managerSlug, auth0Id)
             .compose(row -> service.hasReported(row.getLong("id"), auth0Id)
                 .map(hasReported -> {
-                    // If the company slug in the URL doesn't match the manager's current company, 301
+                    JsonObject response = buildManagerResponse(row, hasReported);
+                    // If company slug in the URL is stale, include canonical path so the
+                    // frontend can silently correct the URL without a second round trip.
                     if (expectedCompanySlug != null && !expectedCompanySlug.isBlank()) {
                         String currentCompanySlug = row.getString("company_slug");
                         if (currentCompanySlug != null && !currentCompanySlug.equals(expectedCompanySlug)) {
-                            String redirectUrl = "/companies/" + currentCompanySlug + "/managers/" + row.getString("slug");
-                            return new JsonObject().put("__redirect", redirectUrl);
+                            response.put("canonicalPath", "/companies/" + currentCompanySlug + "/managers/" + row.getString("slug"));
                         }
                     }
-                    return buildManagerResponse(row, hasReported);
+                    return response;
                 })
             )
-            .onSuccess(json -> {
-                if (json.containsKey("__redirect")) {
-                    ctx.response()
-                        .putHeader("Location", json.getString("__redirect"))
-                        .setStatusCode(301)
-                        .end(new JsonObject().put("redirect", json.getString("__redirect")).encode());
-                } else {
-                    ctx.response().putHeader("Content-Type", "application/json").end(json.encode());
-                }
-            })
+            .onSuccess(json -> ctx.response().putHeader("Content-Type", "application/json").end(json.encode()))
             .onFailure(err -> handleError(ctx, err));
     }
 

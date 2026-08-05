@@ -56,6 +56,7 @@ class AdminServiceTest {
         when(companyRepo.refreshCompanyStats()).thenReturn(Future.succeededFuture());
         when(companyRepo.updateCompanyStatsForManager(anyLong())).thenReturn(Future.succeededFuture());
         when(companyRepo.updateCompanyStatsForCompany(anyLong())).thenReturn(Future.succeededFuture());
+        when(managerRepo.findSlugs(anyLong())).thenReturn(Future.succeededFuture(Optional.empty()));
         service     = new AdminService(userRepo, managerRepo, reviewRepo, editRepo, notifRepo, companyRepo);
 
         Row adminRow = adminUserRow(ADMIN_ID);

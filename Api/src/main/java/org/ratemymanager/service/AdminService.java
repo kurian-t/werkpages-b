@@ -242,21 +242,46 @@ public class AdminService {
                         ? companyRepo.findOrCreate(effectiveCo, null, null).map(r -> r.getLong("id"))
                         : Future.succeededFuture(currentCompanyId);
 
-                    return newCompanyIdFuture.compose(newCompanyId ->
-                        managerRepo.closeOpenCareerEntry(managerId, now)
-                            .compose(closed -> {
-                                Future<Void> archiveOld;
-                                if (closed == 0) {
-                                    OffsetDateTime oldStart = row.getOffsetDateTime("manager_created_at");
-                                    archiveOld = managerRepo.insertCareerEntry(managerId, currentCompany, currentTitle, oldStart, now, currentCompanyId);
-                                } else {
-                                    archiveOld = Future.succeededFuture();
-                                }
-                                return archiveOld.compose(v ->
-                                    managerRepo.insertCareerEntry(managerId, effectiveCo, effectiveTit, now, null, newCompanyId)
-                                );
-                            })
-                            .compose(v -> applyEditAndApprove(managerId, editId, newCompany, newTitle, newStatus, newCountry, newLinkedinUrl, effectiveCo, effectiveTit, adminId, now, proposedBy, managerName, newCompanyId))
+                    // Snapshot current slugs before update so we can record URL history if company changes
+                    Future<Optional<Row>> slugsFuture = (newCompany != null)
+                        ? managerRepo.findSlugs(managerId)
+                        : Future.succeededFuture(Optional.empty());
+
+                    return slugsFuture.compose(slugsOpt ->
+                        newCompanyIdFuture.compose(newCompanyId ->
+                            managerRepo.closeOpenCareerEntry(managerId, now)
+                                .compose(closed -> {
+                                    Future<Void> archiveOld;
+                                    if (closed == 0) {
+                                        OffsetDateTime oldStart = row.getOffsetDateTime("manager_created_at");
+                                        archiveOld = managerRepo.insertCareerEntry(managerId, currentCompany, currentTitle, oldStart, now, currentCompanyId);
+                                    } else {
+                                        archiveOld = Future.succeededFuture();
+                                    }
+                                    return archiveOld.compose(v ->
+                                        managerRepo.insertCareerEntry(managerId, effectiveCo, effectiveTit, now, null, newCompanyId)
+                                    );
+                                })
+                                .compose(v -> applyEditAndApprove(managerId, editId, newCompany, newTitle, newStatus, newCountry, newLinkedinUrl, effectiveCo, effectiveTit, adminId, now, proposedBy, managerName, newCompanyId))
+                                .compose(result -> {
+                                    if (newCompany != null) {
+                                        // Fire-and-forget: refresh old company's stats so its logo/counts stay accurate
+                                        if (currentCompanyId != null && companyRepo != null)
+                                            companyRepo.updateCompanyStatsForCompany(currentCompanyId)
+                                                .onFailure(err -> System.err.println("old company stats update failed: " + err.getMessage()));
+                                        // Fire-and-forget: record old URL so external/crawled links can resolve
+                                        if (slugsOpt.isPresent()) {
+                                            String oldCompanySlug = slugsOpt.get().getString("company_slug");
+                                            String managerSlug    = slugsOpt.get().getString("slug");
+                                            if (oldCompanySlug != null && managerSlug != null) {
+                                                managerRepo.recordUrlHistory(managerId, oldCompanySlug, managerSlug)
+                                                    .onFailure(err -> System.err.println("recordUrlHistory failed: " + err.getMessage()));
+                                            }
+                                        }
+                                    }
+                                    return Future.succeededFuture(result);
+                                })
+                        )
                     );
                 })
             );
