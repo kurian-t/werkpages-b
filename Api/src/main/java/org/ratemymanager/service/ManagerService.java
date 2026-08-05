@@ -1957,12 +1957,22 @@ public class ManagerService {
                 }
                 return companyRepo.findOrCreate(company, null, resolvedLogoUrl)
                     .compose(companyRow -> managerRepo.createGhost(name, company, title, country, fState, fCity, resolvedLogoUrl, companyRow.getLong("id")))
-                    .map(row -> {
-                        return new JsonObject()
-                            .put("id", row.getLong("id"))
-                            .put("name", row.getString("name"))
-                            .put("created", true);
-                    });
+                    .compose(row -> {
+                        long newId = row.getLong("id");
+                        return reviewRepo.createSeedReview(newId, company, title)
+                            .compose(ignored -> {
+                                managerRepo.recalculateInBackground(newId);
+                                return Future.succeededFuture(row);
+                            })
+                            .recover(err -> {
+                                System.err.println("Seed review creation failed for ghost manager " + newId + ": " + err.getMessage());
+                                return Future.succeededFuture(row);
+                            });
+                    })
+                    .map(row -> new JsonObject()
+                        .put("id", row.getLong("id"))
+                        .put("name", row.getString("name"))
+                        .put("created", true));
             });
     }
 

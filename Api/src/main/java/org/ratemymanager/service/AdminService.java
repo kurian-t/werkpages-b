@@ -142,13 +142,14 @@ public class AdminService {
                 Row row = opt.get();
                 String company      = row.getString("company");
                 String existingLogo = row.getString("company_logo_url");
-                UUID   submittedBy  = row.getUUID("submitted_by");
-                String managerName  = row.getString("name");
+                UUID   submittedBy         = row.getUUID("submitted_by");
+                UUID   searchCreatedBy     = row.getUUID("search_created_by_user_id");
+                String managerName         = row.getString("name");
+                boolean isSearchCreated    = searchCreatedBy != null;
 
-                // The handler provides the logo URL resolution since CompanyLogoUtils is in RestApi
-                // We use the resolveLogoFn token to signal this needs resolution
-                // Notify submitter
-                if (submittedBy != null) {
+                // Only notify users who purposefully submitted a manager, not those whose
+                // search silently created one — notifying them would reveal the capture.
+                if (submittedBy != null && !isSearchCreated) {
                     notifRepo.sendAsync(submittedBy, "manager_approved",
                         "Manager Approved",
                         "Your manager profile for " + managerName +
