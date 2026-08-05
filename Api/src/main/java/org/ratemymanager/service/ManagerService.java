@@ -370,12 +370,9 @@ public class ManagerService {
             if (logoUrl != null && !logoUrl.isBlank()) empty.put("logoUrl", logoUrl);
             return empty;
         }
-        String bestLogoUrl = logoUrl;
-        for (Row row : rows) {
-            String mgrLogo = row.getString("company_logo_url");
-            if (mgrLogo != null && mgrLogo.contains("logo.dev")) { bestLogoUrl = mgrLogo; break; }
-        }
-        final String finalLogoUrl = bestLogoUrl;
+        // logoUrl already comes from company_stats_live (FK-linked managers only) — don't
+        // override it with career-history-linked manager logos which may belong to other companies.
+        final String finalLogoUrl = logoUrl;
         JsonArray managers  = new JsonArray();
         long   totalReviews = 0;
         double ratingSum    = 0.0;
