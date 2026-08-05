@@ -155,12 +155,15 @@ public class CompanyRepository {
                 : Optional.empty());
     }
 
-    /** Looks up a company by its URL slug. */
+    /** Looks up a company by its URL slug. Also returns the logo from company_stats_live
+     *  (which reflects only current FK-linked managers) as stats_logo_url. */
     public Future<Optional<Row>> findBySlug(String slug) {
         return db.preparedQuery("""
-                SELECT id, name, slug, logo_url, status
-                FROM companies
-                WHERE slug = $1
+                SELECT c.id, c.name, c.slug, c.logo_url, c.status,
+                       cs.logo_url AS stats_logo_url
+                FROM companies c
+                LEFT JOIN company_stats_live cs ON cs.company_id = c.id
+                WHERE c.slug = $1
                 LIMIT 1
                 """)
             .execute(Tuple.of(slug))

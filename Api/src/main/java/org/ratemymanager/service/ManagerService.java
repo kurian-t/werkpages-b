@@ -340,10 +340,14 @@ public class ManagerService {
                 Row companyRow = opt.get();
                 String canonicalName    = companyRow.getString("name");
                 String companySlug      = companyRow.getString("slug");
-                String resolvedLogoUrl  = logoResolver.apply(canonicalName);
+                // Prefer stats_logo_url (computed from current FK-linked managers only) so
+                // career-history-linked managers from other companies don't bleed their logos in.
+                String statsLogoUrl     = companyRow.getString("stats_logo_url");
                 String storedLogoUrl    = companyRow.getString("logo_url");
-                String logoUrl = (storedLogoUrl != null && storedLogoUrl.contains("logo.dev"))
-                    ? storedLogoUrl : resolvedLogoUrl;
+                String resolvedLogoUrl  = logoResolver.apply(canonicalName);
+                String logoUrl = statsLogoUrl != null && statsLogoUrl.contains("logo.dev") ? statsLogoUrl
+                               : storedLogoUrl != null && storedLogoUrl.contains("logo.dev") ? storedLogoUrl
+                               : resolvedLogoUrl;
                 long companyId = companyRow.getLong("id");
                 return companyRepo.findManagersByCompanyId(companyId)
                     .map(rows -> buildCompanyProfileResponse(companyId, canonicalName, companySlug, logoUrl, rows));
