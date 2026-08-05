@@ -370,6 +370,92 @@ class AdminServiceIntegrationTest {
     }
 
     @Test
+    void approveEdit_withHistoricalDates_succeedsWhenStartDatePredesManagerCreation() throws Exception {
+        // Regression test: approving an edit whose new_start_date is before the manager's
+        // created_at used to trigger a CHECK (end_date >= start_date) violation in career_history
+        // because the archive-old block tried to create an entry spanning created_at → careerStart
+        // where careerStart < created_at.
+        String adminAuth0 = insertUser("auth0|admin-hist01", "AdminHist01", "admin");
+        String userAuth   = insertUser("auth0|editor-hist01", "EditorHist01", "user");
+        UUID   userId     = findUserId(userAuth);
+        long managerId    = insertApprovedManager("History Test", "IBM", "Engineer");
+
+        // Edit: change company to Amazon with dates 2020-2026 (both before manager_created_at = now)
+        UUID editId = insertPendingEditWithDates(managerId, userId, "Amazon", "Director",
+                "retired",
+                java.time.OffsetDateTime.of(2020, 1, 1, 0, 0, 0, 0, java.time.ZoneOffset.UTC),
+                java.time.OffsetDateTime.of(2026, 1, 1, 0, 0, 0, 0, java.time.ZoneOffset.UTC));
+
+        // Must not throw (no CHECK constraint violation)
+        JsonObject result = await(service.approveEdit(adminAuth0, editId));
+        assertTrue(result.getBoolean("success"));
+    }
+
+    @Test
+    void approveEdit_withHistoricalDates_insertsCareerHistoryWithCorrectDateRange() throws Exception {
+        String adminAuth0 = insertUser("auth0|admin-hist02", "AdminHist02", "admin");
+        String userAuth   = insertUser("auth0|editor-hist02", "EditorHist02", "user");
+        UUID   userId     = findUserId(userAuth);
+        long managerId    = insertApprovedManager("Career History Test", "IBM", "Engineer");
+
+        UUID editId = insertPendingEditWithDates(managerId, userId, "Amazon", "Director",
+                "retired",
+                java.time.OffsetDateTime.of(2020, 1, 1, 0, 0, 0, 0, java.time.ZoneOffset.UTC),
+                java.time.OffsetDateTime.of(2026, 1, 1, 0, 0, 0, 0, java.time.ZoneOffset.UTC));
+
+        await(service.approveEdit(adminAuth0, editId));
+
+        // Career history entry should exist for Amazon 2020-2026
+        io.vertx.sqlclient.Row hist = await(pool.preparedQuery("""
+                SELECT company, start_date, end_date FROM career_history
+                WHERE manager_id = $1 AND company = 'Amazon'
+                """)
+            .execute(Tuple.of(managerId))
+            .map(rs -> rs.iterator().hasNext() ? rs.iterator().next() : null));
+
+        assertNotNull(hist, "Career history entry for Amazon must exist");
+        assertEquals("Amazon", hist.getString("company"));
+        assertNotNull(hist.getOffsetDateTime("start_date"));
+        assertNotNull(hist.getOffsetDateTime("end_date"));
+        assertEquals(2020, hist.getOffsetDateTime("start_date").getYear());
+        assertEquals(2026, hist.getOffsetDateTime("end_date").getYear());
+    }
+
+    @Test
+    void approveEdit_withOpenEntryStartedAfterCareerStart_doesNotCloseOpenEntry() throws Exception {
+        // Regression test: closeOpenCareerEntry must not set end_date = careerStart on an open
+        // entry whose start_date > careerStart — that would violate CHECK (end_date >= start_date).
+        String adminAuth0 = insertUser("auth0|admin-hist03", "AdminHist03", "admin");
+        String userAuth   = insertUser("auth0|editor-hist03", "EditorHist03", "user");
+        UUID   userId     = findUserId(userAuth);
+        long managerId    = insertApprovedManager("Open Entry Test", "Google", "Engineer");
+
+        // Insert an open career entry that started recently (now), simulating the manager's
+        // current Google position
+        await(pool.preparedQuery(
+            "INSERT INTO career_history(manager_id, company, title, start_date) VALUES ($1,'Google','Engineer',now())")
+            .execute(Tuple.of(managerId)));
+
+        // Approve an edit inserting Amazon (2020-2026) — careerStart is before the Google entry
+        UUID editId = insertPendingEditWithDates(managerId, userId, "Amazon", "Director",
+                "retired",
+                java.time.OffsetDateTime.of(2020, 1, 1, 0, 0, 0, 0, java.time.ZoneOffset.UTC),
+                java.time.OffsetDateTime.of(2026, 1, 1, 0, 0, 0, 0, java.time.ZoneOffset.UTC));
+
+        // Must not throw (old code would set end_date=2020 on Google entry → CHECK violation)
+        await(service.approveEdit(adminAuth0, editId));
+
+        // The Google open entry must still be open (end_date untouched)
+        Long closedCount = await(pool.preparedQuery("""
+                SELECT COUNT(*) FROM career_history
+                WHERE manager_id = $1 AND company = 'Google' AND end_date IS NULL
+                """)
+            .execute(Tuple.of(managerId))
+            .map(rs -> rs.iterator().next().getLong(0)));
+        assertEquals(1L, closedCount, "Google open entry must not have been closed");
+    }
+
+    @Test
     void approveEdit_withProposedBy_sendsNotification() throws Exception {
         String adminAuth0 = insertUser("auth0|admin16", "Admin16", "admin");
         String userAuth   = insertUser("auth0|editor04", "Editor04", "user");
@@ -848,6 +934,17 @@ class AdminServiceIntegrationTest {
             "INSERT INTO manager_edits(manager_id, proposed_by, new_company, new_title, new_status, new_linkedin_url) " +
             "VALUES ($1,$2,$3,$4,$5,$6) RETURNING id")
             .execute(Tuple.of(managerId, proposedBy, newCompany, newTitle, newStatus, newLinkedinUrl))
+            .map(rs -> rs.iterator().next().getUUID("id")));
+    }
+
+    private UUID insertPendingEditWithDates(long managerId, UUID proposedBy, String newCompany,
+                                             String newTitle, String newStatus,
+                                             java.time.OffsetDateTime newStartDate,
+                                             java.time.OffsetDateTime newEndDate) throws Exception {
+        return await(pool.preparedQuery(
+            "INSERT INTO manager_edits(manager_id, proposed_by, new_company, new_title, new_status, new_start_date, new_end_date) " +
+            "VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id")
+            .execute(Tuple.of(managerId, proposedBy, newCompany, newTitle, newStatus, newStartDate, newEndDate))
             .map(rs -> rs.iterator().next().getUUID("id")));
     }
 
