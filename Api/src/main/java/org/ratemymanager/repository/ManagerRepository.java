@@ -389,7 +389,9 @@ public class ManagerRepository {
     }
 
     public Future<Integer> closeOpenCareerEntry(long managerId, OffsetDateTime endDate) {
-        return db.preparedQuery("UPDATE career_history SET end_date = $1 WHERE manager_id = $2 AND end_date IS NULL")
+        // Only close entries whose start_date <= endDate to avoid violating the CHECK (end_date >= start_date) constraint.
+        // If the current open entry started after endDate (e.g. inserting a historical position), it stays open.
+        return db.preparedQuery("UPDATE career_history SET end_date = $1 WHERE manager_id = $2 AND end_date IS NULL AND start_date <= $1")
             .execute(Tuple.of(endDate, managerId))
             .map(RowSet::rowCount);
     }

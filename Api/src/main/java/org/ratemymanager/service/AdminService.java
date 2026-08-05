@@ -258,7 +258,14 @@ public class AdminService {
                                     Future<Void> archiveOld;
                                     if (closed == 0) {
                                         OffsetDateTime oldStart = row.getOffsetDateTime("manager_created_at");
-                                        archiveOld = managerRepo.insertCareerEntry(managerId, currentCompany, currentTitle, oldStart, careerStart, currentCompanyId);
+                                        // Only archive the implicit initial entry if careerStart is at or after oldStart.
+                                        // If careerStart < oldStart the new position predates the manager record; skip archival
+                                        // to avoid violating the CHECK (end_date >= start_date) constraint.
+                                        if (oldStart != null && !careerStart.isBefore(oldStart)) {
+                                            archiveOld = managerRepo.insertCareerEntry(managerId, currentCompany, currentTitle, oldStart, careerStart, currentCompanyId);
+                                        } else {
+                                            archiveOld = Future.succeededFuture();
+                                        }
                                     } else {
                                         archiveOld = Future.succeededFuture();
                                     }
