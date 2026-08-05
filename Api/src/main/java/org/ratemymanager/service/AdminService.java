@@ -232,11 +232,15 @@ public class AdminService {
                     String newStatus        = row.getString("new_status");
                     String newCountry       = row.getString("new_country");
                     String newLinkedinUrl   = row.getString("new_linkedin_url");
+                    OffsetDateTime newStartDate = row.getOffsetDateTime("new_start_date");
+                    OffsetDateTime newEndDate   = row.getOffsetDateTime("new_end_date");
                     String effectiveCo      = newCompany != null ? newCompany : currentCompany;
                     String effectiveTit     = newTitle   != null ? newTitle   : currentTitle;
                     UUID   proposedBy       = row.getUUID("proposed_by");
                     String managerName      = row.getString("manager_name");
                     OffsetDateTime now      = OffsetDateTime.now(ZoneOffset.UTC);
+                    // Use the user-specified start date for the new career entry; fall back to now.
+                    OffsetDateTime careerStart = newStartDate != null ? newStartDate : now;
 
                     Future<Long> newCompanyIdFuture = (companyRepo != null)
                         ? companyRepo.findOrCreate(effectiveCo, null, null).map(r -> r.getLong("id"))
@@ -249,17 +253,17 @@ public class AdminService {
 
                     return slugsFuture.compose(slugsOpt ->
                         newCompanyIdFuture.compose(newCompanyId ->
-                            managerRepo.closeOpenCareerEntry(managerId, now)
+                            managerRepo.closeOpenCareerEntry(managerId, careerStart)
                                 .compose(closed -> {
                                     Future<Void> archiveOld;
                                     if (closed == 0) {
                                         OffsetDateTime oldStart = row.getOffsetDateTime("manager_created_at");
-                                        archiveOld = managerRepo.insertCareerEntry(managerId, currentCompany, currentTitle, oldStart, now, currentCompanyId);
+                                        archiveOld = managerRepo.insertCareerEntry(managerId, currentCompany, currentTitle, oldStart, careerStart, currentCompanyId);
                                     } else {
                                         archiveOld = Future.succeededFuture();
                                     }
                                     return archiveOld.compose(v ->
-                                        managerRepo.insertCareerEntry(managerId, effectiveCo, effectiveTit, now, null, newCompanyId)
+                                        managerRepo.insertCareerEntry(managerId, effectiveCo, effectiveTit, careerStart, newEndDate, newCompanyId)
                                     );
                                 })
                                 .compose(v -> applyEditAndApprove(managerId, editId, newCompany, newTitle, newStatus, newCountry, newLinkedinUrl, effectiveCo, effectiveTit, adminId, now, proposedBy, managerName, newCompanyId))

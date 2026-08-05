@@ -79,7 +79,8 @@ public class EditRepository {
     public Future<Optional<Row>> findByIdWithManager(UUID editId) {
         return db.preparedQuery("""
                 SELECT pe.id, pe.manager_id, pe.new_company, pe.new_title, pe.new_status,
-                       pe.new_country, pe.new_linkedin_url, pe.status, pe.proposed_by,
+                       pe.new_country, pe.new_linkedin_url, pe.new_start_date, pe.new_end_date,
+                       pe.status, pe.proposed_by,
                        m.company AS current_company, m.title AS current_title,
                        m.company_id AS current_company_id,
                        m.created_at AS manager_created_at, m.name AS manager_name
