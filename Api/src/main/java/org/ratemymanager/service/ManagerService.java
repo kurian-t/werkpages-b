@@ -1149,13 +1149,31 @@ public class ManagerService {
                             String currentLogo = newId.equals(mostCurrent.getUUID("id"))
                                 ? resolvedLogoUrl
                                 : logoResolver.apply(currentCompany);
+                            // SELECT first to avoid aborting the transaction with a constraint
+                            // violation. ON CONFLICT inside withTransaction leaves the
+                            // connection in an aborted state; SAVEPOINT or pre-check avoids it.
                             return conn.preparedQuery("""
-                                        INSERT INTO companies (name, status, created_at, updated_at)
-                                        VALUES ($1, 'ghost', now(), now())
-                                        ON CONFLICT ((LOWER(TRIM(name)))) DO UPDATE SET updated_at = now()
-                                        RETURNING id
+                                        SELECT id FROM companies
+                                        WHERE LOWER(TRIM(name)) = LOWER(TRIM($1))
+                                           OR slug = lower(regexp_replace(regexp_replace(lower(trim($1)), '[^a-z0-9\\s-]', '', 'g'), '\\s+', '-', 'g'))
+                                        ORDER BY (LOWER(TRIM(name)) = LOWER(TRIM($1))) DESC
+                                        LIMIT 1
                                         """)
                                 .execute(Tuple.of(currentCompany))
+                                .compose(existing -> {
+                                    if (existing.iterator().hasNext()) {
+                                        return Future.succeededFuture(existing);
+                                    }
+                                    return conn.preparedQuery("""
+                                            INSERT INTO companies (name, status, slug, created_at, updated_at)
+                                            VALUES ($1, 'ghost',
+                                                lower(regexp_replace(regexp_replace(lower(trim($1)), '[^a-z0-9\\s-]', '', 'g'), '\\s+', '-', 'g')),
+                                                now(), now())
+                                            ON CONFLICT (slug) DO UPDATE SET updated_at = now()
+                                            RETURNING id
+                                            """)
+                                        .execute(Tuple.of(currentCompany));
+                                })
                                 .compose(cmpResult -> {
                                     long cmpId = cmpResult.iterator().next().getLong("id");
                                     return conn.preparedQuery(

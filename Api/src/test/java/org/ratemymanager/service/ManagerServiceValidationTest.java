@@ -577,6 +577,13 @@ class ManagerServiceValidationTest {
     }
 
     private void stubConnCompany(SqlConnection conn) {
+        // SELECT-first pattern: return empty RowSet so the code falls through to INSERT
+        RowSet<Row> emptyRs = rowSetOf();
+        PreparedQuery<RowSet<Row>> selectPq = mock(PreparedQuery.class);
+        when(selectPq.execute(any(Tuple.class))).thenReturn(Future.succeededFuture(emptyRs));
+        when(conn.preparedQuery(argThat(s -> s != null && s.contains("SELECT id FROM companies"))))
+            .thenReturn(selectPq);
+
         Row companyRow = mock(Row.class);
         when(companyRow.getLong("id")).thenReturn(1L);
         RowSet<Row> rs = rowSetOf(companyRow);

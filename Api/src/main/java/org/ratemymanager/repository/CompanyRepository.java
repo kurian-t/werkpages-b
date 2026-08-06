@@ -27,19 +27,40 @@ public class CompanyRepository {
      * row is touched only to update updated_at so the RETURNING clause is always valid.
      */
     public Future<Row> findOrCreate(String name, String domain, String logoUrl) {
-        // Slug is generated from name inline. Company names are unique (case-insensitive),
-        // so slug conflicts are extremely rare and caught by the unique index.
+        // Primary conflict target is the slug index. Two names that produce the same slug
+        // (e.g. "Acme Corp" and "Acme Corp.") are treated as the same company.
+        //
+        // A .recover() fallback handles the two remaining 23505 scenarios:
+        //   companies_slug_idx  — same slug but was missed by ON CONFLICT (shouldn't happen
+        //                         but guards against trigger-generated slugs in the DB)
+        //   companies_name_ci   — same LOWER(TRIM(name)) but slug differs (e.g. the existing
+        //                         row was inserted without a slug and the trigger added "<base>-<id>")
+        // Both cases are resolved by a SELECT that tries name then slug.
         return db.preparedQuery("""
                 INSERT INTO companies (name, domain, logo_url, status, slug, created_at, updated_at)
                 VALUES ($1, $2, $3, 'ghost',
                     lower(regexp_replace(regexp_replace(lower(trim($1)), '[^a-z0-9\\s-]', '', 'g'), '\\s+', '-', 'g')),
                     now(), now())
-                ON CONFLICT ((LOWER(TRIM(name)))) DO UPDATE
+                ON CONFLICT (slug) DO UPDATE
                     SET updated_at = now()
                 RETURNING *
                 """)
             .execute(Tuple.of(name.trim(), domain, logoUrl))
-            .map(rows -> rows.iterator().next());
+            .map(rows -> rows.iterator().next())
+            .recover(err -> {
+                if (err.getMessage() != null && err.getMessage().contains("23505")) {
+                    return db.preparedQuery("""
+                            SELECT * FROM companies
+                            WHERE LOWER(TRIM(name)) = LOWER(TRIM($1))
+                               OR slug = lower(regexp_replace(regexp_replace(lower(trim($1)), '[^a-z0-9\\s-]', '', 'g'), '\\s+', '-', 'g'))
+                            ORDER BY (LOWER(TRIM(name)) = LOWER(TRIM($1))) DESC
+                            LIMIT 1
+                            """)
+                        .execute(Tuple.of(name.trim()))
+                        .map(rows -> rows.iterator().next());
+                }
+                return Future.failedFuture(err);
+            });
     }
 
     /**

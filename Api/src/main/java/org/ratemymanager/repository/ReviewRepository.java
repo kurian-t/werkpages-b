@@ -285,10 +285,16 @@ public class ReviewRepository {
 
     /** Moves reviews from one manager to another, skipping users who already reviewed keepId. */
     public Future<Integer> moveToManager(long fromManagerId, long toManagerId) {
+        // Skip seed reviews (weight = TRUE) when the target already has one —
+        // idx_one_seed_per_manager allows only one seed per manager. The leftover
+        // seed on the source is cleaned up by the subsequent deleteByManager call.
         return db.preparedQuery("""
                 UPDATE reviews SET manager_id = $1
                 WHERE manager_id = $2
                   AND deleted_at IS NULL
+                  AND (weight = FALSE OR NOT EXISTS (
+                      SELECT 1 FROM reviews WHERE manager_id = $1 AND weight = TRUE
+                  ))
                   AND (user_id IS NULL
                        OR user_id NOT IN (
                            SELECT user_id FROM reviews
