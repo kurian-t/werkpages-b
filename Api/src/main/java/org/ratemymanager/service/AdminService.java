@@ -156,6 +156,8 @@ public class AdminService {
                         " has been approved and is now live on the platform.",
                         managerId);
                 }
+                // Compute the real rating from submitted reviews now that the manager is live.
+                managerRepo.recalculateInBackground(managerId);
                 if (companyRepo != null)
                     companyRepo.updateCompanyStatsForManager(managerId)
                         .onFailure(err -> System.err.println("company_stats_live update failed: " + err.getMessage()));

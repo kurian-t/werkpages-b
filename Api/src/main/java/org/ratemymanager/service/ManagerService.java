@@ -725,7 +725,8 @@ public class ManagerService {
                                             );
                                         })
                                 ).onSuccess(managerRow -> {
-                                    managerRepo.recalculateInBackground(managerRow.getLong("id"));
+                                    // Pending managers must NOT have a cached rating — recalculate
+                                    // runs on admin approval instead (AdminService.approvePendingManager).
                                     managerRepo.deleteFakeManagerInBackground();
                                 })
                                 ); // compose(slug ->
@@ -787,9 +788,21 @@ public class ManagerService {
                                 ? Future.succeededFuture()
                                 : companyRepo.findOrCreate(company, null, logoUrl)
                                     .compose(cRow -> managerRepo.insertCareerEntry(existingId, company, title, startDt, endDt, cRow.getLong("id")));
+                            // First-time raters (non-contributors) who rate the ghost manager they
+                            // found via /find get the seed deleted immediately so their real rating
+                            // shows at once. Contributors who happen to rate a ghost manager keep
+                            // the seed on the 14-day expiry counter instead.
+                            Future<Long> reviewCountFuture = userId != null
+                                ? db.preparedQuery("SELECT COUNT(*) AS cnt FROM reviews WHERE user_id = $1 AND deleted_at IS NULL")
+                                    .execute(Tuple.of(userId))
+                                    .map(rs -> rs.iterator().next().getLong("cnt"))
+                                : Future.succeededFuture(1L); // anonymous → treat as contributor
                             return histFuture
+                                .compose(v -> reviewCountFuture)
+                                .compose(existingReviewCount -> existingReviewCount == 0
+                                    ? reviewRepo.deleteSeedReview(existingId)
+                                    : reviewRepo.scheduleSeedExpiry(existingId))
                                 .compose(v -> validateAndInsertReview(reviewBody, existingId, userId, author, logoUrl, draftToken))
-                                .compose(ignored -> reviewRepo.scheduleSeedExpiry(existingId))
                                 .map(ignored -> updatedRow);
                         });
                 });
