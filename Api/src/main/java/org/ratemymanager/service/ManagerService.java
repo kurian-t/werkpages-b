@@ -1534,11 +1534,12 @@ public class ManagerService {
 
     public Future<JsonObject> createEditRequest(String auth0Id, long managerId, JsonObject body) {
         if (body == null) return Future.failedFuture(ServiceException.badRequest("Missing request body"));
-        String newCompany     = body.getString("company");
-        String newTitle       = body.getString("title");
-        String newStatus      = body.getString("status");
-        String newCountry     = body.getString("country");
-        String newLinkedinUrl = body.getString("linkedinUrl");
+        String newCompany        = body.getString("company");
+        String newCompanyLogoUrl = body.getString("companyLogoUrl");
+        String newTitle          = body.getString("title");
+        String newStatus         = body.getString("status");
+        String newCountry        = body.getString("country");
+        String newLinkedinUrl    = body.getString("linkedinUrl");
         String startDateStr   = body.getString("startDate");
         String endDateStr     = body.getString("endDate");
 
@@ -1557,11 +1558,12 @@ public class ManagerService {
         OffsetDateTime newStartDate = startDateLocal != null ? startDateLocal.atStartOfDay(ZoneOffset.UTC).toOffsetDateTime() : null;
         OffsetDateTime newEndDate   = endDateLocal   != null ? endDateLocal.atStartOfDay(ZoneOffset.UTC).toOffsetDateTime()   : null;
 
-        String effectiveCompany     = toNullIfBlank(newCompany);
-        String effectiveTitle       = toNullIfBlank(newTitle);
-        String effectiveStatus      = toNullIfBlank(newStatus);
-        String effectiveCountry     = toNullIfBlank(newCountry);
-        String effectiveLinkedinUrl = toNullIfBlank(newLinkedinUrl);
+        String effectiveCompany        = toNullIfBlank(newCompany);
+        String effectiveCompanyLogoUrl = toNullIfBlank(newCompanyLogoUrl);
+        String effectiveTitle          = toNullIfBlank(newTitle);
+        String effectiveStatus         = toNullIfBlank(newStatus);
+        String effectiveCountry        = toNullIfBlank(newCountry);
+        String effectiveLinkedinUrl    = toNullIfBlank(newLinkedinUrl);
 
         return userRepo.findByAuth0IdWithBan(auth0Id)
             .compose(opt -> {
@@ -1575,7 +1577,7 @@ public class ManagerService {
                         return managerRepo.findById(managerId)
                             .compose(mgrOpt -> {
                                 if (mgrOpt.isEmpty()) return Future.failedFuture(ServiceException.notFound("Manager not found"));
-                                return editRepo.upsert(managerId, userId, effectiveCompany, effectiveTitle, effectiveStatus, effectiveCountry, effectiveLinkedinUrl, newStartDate, newEndDate)
+                                return editRepo.upsert(managerId, userId, effectiveCompany, effectiveCompanyLogoUrl, effectiveTitle, effectiveStatus, effectiveCountry, effectiveLinkedinUrl, newStartDate, newEndDate)
                                     .map(row -> new JsonObject()
                                         .put("id", row.getUUID("id").toString())
                                         .put("managerId", managerId)

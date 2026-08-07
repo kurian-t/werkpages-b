@@ -189,7 +189,13 @@ public class CompanyLogoUtils {
             prev = cleaned;
             cleaned = CORP_SUFFIX_RE.matcher(cleaned).replaceFirst("").trim();
         } while (!cleaned.equals(prev));
-        return cleaned.toLowerCase().replaceAll("[^a-z0-9]", "") + ".com";
+        String lower = cleaned.toLowerCase();
+        // If the name already looks like a domain (e.g. "Priceline.com", "Booking.com"),
+        // use it directly rather than mangling it into "pricelinecom.com".
+        if (lower.matches("^[a-z0-9][a-z0-9\\-]*\\.[a-z]{2,}(\\.[a-z]{2,})?$")) {
+            return lower;
+        }
+        return lower.replaceAll("[^a-z0-9]", "") + ".com";
     }
 
     private static final String LOGO_DEV_TOKEN = "pk_MXSjJV-uTC6-L5D_FbXZUA";

@@ -894,6 +894,99 @@ class AdminServiceIntegrationTest {
     }
 
     // ══════════════════════════════════════════════════════════════════════════
+    // approveEdit — new_company_logo_url
+    // ══════════════════════════════════════════════════════════════════════════
+
+    @Test
+    void approveEdit_withStoredLogoUrl_resultContainsNewCompanyLogoUrl() throws Exception {
+        String adminAuth0 = insertUser("auth0|admin-logo01", "AdminLogo01", "admin");
+        String userAuth   = insertUser("auth0|editor-logo01", "EditorLogo01", "user");
+        UUID   userId     = findUserId(userAuth);
+        long managerId    = insertApprovedManager("Logo Test Manager", "OldCo", "Engineer");
+
+        UUID editId = insertPendingEditWithLogoUrl(managerId, userId,
+                "NewCo", "https://example.com/logo.png", "Senior Engineer", null, null);
+
+        JsonObject result = await(service.approveEdit(adminAuth0, editId));
+
+        assertTrue(result.getBoolean("success"));
+        assertEquals("NewCo", result.getString("newCompany"));
+        assertEquals("https://example.com/logo.png", result.getString("newCompanyLogoUrl"));
+    }
+
+    @Test
+    void approveEdit_withoutStoredLogoUrl_resultDoesNotContainNewCompanyLogoUrl() throws Exception {
+        String adminAuth0 = insertUser("auth0|admin-logo02", "AdminLogo02", "admin");
+        String userAuth   = insertUser("auth0|editor-logo02", "EditorLogo02", "user");
+        UUID   userId     = findUserId(userAuth);
+        long managerId    = insertApprovedManager("No Logo Manager", "OldCo", "Engineer");
+
+        UUID editId = insertPendingEdit(managerId, userId, "NewCo", "Director", null, null);
+
+        JsonObject result = await(service.approveEdit(adminAuth0, editId));
+
+        assertTrue(result.getBoolean("success"));
+        assertNull(result.getString("newCompanyLogoUrl"),
+                "newCompanyLogoUrl must be absent when no logo URL was stored");
+    }
+
+    @Test
+    void editRepository_upsert_persistsLogoUrl() throws Exception {
+        String userAuth = insertUser("auth0|editor-logo03", "EditorLogo03", "user");
+        UUID userId     = findUserId(userAuth);
+        long managerId  = insertApprovedManager("Upsert Logo Test", "OldCo", "Engineer");
+
+        EditRepository editRepo = new EditRepository(pool);
+        await(editRepo.upsert(managerId, userId, "NewCo", "https://cdn.example.com/newco.png",
+                "CTO", null, null, null, null, null));
+
+        String storedLogoUrl = await(pool
+                .preparedQuery("SELECT new_company_logo_url FROM manager_edits WHERE manager_id = $1")
+                .execute(Tuple.of(managerId))
+                .map(rs -> rs.iterator().hasNext() ? rs.iterator().next().getString("new_company_logo_url") : null));
+
+        assertEquals("https://cdn.example.com/newco.png", storedLogoUrl);
+    }
+
+    @Test
+    void editRepository_upsert_updatesLogoUrlOnConflict() throws Exception {
+        String userAuth = insertUser("auth0|editor-logo04", "EditorLogo04", "user");
+        UUID userId     = findUserId(userAuth);
+        long managerId  = insertApprovedManager("Upsert Logo Update", "OldCo", "Engineer");
+
+        EditRepository editRepo = new EditRepository(pool);
+        await(editRepo.upsert(managerId, userId, "NewCo", "https://cdn.example.com/old.png",
+                "CTO", null, null, null, null, null));
+        await(editRepo.upsert(managerId, userId, "NewCo", "https://cdn.example.com/new.png",
+                "CTO", null, null, null, null, null));
+
+        String storedLogoUrl = await(pool
+                .preparedQuery("SELECT new_company_logo_url FROM manager_edits WHERE manager_id = $1")
+                .execute(Tuple.of(managerId))
+                .map(rs -> rs.iterator().next().getString("new_company_logo_url")));
+
+        assertEquals("https://cdn.example.com/new.png", storedLogoUrl,
+                "ON CONFLICT DO UPDATE must overwrite old logo URL with new one");
+    }
+
+    @Test
+    void editRepository_upsert_nullLogoUrl_isStoredAsNull() throws Exception {
+        String userAuth = insertUser("auth0|editor-logo05", "EditorLogo05", "user");
+        UUID userId     = findUserId(userAuth);
+        long managerId  = insertApprovedManager("Null Logo Test", "OldCo", "Engineer");
+
+        EditRepository editRepo = new EditRepository(pool);
+        await(editRepo.upsert(managerId, userId, "NewCo", null, "CTO", null, null, null, null, null));
+
+        String storedLogoUrl = await(pool
+                .preparedQuery("SELECT new_company_logo_url FROM manager_edits WHERE manager_id = $1")
+                .execute(Tuple.of(managerId))
+                .map(rs -> rs.iterator().next().getString("new_company_logo_url")));
+
+        assertNull(storedLogoUrl, "null logo URL must be stored as NULL, not a string");
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
     // Helpers
     // ══════════════════════════════════════════════════════════════════════════
 
@@ -934,6 +1027,16 @@ class AdminServiceIntegrationTest {
             "INSERT INTO manager_edits(manager_id, proposed_by, new_company, new_title, new_status, new_linkedin_url) " +
             "VALUES ($1,$2,$3,$4,$5,$6) RETURNING id")
             .execute(Tuple.of(managerId, proposedBy, newCompany, newTitle, newStatus, newLinkedinUrl))
+            .map(rs -> rs.iterator().next().getUUID("id")));
+    }
+
+    private UUID insertPendingEditWithLogoUrl(long managerId, UUID proposedBy, String newCompany,
+                                               String newCompanyLogoUrl, String newTitle,
+                                               String newStatus, String newLinkedinUrl) throws Exception {
+        return await(pool.preparedQuery(
+            "INSERT INTO manager_edits(manager_id, proposed_by, new_company, new_company_logo_url, new_title, new_status, new_linkedin_url) " +
+            "VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id")
+            .execute(Tuple.of(managerId, proposedBy, newCompany, newCompanyLogoUrl, newTitle, newStatus, newLinkedinUrl))
             .map(rs -> rs.iterator().next().getUUID("id")));
     }
 

@@ -132,7 +132,8 @@ public class AdminHandler {
                 String newCompany = json.getString("newCompany");
                 if (newCompany != null) {
                     long managerId = json.getLong("managerId");
-                    String logoUrl = CompanyLogoUtils.resolveLogoUrl(newCompany);
+                    String storedLogoUrl = json.getString("newCompanyLogoUrl");
+                    String logoUrl = storedLogoUrl != null ? storedLogoUrl : CompanyLogoUtils.resolveLogoUrl(newCompany);
                     if (logoUrl != null) service.updateManagerLogo(managerId, logoUrl);
                 }
                 ok(ctx, json);

@@ -223,12 +223,13 @@ public class AdminService {
                     Row row = opt.get();
                     if (!"pending".equals(row.getString("status"))) return Future.failedFuture(ServiceException.conflict("Edit request is not pending"));
 
-                    long   managerId        = row.getLong("manager_id");
-                    String currentCompany   = row.getString("current_company");
-                    String currentTitle     = row.getString("current_title");
-                    Long   currentCompanyId = row.getLong("current_company_id");
-                    String newCompany       = row.getString("new_company");
-                    String newTitle         = row.getString("new_title");
+                    long   managerId           = row.getLong("manager_id");
+                    String currentCompany      = row.getString("current_company");
+                    String currentTitle        = row.getString("current_title");
+                    Long   currentCompanyId    = row.getLong("current_company_id");
+                    String newCompany          = row.getString("new_company");
+                    String newCompanyLogoUrl   = row.getString("new_company_logo_url");
+                    String newTitle            = row.getString("new_title");
                     String newStatus        = row.getString("new_status");
                     String newCountry       = row.getString("new_country");
                     String newLinkedinUrl   = row.getString("new_linkedin_url");
@@ -273,7 +274,7 @@ public class AdminService {
                                         managerRepo.insertCareerEntry(managerId, effectiveCo, effectiveTit, careerStart, newEndDate, newCompanyId)
                                     );
                                 })
-                                .compose(v -> applyEditAndApprove(managerId, editId, newCompany, newTitle, newStatus, newCountry, newLinkedinUrl, effectiveCo, effectiveTit, adminId, now, proposedBy, managerName, newCompanyId))
+                                .compose(v -> applyEditAndApprove(managerId, editId, newCompany, newCompanyLogoUrl, newTitle, newStatus, newCountry, newLinkedinUrl, effectiveCo, effectiveTit, adminId, now, proposedBy, managerName, newCompanyId))
                                 .compose(result -> {
                                     if (newCompany != null) {
                                         // Fire-and-forget: refresh old company's stats so its logo/counts stay accurate
@@ -299,7 +300,7 @@ public class AdminService {
     }
 
     private Future<JsonObject> applyEditAndApprove(long managerId, UUID editId,
-                                                     String newCompany, String newTitle, String newStatus, String newCountry,
+                                                     String newCompany, String newCompanyLogoUrl, String newTitle, String newStatus, String newCountry,
                                                      String newLinkedinUrl, String effectiveCo, String effectiveTit,
                                                      UUID adminId, OffsetDateTime reviewedAt,
                                                      UUID proposedBy, String managerName, Long newCompanyId) {
@@ -317,7 +318,10 @@ public class AdminService {
                         .onFailure(err -> System.err.println("company_stats_live update failed: " + err.getMessage()));
                 JsonObject result = new JsonObject().put("success", true).put("message", "Edit approved and applied")
                     .put("managerId", managerId);
-                if (newCompany != null) result.put("newCompany", newCompany);
+                if (newCompany != null) {
+                    result.put("newCompany", newCompany);
+                    if (newCompanyLogoUrl != null) result.put("newCompanyLogoUrl", newCompanyLogoUrl);
+                }
                 return Future.succeededFuture(result);
             });
     }
