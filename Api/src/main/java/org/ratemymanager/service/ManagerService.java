@@ -1860,11 +1860,11 @@ public class ManagerService {
                         }
 
                     if (contributed) {
-                        // Has already rated: create pending for admin, return nothing.
-                        return companyRepo.findOrCreate(company, null, resolvedLogoUrl)
-                            .compose(companyRow -> createSearchPending(fullName, company, title, country,
-                                trimmedState, trimmedCity, resolvedLogoUrl, companyRow.getLong("id"), userId))
-                            .map(row -> new JsonObject()
+                        // Has already rated — manager not found, return empty. No silent pending
+                        // creation: the user is searching, not explicitly submitting, so they
+                        // must not receive an admin rejection notification they don't understand.
+                        return Future.succeededFuture(
+                            new JsonObject()
                                 .put("data", new JsonArray())
                                 .put("created", false)
                                 .put("hasContributed", contributed));
@@ -1874,25 +1874,21 @@ public class ManagerService {
                     boolean shortNames = fullName.trim().length() < 4 || company.trim().length() < 4;
 
                     if (shortNames) {
-                        // Short name can't take the ghost slot — pending for admin, nothing shown.
-                        return companyRepo.findOrCreate(company, null, resolvedLogoUrl)
-                            .compose(companyRow -> createSearchPending(fullName, company, title, country,
-                                trimmedState, trimmedCity, resolvedLogoUrl, companyRow.getLong("id"), userId))
-                            .map(row -> new JsonObject()
+                        // Short name — can't safely ghost. Return empty; user can add explicitly.
+                        return Future.succeededFuture(
+                            new JsonObject()
                                 .put("data", new JsonArray())
                                 .put("created", false)
                                 .put("hasContributed", contributed));
                     }
 
                     // Atomically claim the one-time ghost slot. Only one concurrent request wins;
-                    // the loser falls through to pending_approval.
+                    // the loser gets empty results — no silent pending that could trigger a
+                    // confusing rejection notification.
                     return userRepo.claimAutoCreatedManagerSlot(userId).compose(claimed -> {
                         if (!claimed) {
-                            // Slot already taken — pending for admin, nothing shown.
-                            return companyRepo.findOrCreate(company, null, resolvedLogoUrl)
-                                .compose(companyRow -> createSearchPending(fullName, company, title, country,
-                                    trimmedState, trimmedCity, resolvedLogoUrl, companyRow.getLong("id"), userId))
-                                .map(row -> new JsonObject()
+                            return Future.succeededFuture(
+                                new JsonObject()
                                     .put("data", new JsonArray())
                                     .put("created", false)
                                     .put("hasContributed", contributed));

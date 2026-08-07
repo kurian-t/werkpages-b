@@ -96,46 +96,46 @@ class FindOrCreateIntegrationTest {
         assertTrue(flagSet);
     }
 
-    // ── Second search, long names → pending queued, nothing returned to user ──
+    // ── Second search, long names → ghost slot taken, returns empty, no pending created ──
 
     @Test
-    void findOrCreate_secondSearch_longNames_createsPendingInvisibleToUser() throws Exception {
+    void findOrCreate_secondSearch_longNames_returnsEmptyWithoutCreating() throws Exception {
         String auth0Id = insertUser("auth0|u2", "user2");
 
         // First search — creates ghost (user sees it)
         await(service.findOrCreate(
             auth0Id, "Alice", "Smith", "Engineer", "Acme Corp", "US", null, null, null));
 
-        // Second search (different manager) — creates pending but returns nothing to user
+        // Second search (different manager) — ghost slot taken, returns empty, no pending created
         JsonObject result = await(service.findOrCreate(
             auth0Id, "David", "Lee", "Manager", "Beta Corp", "US", null, null, null));
 
         assertFalse(result.getBoolean("created"));
         assertEquals(0, result.getJsonArray("data").size());
 
-        // Pending was still created in the DB for admin review
-        String status = await(pool.preparedQuery("SELECT approval_status FROM managers WHERE name ILIKE 'David Lee'")
-            .execute().map(rs -> rs.iterator().next().getString("approval_status")));
-        assertEquals("pending_approval", status);
+        // No pending created — user searched, not explicitly submitted
+        long count = await(pool.preparedQuery("SELECT COUNT(*) FROM managers WHERE name ILIKE 'David Lee'")
+            .execute().map(rs -> rs.iterator().next().getLong(0)));
+        assertEquals(0, count);
     }
 
-    // ── Short company name → pending queued, nothing returned to user ─────────
+    // ── Short company name → returns empty, no pending created, ghost slot untouched ──
 
     @Test
-    void findOrCreate_shortCompanyName_createsPendingNotGhost() throws Exception {
+    void findOrCreate_shortCompanyName_returnsEmptyWithoutCreating() throws Exception {
         String auth0Id = insertUser("auth0|u3", "user3");
 
         JsonObject result = await(service.findOrCreate(
             auth0Id, "Carol", "Lee", "Engineer", "Go", "US", null, null, null));
 
-        // Nothing returned to user — pending goes to admin queue
+        // Nothing returned to user — short name can't safely ghost
         assertFalse(result.getBoolean("created"));
         assertEquals(0, result.getJsonArray("data").size());
 
-        // Pending was still created in the DB
-        String status = await(pool.preparedQuery("SELECT approval_status FROM managers WHERE name ILIKE 'Carol Lee'")
-            .execute().map(rs -> rs.iterator().next().getString("approval_status")));
-        assertEquals("pending_approval", status);
+        // No pending created — user searched, not explicitly submitted
+        long count = await(pool.preparedQuery("SELECT COUNT(*) FROM managers WHERE name ILIKE 'Carol Lee'")
+            .execute().map(rs -> rs.iterator().next().getLong(0)));
+        assertEquals(0, count);
 
         // Ghost slot should NOT be consumed for short-name searches
         boolean flagSet = ghostSlotClaimed(findUserId(auth0Id));
@@ -162,60 +162,60 @@ class FindOrCreateIntegrationTest {
         assertEquals("ghost", result.getJsonArray("data").getJsonObject(0).getString("approvalStatus"));
     }
 
-    // ── Duplicate guard: searching same pending manager twice → no duplicate ──
+    // ── Ghost slot taken: repeated searches return empty, no managers created ──
 
     @Test
-    void findOrCreate_sameUserSearchesSamePendingManager_noDuplicate() throws Exception {
+    void findOrCreate_ghostSlotTaken_repeatedSearchesReturnEmpty() throws Exception {
         String auth0Id = insertUser("auth0|u5", "user5");
 
         // First search: creates ghost (consume slot)
         await(service.findOrCreate(
             auth0Id, "Alice", "Smith", "Engineer", "Acme Corp", "US", null, null, null));
 
-        // Second search: different name → pending (nothing returned)
-        await(service.findOrCreate(
-            auth0Id, "David", "Lee", "Manager", "Beta Corp", "US", null, null, null));
-
-        // Third search: same name/company → must NOT create a duplicate pending
+        // Second search: different name → ghost slot taken, returns empty, no manager created
         JsonObject second = await(service.findOrCreate(
             auth0Id, "David", "Lee", "Manager", "Beta Corp", "US", null, null, null));
-
         assertFalse(second.getBoolean("created"));
         assertEquals(0, second.getJsonArray("data").size());
 
+        // Third search: same name/company again → still empty, still no manager created
+        JsonObject third = await(service.findOrCreate(
+            auth0Id, "David", "Lee", "Manager", "Beta Corp", "US", null, null, null));
+        assertFalse(third.getBoolean("created"));
+        assertEquals(0, third.getJsonArray("data").size());
+
         long count = await(pool.preparedQuery("SELECT COUNT(*) FROM managers WHERE name ILIKE 'David Lee'")
             .execute().map(rs -> rs.iterator().next().getLong(0)));
-        assertEquals(1, count);
+        assertEquals(0, count);
     }
 
-    // ── Pending manager not visible to any user ───────────────────────────────
+    // ── Ghost slot taken for user1, user2 can still create ghost for same manager ──
 
     @Test
-    void findOrCreate_pendingManagerNotVisibleToAnyUser() throws Exception {
+    void findOrCreate_user2CanCreateGhostWhenUser1SlotWasExhausted() throws Exception {
         String auth0Id1 = insertUser("auth0|u6", "user6");
         String auth0Id2 = insertUser("auth0|u7", "user7");
 
-        // user1 creates ghost (Alice at Acme)
+        // user1 creates ghost (Alice at Acme) — consumes their slot
         await(service.findOrCreate(
             auth0Id1, "Alice", "Smith", "Engineer", "Acme Corp", "US", null, null, null));
 
-        // user1's second search creates pending (David at Beta) — user sees nothing
+        // user1's second search (David at Beta) — slot taken, returns empty, no manager created
         JsonObject u1Result = await(service.findOrCreate(
             auth0Id1, "David", "Lee", "Manager", "Beta Corp", "US", null, null, null));
         assertFalse(u1Result.getBoolean("created"));
         assertEquals(0, u1Result.getJsonArray("data").size());
 
-        // user2 searches same name/company — pending is hidden, user2 has their ghost slot free
-        // so they would claim it and create a second ghost (different row from user1's pending)
+        // user2 searches same name/company — their slot is free, creates ghost
         JsonObject u2Result = await(service.findOrCreate(
             auth0Id2, "David", "Lee", "Manager", "Beta Corp", "US", null, null, null));
         assertEquals("ghost", u2Result.getJsonArray("data").getJsonObject(0).getString("approvalStatus"));
 
-        long pendingId = await(pool.preparedQuery(
-            "SELECT id FROM managers WHERE name ILIKE 'David Lee' AND approval_status = 'pending_approval'")
-            .execute().map(rs -> rs.iterator().next().getLong("id")));
-        long ghostId = u2Result.getJsonArray("data").getJsonObject(0).getLong("id");
-        assertNotEquals(pendingId, ghostId);
+        // Only the ghost exists — no pending was created by user1's search
+        long pendingCount = await(pool.preparedQuery(
+            "SELECT COUNT(*) FROM managers WHERE name ILIKE 'David Lee' AND approval_status = 'pending_approval'")
+            .execute().map(rs -> rs.iterator().next().getLong(0)));
+        assertEquals(0, pendingCount);
     }
 
     // ── findPendingByUser excludes search-created managers ───────────────────
@@ -243,7 +243,7 @@ class FindOrCreateIntegrationTest {
         assertEquals("Submitted Manager", rows.iterator().next().getString("name"));
     }
 
-    // ── Concurrent searches by same user: only one ghost created ─────────────
+    // ── Concurrent searches by same user: only one ghost, loser gets empty ───
 
     @Test
     void findOrCreate_concurrentSearches_onlyOneGhostCreated() throws Exception {
@@ -258,23 +258,22 @@ class FindOrCreateIntegrationTest {
         List<JsonObject> results = await(Future.all(f1, f2)
             .map(cf -> List.of((JsonObject) cf.resultAt(0), (JsonObject) cf.resultAt(1))));
 
-        // Pending is no longer returned in data — verify via DB
+        // Exactly one ghost, zero pending — loser just gets empty results
         long ghostsInDB = await(pool.query("SELECT COUNT(*) FROM managers WHERE approval_status = 'ghost'")
             .execute().map(rs -> rs.iterator().next().getLong(0)));
         long pendingInDB = await(pool.query("SELECT COUNT(*) FROM managers WHERE approval_status = 'pending_approval'")
             .execute().map(rs -> rs.iterator().next().getLong(0)));
 
-        // Exactly one ghost and one pending — never two ghosts
         assertEquals(1, ghostsInDB, "Expected exactly 1 ghost; race condition may have created 2");
-        assertEquals(1, pendingInDB, "Expected exactly 1 pending_approval");
+        assertEquals(0, pendingInDB, "Loser should get empty results, not a pending manager");
 
-        // Only the ghost is returned in data; pending returns empty
+        // Only the winner returns data
         long dataWithResults = results.stream().filter(r -> r.getJsonArray("data").size() > 0).count();
         assertEquals(1, dataWithResults, "Only the ghost response should have data");
 
         long totalManagers = await(pool.query("SELECT COUNT(*) FROM managers")
             .execute().map(rs -> rs.iterator().next().getLong(0)));
-        assertEquals(2, totalManagers);
+        assertEquals(1, totalManagers);
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
