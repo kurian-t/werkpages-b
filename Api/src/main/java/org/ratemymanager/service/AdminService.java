@@ -329,7 +329,8 @@ public class AdminService {
     }
 
     public Future<Void> updateManagerLogo(long managerId, String logoUrl) {
-        return managerRepo.updateLogoUrl(managerId, logoUrl).mapEmpty();
+        return managerRepo.updateLogoUrl(managerId, logoUrl)
+            .compose(ignored -> companyRepo.updateCompanyStatsForManager(managerId));
     }
 
     public Future<JsonObject> rejectEdit(String auth0Id, UUID editId) {

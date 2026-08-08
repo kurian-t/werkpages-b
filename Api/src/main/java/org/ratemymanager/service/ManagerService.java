@@ -916,6 +916,8 @@ public class ManagerService {
             .compose(opt -> {
                 if (opt.isEmpty()) return Future.failedFuture(ServiceException.notFound("Manager not found"));
                 Row row = opt.get();
+                companyRepo.updateCompanyStatsForManager(managerId)
+                    .onFailure(err -> System.err.println("company_stats_live update failed after manager edit: " + err.getMessage()));
                 return managerRepo.getCareerHistory(managerId)
                     .map(chRows -> buildManagerUpdateJson(row, chRows));
             });

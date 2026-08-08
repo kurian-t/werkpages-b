@@ -7,6 +7,7 @@ import io.vertx.pgclient.PgPool;
 import io.vertx.sqlclient.Pool;
 import io.vertx.sqlclient.PoolOptions;
 import io.vertx.sqlclient.Row;
+import io.vertx.sqlclient.RowSet;
 import io.vertx.sqlclient.Tuple;
 import org.flywaydb.core.Flyway;
 import org.junit.jupiter.api.BeforeAll;
@@ -260,6 +261,45 @@ class ManagerServiceCoverage4IntegrationTest {
         JsonObject body = validReviewBody().put("draftToken", draftToken);
         Row result = await(service.createReview(auth0Id, managerId, body, null));
         assertNotNull(result);
+    }
+
+    @Test
+    void createReview_draftTokenReplacesAnonymousDropOff_notDuplicate() throws Exception {
+        // Regression: before the fix, validateAndInsertReview found the anonymous drop-off review
+        // via author-name match and rejected the authenticated submission as "already_reviewed_this_role".
+        String auth0Id = insertUser("auth0|cr-draft-replace");
+        long managerId = insertManager("Drop Off Replace Target", "DropCorp", "Lead", "approved");
+        UUID draftToken = UUID.randomUUID();
+        String authorName = "anon_dropoff_author_xyz";
+
+        // Insert an anonymous drop-off review (simulates what the pre-login drop-off capture creates)
+        pool.preparedQuery(
+                "INSERT INTO reviews(manager_id, user_id, author, overall_rating, " +
+                "communication_style, perceived_approachability, perceived_clarity_of_expectations, " +
+                "feedback_style, perceived_supportiveness, decision_making_style, " +
+                "organization_and_planning_style, delegation_style, perceived_professional_demeanor, " +
+                "overall_working_experience, manager_company, manager_title, " +
+                "worked_from, verified, helpful_count, draft_token, created_at, updated_at) " +
+                "VALUES ($1, NULL, $2, 3.0, 3,3,3,3,3,3,3,3,3,3,$3,$4,'2023-01-01',true,0,$5,now(),now())")
+            .execute(Tuple.of(managerId, authorName, "DropCorp", "Lead", draftToken))
+            .toCompletionStage().toCompletableFuture().get(5, TimeUnit.SECONDS);
+
+        // Authenticated user submits with the same draftToken and same author name (as generated during drop-off)
+        JsonObject body = validReviewBody()
+            .put("draftToken", draftToken.toString())
+            .put("author", authorName)
+            .put("managerCompany", "DropCorp")
+            .put("managerTitle", "Lead");
+        Row result = await(service.createReview(auth0Id, managerId, body, null));
+        assertNotNull(result);
+
+        // The anonymous drop-off should have been deleted; only the authenticated review remains
+        RowSet<Row> remaining = pool.preparedQuery(
+                "SELECT id, user_id FROM reviews WHERE manager_id = $1 AND deleted_at IS NULL")
+            .execute(Tuple.of(managerId))
+            .toCompletionStage().toCompletableFuture().get(5, TimeUnit.SECONDS);
+        assertEquals(1, remaining.size(), "Only the authenticated review should remain");
+        assertNotNull(remaining.iterator().next().getUUID("user_id"), "Review should be linked to authenticated user");
     }
 
     // ── validateAndInsertReview — edge cases ──────────────────────────────────
