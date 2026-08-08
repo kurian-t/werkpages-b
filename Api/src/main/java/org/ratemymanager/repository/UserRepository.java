@@ -84,7 +84,8 @@ public class UserRepository {
     /** Includes ban check — used for sign-in response. */
     public Future<Optional<Row>> findByAuth0IdForSignin(String auth0Id) {
         return db.preparedQuery("""
-                SELECT COALESCE(u.email_encrypted, u.email)           AS email,
+                SELECT u.id,
+                       COALESCE(u.email_encrypted, u.email)           AS email,
                        u.username,
                        COALESCE(u.first_name_encrypted, u.first_name) AS first_name,
                        COALESCE(u.last_name_encrypted,  u.last_name)  AS last_name,

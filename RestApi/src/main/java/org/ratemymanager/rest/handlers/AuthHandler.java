@@ -375,18 +375,25 @@ public class AuthHandler {
                                 return;
                             }
                             io.vertx.sqlclient.Row row = opt.get();
+                            java.util.UUID userId = row.getUUID("id");
                             boolean isProd = "true".equalsIgnoreCase(System.getenv("USE_AWS_SECRETS"));
                             String setCookie = "auth_token=" + accessToken
                                 + "; HttpOnly; Path=/; Max-Age=86400; SameSite=Lax" + (isProd ? "; Secure" : "");
-                            ctx.response().putHeader("Set-Cookie", setCookie).putHeader("Content-Type", "application/json")
-                                .end(new JsonObject().put("user", new JsonObject()
-                                    .put("email",     userRepo.decryptField(row.getString("email")))
-                                    .put("username",  row.getString("username"))
-                                    .put("firstName", userRepo.decryptField(row.getString("first_name")))
-                                    .put("lastName",  userRepo.decryptField(row.getString("last_name")))
-                                    .put("role",      row.getString("role"))
-                                    .put("isBanned",  row.getBoolean("is_banned"))
-                                ).encode());
+                            userRepo.hasContributed(userId)
+                                .onSuccess(contributed -> ctx.response()
+                                    .putHeader("Set-Cookie", setCookie)
+                                    .putHeader("Content-Type", "application/json")
+                                    .end(new JsonObject().put("user", new JsonObject()
+                                        .put("id",            userId.toString())
+                                        .put("email",         userRepo.decryptField(row.getString("email")))
+                                        .put("username",      row.getString("username"))
+                                        .put("firstName",     userRepo.decryptField(row.getString("first_name")))
+                                        .put("lastName",      userRepo.decryptField(row.getString("last_name")))
+                                        .put("role",          row.getString("role"))
+                                        .put("isBanned",      row.getBoolean("is_banned"))
+                                        .put("hasContributed", contributed)
+                                    ).encode()))
+                                .onFailure(ctx::fail);
                         })
                         .onFailure(ctx::fail);
                 } catch (Exception e) {
@@ -531,15 +538,22 @@ public class AuthHandler {
                                 boolean isProd = "true".equalsIgnoreCase(System.getenv("USE_AWS_SECRETS"));
                                 String setCookie = "auth_token=" + fTokenForCookie
                                     + "; HttpOnly; Path=/; Max-Age=86400; SameSite=Lax" + (isProd ? "; Secure" : "");
-                                ctx.response().putHeader("Set-Cookie", setCookie).putHeader("Content-Type", "application/json")
-                                    .end(new JsonObject().put("user", new JsonObject()
-                                        .put("email",     userRepo.decryptField(row.getString("email")))
-                                        .put("username",  row.getString("username"))
-                                        .put("firstName", userRepo.decryptField(row.getString("first_name")))
-                                        .put("lastName",  userRepo.decryptField(row.getString("last_name")))
-                                        .put("role",      row.getString("role"))
-                                        .put("isBanned",  row.getBoolean("is_banned"))
-                                    ).put("isNewUser", isNewUserHolder[0]).encode());
+                                java.util.UUID socialUserId = row.getUUID("id");
+                                userRepo.hasContributed(socialUserId)
+                                    .onSuccess(contributed -> ctx.response()
+                                        .putHeader("Set-Cookie", setCookie)
+                                        .putHeader("Content-Type", "application/json")
+                                        .end(new JsonObject().put("user", new JsonObject()
+                                            .put("id",            socialUserId.toString())
+                                            .put("email",         userRepo.decryptField(row.getString("email")))
+                                            .put("username",      row.getString("username"))
+                                            .put("firstName",     userRepo.decryptField(row.getString("first_name")))
+                                            .put("lastName",      userRepo.decryptField(row.getString("last_name")))
+                                            .put("role",          row.getString("role"))
+                                            .put("isBanned",      row.getBoolean("is_banned"))
+                                            .put("hasContributed", contributed)
+                                        ).put("isNewUser", isNewUserHolder[0]).encode()))
+                                    .onFailure(ctx::fail);
                             })
                             .onFailure(err -> {
                                 String msg = err.getMessage() != null ? err.getMessage().toLowerCase() : "";
