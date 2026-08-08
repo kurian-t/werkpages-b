@@ -108,17 +108,21 @@ public class ManagersHandler {
         final long finalId = managerId;
 
         service.getManagerById(managerId, auth0Id)
-            .compose(row -> service.hasReported(finalId, auth0Id)
-                .map(hasReported -> buildManagerResponse(row, hasReported))
-            )
+            .compose(row -> io.vertx.core.Future.all(
+                service.hasReported(finalId, auth0Id),
+                service.isContributor(auth0Id)
+            ).map(cf -> buildManagerResponse(row, cf.resultAt(0), cf.resultAt(1))))
             .onSuccess(json -> ctx.response().putHeader("Content-Type", "application/json").end(json.encode()))
             .onFailure(err -> handleError(ctx, err));
     }
 
-    private JsonObject buildManagerResponse(Row row, boolean hasReported) {
+    private JsonObject buildManagerResponse(Row row, boolean hasReported, boolean contributed) {
         String company = row.getString("company");
         String logoUrl = row.getString("company_logo_url");
         if (logoUrl == null) logoUrl = CompanyLogoUtils.resolveLogoUrl(company);
+        JsonObject categoryAverages = contributed
+            ? row.getJsonObject("category_averages")
+            : new JsonObject();
         return new JsonObject()
             .put("hasReported", hasReported)
             .put("id", row.getLong("id"))
@@ -131,7 +135,7 @@ public class ManagersHandler {
             .put("bio", row.getString("bio"))
             .put("status", row.getString("status"))
             .put("approvalStatus", row.getString("approval_status"))
-            .put("categoryAverages", row.getJsonObject("category_averages"))
+            .put("categoryAverages", categoryAverages)
             .put("linkedinUrl", row.getString("linkedin_url"))
             .put("country", row.getString("country"))
             .put("companyLogoUrl", logoUrl)
@@ -163,42 +167,55 @@ public class ManagersHandler {
 
     public void handleGetCompanyProfile(RoutingContext ctx) {
         String company = ctx.queryParam("company").stream().findFirst().orElse(null);
-        service.getCompanyProfile(company)
-            .onSuccess(json -> ctx.response().putHeader("Content-Type", "application/json").end(json.encode()))
-            .onFailure(err -> handleError(ctx, err));
+        String auth0Id = extractAuth0IdFromRequest(ctx);
+        io.vertx.core.Future.all(
+            service.getCompanyProfile(company),
+            service.isContributor(auth0Id)
+        ).onSuccess(cf -> {
+            JsonObject json = cf.resultAt(0);
+            boolean contributed = cf.resultAt(1);
+            if (!contributed) json.put("categoryAverages", new JsonObject());
+            ctx.response().putHeader("Content-Type", "application/json").end(json.encode());
+        }).onFailure(err -> handleError(ctx, err));
     }
 
     // ── GET /api/companies/by-slug/{companySlug} ──────────────────────────────
 
     public void handleGetCompanyBySlug(RoutingContext ctx) {
-        String slug = ctx.pathParam("companySlug");
-        service.getCompanyBySlug(slug)
-            .onSuccess(json -> ctx.response().putHeader("Content-Type", "application/json").end(json.encode()))
-            .onFailure(err -> handleError(ctx, err));
+        String slug    = ctx.pathParam("companySlug");
+        String auth0Id = extractAuth0IdFromRequest(ctx);
+        io.vertx.core.Future.all(
+            service.getCompanyBySlug(slug),
+            service.isContributor(auth0Id)
+        ).onSuccess(cf -> {
+            JsonObject json = cf.resultAt(0);
+            boolean contributed = cf.resultAt(1);
+            if (!contributed) json.put("categoryAverages", new JsonObject());
+            ctx.response().putHeader("Content-Type", "application/json").end(json.encode());
+        }).onFailure(err -> handleError(ctx, err));
     }
 
     // ── GET /api/managers/by-slug/{managerSlug} ───────────────────────────────
 
     public void handleGetManagerBySlug(RoutingContext ctx) {
-        String managerSlug        = ctx.pathParam("managerSlug");
+        String managerSlug         = ctx.pathParam("managerSlug");
         String expectedCompanySlug = ctx.queryParam("expectedCompanySlug").stream().findFirst().orElse(null);
-        String auth0Id            = extractAuth0IdFromRequest(ctx);
+        String auth0Id             = extractAuth0IdFromRequest(ctx);
 
         service.getManagerBySlug(managerSlug, auth0Id)
-            .compose(row -> service.hasReported(row.getLong("id"), auth0Id)
-                .map(hasReported -> {
-                    JsonObject response = buildManagerResponse(row, hasReported);
-                    // If company slug in the URL is stale, include canonical path so the
-                    // frontend can silently correct the URL without a second round trip.
-                    if (expectedCompanySlug != null && !expectedCompanySlug.isBlank()) {
-                        String currentCompanySlug = row.getString("company_slug");
-                        if (currentCompanySlug != null && !currentCompanySlug.equals(expectedCompanySlug)) {
-                            response.put("canonicalPath", "/companies/" + currentCompanySlug + "/managers/" + row.getString("slug"));
-                        }
+            .compose(row -> io.vertx.core.Future.all(
+                service.hasReported(row.getLong("id"), auth0Id),
+                service.isContributor(auth0Id)
+            ).map(cf -> {
+                JsonObject response = buildManagerResponse(row, cf.resultAt(0), cf.resultAt(1));
+                if (expectedCompanySlug != null && !expectedCompanySlug.isBlank()) {
+                    String currentCompanySlug = row.getString("company_slug");
+                    if (currentCompanySlug != null && !currentCompanySlug.equals(expectedCompanySlug)) {
+                        response.put("canonicalPath", "/companies/" + currentCompanySlug + "/managers/" + row.getString("slug"));
                     }
-                    return response;
-                })
-            )
+                }
+                return response;
+            }))
             .onSuccess(json -> ctx.response().putHeader("Content-Type", "application/json").end(json.encode()))
             .onFailure(err -> handleError(ctx, err));
     }

@@ -1520,6 +1520,15 @@ public class ManagerService {
             .map(contributed -> new JsonObject().put("hasContributed", contributed));
     }
 
+    /** Returns true if the user identified by auth0Id has at least one review; false if null or not found. */
+    public Future<Boolean> isContributor(String auth0Id) {
+        if (auth0Id == null) return Future.succeededFuture(false);
+        return userRepo.findIdByAuth0Id(auth0Id)
+            .compose(opt -> opt.isPresent()
+                ? userRepo.hasContributed(opt.get())
+                : Future.succeededFuture(false));
+    }
+
     public Future<JsonObject> getMyReviews(String auth0Id, int limit, int offset) {
         int effectiveLimit  = Math.min(Math.max(limit, 1), 50);
         int effectiveOffset = Math.max(offset, 0);

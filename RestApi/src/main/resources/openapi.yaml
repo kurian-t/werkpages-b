@@ -2214,6 +2214,14 @@ components:
         createdAt:
           type: string
           format: date-time
+        role:
+          type: string
+          enum: [admin, user]
+        isBanned:
+          type: boolean
+        hasContributed:
+          type: boolean
+          description: True if the user has submitted at least one review
 
     SignupRequest:
       type: object

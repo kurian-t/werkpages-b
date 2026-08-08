@@ -411,18 +411,23 @@ public class AuthHandler {
                         .end(new JsonObject().put("error", "User not found").encode()); return;
                 }
                 io.vertx.sqlclient.Row row = opt.get();
-                ctx.response().setStatusCode(200).putHeader("Content-Type", "application/json")
-                    .end(new JsonObject()
-                        .put("id",        row.getUUID("id").toString())
-                        .put("auth0Id",   row.getString("auth0_id"))
-                        .put("email",     userRepo.decryptField(row.getString("email")))
-                        .put("username",  row.getString("username"))
-                        .put("firstName", userRepo.decryptField(row.getString("first_name")))
-                        .put("lastName",  userRepo.decryptField(row.getString("last_name")))
-                        .put("role",      row.getString("role"))
-                        .put("isBanned",  row.getBoolean("is_banned"))
-                        .put("createdAt", row.getLocalDateTime("created_at").toString())
-                        .encode());
+                java.util.UUID userId = row.getUUID("id");
+                userRepo.hasContributed(userId)
+                    .onSuccess(contributed -> ctx.response().setStatusCode(200)
+                        .putHeader("Content-Type", "application/json")
+                        .end(new JsonObject()
+                            .put("id",             userId.toString())
+                            .put("auth0Id",        row.getString("auth0_id"))
+                            .put("email",          userRepo.decryptField(row.getString("email")))
+                            .put("username",       row.getString("username"))
+                            .put("firstName",      userRepo.decryptField(row.getString("first_name")))
+                            .put("lastName",       userRepo.decryptField(row.getString("last_name")))
+                            .put("role",           row.getString("role"))
+                            .put("isBanned",       row.getBoolean("is_banned"))
+                            .put("hasContributed", contributed)
+                            .put("createdAt",      row.getLocalDateTime("created_at").toString())
+                            .encode()))
+                    .onFailure(ctx::fail);
             })
             .onFailure(ctx::fail);
     }
