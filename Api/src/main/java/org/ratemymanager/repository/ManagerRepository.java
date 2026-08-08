@@ -27,7 +27,7 @@ public class ManagerRepository {
                 m.id, m.name, m.company, m.title, m.image, m.overall_rating,
                 m.reviews_count, m.bio, m.status, m.approval_status,
                 m.category_averages, m.linkedin_url, m.company_logo_url, m.country,
-                m.created_at, m.submitted_by, m.slug,
+                m.created_at, m.submitted_by, m.company_id, m.slug,
                 c.slug AS company_slug,
                 COALESCE(ch.career_history, '[]') AS career_history,
                 COALESCE(r.reviews, '[]') AS reviews

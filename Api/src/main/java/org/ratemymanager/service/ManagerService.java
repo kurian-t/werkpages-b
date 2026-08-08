@@ -1033,8 +1033,18 @@ public class ManagerService {
             if (!isValidRating(v)) return Future.failedFuture(ServiceException.badRequest("Rating for '" + RATING_KEYS[i] + "' must be between 1 and 5"));
         }
 
+        // When an authenticated user submits using a draftToken, delete the anonymous drop-off review
+        // before the duplicate check. Without this, findByUserForValidation finds the drop-off via
+        // author match and rejects the submission as a duplicate even though it's the same user.
+        Future<Void> deleteDraftFirst = (userId != null && draftToken != null)
+            ? db.preparedQuery("DELETE FROM reviews WHERE draft_token = $1 AND user_id IS NULL")
+                  .execute(Tuple.of(draftToken))
+                  .mapEmpty()
+            : Future.succeededFuture();
+
         // Fetch all existing reviews by this user (or anonymous reviews with the same author name)
-        return reviewRepo.findByUserForValidation(userId != null ? userId : UUID.fromString("00000000-0000-0000-0000-000000000000"), author)
+        return deleteDraftFirst.compose(v ->
+            reviewRepo.findByUserForValidation(userId != null ? userId : UUID.fromString("00000000-0000-0000-0000-000000000000"), author)
             .compose(existingRows -> {
                 List<Row> existing = new ArrayList<>();
                 for (Row r : existingRows) existing.add(r);
@@ -1090,7 +1100,8 @@ public class ManagerService {
                                 ratings, managerCompany, managerTitle, text,
                                 workedFrom, workedUntil, managerRoleStart, managerRoleEnd, resolvedLogoUrl, draftToken);
                     });  // closes allRoleRows compose
-            });  // closes existingRows compose
+            })  // closes existingRows compose
+        );  // closes deleteDraftFirst compose
     }
 
     /**
