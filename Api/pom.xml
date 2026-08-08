@@ -125,6 +125,8 @@
 					<excludes>
 						<exclude>**/*IntegrationTest.java</exclude>
 					</excludes>
+					<!-- Picks up JaCoCo agent set by pre-unit-test execution -->
+					<argLine>${jacoco.agent.argLine}</argLine>
 				</configuration>
 			</plugin>
 			<!-- Integration tests run during the verify phase (mvn verify / mvn install) -->
@@ -155,21 +157,90 @@
 					</execution>
 				</executions>
 			</plugin>
-			<!-- Code coverage for integration tests -->
+			<!-- Code coverage: unit tests + integration tests, merged into one report -->
 			<plugin>
 				<groupId>org.jacoco</groupId>
 				<artifactId>jacoco-maven-plugin</artifactId>
 				<version>0.8.12</version>
+				<configuration>
+					<!-- Infrastructure-only classes: entry point, connection pool setup,
+					     cloud secrets reader, external AI client, one-time migration tool.
+					     None of these can be meaningfully exercised in automated tests. -->
+					<excludes>
+						<exclude>org/ratemymanager/Main.class</exclude>
+						<exclude>org/ratemymanager/db/Database.class</exclude>
+						<exclude>org/ratemymanager/config/SecretsConfig.class</exclude>
+						<exclude>org/ratemymanager/service/AnthropicClient.class</exclude>
+						<exclude>org/ratemymanager/tools/BackfillEncryption.class</exclude>
+					</excludes>
+				</configuration>
 				<executions>
+					<!-- Instrument unit tests (Surefire) -->
+					<execution>
+						<id>pre-unit-test</id>
+						<phase>initialize</phase>
+						<goals><goal>prepare-agent</goal></goals>
+						<configuration>
+							<propertyName>jacoco.agent.argLine</propertyName>
+							<destFile>${project.build.directory}/jacoco.exec</destFile>
+						</configuration>
+					</execution>
+					<!-- Unit-test-only report (useful for fast feedback) -->
+					<execution>
+						<id>report-unit-test</id>
+						<phase>test</phase>
+						<goals><goal>report</goal></goals>
+						<configuration>
+							<dataFile>${project.build.directory}/jacoco.exec</dataFile>
+							<outputDirectory>${project.reporting.outputDirectory}/jacoco</outputDirectory>
+						</configuration>
+					</execution>
+					<!-- Instrument integration tests (Failsafe) -->
 					<execution>
 						<id>pre-integration-test</id>
 						<phase>pre-integration-test</phase>
 						<goals><goal>prepare-agent-integration</goal></goals>
+						<configuration>
+							<destFile>${project.build.directory}/jacoco-it.exec</destFile>
+						</configuration>
 					</execution>
+					<!-- Integration-test-only report -->
 					<execution>
 						<id>report-integration</id>
 						<phase>post-integration-test</phase>
 						<goals><goal>report-integration</goal></goals>
+						<configuration>
+							<dataFile>${project.build.directory}/jacoco-it.exec</dataFile>
+							<outputDirectory>${project.reporting.outputDirectory}/jacoco-it</outputDirectory>
+						</configuration>
+					</execution>
+					<!-- Merge unit + IT exec files into a single combined exec -->
+					<execution>
+						<id>merge-results</id>
+						<phase>verify</phase>
+						<goals><goal>merge</goal></goals>
+						<configuration>
+							<fileSets>
+								<fileSet>
+									<directory>${project.build.directory}</directory>
+									<includes>
+										<include>jacoco.exec</include>
+										<include>jacoco-it.exec</include>
+									</includes>
+								</fileSet>
+							</fileSets>
+							<destFile>${project.build.directory}/jacoco-merged.exec</destFile>
+						</configuration>
+					</execution>
+					<!-- Combined unit + IT report -->
+					<execution>
+						<id>post-merge-report</id>
+						<phase>verify</phase>
+						<goals><goal>report</goal></goals>
+						<configuration>
+							<dataFile>${project.build.directory}/jacoco-merged.exec</dataFile>
+							<outputDirectory>${project.reporting.outputDirectory}/jacoco-merged</outputDirectory>
+						</configuration>
 					</execution>
 				</executions>
 			</plugin>
@@ -181,5 +252,7 @@
 		<maven.compiler.target>21</maven.compiler.target>
 		<project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
 		<skipITs>true</skipITs>
+		<!-- Default to empty so Surefire doesn't fail when JaCoCo hasn't run -->
+		<jacoco.agent.argLine></jacoco.agent.argLine>
 	</properties>
 </project>
