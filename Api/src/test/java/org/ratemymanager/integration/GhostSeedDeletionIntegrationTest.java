@@ -80,6 +80,7 @@ class GhostSeedDeletionIntegrationTest {
 
     @BeforeEach
     void cleanDb() throws Exception {
+        await(pool.query("TRUNCATE notifications, manager_url_history, company_stats_live").execute());
         await(pool.query("TRUNCATE managers, companies, users CASCADE").execute());
     }
 

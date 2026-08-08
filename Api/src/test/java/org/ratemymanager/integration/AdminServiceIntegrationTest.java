@@ -70,6 +70,10 @@ class AdminServiceIntegrationTest {
 
     @BeforeEach
     void cleanDb() throws Exception {
+        // Truncate leaf tables first to avoid deadlock with fire-and-forget background tasks
+        // (e.g. notifRepo.sendAsync holds notifications row lock while checking managers FK;
+        // a single CASCADE TRUNCATE on managers holds managers lock and then wants notifications)
+        await(pool.query("TRUNCATE notifications, manager_url_history, company_stats_live").execute());
         await(pool.query("TRUNCATE managers, users CASCADE").execute());
     }
 
