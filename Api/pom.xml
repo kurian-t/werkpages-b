@@ -136,6 +136,8 @@
 					<includes>
 						<include>**/*IntegrationTest.java</include>
 					</includes>
+					<!-- @{argLine} picks up the JaCoCo agent set by prepare-agent-integration -->
+					<argLine>@{argLine}</argLine>
 					<environmentVariables>
 						<DOCKER_HOST>unix:///home/noragrats/.docker/desktop/docker.sock</DOCKER_HOST>
 						<TESTCONTAINERS_RYUK_DISABLED>true</TESTCONTAINERS_RYUK_DISABLED>
@@ -150,6 +152,24 @@
 							<goal>integration-test</goal>
 							<goal>verify</goal>
 						</goals>
+					</execution>
+				</executions>
+			</plugin>
+			<!-- Code coverage for integration tests -->
+			<plugin>
+				<groupId>org.jacoco</groupId>
+				<artifactId>jacoco-maven-plugin</artifactId>
+				<version>0.8.12</version>
+				<executions>
+					<execution>
+						<id>pre-integration-test</id>
+						<phase>pre-integration-test</phase>
+						<goals><goal>prepare-agent-integration</goal></goals>
+					</execution>
+					<execution>
+						<id>report-integration</id>
+						<phase>post-integration-test</phase>
+						<goals><goal>report-integration</goal></goals>
 					</execution>
 				</executions>
 			</plugin>
