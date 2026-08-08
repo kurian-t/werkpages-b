@@ -244,6 +244,7 @@ public class ManagerService {
             .compose(companyRow -> {
                 long companyId = companyRow.getLong("id");
                 String canonicalName = companyRow.getString("name");
+                String companySlug   = companyRow.getString("slug");
                 String storedLogoUrl = companyRow.getString("logo_url");
                 String logoUrl = (storedLogoUrl != null && storedLogoUrl.contains("logo.dev"))
                     ? storedLogoUrl : resolvedLogoUrl;
@@ -253,6 +254,7 @@ public class ManagerService {
                             JsonObject empty = new JsonObject()
                                 .put("id",              companyId)
                                 .put("name",            canonicalName)
+                                .put("slug",            companySlug)
                                 .put("managerCount",    0)
                                 .put("totalReviews",    0)
                                 .put("avgRating",       (Object) null)
@@ -307,6 +309,7 @@ public class ManagerService {
                                 .put("overallRating",  hasRating ? rating : (Object) null)
                                 .put("reviewsCount",   reviews != null ? reviews : 0)
                                 .put("company",        row.getString("company"))
+                                .put("slug",           row.getString("slug"))
                                 .put("approvalStatus", row.getString("approval_status"));
                             if (mgrLogoUrl != null && !mgrLogoUrl.isBlank()) mgr.put("companyLogoUrl", mgrLogoUrl);
                             managers.add(mgr);
@@ -319,6 +322,7 @@ public class ManagerService {
                         JsonObject result = new JsonObject()
                             .put("id",              companyId)
                             .put("name",            canonicalName)
+                            .put("slug",            companySlug)
                             .put("managerCount",    managers.size())
                             .put("totalReviews",    totalReviews)
                             .put("avgRating",       ratingCount > 0
