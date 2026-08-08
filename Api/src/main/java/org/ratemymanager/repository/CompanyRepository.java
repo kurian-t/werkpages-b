@@ -198,7 +198,7 @@ public class CompanyRepository {
         return db.preparedQuery("""
                 WITH target AS (SELECT LOWER(TRIM(name)) AS lname FROM companies WHERE id = $1)
                 SELECT DISTINCT m.id, m.name, m.title, m.image, m.overall_rating, m.reviews_count,
-                       m.company_logo_url, m.category_averages, m.company, m.slug
+                       m.company_logo_url, m.category_averages, m.company, m.slug, m.approval_status
                 FROM managers m, target
                 WHERE m.approval_status IN ('approved', 'ghost')
                   AND (m.external_id IS NULL OR m.external_id NOT LIKE 'seed_%')

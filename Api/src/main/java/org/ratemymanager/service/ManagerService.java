@@ -300,13 +300,14 @@ public class ManagerService {
                                 }
                             }
                             JsonObject mgr = new JsonObject()
-                                .put("id",           row.getLong("id"))
-                                .put("name",         row.getString("name"))
-                                .put("title",        row.getString("title"))
-                                .put("image",        row.getString("image"))
-                                .put("overallRating", hasRating ? rating : (Object) null)
-                                .put("reviewsCount", reviews != null ? reviews : 0)
-                                .put("company",      row.getString("company"));
+                                .put("id",             row.getLong("id"))
+                                .put("name",           row.getString("name"))
+                                .put("title",          row.getString("title"))
+                                .put("image",          row.getString("image"))
+                                .put("overallRating",  hasRating ? rating : (Object) null)
+                                .put("reviewsCount",   reviews != null ? reviews : 0)
+                                .put("company",        row.getString("company"))
+                                .put("approvalStatus", row.getString("approval_status"));
                             if (mgrLogoUrl != null && !mgrLogoUrl.isBlank()) mgr.put("companyLogoUrl", mgrLogoUrl);
                             managers.add(mgr);
                         }
@@ -409,14 +410,15 @@ public class ManagerService {
                 }
             }
             JsonObject mgr = new JsonObject()
-                .put("id",            row.getLong("id"))
-                .put("name",          row.getString("name"))
-                .put("title",         row.getString("title"))
-                .put("image",         row.getString("image"))
-                .put("overallRating", hasRating ? rating : (Object) null)
-                .put("reviewsCount",  reviews != null ? reviews : 0)
-                .put("company",       row.getString("company"))
-                .put("slug",          row.getString("slug"));
+                .put("id",             row.getLong("id"))
+                .put("name",           row.getString("name"))
+                .put("title",          row.getString("title"))
+                .put("image",          row.getString("image"))
+                .put("overallRating",  hasRating ? rating : (Object) null)
+                .put("reviewsCount",   reviews != null ? reviews : 0)
+                .put("company",        row.getString("company"))
+                .put("slug",           row.getString("slug"))
+                .put("approvalStatus", row.getString("approval_status"));
             if (mgrLogoUrl != null && !mgrLogoUrl.isBlank()) mgr.put("companyLogoUrl", mgrLogoUrl);
             managers.add(mgr);
         }
