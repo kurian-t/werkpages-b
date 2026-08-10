@@ -730,6 +730,54 @@ class AdminServiceIntegrationTest {
         assertEquals(0L, mergeReviews, "No reviews must remain on the deleted manager");
     }
 
+    @Test
+    void mergeManagers_sameUserDifferentRole_bothReviewsMoved() throws Exception {
+        // A user who reviewed the same manager under two different company/title combos
+        // (one review per manager page) must have BOTH reviews on the kept manager after merge.
+        // The old user_id-only skip dropped the second review; the fix uses user+company+title.
+        String adminAuth0 = insertUser("auth0|admin-role01", "AdminRole01", "admin");
+        String userAuth   = insertUser("auth0|merge-role-user", "MergeRoleUser", "user");
+        UUID   userId     = findUserId(userAuth);
+        long keepId  = insertApprovedManager("Keep Role Manager",  "Corp A", "Director");
+        long mergeId = insertApprovedManager("Merge Role Manager", "Corp A", "Director");
+
+        // Keep manager: user reviewed Angela at Ciel Luxury Apartments
+        insertReviewWithValues(keepId,  userId, "Ciel Luxury Apartments", "Property Manager");
+        // Merge manager: same user reviewed Angela at WRH Realty Services (different role)
+        insertReviewWithValues(mergeId, userId, "WRH Realty Services",    "Property Manager");
+
+        await(service.mergeManagers(adminAuth0, keepId, mergeId));
+
+        // Both reviews must survive on the kept manager
+        long keepReviews = await(pool
+            .preparedQuery("SELECT COUNT(*) FROM reviews WHERE manager_id = $1 AND weight = FALSE")
+            .execute(Tuple.of(keepId))
+            .map(rs -> rs.iterator().next().getLong(0)));
+        assertEquals(2L, keepReviews, "Both role reviews must be moved to the kept manager");
+    }
+
+    @Test
+    void mergeManagers_sameUserSameRole_duplicateDropped() throws Exception {
+        // A user who reviewed the exact same role on both manager pages — true duplicate.
+        // Only one should survive after the merge.
+        String adminAuth0 = insertUser("auth0|admin-dup01", "AdminDup01", "admin");
+        String userAuth   = insertUser("auth0|merge-dup-user", "MergeDupUser", "user");
+        UUID   userId     = findUserId(userAuth);
+        long keepId  = insertApprovedManager("Keep Dup Manager",  "Corp", "Director");
+        long mergeId = insertApprovedManager("Merge Dup Manager", "Corp", "Director");
+
+        insertReviewWithValues(keepId,  userId, "Acme Corp", "Engineer");
+        insertReviewWithValues(mergeId, userId, "Acme Corp", "Engineer"); // exact same role
+
+        await(service.mergeManagers(adminAuth0, keepId, mergeId));
+
+        long keepReviews = await(pool
+            .preparedQuery("SELECT COUNT(*) FROM reviews WHERE manager_id = $1 AND weight = FALSE")
+            .execute(Tuple.of(keepId))
+            .map(rs -> rs.iterator().next().getLong(0)));
+        assertEquals(1L, keepReviews, "True duplicate (same user+company+title) must not be duplicated");
+    }
+
     // ══════════════════════════════════════════════════════════════════════════
     // deleteManager
     // ══════════════════════════════════════════════════════════════════════════

@@ -288,6 +288,10 @@ public class ReviewRepository {
         // Skip seed reviews (weight = TRUE) when the target already has one —
         // idx_one_seed_per_manager allows only one seed per manager. The leftover
         // seed on the source is cleaned up by the subsequent deleteByManager call.
+        // Skip only true role duplicates (same user + same manager_company + same manager_title
+        // already exists on the target). Blocking on user_id alone was wrong — a user who
+        // reviewed the same manager at two different companies/roles should have both reviews
+        // preserved after a merge.
         return db.preparedQuery("""
                 UPDATE reviews SET manager_id = $1
                 WHERE manager_id = $2
@@ -295,11 +299,14 @@ public class ReviewRepository {
                   AND (weight = FALSE OR NOT EXISTS (
                       SELECT 1 FROM reviews WHERE manager_id = $1 AND weight = TRUE
                   ))
-                  AND (user_id IS NULL
-                       OR user_id NOT IN (
-                           SELECT user_id FROM reviews
-                           WHERE manager_id = $1 AND user_id IS NOT NULL
-                       ))
+                  AND NOT EXISTS (
+                      SELECT 1 FROM reviews t
+                      WHERE t.manager_id = $1
+                        AND t.user_id IS NOT NULL
+                        AND t.user_id = reviews.user_id
+                        AND LOWER(TRIM(t.manager_company)) = LOWER(TRIM(reviews.manager_company))
+                        AND LOWER(TRIM(t.manager_title))   = LOWER(TRIM(reviews.manager_title))
+                  )
                 """)
             .execute(Tuple.of(toManagerId, fromManagerId))
             .map(RowSet::rowCount);
