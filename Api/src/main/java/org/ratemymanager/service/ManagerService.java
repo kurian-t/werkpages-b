@@ -1758,6 +1758,17 @@ public class ManagerService {
 
     private static boolean isValidRating(Double v) { return v != null && v >= 1 && v <= 5; }
 
+    /**
+     * Returns true if the first name should be allowed to auto-create a ghost manager.
+     * Exactly 2-char names (DJ, TJ, etc.) always pass. All others must contain at least
+     * one vowel — a/e/i/o/u/y (Y counts) — to avoid ghosting garbage keystrokes like "Lxmb".
+     */
+    static boolean firstNamePassesVowelCheck(String firstName) {
+        String f = firstName == null ? "" : firstName.trim();
+        if (f.length() == 2) return true;
+        return f.toLowerCase().chars().anyMatch(c -> "aeiouy".indexOf(c) >= 0);
+    }
+
     private static boolean isValidLinkedinUrl(String url) {
         return url != null && (url.startsWith("https://www.linkedin.com/") || url.startsWith("https://linkedin.com/"));
     }
@@ -1920,6 +1931,23 @@ public class ManagerService {
                         // Short name — can't safely ghost. Return empty; user can add explicitly.
                         return Future.succeededFuture(
                             new JsonObject()
+                                .put("data", new JsonArray())
+                                .put("created", false)
+                                .put("hasContributed", contributed));
+                    }
+
+                    // Vowel check: first names of 3+ chars with no vowels (a/e/i/o/u/y) look like
+                    // garbage input (e.g. "Lxmb", "Qwrt"). Exactly 2-char names always pass (DJ, TJ).
+                    // Failed check → send to pending_approval without claiming the slot so the user
+                    // can retry with a correctly-spelled name.
+                    if (!firstNamePassesVowelCheck(firstName)) {
+                        final String fState2 = trimmedState;
+                        final String fCity2  = trimmedCity;
+                        return companyRepo.findOrCreate(company, null, resolvedLogoUrl)
+                            .compose(cRow -> managerRepo.createSearchPending(
+                                fullName, company, title, country,
+                                fState2, fCity2, resolvedLogoUrl, cRow.getLong("id"), userId))
+                            .map(row -> new JsonObject()
                                 .put("data", new JsonArray())
                                 .put("created", false)
                                 .put("hasContributed", contributed));

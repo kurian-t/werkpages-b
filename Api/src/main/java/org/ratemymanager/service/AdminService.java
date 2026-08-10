@@ -451,12 +451,19 @@ public class AdminService {
 
     public Future<Void> deleteManager(String auth0Id, long managerId) {
         return requireAdmin(auth0Id)
-            .compose(adminId -> managerRepo.countExistingById(new Long[]{managerId}))
-            .compose(count -> {
-                if (count < 1) return Future.failedFuture(ServiceException.notFound("Manager not found"));
-                return reviewRepo.deleteByManager(managerId);
-            })
-            .compose(v -> managerRepo.delete(managerId));
+            .compose(adminId -> managerRepo.findById(managerId))
+            .compose(opt -> {
+                if (opt.isEmpty()) return Future.failedFuture(ServiceException.notFound("Manager not found"));
+                Long companyId = opt.get().getLong("company_id");
+                return reviewRepo.deleteByManager(managerId)
+                    .compose(v -> managerRepo.delete(managerId))
+                    .compose(v -> {
+                        if (companyId != null && companyRepo != null) {
+                            return companyRepo.updateCompanyStatsForCompany(companyId);
+                        }
+                        return Future.succeededFuture();
+                    });
+            });
     }
 
     public Future<JsonObject> mergeManagers(String auth0Id, long keepId, long mergeId) {

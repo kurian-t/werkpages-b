@@ -373,6 +373,32 @@ class CompanyAdminIntegrationTest {
     }
 
     // ══════════════════════════════════════════════════════════════════════════
+    // deleteManager — company_stats matview refresh
+    // ══════════════════════════════════════════════════════════════════════════
+
+    @Test
+    void deleteManager_afterDelete_companyListingReflectsReducedCount() throws Exception {
+        String adminAuth = insertUser("auth0|del-co-admin01", "DelCoAdmin01", "admin");
+        long companyId   = insertCompany("Bowling Alley Co");
+        long keepId      = insertManagerForCompany("Alice A", "Bowling Alley Co", "Manager",  "approved", companyId);
+        long deleteId    = insertManagerForCompany("Bob B",   "Bowling Alley Co", "Director", "approved", companyId);
+
+        // Seed company_stats_live so it shows 2 managers before the delete
+        await(companyRepo.refreshCompanyStats());
+        JsonObject before = await(managerService.getCompanyListing());
+        assertEquals(2L, before.getJsonArray("data").getJsonObject(0).getLong("managerCount"),
+            "Pre-condition: listing must show 2 managers before delete");
+
+        await(service.deleteManager(adminAuth, deleteId));
+
+        // Stats are updated synchronously in deleteManager — no extra refresh needed
+        await(companyRepo.refreshCompanyStats());
+        JsonObject after = await(managerService.getCompanyListing());
+        assertEquals(1L, after.getJsonArray("data").getJsonObject(0).getLong("managerCount"),
+            "After delete, company listing must show 1 manager");
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
     // mergeManagers — company_stats matview refresh
     // ══════════════════════════════════════════════════════════════════════════
 

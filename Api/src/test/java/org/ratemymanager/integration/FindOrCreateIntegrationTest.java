@@ -277,6 +277,73 @@ class FindOrCreateIntegrationTest {
         assertEquals(1, totalManagers);
     }
 
+    // ── Vowel check tests ─────────────────────────────────────────────────────
+
+    @Test
+    void findOrCreate_noVowelFirstName_3chars_createsPending_flagNotSet() throws Exception {
+        // "Lxm" has 3 chars and no vowels → should go to pending, slot stays unclaimed
+        String auth0Id = insertUser("auth0|v1", "voweluser1");
+        UUID userId = findUserId(auth0Id);
+
+        JsonObject result = await(service.findOrCreate(
+            auth0Id, "Lxm", "Smith", "Engineer", "Acme Corp", "CA", null, null, null));
+
+        assertFalse(result.getBoolean("created"));
+        assertEquals(0, result.getJsonArray("data").size());
+
+        // Flag must NOT be set — user can retry
+        assertFalse(ghostSlotClaimed(userId));
+
+        // Manager should be in pending_approval, not ghost
+        long pendingCount = await(pool.preparedQuery(
+            "SELECT COUNT(*) FROM managers WHERE name ILIKE 'Lxm Smith' AND approval_status = 'pending_approval'")
+            .execute().map(rs -> rs.iterator().next().getLong(0)));
+        assertEquals(1, pendingCount);
+
+        long ghostCount = await(pool.preparedQuery(
+            "SELECT COUNT(*) FROM managers WHERE name ILIKE 'Lxm Smith' AND approval_status = 'ghost'")
+            .execute().map(rs -> rs.iterator().next().getLong(0)));
+        assertEquals(0, ghostCount);
+    }
+
+    @Test
+    void findOrCreate_exactlyTwoCharsNoVowel_createsGhost_flagSet() throws Exception {
+        // "DJ" has exactly 2 chars and no vowels → exception, should ghost normally
+        String auth0Id = insertUser("auth0|v2", "voweluser2");
+        UUID userId = findUserId(auth0Id);
+
+        JsonObject result = await(service.findOrCreate(
+            auth0Id, "DJ", "Johnson", "Director", "Big Corp", "CA", null, null, null));
+
+        assertTrue(result.getBoolean("created"));
+        assertEquals(1, result.getJsonArray("data").size());
+        assertEquals("ghost", result.getJsonArray("data").getJsonObject(0).getString("approvalStatus"));
+        assertTrue(ghostSlotClaimed(userId));
+    }
+
+    @Test
+    void findOrCreate_noVowelThenVowel_secondSearchCreatesGhost() throws Exception {
+        // First search with no-vowel name → pending, flag stays unset
+        // Second search with valid name → ghost created, flag set
+        String auth0Id = insertUser("auth0|v3", "voweluser3");
+        UUID userId = findUserId(auth0Id);
+
+        JsonObject first = await(service.findOrCreate(
+            auth0Id, "Lxmb", "Brown", "Analyst", "Corp One", "CA", null, null, null));
+
+        assertFalse(first.getBoolean("created"));
+        assertFalse(ghostSlotClaimed(userId));
+
+        // Now search with a valid name at a different company
+        JsonObject second = await(service.findOrCreate(
+            auth0Id, "Alice", "Brown", "Analyst", "Corp Two", "CA", null, null, null));
+
+        assertTrue(second.getBoolean("created"));
+        assertEquals(1, second.getJsonArray("data").size());
+        assertEquals("ghost", second.getJsonArray("data").getJsonObject(0).getString("approvalStatus"));
+        assertTrue(ghostSlotClaimed(userId));
+    }
+
     // ── Helpers ───────────────────────────────────────────────────────────────
 
     private boolean ghostSlotClaimed(UUID userId) throws Exception {
