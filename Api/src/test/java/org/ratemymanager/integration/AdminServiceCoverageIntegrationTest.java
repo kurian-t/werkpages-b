@@ -435,6 +435,51 @@ class AdminServiceCoverageIntegrationTest {
         assertEquals(1L, caCount, "seed managers must appear; scraped managers must not");
     }
 
+    @Test
+    void getCountryStats_ratingsExcludesReviewsOnScrapedManagers() throws Exception {
+        String adminAuth = insertUser("auth0|cs-admin03", "CsAdmin03", "admin");
+
+        // Scraped manager with a real review — review must NOT appear in ratings by country
+        long scrapedId = await(pool.preparedQuery("""
+                INSERT INTO managers(name,company,title,image,status,approval_status,
+                                     overall_rating,reviews_count,category_averages,country,external_id)
+                VALUES ($1,$2,$3,'img','active','approved',3.0,1,'{}','United States','scraper_y')
+                RETURNING id
+                """)
+            .execute(Tuple.of("Scraped With Review", "ScrapedCo", "Manager"))
+            .map(rs -> rs.iterator().next().getLong("id")));
+        await(pool.preparedQuery("""
+                INSERT INTO reviews(manager_id,user_id,author,overall_rating,manager_company,manager_title,weight)
+                VALUES ($1,NULL,'Anon',3.0,$2,$3,FALSE)
+                """)
+            .execute(Tuple.of(scrapedId, "ScrapedCo", "Manager")));
+
+        // Organic manager with a real review — must appear
+        long organicId = await(pool.preparedQuery("""
+                INSERT INTO managers(name,company,title,image,status,approval_status,
+                                     overall_rating,reviews_count,category_averages,country)
+                VALUES ($1,$2,$3,'img','active','approved',4.0,1,'{}','United States')
+                RETURNING id
+                """)
+            .execute(Tuple.of("Organic Manager", "OrganicCo", "Manager"))
+            .map(rs -> rs.iterator().next().getLong("id")));
+        await(pool.preparedQuery("""
+                INSERT INTO reviews(manager_id,user_id,author,overall_rating,manager_company,manager_title,weight)
+                VALUES ($1,NULL,'Anon',4.0,$2,$3,FALSE)
+                """)
+            .execute(Tuple.of(organicId, "OrganicCo", "Manager")));
+
+        JsonObject result = await(service.getCountryStats(adminAuth));
+        JsonArray reviews = result.getJsonArray("reviews");
+
+        long usCount = reviews.stream()
+            .map(o -> (JsonObject) o)
+            .filter(e -> "United States".equals(e.getString("country")))
+            .mapToLong(e -> e.getLong("count"))
+            .findFirst().orElse(0L);
+        assertEquals(1L, usCount, "ratings on scraped managers must not appear in ratings by country");
+    }
+
     // ══════════════════════════════════════════════════════════════════════════
     // Helpers
     // ══════════════════════════════════════════════════════════════════════════
