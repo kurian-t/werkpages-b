@@ -372,28 +372,26 @@ class AdminServiceCoverageIntegrationTest {
     // ══════════════════════════════════════════════════════════════════════════
 
     @Test
-    void getCountryStats_excludesBotManagersWithNoUserContext() throws Exception {
+    void getCountryStats_excludesScrapedManagers() throws Exception {
         String adminAuth = insertUser("auth0|cs-admin01", "CsAdmin01", "admin");
 
-        // 3 bot managers: no submitted_by, no search_created_by_user_id, no reviews
+        // 3 scraped managers: external_id set to a non-seed value
         for (int i = 0; i < 3; i++) {
             await(pool.preparedQuery("""
                     INSERT INTO managers(name,company,title,image,status,approval_status,
-                                        overall_rating,reviews_count,category_averages,country)
-                    VALUES ($1,$2,$3,'img','active','approved',0,0,'{}','United States')
+                                        overall_rating,reviews_count,category_averages,country,external_id)
+                    VALUES ($1,$2,$3,'img','active','approved',0,0,'{}','United States',$4)
                     """)
-                .execute(Tuple.of("Bot " + i, "BotCo", "Role")));
+                .execute(Tuple.of("Scraped " + i, "ScrapedCo", "Role", "scraper_" + i)));
         }
 
-        // 1 organic manager: has a submitter
-        insertUser("auth0|cs-user01", "CsUser01", "user");
-        UUID submitterId = findUserId("auth0|cs-user01");
+        // 1 organic manager: external_id IS NULL
         await(pool.preparedQuery("""
                 INSERT INTO managers(name,company,title,image,status,approval_status,
-                                     overall_rating,reviews_count,category_averages,country,submitted_by)
-                VALUES ($1,$2,$3,'img','active','approved',0,0,'{}','United States',$4)
+                                     overall_rating,reviews_count,category_averages,country)
+                VALUES ($1,$2,$3,'img','active','approved',0,0,'{}','United States')
                 """)
-            .execute(Tuple.of("Real Manager", "RealCo", "Director", submitterId)));
+            .execute(Tuple.of("Real Manager", "RealCo", "Director")));
 
         JsonObject result = await(service.getCountryStats(adminAuth));
         JsonArray managers = result.getJsonArray("managers");
@@ -403,28 +401,28 @@ class AdminServiceCoverageIntegrationTest {
             .filter(e -> "United States".equals(e.getString("country")))
             .mapToLong(e -> e.getLong("count"))
             .findFirst().orElse(0L);
-        assertEquals(1L, usCount, "bot managers must not appear in country stats");
+        assertEquals(1L, usCount, "scraped managers (external_id set) must not appear in country stats");
     }
 
     @Test
-    void getCountryStats_includesManagersWithReviews() throws Exception {
+    void getCountryStats_includesSeedManagers() throws Exception {
         String adminAuth = insertUser("auth0|cs-admin02", "CsAdmin02", "admin");
 
-        // Manager with no submitter but reviews_count > 0 — counts as organic
+        // Seed manager (external_id LIKE 'seed_%') — must be included, it's a real ghost profile
         await(pool.preparedQuery("""
                 INSERT INTO managers(name,company,title,image,status,approval_status,
-                                     overall_rating,reviews_count,category_averages,country)
-                VALUES ($1,$2,$3,'img','active','approved',4.0,1,'{}','Canada')
+                                     overall_rating,reviews_count,category_averages,country,external_id)
+                VALUES ($1,$2,$3,'img','active','ghost',0,0,'{}','Canada','seed_abc')
                 """)
-            .execute(Tuple.of("Reviewed Manager", "ReviewedCo", "Manager")));
+            .execute(Tuple.of("Ghost Manager", "GhostCo", "Manager")));
 
-        // Bot manager in same country — must be excluded
+        // Scraped manager in same country — must be excluded
         await(pool.preparedQuery("""
                 INSERT INTO managers(name,company,title,image,status,approval_status,
-                                     overall_rating,reviews_count,category_averages,country)
-                VALUES ($1,$2,$3,'img','active','approved',0,0,'{}','Canada')
+                                     overall_rating,reviews_count,category_averages,country,external_id)
+                VALUES ($1,$2,$3,'img','active','approved',0,0,'{}','Canada','scraper_x')
                 """)
-            .execute(Tuple.of("Bot Manager", "BotCo", "Bot")));
+            .execute(Tuple.of("Scraped Manager", "ScrapedCo", "Bot")));
 
         JsonObject result = await(service.getCountryStats(adminAuth));
         JsonArray managers = result.getJsonArray("managers");
@@ -434,7 +432,7 @@ class AdminServiceCoverageIntegrationTest {
             .filter(e -> "Canada".equals(e.getString("country")))
             .mapToLong(e -> e.getLong("count"))
             .findFirst().orElse(0L);
-        assertEquals(1L, caCount, "manager with reviews must appear; bot without reviews must not");
+        assertEquals(1L, caCount, "seed managers must appear; scraped managers must not");
     }
 
     // ══════════════════════════════════════════════════════════════════════════
