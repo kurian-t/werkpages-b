@@ -623,6 +623,9 @@ public class AdminService {
                     SELECT COALESCE(country, 'Unknown') AS country, COUNT(*) AS count
                     FROM managers
                     WHERE approval_status IN ('approved', 'ghost')
+                      AND (submitted_by IS NOT NULL
+                           OR search_created_by_user_id IS NOT NULL
+                           OR reviews_count > 0)
                     GROUP BY country
                     ORDER BY count DESC
                     """).execute(),

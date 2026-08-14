@@ -73,7 +73,7 @@ class AdminServiceCoverageIntegrationTest {
         EditRepository         editRepo   = new EditRepository(pool);
         NotificationRepository notifRepo  = new NotificationRepository(pool);
         service = new AdminService(userRepo, managerRepo, reviewRepo, editRepo, notifRepo,
-                                   companyRepo, mergeSuggestionsRepo);
+                                   companyRepo, mergeSuggestionsRepo, pool);
     }
 
     @BeforeEach
@@ -365,6 +365,76 @@ class AdminServiceCoverageIntegrationTest {
         String adminAuth = insertUser("auth0|pub-admin01", "PubAdmin01", "admin");
         UUID adminId = await(service.requireAdminPublic(adminAuth));
         assertNotNull(adminId);
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // getCountryStats — bot filter
+    // ══════════════════════════════════════════════════════════════════════════
+
+    @Test
+    void getCountryStats_excludesBotManagersWithNoUserContext() throws Exception {
+        String adminAuth = insertUser("auth0|cs-admin01", "CsAdmin01", "admin");
+
+        // 3 bot managers: no submitted_by, no search_created_by_user_id, no reviews
+        for (int i = 0; i < 3; i++) {
+            await(pool.preparedQuery("""
+                    INSERT INTO managers(name,company,title,image,status,approval_status,
+                                        overall_rating,reviews_count,category_averages,country)
+                    VALUES ($1,$2,$3,'img','active','approved',0,0,'{}','United States')
+                    """)
+                .execute(Tuple.of("Bot " + i, "BotCo", "Role")));
+        }
+
+        // 1 organic manager: has a submitter
+        insertUser("auth0|cs-user01", "CsUser01", "user");
+        UUID submitterId = findUserId("auth0|cs-user01");
+        await(pool.preparedQuery("""
+                INSERT INTO managers(name,company,title,image,status,approval_status,
+                                     overall_rating,reviews_count,category_averages,country,submitted_by)
+                VALUES ($1,$2,$3,'img','active','approved',0,0,'{}','United States',$4)
+                """)
+            .execute(Tuple.of("Real Manager", "RealCo", "Director", submitterId)));
+
+        JsonObject result = await(service.getCountryStats(adminAuth));
+        JsonArray managers = result.getJsonArray("managers");
+
+        long usCount = managers.stream()
+            .map(o -> (JsonObject) o)
+            .filter(e -> "United States".equals(e.getString("country")))
+            .mapToLong(e -> e.getLong("count"))
+            .findFirst().orElse(0L);
+        assertEquals(1L, usCount, "bot managers must not appear in country stats");
+    }
+
+    @Test
+    void getCountryStats_includesManagersWithReviews() throws Exception {
+        String adminAuth = insertUser("auth0|cs-admin02", "CsAdmin02", "admin");
+
+        // Manager with no submitter but reviews_count > 0 — counts as organic
+        await(pool.preparedQuery("""
+                INSERT INTO managers(name,company,title,image,status,approval_status,
+                                     overall_rating,reviews_count,category_averages,country)
+                VALUES ($1,$2,$3,'img','active','approved',4.0,1,'{}','Canada')
+                """)
+            .execute(Tuple.of("Reviewed Manager", "ReviewedCo", "Manager")));
+
+        // Bot manager in same country — must be excluded
+        await(pool.preparedQuery("""
+                INSERT INTO managers(name,company,title,image,status,approval_status,
+                                     overall_rating,reviews_count,category_averages,country)
+                VALUES ($1,$2,$3,'img','active','approved',0,0,'{}','Canada')
+                """)
+            .execute(Tuple.of("Bot Manager", "BotCo", "Bot")));
+
+        JsonObject result = await(service.getCountryStats(adminAuth));
+        JsonArray managers = result.getJsonArray("managers");
+
+        long caCount = managers.stream()
+            .map(o -> (JsonObject) o)
+            .filter(e -> "Canada".equals(e.getString("country")))
+            .mapToLong(e -> e.getLong("count"))
+            .findFirst().orElse(0L);
+        assertEquals(1L, caCount, "manager with reviews must appear; bot without reviews must not");
     }
 
     // ══════════════════════════════════════════════════════════════════════════
