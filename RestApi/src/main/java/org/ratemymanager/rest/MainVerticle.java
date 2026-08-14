@@ -99,7 +99,7 @@ public class MainVerticle extends AbstractVerticle {
                         // ── Services ──────────────────────────────────────────────────────────
                         MergeSuggestionsRepository mergeSuggestionsRepo = new MergeSuggestionsRepository(Database.getClient());
                         ManagerService      managerService = new ManagerService(managerRepo, reviewRepo, userRepo, editRepo, reportRepo, companyRepo, Database.getClient(), CompanyLogoUtils::resolveLogoUrl);
-                        AdminService        adminService   = new AdminService(userRepo, managerRepo, reviewRepo, editRepo, notifRepo, companyRepo, mergeSuggestionsRepo);
+                        AdminService        adminService   = new AdminService(userRepo, managerRepo, reviewRepo, editRepo, notifRepo, companyRepo, mergeSuggestionsRepo, Database.getClient());
                         NotificationService notifService   = new NotificationService(userRepo, notifRepo);
                         ReportService       reportService  = new ReportService(userRepo, reportRepo);
 
@@ -194,6 +194,7 @@ public class MainVerticle extends AbstractVerticle {
                         routerFactory.addHandlerByOperationId("getMergeSuggestions",      adminHandler::handleGetMergeSuggestions);
                         routerFactory.addHandlerByOperationId("dismissMergeSuggestion",   adminHandler::handleDismissMergeSuggestion);
                         routerFactory.addHandlerByOperationId("triggerDeduplication",     adminHandler::handleTriggerDeduplication);
+                        routerFactory.addHandlerByOperationId("getAdminCountryStats",     adminHandler::handleGetCountryStats);
                         routerFactory.addHandlerByOperationId("getNotifications",             notificationsHandler::handleGetNotifications);
                         routerFactory.addHandlerByOperationId("getNotificationsUnreadCount",  notificationsHandler::handleGetUnreadCount);
                         routerFactory.addHandlerByOperationId("markAllNotificationsRead",     notificationsHandler::handleMarkAllAsRead);

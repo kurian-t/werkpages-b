@@ -4,6 +4,7 @@ import io.vertx.core.Future;
 import io.vertx.core.json.JsonArray;
 import io.vertx.core.json.JsonObject;
 import io.vertx.sqlclient.Row;
+import io.vertx.sqlclient.SqlClient;
 import org.ratemymanager.repository.CompanyRepository;
 import org.ratemymanager.repository.EditRepository;
 import org.ratemymanager.repository.ManagerRepository;
@@ -32,23 +33,31 @@ public class AdminService {
     private final NotificationRepository      notifRepo;
     private final CompanyRepository           companyRepo;
     private final MergeSuggestionsRepository  mergeSuggestionsRepo;
+    private final SqlClient                   db;
 
     public AdminService(UserRepository userRepo, ManagerRepository managerRepo,
                         ReviewRepository reviewRepo, EditRepository editRepo,
                         NotificationRepository notifRepo) {
-        this(userRepo, managerRepo, reviewRepo, editRepo, notifRepo, null, null);
+        this(userRepo, managerRepo, reviewRepo, editRepo, notifRepo, null, null, null);
     }
 
     public AdminService(UserRepository userRepo, ManagerRepository managerRepo,
                         ReviewRepository reviewRepo, EditRepository editRepo,
                         NotificationRepository notifRepo, CompanyRepository companyRepo) {
-        this(userRepo, managerRepo, reviewRepo, editRepo, notifRepo, companyRepo, null);
+        this(userRepo, managerRepo, reviewRepo, editRepo, notifRepo, companyRepo, null, null);
     }
 
     public AdminService(UserRepository userRepo, ManagerRepository managerRepo,
                         ReviewRepository reviewRepo, EditRepository editRepo,
                         NotificationRepository notifRepo, CompanyRepository companyRepo,
                         MergeSuggestionsRepository mergeSuggestionsRepo) {
+        this(userRepo, managerRepo, reviewRepo, editRepo, notifRepo, companyRepo, mergeSuggestionsRepo, null);
+    }
+
+    public AdminService(UserRepository userRepo, ManagerRepository managerRepo,
+                        ReviewRepository reviewRepo, EditRepository editRepo,
+                        NotificationRepository notifRepo, CompanyRepository companyRepo,
+                        MergeSuggestionsRepository mergeSuggestionsRepo, SqlClient db) {
         this.userRepo             = userRepo;
         this.managerRepo          = managerRepo;
         this.reviewRepo           = reviewRepo;
@@ -56,6 +65,7 @@ public class AdminService {
         this.notifRepo            = notifRepo;
         this.companyRepo          = companyRepo;
         this.mergeSuggestionsRepo = mergeSuggestionsRepo;
+        this.db                   = db;
     }
 
     // ── Guard: verify admin ───────────────────────────────────────────────────
@@ -569,5 +579,46 @@ public class AdminService {
         return requireAdmin(auth0Id)
             .compose(adminId -> mergeSuggestionsRepo.updateStatus(suggestionId, "dismissed"))
             .map(v -> new JsonObject().put("success", true));
+    }
+
+    public Future<JsonObject> getCountryStats(String auth0Id) {
+        if (db == null) return Future.failedFuture(ServiceException.forbidden("DB not configured"));
+        return requireAdmin(auth0Id)
+            .compose(adminId -> Future.all(
+                db.preparedQuery("""
+                    SELECT COALESCE(country, 'Unknown') AS country, COUNT(*) AS count
+                    FROM managers
+                    WHERE approval_status IN ('approved', 'ghost')
+                    GROUP BY country
+                    ORDER BY count DESC
+                    """).execute(),
+                db.preparedQuery("""
+                    SELECT COALESCE(m.country, 'Unknown') AS country, COUNT(*) AS count
+                    FROM reviews r
+                    JOIN managers m ON r.manager_id = m.id
+                    WHERE r.weight = FALSE
+                      AND r.deleted_at IS NULL
+                      AND m.approval_status IN ('approved', 'ghost')
+                    GROUP BY m.country
+                    ORDER BY count DESC
+                    """).execute()
+            ))
+            .map(cf -> {
+                JsonArray managers = new JsonArray();
+                for (Row row : (io.vertx.sqlclient.RowSet<Row>) cf.resultAt(0)) {
+                    managers.add(new JsonObject()
+                        .put("country", row.getString("country"))
+                        .put("count",   row.getLong("count")));
+                }
+                JsonArray reviews = new JsonArray();
+                for (Row row : (io.vertx.sqlclient.RowSet<Row>) cf.resultAt(1)) {
+                    reviews.add(new JsonObject()
+                        .put("country", row.getString("country"))
+                        .put("count",   row.getLong("count")));
+                }
+                return new JsonObject()
+                    .put("managers", managers)
+                    .put("reviews",  reviews);
+            });
     }
 }

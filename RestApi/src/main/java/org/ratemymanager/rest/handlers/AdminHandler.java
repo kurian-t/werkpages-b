@@ -359,6 +359,15 @@ public class AdminHandler {
             .onFailure(err -> ManagersHandler.handleError(ctx, err));
     }
 
+    // ── GET /api/admin/country-stats ─────────────────────────────────────────
+
+    public void handleGetCountryStats(RoutingContext ctx) {
+        String auth0Id = ctx.get("auth0Id");
+        service.getCountryStats(auth0Id)
+            .onSuccess(json -> ok(ctx, json))
+            .onFailure(err -> ManagersHandler.handleError(ctx, err));
+    }
+
     // ── Helpers ───────────────────────────────────────────────────────────────
 
     private static void ok(RoutingContext ctx, JsonObject body) {

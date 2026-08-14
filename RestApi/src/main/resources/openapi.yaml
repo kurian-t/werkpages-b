@@ -1714,6 +1714,41 @@ paths:
         '403':
           description: Forbidden
 
+  /api/admin/country-stats:
+    get:
+      operationId: getAdminCountryStats
+      summary: Get manager and review counts broken down by country (admin only)
+      tags:
+        - Admin
+      responses:
+        '200':
+          description: Country breakdown for managers and reviews
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  managers:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        country:
+                          type: string
+                        count:
+                          type: integer
+                  reviews:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        country:
+                          type: string
+                        count:
+                          type: integer
+        '403':
+          description: Forbidden
+
   /api/notifications:
     get:
       operationId: getNotifications
