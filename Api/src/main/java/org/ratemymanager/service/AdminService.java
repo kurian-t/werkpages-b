@@ -634,7 +634,7 @@ public class AdminService {
                     WHERE r.weight = FALSE
                       AND r.deleted_at IS NULL
                       AND m.approval_status IN ('approved', 'ghost')
-                      AND (m.external_id IS NULL OR m.external_id LIKE 'seed_%')
+                      AND m.external_id IS NULL
                     GROUP BY m.country
                     ORDER BY count DESC
                     """).execute()
