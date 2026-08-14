@@ -1434,11 +1434,13 @@ public class ManagerService {
                         if (ownerOpt.isEmpty()) return Future.failedFuture(ServiceException.notFound("Review not found"));
                         if (!ownerOpt.get().equals(userId)) return Future.failedFuture(ServiceException.forbidden("Forbidden"));
                         return reviewRepo.delete(reviewId, managerId)
-                            .compose(v -> reviewRepo.recordDeletion(userId, managerId))
-                            .map(v -> {
+                            .compose(v -> {
+                                // Recalculate immediately after soft-delete, before recordDeletion,
+                                // so stale stats are never left behind if recordDeletion fails.
                                 managerRepo.recalculateInBackground(managerId);
-                                return new JsonObject().put("success", true).put("message", "Review deleted");
-                            });
+                                return reviewRepo.recordDeletion(userId, managerId);
+                            })
+                            .map(v -> new JsonObject().put("success", true).put("message", "Review deleted"));
                     });
             });
     }

@@ -1714,6 +1714,77 @@ paths:
         '403':
           description: Forbidden
 
+  /api/admin/managers/{managerId}/career-history/{entryId}:
+    put:
+      operationId: adminUpdateCareerEntry
+      summary: Update a career history entry (admin only)
+      tags:
+        - Admin
+      parameters:
+        - name: managerId
+          in: path
+          required: true
+          schema:
+            type: integer
+            format: int64
+        - name: entryId
+          in: path
+          required: true
+          schema:
+            type: integer
+            format: int64
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [company, title, startDate]
+              properties:
+                company:
+                  type: string
+                title:
+                  type: string
+                startDate:
+                  type: string
+                endDate:
+                  type: string
+                  nullable: true
+      responses:
+        '200':
+          description: Entry updated
+          content:
+            application/json:
+              schema:
+                type: object
+        '400':
+          description: Bad request
+        '403':
+          description: Forbidden
+    delete:
+      operationId: adminDeleteCareerEntry
+      summary: Delete a career history entry (admin only)
+      tags:
+        - Admin
+      parameters:
+        - name: managerId
+          in: path
+          required: true
+          schema:
+            type: integer
+            format: int64
+        - name: entryId
+          in: path
+          required: true
+          schema:
+            type: integer
+            format: int64
+      responses:
+        '204':
+          description: Entry deleted
+        '403':
+          description: Forbidden
+
   /api/admin/country-stats:
     get:
       operationId: getAdminCountryStats

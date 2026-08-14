@@ -581,6 +581,40 @@ public class AdminService {
             .map(v -> new JsonObject().put("success", true));
     }
 
+    // ── Career history admin ──────────────────────────────────────────────────
+
+    public Future<JsonObject> adminUpdateCareerEntry(String auth0Id, long managerId, long entryId,
+            String company, String title, String startDateStr, String endDateStr) {
+        return requireAdmin(auth0Id)
+            .compose(adminId -> {
+                if (company == null || company.isBlank()) return Future.failedFuture(ServiceException.badRequest("company required"));
+                if (title  == null || title.isBlank())   return Future.failedFuture(ServiceException.badRequest("title required"));
+                if (startDateStr == null || startDateStr.isBlank()) return Future.failedFuture(ServiceException.badRequest("startDate required"));
+                OffsetDateTime start;
+                OffsetDateTime end = null;
+                try {
+                    start = OffsetDateTime.parse(startDateStr.length() == 4
+                        ? startDateStr + "-01-01T00:00:00Z"
+                        : startDateStr + "-01T00:00:00Z");
+                    if (endDateStr != null && !endDateStr.isBlank()) {
+                        end = OffsetDateTime.parse(endDateStr.length() == 4
+                            ? endDateStr + "-01-01T00:00:00Z"
+                            : endDateStr + "-01T00:00:00Z");
+                    }
+                } catch (Exception e) {
+                    return Future.failedFuture(ServiceException.badRequest("Invalid date format"));
+                }
+                return managerRepo.updateCareerEntry(entryId, managerId, company.trim(), title.trim(), start, end);
+            })
+            .map(count -> new JsonObject().put("success", true).put("updated", count));
+    }
+
+    public Future<JsonObject> adminDeleteCareerEntry(String auth0Id, long managerId, long entryId) {
+        return requireAdmin(auth0Id)
+            .compose(adminId -> managerRepo.deleteCareerEntry(entryId, managerId))
+            .map(count -> new JsonObject().put("success", true).put("deleted", count));
+    }
+
     public Future<JsonObject> getCountryStats(String auth0Id) {
         if (db == null) return Future.failedFuture(ServiceException.forbidden("DB not configured"));
         return requireAdmin(auth0Id)

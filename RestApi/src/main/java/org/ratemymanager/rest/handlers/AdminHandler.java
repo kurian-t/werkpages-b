@@ -359,6 +359,38 @@ public class AdminHandler {
             .onFailure(err -> ManagersHandler.handleError(ctx, err));
     }
 
+    // ── PUT /api/admin/managers/:managerId/career-history/:entryId ───────────
+
+    public void handleUpdateCareerEntry(RoutingContext ctx) {
+        String auth0Id = ctx.get("auth0Id");
+        long managerId, entryId;
+        try {
+            managerId = Long.parseLong(ctx.pathParam("managerId"));
+            entryId   = Long.parseLong(ctx.pathParam("entryId"));
+        } catch (NumberFormatException e) { bad(ctx, "Invalid ID"); return; }
+        JsonObject body = ctx.getBodyAsJson();
+        if (body == null) { bad(ctx, "Body required"); return; }
+        service.adminUpdateCareerEntry(auth0Id, managerId, entryId,
+                body.getString("company"), body.getString("title"),
+                body.getString("startDate"), body.getString("endDate"))
+            .onSuccess(json -> ok(ctx, json))
+            .onFailure(err -> ManagersHandler.handleError(ctx, err));
+    }
+
+    // ── DELETE /api/admin/managers/:managerId/career-history/:entryId ────────
+
+    public void handleDeleteCareerEntry(RoutingContext ctx) {
+        String auth0Id = ctx.get("auth0Id");
+        long managerId, entryId;
+        try {
+            managerId = Long.parseLong(ctx.pathParam("managerId"));
+            entryId   = Long.parseLong(ctx.pathParam("entryId"));
+        } catch (NumberFormatException e) { bad(ctx, "Invalid ID"); return; }
+        service.adminDeleteCareerEntry(auth0Id, managerId, entryId)
+            .onSuccess(json -> ctx.response().setStatusCode(204).end())
+            .onFailure(err -> ManagersHandler.handleError(ctx, err));
+    }
+
     // ── GET /api/admin/country-stats ─────────────────────────────────────────
 
     public void handleGetCountryStats(RoutingContext ctx) {

@@ -22,7 +22,7 @@ public class ManagerRepository {
 
     // ── SQL constants ─────────────────────────────────────────────────────────
 
-    static final String GET_BY_ID_SQL = """
+    public static final String GET_BY_ID_SQL = """
             SELECT
                 m.id, m.name, m.company, m.title, m.image, m.overall_rating,
                 m.reviews_count, m.bio, m.status, m.approval_status,
@@ -36,7 +36,7 @@ public class ManagerRepository {
             LEFT JOIN (
                 SELECT manager_id,
                     json_agg(jsonb_build_object(
-                        'company', company, 'title', title,
+                        'id', id, 'company', company, 'title', title,
                         'startDate', start_date, 'endDate', end_date
                     ) ORDER BY start_date DESC) AS career_history
                 FROM career_history GROUP BY manager_id
@@ -77,7 +77,7 @@ public class ManagerRepository {
                 c.slug AS company_slug,
                 COALESCE(
                     json_agg(json_build_object(
-                        'company', ch.company, 'title', ch.title,
+                        'id', ch.id, 'company', ch.company, 'title', ch.title,
                         'startDate', ch.start_date, 'endDate', ch.end_date
                     ) ORDER BY ch.start_date DESC)
                     FILTER (WHERE ch.id IS NOT NULL), '[]'
@@ -393,6 +393,23 @@ public class ManagerRepository {
         // If the current open entry started after endDate (e.g. inserting a historical position), it stays open.
         return db.preparedQuery("UPDATE career_history SET end_date = $1 WHERE manager_id = $2 AND end_date IS NULL AND start_date <= $1")
             .execute(Tuple.of(endDate, managerId))
+            .map(RowSet::rowCount);
+    }
+
+    public Future<Integer> updateCareerEntry(long entryId, long managerId, String company, String title,
+                                              OffsetDateTime startDate, OffsetDateTime endDate) {
+        return db.preparedQuery("""
+                UPDATE career_history
+                SET company = $3, title = $4, start_date = $5, end_date = $6, updated_at = now()
+                WHERE id = $1 AND manager_id = $2
+                """)
+            .execute(Tuple.of(entryId, managerId, company, title, startDate, endDate))
+            .map(RowSet::rowCount);
+    }
+
+    public Future<Integer> deleteCareerEntry(long entryId, long managerId) {
+        return db.preparedQuery("DELETE FROM career_history WHERE id = $1 AND manager_id = $2")
+            .execute(Tuple.of(entryId, managerId))
             .map(RowSet::rowCount);
     }
 
