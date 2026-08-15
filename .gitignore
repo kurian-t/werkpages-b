@@ -83,6 +83,10 @@ __pycache__/
 # Coverage
 coverage/
 
+# AWS CLI binaries and zip
+aws/
+*.zip
+
 # Misc
 .tmp/
 .cache/

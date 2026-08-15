@@ -5,8 +5,8 @@
 	<modelVersion>4.0.0</modelVersion>
 
 	<parent>
-		<groupId>org.ratemymanager</groupId>
-		<artifactId>RateMyManagerBackend</artifactId>
+		<groupId>org.werkpages</groupId>
+		<artifactId>WerkpagesBackend</artifactId>
 		<version>1.0-SNAPSHOT</version>
 	</parent>
 
@@ -167,11 +167,11 @@
 					     cloud secrets reader, external AI client, one-time migration tool.
 					     None of these can be meaningfully exercised in automated tests. -->
 					<excludes>
-						<exclude>org/ratemymanager/Main.class</exclude>
-						<exclude>org/ratemymanager/db/Database.class</exclude>
-						<exclude>org/ratemymanager/config/SecretsConfig.class</exclude>
-						<exclude>org/ratemymanager/service/AnthropicClient.class</exclude>
-						<exclude>org/ratemymanager/tools/BackfillEncryption.class</exclude>
+						<exclude>org/werkpages/Main.class</exclude>
+						<exclude>org/werkpages/db/Database.class</exclude>
+						<exclude>org/werkpages/config/SecretsConfig.class</exclude>
+						<exclude>org/werkpages/service/AnthropicClient.class</exclude>
+						<exclude>org/werkpages/tools/BackfillEncryption.class</exclude>
 					</excludes>
 				</configuration>
 				<executions>

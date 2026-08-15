@@ -5,8 +5,8 @@
 	<modelVersion>4.0.0</modelVersion>
 
 	<parent>
-		<groupId>org.ratemymanager</groupId>
-		<artifactId>RateMyManagerBackend</artifactId>
+		<groupId>org.werkpages</groupId>
+		<artifactId>WerkpagesBackend</artifactId>
 		<version>1.0-SNAPSHOT</version>
 	</parent>
 
@@ -141,7 +141,7 @@
 			<version>${vertx.version}</version>
 		</dependency>
 		<dependency>
-			<groupId>org.ratemymanager</groupId>
+			<groupId>org.werkpages</groupId>
 			<artifactId>Api</artifactId>
 			<version>1.0-SNAPSHOT</version>
 			<scope>compile</scope>
@@ -199,7 +199,7 @@
 								<transformer
 									implementation="org.apache.maven.plugins.shade.resource.ManifestResourceTransformer">
 									<mainClass>
-										org.ratemymanager.rest.MainVerticle</mainClass>
+										org.werkpages.rest.MainVerticle</mainClass>
 								</transformer>
 							</transformers>
 						</configuration>

@@ -1,6 +1,6 @@
 openapi: 3.0.3
 info:
-  title: RateMyManager API
+  title: Werkpages API
   version: 1.0.0
 servers:
   - url: http://localhost:8888
