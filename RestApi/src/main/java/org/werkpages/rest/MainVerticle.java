@@ -19,6 +19,7 @@ import org.werkpages.rest.handlers.ManagersHandler;
 import org.werkpages.rest.handlers.NotificationsHandler;
 import org.werkpages.rest.handlers.RateLimitHandler;
 import org.werkpages.rest.handlers.ReportsHandler;
+import org.werkpages.rest.handlers.ResumesHandler;
 import org.werkpages.service.AdminService;
 import org.werkpages.service.AnthropicClient;
 import org.werkpages.rest.handlers.CompanyLogoUtils;
@@ -27,8 +28,10 @@ import org.werkpages.service.EncryptionService;
 import org.werkpages.service.ManagerService;
 import org.werkpages.service.NotificationService;
 import org.werkpages.service.ReportService;
+import org.werkpages.service.ResumeService;
 import org.werkpages.service.SitemapService;
 import org.werkpages.repository.MergeSuggestionsRepository;
+import org.werkpages.repository.ResumeRepository;
 
 import io.vertx.core.AbstractVerticle;
 import io.vertx.core.Vertx;
@@ -95,6 +98,7 @@ public class MainVerticle extends AbstractVerticle {
                         ReportRepository       reportRepo  = new ReportRepository(Database.getClient());
                         EditRepository         editRepo    = new EditRepository(Database.getClient());
                         CompanyRepository      companyRepo = new CompanyRepository(Database.getClient());
+                        ResumeRepository       resumeRepo  = new ResumeRepository(Database.getClient());
 
                         // ── Services ──────────────────────────────────────────────────────────
                         MergeSuggestionsRepository mergeSuggestionsRepo = new MergeSuggestionsRepository(Database.getClient());
@@ -102,6 +106,7 @@ public class MainVerticle extends AbstractVerticle {
                         AdminService        adminService   = new AdminService(userRepo, managerRepo, reviewRepo, editRepo, notifRepo, companyRepo, mergeSuggestionsRepo, Database.getClient());
                         NotificationService notifService   = new NotificationService(userRepo, notifRepo);
                         ReportService       reportService  = new ReportService(userRepo, reportRepo);
+                        ResumeService       resumeService  = new ResumeService(userRepo, resumeRepo, companyRepo);
 
                         // ── Sitemap ───────────────────────────────────────────────────────────
                         SitemapService sitemapService = new SitemapService(Database.getClient());
@@ -142,6 +147,7 @@ public class MainVerticle extends AbstractVerticle {
                         ReportsHandler       reportsHandler       = new ReportsHandler(reportService);
                         AdminHandler         adminHandler         = new AdminHandler(adminService, deduplicationJob);
                         NotificationsHandler notificationsHandler = new NotificationsHandler(notifService);
+                        ResumesHandler       resumesHandler       = new ResumesHandler(resumeService);
 
                         routerFactory.addHandlerByOperationId("getManagers",           managersHandler::handleGetManagers);
                         routerFactory.addHandlerByOperationId("getManagerById",        managersHandler::handleGetManagerById);
@@ -197,6 +203,9 @@ public class MainVerticle extends AbstractVerticle {
                         routerFactory.addHandlerByOperationId("adminUpdateCareerEntry",   adminHandler::handleUpdateCareerEntry);
                         routerFactory.addHandlerByOperationId("adminDeleteCareerEntry",   adminHandler::handleDeleteCareerEntry);
                         routerFactory.addHandlerByOperationId("getAdminCountryStats",     adminHandler::handleGetCountryStats);
+                        routerFactory.addHandlerByOperationId("getMyResume",         resumesHandler::handleGetResume);
+                        routerFactory.addHandlerByOperationId("saveMyResume",        resumesHandler::handleSaveResume);
+                        routerFactory.addHandlerByOperationId("getResumePrefill",    resumesHandler::handleGetPrefill);
                         routerFactory.addHandlerByOperationId("getNotifications",             notificationsHandler::handleGetNotifications);
                         routerFactory.addHandlerByOperationId("getNotificationsUnreadCount",  notificationsHandler::handleGetUnreadCount);
                         routerFactory.addHandlerByOperationId("markAllNotificationsRead",     notificationsHandler::handleMarkAllAsRead);

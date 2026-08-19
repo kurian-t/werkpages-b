@@ -1891,6 +1891,94 @@ paths:
         '401':
           description: Unauthorized
 
+  /api/resumes/mine:
+    get:
+      operationId: getMyResume
+      summary: Get the authenticated user's saved resume
+      tags:
+        - Resumes
+      responses:
+        '200':
+          description: Resume data
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+        '204':
+          description: No resume saved yet
+        '401':
+          description: Unauthorized
+    put:
+      operationId: saveMyResume
+      summary: Create or update the authenticated user's resume
+      tags:
+        - Resumes
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                templateId:
+                  type: string
+                summary:
+                  type: string
+                skills:
+                  type: array
+                  items:
+                    type: string
+                education:
+                  type: array
+                  items:
+                    type: object
+                workEntries:
+                  type: array
+                  items:
+                    type: object
+                extraLinks:
+                  type: array
+                  items:
+                    type: object
+      responses:
+        '200':
+          description: Resume saved
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+        '400':
+          description: Invalid request
+        '401':
+          description: Unauthorized
+
+  /api/resumes/mine/prefill:
+    get:
+      operationId: getResumePrefill
+      summary: Get work history entries pre-populated from the user's review submissions
+      tags:
+        - Resumes
+      responses:
+        '200':
+          description: Pre-fill data
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items:
+                      type: object
+        '401':
+          description: Unauthorized
+
   /api/managers/{managerId}/reviews/{reviewId}:
     put:
       operationId: updateManagerReview
