@@ -187,10 +187,14 @@ public class AdminService {
             .compose(opt -> {
                 if (opt.isEmpty()) return Future.failedFuture(ServiceException.notFound("Pending manager not found"));
                 Row row = opt.get();
-                UUID submittedBy = row.getUUID("submitted_by");
-                String managerName = row.getString("name");
+                UUID submittedBy     = row.getUUID("submitted_by");
+                UUID searchCreatedBy = row.getUUID("search_created_by_user_id");
+                String managerName    = row.getString("name");
                 String managerCompany = row.getString("company");
-                if (submittedBy != null) {
+                boolean isSearchCreated = searchCreatedBy != null;
+                // Only notify users who explicitly submitted — search-created managers must not
+                // send rejection emails the user would find confusing (they just searched).
+                if (submittedBy != null && !isSearchCreated) {
                     String msg = "Your submitted manager profile for " + managerName + " at " + managerCompany + " was not approved.";
                     if (reason != null && !reason.isBlank()) msg += " Reason: " + reason.trim();
                     notifRepo.sendAsync(submittedBy, "manager_rejected", "Manager Not Approved", msg);
@@ -265,8 +269,25 @@ public class AdminService {
                         : Future.succeededFuture(Optional.empty());
 
                     return slugsFuture.compose(slugsOpt ->
-                        newCompanyIdFuture.compose(newCompanyId ->
-                            managerRepo.closeOpenCareerEntry(managerId, careerStart)
+                        newCompanyIdFuture.compose(newCompanyId -> {
+                            if (newEndDate != null) {
+                                // User is adding a PAST role (has an end date) — insert the segment
+                                // without closing the current open career entry or changing manager.company.
+                                return managerRepo.insertCareerEntry(managerId, effectiveCo, effectiveTit, careerStart, newEndDate, newCompanyId)
+                                    .compose(v -> applyEditAndApprove(managerId, editId, null, null, null, newStatus, newCountry, newLinkedinUrl, effectiveCo, effectiveTit, adminId, now, proposedBy, managerName, null));
+                            }
+                            // No end date. Only treat this as a genuine *current* role change when the
+                            // new role starts on/after the manager's existing current role. An older
+                            // open-ended role must be archived as a past segment WITHOUT taking over the
+                            // manager's headline company/title/logo (the most-recent role stays on top).
+                            return managerRepo.findCurrentRoleStart(managerId).compose(curStartOpt -> {
+                              OffsetDateTime currentStart = curStartOpt.orElse(row.getOffsetDateTime("manager_created_at"));
+                              boolean isHistorical = newStartDate != null && currentStart != null && newStartDate.isBefore(currentStart);
+                              if (isHistorical) {
+                                  return managerRepo.insertCareerEntry(managerId, effectiveCo, effectiveTit, careerStart, currentStart, newCompanyId)
+                                      .compose(v -> applyEditAndApprove(managerId, editId, null, null, null, newStatus, newCountry, newLinkedinUrl, effectiveCo, effectiveTit, adminId, now, proposedBy, managerName, null));
+                              }
+                              return managerRepo.closeOpenCareerEntry(managerId, careerStart)
                                 .compose(closed -> {
                                     Future<Void> archiveOld;
                                     if (closed == 0) {
@@ -283,7 +304,7 @@ public class AdminService {
                                         archiveOld = Future.succeededFuture();
                                     }
                                     return archiveOld.compose(v ->
-                                        managerRepo.insertCareerEntry(managerId, effectiveCo, effectiveTit, careerStart, newEndDate, newCompanyId)
+                                        managerRepo.insertCareerEntry(managerId, effectiveCo, effectiveTit, careerStart, null, newCompanyId)
                                     );
                                 })
                                 .compose(v -> applyEditAndApprove(managerId, editId, newCompany, newCompanyLogoUrl, newTitle, newStatus, newCountry, newLinkedinUrl, effectiveCo, effectiveTit, adminId, now, proposedBy, managerName, newCompanyId))
@@ -304,8 +325,9 @@ public class AdminService {
                                         }
                                     }
                                     return Future.succeededFuture(result);
-                                })
-                        )
+                                });
+                            });
+                        })
                     );
                 })
             );

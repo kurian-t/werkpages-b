@@ -1039,15 +1039,16 @@ public class ManagerServiceCoverage5IntegrationTest {
     // ── findOrCreate — hasContributed=true path ───────────────────────────────
 
     @Test
-    void findOrCreate_hasContributed_noManager_returnsEmptyData() throws Exception {
+    void findOrCreate_hasContributed_noManager_createsGhost() throws Exception {
         String auth0Id = insertUser("auth0|foc-contrib");
         long managerId = insertManager("Existing Mgr", "ExistingCorp", "Dev", "approved");
         // Insert a review so hasContributed = true
         insertReviewForUser(managerId, auth0Id, "ExistingCorp", "Dev");
-        // Now search for a non-existent manager — should get empty result (no auto-create)
+        // First findOrCreate search — ghost slot not yet claimed, so ghost is created
         JsonObject result = await(service.findOrCreate(auth0Id, "Patricia", "Chen", "Manager", "NonExistentCo999", "US", null, null, null));
-        assertFalse(result.getBoolean("created"));
-        assertEquals(0, result.getJsonArray("data").size());
+        assertTrue(result.getBoolean("created"), "First search should create a ghost");
+        assertEquals(1, result.getJsonArray("data").size());
+        assertEquals("ghost", result.getJsonArray("data").getJsonObject(0).getString("approvalStatus"));
         assertTrue(result.getBoolean("hasContributed"));
     }
 

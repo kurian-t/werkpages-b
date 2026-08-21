@@ -367,19 +367,20 @@ class ManagerServiceCoverage2IntegrationTest {
     }
 
     @Test
-    void findOrCreate_contributedUser_noMatch_returnsEmptyData() throws Exception {
+    void findOrCreate_contributedUser_noMatch_createsGhost() throws Exception {
         String auth0Id = insertUser("auth0|foc-contributed");
         long managerId = insertManager("Contrib Target", "ContribCorp", "Director", "approved");
         // Make the user a contributor
         await(service.createReview(auth0Id, managerId, reviewBody(), null));
 
-        // Now search for a different, non-existent manager
+        // First findOrCreate search — ghost slot not yet claimed, so ghost is created
         JsonObject result = await(service.findOrCreate(auth0Id,
             "Zara", "Quincey", "Analyst", "NoSuchCompanyXYZ", "US", null, null, null));
 
         assertNotNull(result);
-        assertFalse(result.getBoolean("created"));
-        assertEquals(0, result.getJsonArray("data").size());
+        assertTrue(result.getBoolean("created"), "First search should create a ghost");
+        assertEquals(1, result.getJsonArray("data").size());
+        assertEquals("ghost", result.getJsonArray("data").getJsonObject(0).getString("approvalStatus"));
         assertTrue(result.getBoolean("hasContributed"), "Should indicate user has contributed");
     }
 

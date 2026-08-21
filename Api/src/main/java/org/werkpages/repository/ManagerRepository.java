@@ -348,7 +348,7 @@ public class ManagerRepository {
         return db.preparedQuery("""
                 UPDATE managers SET approval_status = 'rejected', updated_at = now()
                 WHERE id = $1 AND approval_status = 'pending_approval'
-                RETURNING id, name, company, submitted_by
+                RETURNING id, name, company, submitted_by, search_created_by_user_id
                 """)
             .execute(Tuple.of(managerId))
             .map(rows -> rows.iterator().hasNext()
@@ -376,6 +376,30 @@ public class ManagerRepository {
                 FROM career_history WHERE manager_id = $1 ORDER BY start_date DESC
                 """)
             .execute(Tuple.of(managerId));
+    }
+
+    /**
+     * Start date of the manager's genuinely-current role: the open (end_date IS NULL) career
+     * entry with the latest start_date. Returns empty when the manager has no open career entry
+     * (callers fall back to the manager's created_at as the implicit current-role start).
+     *
+     * Used to decide whether a newly-added open-ended role is actually more recent than the
+     * current one — an OLDER role must not take over the manager's headline company/title/logo.
+     */
+    public Future<Optional<OffsetDateTime>> findCurrentRoleStart(long managerId) {
+        return db.preparedQuery("""
+                SELECT start_date FROM career_history
+                WHERE manager_id = $1 AND end_date IS NULL
+                ORDER BY start_date DESC NULLS LAST
+                LIMIT 1
+                """)
+            .execute(Tuple.of(managerId))
+            .map(rs -> {
+                Iterator<Row> it = rs.iterator();
+                return it.hasNext()
+                    ? Optional.ofNullable(it.next().getOffsetDateTime("start_date"))
+                    : Optional.<OffsetDateTime>empty();
+            });
     }
 
     public Future<Void> insertCareerEntry(long managerId, String company, String title,

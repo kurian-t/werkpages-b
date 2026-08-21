@@ -72,6 +72,7 @@ public class CompanyRepository {
                 SELECT c.id, c.name, c.slug, cs.logo_url, cs.manager_count, cs.total_reviews, cs.avg_rating
                 FROM company_stats_live cs
                 JOIN companies c ON c.id = cs.company_id
+                WHERE cs.manager_count > 0
                 ORDER BY cs.total_reviews DESC, cs.manager_count DESC, c.name ASC
                 """)
             .execute();

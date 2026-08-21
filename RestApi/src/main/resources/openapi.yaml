@@ -1785,6 +1785,25 @@ paths:
         '403':
           description: Forbidden
 
+  /api/admin/refresh-company-stats:
+    post:
+      operationId: refreshCompanyStats
+      summary: Force a full resync of company_stats_live from source tables (admin only)
+      tags:
+        - Admin
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Stats refreshed
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+
   /api/admin/country-stats:
     get:
       operationId: getAdminCountryStats

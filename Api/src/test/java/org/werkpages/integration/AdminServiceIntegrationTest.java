@@ -460,6 +460,96 @@ class AdminServiceIntegrationTest {
     }
 
     @Test
+    void approveEdit_olderOpenEndedRole_doesNotTakeOverManagerHeadline() throws Exception {
+        // Adding an OLDER role that the user forgot to mark as ended (no end date) must NOT
+        // move the manager's headline company/title/logo off the most-recent role. The logo
+        // shown next to the manager's name must stay on the current company.
+        String adminAuth0 = insertUser("auth0|admin-older01", "AdminOlder01", "admin");
+        String userAuth   = insertUser("auth0|editor-older01", "EditorOlder01", "user");
+        UUID   userId     = findUserId(userAuth);
+
+        // Current role: NowCo, with a real logo, and an OPEN career entry that started recently.
+        long managerId = await(pool.preparedQuery("""
+                INSERT INTO managers(name,company,title,image,status,approval_status,
+                                     overall_rating,reviews_count,category_averages,company_logo_url)
+                VALUES ('Ada Current','NowCo','Engineer','img','active','approved',0,0,'{}',
+                        'https://img.logo.dev/nowco.com') RETURNING id
+                """)
+            .execute()
+            .map(rs -> rs.iterator().next().getLong("id")));
+        await(pool.preparedQuery(
+                "INSERT INTO career_history(manager_id, company, title, start_date) VALUES ($1,'NowCo','Engineer','2020-01-01 00:00:00+00')")
+            .execute(Tuple.of(managerId)));
+
+        // Edit adds an OLDER role (starts 2015, no end date) at OldCo.
+        UUID editId = insertPendingEditWithDates(managerId, userId, "OldCo", "Intern", "active",
+                java.time.OffsetDateTime.of(2015, 1, 1, 0, 0, 0, 0, java.time.ZoneOffset.UTC),
+                null);
+
+        await(service.approveEdit(adminAuth0, editId));
+
+        // Manager headline must be unchanged — still NowCo with its logo.
+        io.vertx.sqlclient.Row mgr = await(pool
+            .preparedQuery("SELECT company, title, company_logo_url FROM managers WHERE id = $1")
+            .execute(Tuple.of(managerId))
+            .map(rs -> rs.iterator().next()));
+        assertEquals("NowCo", mgr.getString("company"), "headline company must stay on the most-recent role");
+        assertEquals("Engineer", mgr.getString("title"), "headline title must stay on the most-recent role");
+        assertEquals("https://img.logo.dev/nowco.com", mgr.getString("company_logo_url"),
+            "headline logo must stay on the most-recent role, not the older role's logo");
+
+        // The older role is still recorded, as a closed past segment.
+        io.vertx.sqlclient.Row oldRole = await(pool.preparedQuery("""
+                SELECT start_date, end_date FROM career_history
+                WHERE manager_id = $1 AND company = 'OldCo'
+                """)
+            .execute(Tuple.of(managerId))
+            .map(rs -> rs.iterator().hasNext() ? rs.iterator().next() : null));
+        assertNotNull(oldRole, "older role must be recorded in career history");
+        assertEquals(2015, oldRole.getOffsetDateTime("start_date").getYear());
+        assertNotNull(oldRole.getOffsetDateTime("end_date"),
+            "older open-ended role must be archived as a closed segment");
+
+        // The current NowCo entry must remain open.
+        Long openNowCo = await(pool.preparedQuery("""
+                SELECT COUNT(*) FROM career_history
+                WHERE manager_id = $1 AND company = 'NowCo' AND end_date IS NULL
+                """)
+            .execute(Tuple.of(managerId))
+            .map(rs -> rs.iterator().next().getLong(0)));
+        assertEquals(1L, openNowCo, "current NowCo role must remain the open, current role");
+    }
+
+    @Test
+    void approveEdit_newerOpenEndedRole_becomesCurrentHeadline() throws Exception {
+        // Guard must NOT block a legitimate current-role change: a role that starts AFTER the
+        // existing current role should still take over the manager's headline.
+        String adminAuth0 = insertUser("auth0|admin-newer01", "AdminNewer01", "admin");
+        String userAuth   = insertUser("auth0|editor-newer01", "EditorNewer01", "user");
+        UUID   userId     = findUserId(userAuth);
+
+        long managerId = insertApprovedManager("Ben Newer", "OldCo", "Engineer");
+        // Existing current role started in 2010.
+        await(pool.preparedQuery(
+                "INSERT INTO career_history(manager_id, company, title, start_date) VALUES ($1,'OldCo','Engineer','2010-01-01 00:00:00+00')")
+            .execute(Tuple.of(managerId)));
+
+        // Edit moves to NewCo starting 2020 (after 2010), no end date — a genuine current change.
+        UUID editId = insertPendingEditWithDates(managerId, userId, "NewCo", "Director", "active",
+                java.time.OffsetDateTime.of(2020, 1, 1, 0, 0, 0, 0, java.time.ZoneOffset.UTC),
+                null);
+
+        await(service.approveEdit(adminAuth0, editId));
+
+        io.vertx.sqlclient.Row mgr = await(pool
+            .preparedQuery("SELECT company, title FROM managers WHERE id = $1")
+            .execute(Tuple.of(managerId))
+            .map(rs -> rs.iterator().next()));
+        assertEquals("NewCo", mgr.getString("company"), "newer role must become the headline company");
+        assertEquals("Director", mgr.getString("title"), "newer role must become the headline title");
+    }
+
+    @Test
     void approveEdit_withProposedBy_sendsNotification() throws Exception {
         String adminAuth0 = insertUser("auth0|admin16", "Admin16", "admin");
         String userAuth   = insertUser("auth0|editor04", "Editor04", "user");

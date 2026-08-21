@@ -151,6 +151,48 @@ class CompanyListingIntegrationTest {
         assertEquals(0, data.size());
     }
 
+    // ── Live (immediate) stat updates — must not wait for the periodic full refresh ──────────
+
+    @Test
+    void liveStats_managerCountIncrementsImmediatelyOnAdd_withoutFullRefresh() throws Exception {
+        // Adding a manager must bump the company's live manager_count straight away via the
+        // targeted upsert the write path calls — WITHOUT the periodic refreshCompanyStats() sweep.
+        long companyId = await(companyRepo.findOrCreate("Acme Corp", null, null)).getLong("id");
+
+        long id1 = insertApprovedManagerReturningId("Alice A", "Acme Corp", "Engineer", companyId);
+        await(companyRepo.updateCompanyStatsForManager(id1));
+
+        JsonArray afterFirst = await(service.getCompanyListing()).getJsonArray("data");
+        assertEquals(1, afterFirst.size());
+        assertEquals(1L, afterFirst.getJsonObject(0).getLong("managerCount"));
+
+        long id2 = insertApprovedManagerReturningId("Bob B", "Acme Corp", "Director", companyId);
+        await(companyRepo.updateCompanyStatsForManager(id2));
+
+        // No refreshCompanyStats() here — the live table must already reflect the second manager.
+        JsonArray afterSecond = await(service.getCompanyListing()).getJsonArray("data");
+        assertEquals(1, afterSecond.size());
+        assertEquals(2L, afterSecond.getJsonObject(0).getLong("managerCount"),
+            "manager_count must increment immediately when a manager is added");
+    }
+
+    @Test
+    void liveStats_companyDropsFromListingWhenLastManagerDeleted() throws Exception {
+        long companyId = await(companyRepo.findOrCreate("Solo Corp", null, null)).getLong("id");
+        long id1 = insertApprovedManagerReturningId("Only One", "Solo Corp", "Engineer", companyId);
+        await(companyRepo.updateCompanyStatsForManager(id1));
+
+        assertEquals(1, await(service.getCompanyListing()).getJsonArray("data").size());
+
+        // Delete the only manager and refresh that company's live stats (the delete path).
+        await(pool.preparedQuery("DELETE FROM managers WHERE id = $1").execute(Tuple.of(id1)));
+        await(companyRepo.updateCompanyStatsForCompany(companyId));
+
+        JsonArray after = await(service.getCompanyListing()).getJsonArray("data");
+        assertEquals(0, after.size(),
+            "company must drop out of the listing immediately once its manager_count hits 0");
+    }
+
     @Test
     void getCompanyListing_avgRatingIgnoresZeroReviewManagers() throws Exception {
         insertManager("Rated",   "Acme Corp", "Manager",  "approved", 4.0, 2);
@@ -512,6 +554,17 @@ class CompanyListingIntegrationTest {
                 VALUES ($1,$2,$3,'img','active',$4,$5,$6,'{}', $7, $8) RETURNING id
                 """)
             .execute(Tuple.of(name, company, title, status, overallRating, reviewsCount, companyId, externalId)));
+    }
+
+    private long insertApprovedManagerReturningId(String name, String company, String title, Long companyId) throws Exception {
+        return await(pool
+            .preparedQuery("""
+                INSERT INTO managers(name,company,title,image,status,approval_status,
+                                     overall_rating,reviews_count,category_averages,company_id)
+                VALUES ($1,$2,$3,'img','active','approved',0,0,'{}', $4) RETURNING id
+                """)
+            .execute(Tuple.of(name, company, title, companyId))
+            .map(rs -> rs.iterator().next().getLong("id")));
     }
 
     private void insertManagerWithLogoUrl(String name, String company, String title, String status,

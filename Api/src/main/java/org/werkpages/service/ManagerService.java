@@ -839,6 +839,7 @@ public class ManagerService {
         String newLinkedinUrl = body.getString("linkedinUrl");
         String newLogoUrl     = body.getString("resolvedLogoUrl");
         String startDateStr   = body.getString("startDate");
+        String endDateStr     = body.getString("endDate");
 
         if (newCompany == null && newTitle == null && newImage == null && newBio == null && newStatus == null && newCountry == null && newLinkedinUrl == null) {
             return Future.failedFuture(ServiceException.badRequest("Nothing to update"));
@@ -884,24 +885,48 @@ public class ManagerService {
                                     .compose(v -> doUpdate(managerId, newCompany, newTitle, newImage, newBio, newStatus, newCountry, newLinkedinUrl, newLogoUrl, newCompanyId));
                             }
 
-                            // Start date provided — genuine role change: close old segment, open a new one.
+                            LocalDate endDateLocal = parseYearMonth(endDateStr);
+
+                            if (endDateLocal != null) {
+                                // Both start and end date provided — user is adding a PAST role.
+                                // Insert the segment with its dates but DO NOT change manager.company.
+                                OffsetDateTime pastStart = oldStartLocal.atStartOfDay(ZoneOffset.UTC).toOffsetDateTime();
+                                OffsetDateTime pastEnd   = endDateLocal.atStartOfDay(ZoneOffset.UTC).toOffsetDateTime();
+                                return managerRepo.insertCareerEntry(managerId, effectiveCo, effectiveTit, pastStart, pastEnd, newCompanyId)
+                                    .compose(v -> doUpdate(managerId, null, null, newImage, newBio, newStatus, newCountry, newLinkedinUrl, null, null));
+                            }
+
+                            // Start date provided, no end date. This is only a genuine *current* role
+                            // change when the new role starts on/after the manager's existing current
+                            // role. If it starts earlier, the user is recording an OLDER role they simply
+                            // didn't mark as ended — archive it as a past segment and DO NOT move the
+                            // manager's headline company/title/logo off the most-recent role.
                             OffsetDateTime now = OffsetDateTime.now(ZoneOffset.UTC);
                             OffsetDateTime newPosStart = oldStartLocal.atStartOfDay(ZoneOffset.UTC).toOffsetDateTime();
 
-                            return managerRepo.closeOpenCareerEntry(managerId, now)
-                                .compose(closedRows -> {
-                                    Future<Void> archiveOld;
-                                    if (closedRows == 0) {
-                                        OffsetDateTime oldStart = current.getOffsetDateTime("created_at");
-                                        archiveOld = managerRepo.insertCareerEntry(managerId, currentCompany, currentTitle, oldStart, now, oldCompanyId);
-                                    } else {
-                                        archiveOld = Future.succeededFuture();
-                                    }
-                                    return archiveOld.compose(v ->
-                                        managerRepo.insertCareerEntry(managerId, effectiveCo, effectiveTit, newPosStart, null, newCompanyId)
-                                    );
-                                })
-                                .compose(v -> doUpdate(managerId, newCompany, newTitle, newImage, newBio, newStatus, newCountry, newLinkedinUrl, newLogoUrl, newCompanyId));
+                            return managerRepo.findCurrentRoleStart(managerId).compose(curStartOpt -> {
+                                OffsetDateTime currentStart = curStartOpt.orElse(current.getOffsetDateTime("created_at"));
+                                if (currentStart != null && newPosStart.isBefore(currentStart)) {
+                                    // Older open-ended role → store it as a closed past segment ending when
+                                    // the current role began; leave the manager's headline untouched.
+                                    return managerRepo.insertCareerEntry(managerId, effectiveCo, effectiveTit, newPosStart, currentStart, newCompanyId)
+                                        .compose(v -> doUpdate(managerId, null, null, newImage, newBio, newStatus, newCountry, newLinkedinUrl, null, null));
+                                }
+                                return managerRepo.closeOpenCareerEntry(managerId, now)
+                                    .compose(closedRows -> {
+                                        Future<Void> archiveOld;
+                                        if (closedRows == 0) {
+                                            OffsetDateTime oldStart = current.getOffsetDateTime("created_at");
+                                            archiveOld = managerRepo.insertCareerEntry(managerId, currentCompany, currentTitle, oldStart, now, oldCompanyId);
+                                        } else {
+                                            archiveOld = Future.succeededFuture();
+                                        }
+                                        return archiveOld.compose(v ->
+                                            managerRepo.insertCareerEntry(managerId, effectiveCo, effectiveTit, newPosStart, null, newCompanyId)
+                                        );
+                                    })
+                                    .compose(v -> doUpdate(managerId, newCompany, newTitle, newImage, newBio, newStatus, newCountry, newLinkedinUrl, newLogoUrl, newCompanyId));
+                            });
                         });
                 } else {
                     return doUpdate(managerId, newCompany, newTitle, newImage, newBio, newStatus, newCountry, newLinkedinUrl, newLogoUrl, null);
@@ -1915,18 +1940,7 @@ public class ManagerService {
                                     .put("hasContributed", contributed));
                         }
 
-                    if (contributed) {
-                        // Has already rated — manager not found, return empty. No silent pending
-                        // creation: the user is searching, not explicitly submitting, so they
-                        // must not receive an admin rejection notification they don't understand.
-                        return Future.succeededFuture(
-                            new JsonObject()
-                                .put("data", new JsonArray())
-                                .put("created", false)
-                                .put("hasContributed", contributed));
-                    }
-
-                    // First-time user, manager not found: ghost/pending flow.
+                    // Manager not found: ghost/pending flow (regardless of contribution status).
                     boolean shortNames = fullName.trim().length() < 4 || company.trim().length() < 4;
 
                     if (shortNames) {
@@ -1960,8 +1974,17 @@ public class ManagerService {
                     // confusing rejection notification.
                     return userRepo.claimAutoCreatedManagerSlot(userId).compose(claimed -> {
                         if (!claimed) {
-                            return Future.succeededFuture(
-                                new JsonObject()
+                            // Ghost slot already used — silently create a pending_approval for admin
+                            // review. No notification is sent on approval or rejection: the user
+                            // searched but did not explicitly submit, so they must not receive emails
+                            // about a submission they aren't aware of.
+                            final String fState3 = trimmedState;
+                            final String fCity3  = trimmedCity;
+                            return companyRepo.findOrCreate(company, null, resolvedLogoUrl)
+                                .compose(cRow -> managerRepo.createSearchPending(
+                                    fullName, company, title, country,
+                                    fState3, fCity3, resolvedLogoUrl, cRow.getLong("id"), userId))
+                                .map(row -> new JsonObject()
                                     .put("data", new JsonArray())
                                     .put("created", false)
                                     .put("hasContributed", contributed));
