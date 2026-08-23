@@ -513,8 +513,10 @@ paths:
                   type: string
                 state:
                   type: string
+                  nullable: true
                 city:
                   type: string
+                  nullable: true
       responses:
         '200':
           description: Search results (may include a newly created manager)
@@ -559,8 +561,10 @@ paths:
                   type: string
                 state:
                   type: string
+                  nullable: true
                 city:
                   type: string
+                  nullable: true
       responses:
         '200':
           description: Existing manager found — no new record created
@@ -618,8 +622,10 @@ paths:
                   type: string
                 state:
                   type: string
+                  nullable: true
                 city:
                   type: string
+                  nullable: true
       responses:
         '202':
           description: Accepted — pending manager queued for admin review (nothing returned to caller)
@@ -656,6 +662,7 @@ paths:
                   type: string
                 state:
                   type: string
+                  nullable: true
                 status:
                   type: string
                   enum: [active, retired]

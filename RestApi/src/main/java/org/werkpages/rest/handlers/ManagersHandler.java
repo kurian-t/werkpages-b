@@ -626,6 +626,19 @@ public class ManagersHandler {
 
     // ── Find-or-create ────────────────────────────────────────────────────────
 
+    /**
+     * Null-safe trimmed string from a JSON body. Returns {@code ""} both when the key is
+     * absent AND when it is explicitly {@code null}. This matters because Vert.x's
+     * {@code getString(key, default)} only applies the default for an ABSENT key — a key
+     * present with a JSON null returns {@code null}, so {@code .trim()} would NPE. The
+     * frontend sends {@code state:null}/{@code city:null} whenever geolocation can't resolve
+     * them, so this guard is required (regression: find-or-create 500'd on null geo fields).
+     */
+    static String bodyStr(JsonObject body, String key) {
+        String v = body.getString(key, "");
+        return v == null ? "" : v.trim();
+    }
+
     public void handleFindOrCreate(RoutingContext ctx) {
         String auth0Id = ctx.get("auth0Id");
         if (auth0Id == null) {
@@ -636,13 +649,13 @@ public class ManagersHandler {
         if (body == null) { respond(ctx, 400, new JsonObject().put("message", "Request body required")); return; }
         GeoUtils.stampGeo(ctx, body);
 
-        String firstName = body.getString("firstName", "").trim();
-        String lastName  = body.getString("lastName",  "").trim();
-        String title     = body.getString("title",     "").trim();
-        String company   = body.getString("company",   "").trim();
-        String country   = body.getString("country",   "").trim();
-        String state     = body.getString("state",     "").trim();
-        String city      = body.getString("city",      "").trim();
+        String firstName = bodyStr(body, "firstName");
+        String lastName  = bodyStr(body, "lastName");
+        String title     = bodyStr(body, "title");
+        String company   = bodyStr(body, "company");
+        String country   = bodyStr(body, "country");
+        String state     = bodyStr(body, "state");
+        String city      = bodyStr(body, "city");
 
         String logoUrl = CompanyLogoUtils.resolveLogoUrl(company);
         service.findOrCreate(auth0Id, firstName, lastName, title, company, country, state, city, logoUrl)
