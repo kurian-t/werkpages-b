@@ -8,10 +8,14 @@ import java.util.regex.Pattern;
  */
 public class NameValidator {
 
-    private static final int MIN_PART_LENGTH = 2;
-    private static final int MAX_PART_LENGTH = 50;
+    private static final int MIN_PART_LENGTH  = 2;
+    private static final int MAX_PART_LENGTH  = 50;
+    /** A name part must carry real letters, not just punctuation ("--", "''" are not names). */
+    private static final int MIN_PART_LETTERS = 2;
 
     private static final Pattern VALID_NAME_PART = Pattern.compile("[a-zA-ZÀ-ÖØ-öø-ÿ'\\-\\s]+");
+    /** "Bo--b", "O''Brien" — doubled punctuation is junk, never a real name. */
+    private static final Pattern REPEATED_PUNCTUATION = Pattern.compile("['\\-]{2,}");
 
     private static final Set<String> FAKE_FULL_NAMES = Set.of(
         "john doe", "jane doe", "john smith", "jane smith",
@@ -58,6 +62,22 @@ public class NameValidator {
         if ((r = validateField(company, "Company", 100)).valid    == false) return r;
         if ((r = validateField(country, "Country", 100)).valid    == false) return r;
 
+        return validateNameContent(firstName, lastName);
+    }
+
+    /**
+     * Name-only validation, for callers that submit a single "First Last" name and validate the
+     * other fields themselves (e.g. the add-manager form). Applies exactly the same name rules as
+     * {@link #validate} — every path that creates a manager must go through one of the two.
+     */
+    public static ValidationResult validateFullName(String firstName, String lastName) {
+        ValidationResult r;
+        if ((r = validateNamePart(firstName, "First name")).valid == false) return r;
+        if ((r = validateNamePart(lastName,  "Last name")).valid  == false) return r;
+        return validateNameContent(firstName, lastName);
+    }
+
+    private static ValidationResult validateNameContent(String firstName, String lastName) {
         String firstLower = firstName.trim().toLowerCase();
         String lastLower  = lastName.trim().toLowerCase();
         String fullLower  = firstLower + " " + lastLower;
@@ -79,12 +99,21 @@ public class NameValidator {
     private static ValidationResult validateNamePart(String value, String field) {
         if (value == null || value.isBlank())
             return ValidationResult.fail(field + " is required");
-        String trimmed = value.trim();
+        // Collapse internal runs of whitespace so "Mary   Ann" is judged as "Mary Ann".
+        String trimmed = value.trim().replaceAll("\\s+", " ");
         if (trimmed.length() < MIN_PART_LENGTH)
             return ValidationResult.fail(field + " is too short");
         if (trimmed.length() > MAX_PART_LENGTH)
             return ValidationResult.fail(field + " is too long");
         if (!VALID_NAME_PART.matcher(trimmed).matches())
+            return ValidationResult.fail(field + " contains invalid characters");
+        // Letters-only whitelist above still admits punctuation-only junk ("--", "' '") and
+        // fragments like "A-" that are a single letter padded out to the minimum length.
+        if (trimmed.chars().filter(Character::isLetter).count() < MIN_PART_LETTERS)
+            return ValidationResult.fail(field + " must contain at least " + MIN_PART_LETTERS + " letters");
+        if (!Character.isLetter(trimmed.charAt(0)) || !Character.isLetter(trimmed.charAt(trimmed.length() - 1)))
+            return ValidationResult.fail(field + " must start and end with a letter");
+        if (REPEATED_PUNCTUATION.matcher(trimmed).find())
             return ValidationResult.fail(field + " contains invalid characters");
         return ValidationResult.ok();
     }

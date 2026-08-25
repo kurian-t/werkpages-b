@@ -341,6 +341,83 @@ paths:
                         avgRating:
                           type: number
 
+  /api/industries/listing:
+    get:
+      operationId: getIndustryListing
+      summary: Browse industries with aggregate stats (public)
+      tags:
+        - Industries
+      security: []
+      responses:
+        '200':
+          description: One entry per industry with company/manager/review counts and avg rating
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        industry:
+                          type: string
+                        slug:
+                          type: string
+                        companyCount:
+                          type: integer
+                        managerCount:
+                          type: integer
+                        totalReviews:
+                          type: integer
+                        avgRating:
+                          type: number
+                          nullable: true
+
+  /api/industries/by-slug/{slug}:
+    get:
+      operationId: getIndustryProfile
+      summary: Get an industry profile with stats and its companies (public)
+      tags:
+        - Industries
+      security: []
+      parameters:
+        - in: path
+          name: slug
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Industry profile with stats and companies
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  industry:
+                    type: string
+                  slug:
+                    type: string
+                  companyCount:
+                    type: integer
+                  managerCount:
+                    type: integer
+                  totalReviews:
+                    type: integer
+                  avgRating:
+                    type: number
+                    nullable: true
+                  categoryAverages:
+                    type: object
+                  companies:
+                    type: array
+                    items:
+                      type: object
+        '404':
+          description: Industry not found
+
   /api/companies/by-name:
     get:
       operationId: getCompanyProfile
@@ -1679,6 +1756,20 @@ paths:
           description: Job started
         '503':
           description: Job not configured
+
+  /api/admin/industries/classify:
+    post:
+      operationId: classifyIndustries
+      summary: Back-fill industry classification for all unclassified companies (admin only)
+      tags:
+        - Admin
+      security:
+        - bearerAuth: []
+      responses:
+        '202':
+          description: Classification started
+        '503':
+          description: Job not configured (ANTHROPIC_API_KEY missing)
 
   /api/admin/merge-suggestions:
     get:

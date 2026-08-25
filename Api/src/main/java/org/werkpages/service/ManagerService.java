@@ -546,6 +546,15 @@ public class ManagerService {
         if (company.length() > 100) return Future.failedFuture(ServiceException.badRequest("Company must be at most 100 characters"));
         if (title.length() > 100)   return Future.failedFuture(ServiceException.badRequest("Title must be at most 100 characters"));
 
+        // The add-manager form submits one "First Last" string, so split it and apply the same name
+        // rules the find-or-create / ghost paths use. Without this, single-letter and junk names
+        // ("A B", "-- --") reached the directory through the form.
+        String[] nameParts = name.trim().split("\\s+", 2);
+        NameValidator.ValidationResult nameValidation =
+            NameValidator.validateFullName(nameParts[0], nameParts.length > 1 ? nameParts[1] : "");
+        if (!nameValidation.valid())
+            return Future.failedFuture(ServiceException.badRequest(nameValidation.reason()));
+
         String country     = body.getString("country")     != null ? body.getString("country").trim()     : null;
         String state       = body.getString("state")       != null ? body.getString("state").trim()       : null;
         String city        = body.getString("city")        != null ? body.getString("city").trim()        : null;

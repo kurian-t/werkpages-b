@@ -72,14 +72,19 @@ class SitemapServiceIntegrationTest {
             .iterator().next().getLong("id");
     }
 
+    /** Insert a manager with 1 real review by default (so it is sitemap-eligible). */
     private void insertManager(String name, String slug, String status, long companyId, String company) throws Exception {
+        insertManager(name, slug, status, companyId, company, 1);
+    }
+
+    private void insertManager(String name, String slug, String status, long companyId, String company, int reviewsCount) throws Exception {
         pool.preparedQuery("""
                 INSERT INTO managers
                     (name, slug, company, title, status, approval_status, company_id,
                      overall_rating, reviews_count, category_averages, created_at, updated_at)
-                VALUES ($1, $2, $3, 'Manager', 'active', $4, $5, 0, 0, '{}', now(), now())
+                VALUES ($1, $2, $3, 'Manager', 'active', $4, $5, 0, $6, '{}', now(), now())
                 """)
-            .execute(Tuple.of(name, slug, company, status, companyId))
+            .execute(Tuple.of(name, slug, company, status, companyId, reviewsCount))
             .toCompletionStage().toCompletableFuture().get(5, TimeUnit.SECONDS);
     }
 
@@ -107,8 +112,9 @@ class SitemapServiceIntegrationTest {
     }
 
     @Test
-    void generate_approvedCompany_includesCompanyUrl() throws Exception {
-        insertCompany("Acme Corp", "acme-corp", "approved");
+    void generate_approvedCompanyWithReviewedManager_includesCompanyUrl() throws Exception {
+        long id = insertCompany("Acme Corp", "acme-corp", "approved");
+        insertManager("Jane Doe", "jane-doe", "approved", id, "Acme Corp"); // 1 review by default
 
         String xml = sitemapService.generate()
             .toCompletionStage().toCompletableFuture().get(10, TimeUnit.SECONDS);
@@ -117,13 +123,38 @@ class SitemapServiceIntegrationTest {
     }
 
     @Test
-    void generate_ghostCompany_includesCompanyUrl() throws Exception {
-        insertCompany("Ghost Inc", "ghost-inc", "ghost");
+    void generate_ghostCompanyWithReviewedManager_includesCompanyUrl() throws Exception {
+        long id = insertCompany("Ghost Inc", "ghost-inc", "ghost");
+        insertManager("Casper G", "casper-g", "ghost", id, "Ghost Inc");
 
         String xml = sitemapService.generate()
             .toCompletionStage().toCompletableFuture().get(10, TimeUnit.SECONDS);
 
         assertTrue(xml.contains("https://werkpages.com/companies/ghost-inc"));
+    }
+
+    @Test
+    void generate_companyWithOnlyReviewlessManagers_excluded() throws Exception {
+        long id = insertCompany("Empty Ghost Co", "empty-ghost-co", "ghost");
+        insertManager("No Reviews", "no-reviews", "ghost", id, "Empty Ghost Co", 0);
+
+        String xml = sitemapService.generate()
+            .toCompletionStage().toCompletableFuture().get(10, TimeUnit.SECONDS);
+
+        assertFalse(xml.contains("empty-ghost-co"), "a company whose managers have no reviews is thin and must be excluded");
+    }
+
+    @Test
+    void generate_managerWithNoReviews_excluded() throws Exception {
+        long id = insertCompany("Acme Corp", "acme-corp", "approved");
+        insertManager("Reviewed One", "reviewed-one", "approved", id, "Acme Corp", 2);
+        insertManager("Thin One",     "thin-one",     "approved", id, "Acme Corp", 0);
+
+        String xml = sitemapService.generate()
+            .toCompletionStage().toCompletableFuture().get(10, TimeUnit.SECONDS);
+
+        assertTrue(xml.contains("companies/acme-corp/managers/reviewed-one"), "reviewed manager stays in the sitemap");
+        assertFalse(xml.contains("thin-one"), "review-less manager must be excluded from the sitemap");
     }
 
     @Test

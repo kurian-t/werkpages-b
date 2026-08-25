@@ -143,6 +143,89 @@ class NameValidatorTest {
         assertTrue(r.reason().contains("invalid characters"));
     }
 
+    // ── structural junk that the character whitelist alone lets through ───────
+
+    @ParameterizedTest(name = "punctuation-only first name \"{0}\" fails")
+    @ValueSource(strings = { "--", "''", "-'", "' '", "---" })
+    void punctuationOnlyName_fails(String firstName) {
+        var r = NameValidator.validate(firstName, "Smith", VALID_TITLE, VALID_COMPANY, VALID_COUNTRY);
+        assertFalse(r.valid(), "Expected failure for: " + firstName);
+        assertTrue(r.reason().contains("at least 2 letters"), "Got: " + r.reason());
+    }
+
+    @ParameterizedTest(name = "single letter padded to length \"{0}\" fails")
+    @ValueSource(strings = { "A-", "-A", "A'", "'A", "A ", " A" })
+    void singleLetterPaddedWithPunctuation_fails(String firstName) {
+        var r = NameValidator.validate(firstName, "Smith", VALID_TITLE, VALID_COMPANY, VALID_COUNTRY);
+        assertFalse(r.valid(), "Expected failure for: " + firstName);
+    }
+
+    @ParameterizedTest(name = "name with leading/trailing punctuation \"{0}\" fails")
+    @ValueSource(strings = { "-Bob", "Bob-", "'Bob", "Bob'" })
+    void leadingOrTrailingPunctuation_fails(String firstName) {
+        var r = NameValidator.validate(firstName, "Smith", VALID_TITLE, VALID_COMPANY, VALID_COUNTRY);
+        assertFalse(r.valid(), "Expected failure for: " + firstName);
+        assertTrue(r.reason().contains("start and end with a letter"), "Got: " + r.reason());
+    }
+
+    @ParameterizedTest(name = "doubled punctuation \"{0}\" fails")
+    @ValueSource(strings = { "Bo--b", "O''Brien", "Mary--Jane" })
+    void repeatedPunctuation_fails(String firstName) {
+        var r = NameValidator.validate(firstName, "Smith", VALID_TITLE, VALID_COMPANY, VALID_COUNTRY);
+        assertFalse(r.valid(), "Expected failure for: " + firstName);
+        assertTrue(r.reason().contains("invalid characters"), "Got: " + r.reason());
+    }
+
+    @Test
+    void internalWhitespaceIsCollapsed_multiWordNameStillValid() {
+        // "Mary   Ann" is a typo, not junk — it must not be rejected as invalid characters.
+        var r = NameValidator.validate("Mary   Ann", "Fitzgerald", VALID_TITLE, VALID_COMPANY, VALID_COUNTRY);
+        assertTrue(r.valid(), "Expected valid but got: " + r.reason());
+    }
+
+    // ── validateFullName: the name-only entry point used by the add-manager form ──
+
+    @Test
+    void validateFullName_realName_passes() {
+        assertTrue(NameValidator.validateFullName("Margaret", "Williams").valid());
+    }
+
+    @ParameterizedTest(name = "validateFullName rejects \"{0} {1}\"")
+    @CsvSource({
+        "A,      B",
+        "A,      Smith",
+        "John,   B",
+        "'--',   '--'",
+        "John3,  Smith",
+        "Jane,   Smith",
+        "Fuck,   Smith",
+    })
+    void validateFullName_junk_fails(String first, String last) {
+        var r = NameValidator.validateFullName(first, last);
+        assertFalse(r.valid(), "Expected rejection for: " + first + " " + last);
+        assertNotNull(r.reason());
+    }
+
+    @Test
+    void validateFullName_missingLastName_fails() {
+        var r = NameValidator.validateFullName("Margaret", "");
+        assertFalse(r.valid());
+        assertTrue(r.reason().contains("required"), "Got: " + r.reason());
+    }
+
+    @Test
+    void validateFullName_appliesSameRulesAsValidate() {
+        // The two entry points must never diverge on the name itself.
+        String[][] names = {{"A", "B"}, {"--", "--"}, {"Jane", "Smith"}, {"Margaret", "Williams"}};
+        for (String[] n : names) {
+            boolean viaFullName = NameValidator.validateFullName(n[0], n[1]).valid();
+            boolean viaValidate = NameValidator
+                .validate(n[0], n[1], VALID_TITLE, VALID_COMPANY, VALID_COUNTRY).valid();
+            assertEquals(viaValidate, viaFullName,
+                "validateFullName and validate disagree on: " + n[0] + " " + n[1]);
+        }
+    }
+
     // ── fake full names ───────────────────────────────────────────────────────
 
     @ParameterizedTest(name = "fake full name \"{0} {1}\" is rejected")

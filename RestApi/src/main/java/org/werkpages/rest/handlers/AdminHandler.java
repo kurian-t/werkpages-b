@@ -4,6 +4,7 @@ import io.vertx.core.json.JsonObject;
 import io.vertx.ext.web.RoutingContext;
 import org.werkpages.service.AdminService;
 import org.werkpages.service.DeduplicationJob;
+import org.werkpages.service.IndustryClassificationJob;
 
 import java.util.UUID;
 
@@ -13,16 +14,23 @@ import java.util.UUID;
  */
 public class AdminHandler {
 
-    private final AdminService     service;
-    private final DeduplicationJob deduplicationJob;
+    private final AdminService              service;
+    private final DeduplicationJob          deduplicationJob;
+    private final IndustryClassificationJob industryJob;
 
     public AdminHandler(AdminService service) {
-        this(service, null);
+        this(service, null, null);
     }
 
     public AdminHandler(AdminService service, DeduplicationJob deduplicationJob) {
+        this(service, deduplicationJob, null);
+    }
+
+    public AdminHandler(AdminService service, DeduplicationJob deduplicationJob,
+                        IndustryClassificationJob industryJob) {
         this.service          = service;
         this.deduplicationJob = deduplicationJob;
+        this.industryJob      = industryJob;
     }
 
     // ── GET /api/admin/ghost-managers ────────────────────────────────────────
@@ -333,6 +341,31 @@ public class AdminHandler {
         ctx.response().setStatusCode(202).putHeader("Content-Type", "application/json")
             .end(new JsonObject().put("status", "started").encode());
         deduplicationJob.run();
+    }
+
+    // ── POST /api/admin/industries/classify ──────────────────────────────────
+
+    public void handleClassifyIndustries(RoutingContext ctx) {
+        String auth0Id = ctx.get("auth0Id");
+        if ("cron".equals(auth0Id)) { fireIndustryJob(ctx); return; }
+        service.requireAdminPublic(auth0Id)
+            .onSuccess(adminId -> fireIndustryJob(ctx))
+            .onFailure(err -> ManagersHandler.handleError(ctx, err));
+    }
+
+    private void fireIndustryJob(RoutingContext ctx) {
+        if (industryJob == null) {
+            ctx.response().setStatusCode(503).putHeader("Content-Type", "application/json")
+                .end(new JsonObject().put("error", "Industry classification not configured — ANTHROPIC_API_KEY missing").encode());
+            return;
+        }
+        // Fire-and-forget: back-filling can take minutes for thousands of companies, so we
+        // return immediately and log the outcome. Admins can re-check via the industries listing.
+        ctx.response().setStatusCode(202).putHeader("Content-Type", "application/json")
+            .end(new JsonObject().put("status", "started").encode());
+        industryJob.run()
+            .onSuccess(summary -> System.out.println("✓ Industry classification: " + summary.encode()))
+            .onFailure(err -> System.err.println("⚠ Industry classification failed: " + err.getMessage()));
     }
 
     // ── Merge suggestions ─────────────────────────────────────────────────────

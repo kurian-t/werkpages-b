@@ -320,6 +320,27 @@ class ResumeIntegrationTest {
         assertEquals(0, result.getJsonArray("data").size(), "Reviews for pending managers must not appear in prefill");
     }
 
+    // ── unknown-user (unauthorized) branch of resolveUserId ─────────────────────
+
+    @Test
+    void getResume_unknownUser_fails() {
+        assertThrows(Exception.class, () -> await(service.getResume("auth0|does-not-exist")),
+            "getResume for an unknown auth0Id must fail (unauthorized)");
+    }
+
+    @Test
+    void saveResume_unknownUser_fails() {
+        assertThrows(Exception.class,
+            () -> await(service.saveResume("auth0|does-not-exist", new JsonObject().put("summary", "hi"))),
+            "saveResume for an unknown auth0Id must fail (unauthorized)");
+    }
+
+    @Test
+    void getPrefill_unknownUser_fails() {
+        assertThrows(Exception.class, () -> await(service.getPrefill("auth0|does-not-exist")),
+            "getPrefill for an unknown auth0Id must fail (unauthorized)");
+    }
+
     // ── helpers ───────────────────────────────────────────────────────────────
 
     private String insertUser() throws Exception {

@@ -27,6 +27,7 @@ import org.testcontainers.containers.PostgreSQLContainer;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
 
+import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -145,6 +146,30 @@ class PendingManagerRatingIntegrationTest {
             "Approved manager must have a rating computed from the submitted review");
         assertTrue(after.getInteger("reviews_count") > 0,
             "Approved manager must have reviews_count > 0");
+    }
+
+    // ── Adding + rating a manager must record the contribution (unlocks ratings) ─
+
+    /**
+     * Regression guard for the "still locked after rating" bug: the ratings lock reads
+     * hasContributed(userId) = EXISTS(review with that user_id). Even though the created manager
+     * is pending_approval, the submitted review must be persisted with the submitter's user_id so
+     * hasContributed flips true and the site-wide ratings lock lifts. (The frontend mirrors this by
+     * optimistically flipping user.hasContributed after a successful add+rate.)
+     */
+    @Test
+    void createManager_withReview_recordsContribution() throws Exception {
+        String auth0Id = insertUser("auth0|contrib", "ContribUser");
+        UUID userId = await(userRepo.findIdByAuth0Id(auth0Id)).orElseThrow();
+
+        assertFalse(await(userRepo.hasContributed(userId)),
+            "user has not contributed before adding a manager");
+
+        await(managerService.createManager(auth0Id,
+            validCreateManagerBody("Casey Poe", "RivetCo", "Manager"), null));
+
+        assertTrue(await(userRepo.hasContributed(userId)),
+            "adding + rating a manager must record the contribution even while the manager is pending");
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────

@@ -20,6 +20,7 @@ import org.werkpages.rest.handlers.NotificationsHandler;
 import org.werkpages.rest.handlers.RateLimitHandler;
 import org.werkpages.rest.handlers.ReportsHandler;
 import org.werkpages.rest.handlers.ResumesHandler;
+import org.werkpages.rest.handlers.IndustriesHandler;
 import org.werkpages.service.AdminService;
 import org.werkpages.service.AnthropicClient;
 import org.werkpages.rest.handlers.CompanyLogoUtils;
@@ -29,6 +30,8 @@ import org.werkpages.service.ManagerService;
 import org.werkpages.service.NotificationService;
 import org.werkpages.service.ReportService;
 import org.werkpages.service.ResumeService;
+import org.werkpages.service.IndustryService;
+import org.werkpages.service.IndustryClassificationJob;
 import org.werkpages.service.SitemapService;
 import org.werkpages.repository.MergeSuggestionsRepository;
 import org.werkpages.repository.ResumeRepository;
@@ -107,6 +110,7 @@ public class MainVerticle extends AbstractVerticle {
                         NotificationService notifService   = new NotificationService(userRepo, notifRepo);
                         ReportService       reportService  = new ReportService(userRepo, reportRepo);
                         ResumeService       resumeService  = new ResumeService(userRepo, resumeRepo, companyRepo);
+                        IndustryService     industryService = new IndustryService(companyRepo, CompanyLogoUtils::resolveLogoUrl);
 
                         // ── Sitemap ───────────────────────────────────────────────────────────
                         SitemapService sitemapService = new SitemapService(Database.getClient());
@@ -131,23 +135,28 @@ public class MainVerticle extends AbstractVerticle {
                             }
                         });
 
-                        // ── AI deduplication job ───────────────────────────────────────────────
-                        DeduplicationJob deduplicationJob;
+                        // ── AI jobs (deduplication + industry classification) ──────────────────
+                        DeduplicationJob          deduplicationJob;
+                        IndustryClassificationJob industryJob;
                         if (secrets.anthropicApiKey != null && !secrets.anthropicApiKey.isBlank()) {
                             AnthropicClient anthropicClient = new AnthropicClient(vertx, secrets.anthropicApiKey);
                             deduplicationJob = new DeduplicationJob(mergeSuggestionsRepo, anthropicClient);
-                            System.out.println("✓ AI deduplication job ready (triggered via POST /api/admin/deduplication/run)");
+                            industryJob      = new IndustryClassificationJob(companyRepo, anthropicClient);
+                            companyRepo.setClassifier(anthropicClient); // classify each new company on creation
+                            System.out.println("✓ AI jobs ready (dedup: POST /api/admin/deduplication/run, industries: POST /api/admin/industries/classify)");
                         } else {
                             deduplicationJob = null;
-                            System.out.println("⚠ ANTHROPIC_API_KEY not set — deduplication job disabled");
+                            industryJob      = null;
+                            System.out.println("⚠ ANTHROPIC_API_KEY not set — AI dedup + industry classification disabled");
                         }
 
                         // ── Handlers ──────────────────────────────────────────────────────────
                         ManagersHandler      managersHandler      = new ManagersHandler(managerService, vertx);
                         ReportsHandler       reportsHandler       = new ReportsHandler(reportService);
-                        AdminHandler         adminHandler         = new AdminHandler(adminService, deduplicationJob);
+                        AdminHandler         adminHandler         = new AdminHandler(adminService, deduplicationJob, industryJob);
                         NotificationsHandler notificationsHandler = new NotificationsHandler(notifService);
                         ResumesHandler       resumesHandler       = new ResumesHandler(resumeService);
+                        IndustriesHandler    industriesHandler    = new IndustriesHandler(industryService);
 
                         routerFactory.addHandlerByOperationId("getManagers",           managersHandler::handleGetManagers);
                         routerFactory.addHandlerByOperationId("getManagerById",        managersHandler::handleGetManagerById);
@@ -167,6 +176,8 @@ public class MainVerticle extends AbstractVerticle {
                         routerFactory.addHandlerByOperationId("getCompanyListing",      managersHandler::handleGetCompanyListing);
                         routerFactory.addHandlerByOperationId("getCompanyProfile",      managersHandler::handleGetCompanyProfile);
                         routerFactory.addHandlerByOperationId("getCompanyBySlug",       managersHandler::handleGetCompanyBySlug);
+                        routerFactory.addHandlerByOperationId("getIndustryListing",     industriesHandler::handleGetIndustryListing);
+                        routerFactory.addHandlerByOperationId("getIndustryProfile",     industriesHandler::handleGetIndustryProfile);
                         routerFactory.addHandlerByOperationId("getManagerBySlug",       managersHandler::handleGetManagerBySlug);
                         routerFactory.addHandlerByOperationId("getCompanies",           managersHandler::handleGetCompanies);
                         routerFactory.addHandlerByOperationId("suggestCompanies",       managersHandler::handleSuggestCompanies);
@@ -200,6 +211,7 @@ public class MainVerticle extends AbstractVerticle {
                         routerFactory.addHandlerByOperationId("getMergeSuggestions",      adminHandler::handleGetMergeSuggestions);
                         routerFactory.addHandlerByOperationId("dismissMergeSuggestion",   adminHandler::handleDismissMergeSuggestion);
                         routerFactory.addHandlerByOperationId("triggerDeduplication",     adminHandler::handleTriggerDeduplication);
+                        routerFactory.addHandlerByOperationId("classifyIndustries",       adminHandler::handleClassifyIndustries);
                         routerFactory.addHandlerByOperationId("adminUpdateCareerEntry",   adminHandler::handleUpdateCareerEntry);
                         routerFactory.addHandlerByOperationId("adminDeleteCareerEntry",   adminHandler::handleDeleteCareerEntry);
                         routerFactory.addHandlerByOperationId("getAdminCountryStats",     adminHandler::handleGetCountryStats);

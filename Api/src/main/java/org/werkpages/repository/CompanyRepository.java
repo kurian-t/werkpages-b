@@ -6,6 +6,9 @@ import io.vertx.sqlclient.RowSet;
 import io.vertx.sqlclient.SqlClient;
 import io.vertx.sqlclient.Tuple;
 
+import org.werkpages.service.AnthropicClient;
+
+import java.util.List;
 import java.util.Optional;
 
 /**
@@ -17,8 +20,16 @@ public class CompanyRepository {
 
     private final SqlClient db;
 
+    /** Optional AI classifier. When set, brand-new companies are classified into an
+     *  industry on creation (fire-and-forget). Null when no ANTHROPIC_API_KEY is configured. */
+    private AnthropicClient classifier;
+
     public CompanyRepository(SqlClient db) {
         this.db = db;
+    }
+
+    public void setClassifier(AnthropicClient classifier) {
+        this.classifier = classifier;
     }
 
     /**
@@ -60,7 +71,132 @@ public class CompanyRepository {
                         .map(rows -> rows.iterator().next());
                 }
                 return Future.failedFuture(err);
-            });
+            })
+            .map(this::classifyIfNeeded);
+    }
+
+    /**
+     * Fire-and-forget: if this company has no industry yet and a classifier is configured,
+     * classify it in the background and persist the result. Returns the row unchanged so it
+     * never blocks or fails the caller (a manager create must not wait on an AI call).
+     */
+    private Row classifyIfNeeded(Row company) {
+        if (classifier == null || company.getString("industry") != null) return company;
+        long   id     = company.getLong("id");
+        String name   = company.getString("name");
+        String domain = company.getString("domain");
+        classifier.classifyIndustries(List.of(new AnthropicClient.CompanyToClassify(id, name, domain)))
+            .compose(map -> {
+                String industry = map.get(id);
+                return industry != null ? updateIndustry(id, industry) : Future.succeededFuture();
+            })
+            .onFailure(e -> System.err.println("industry classify-on-create failed for company " + id + ": " + e.getMessage()));
+        return company;
+    }
+
+    /** Sets a company's industry. */
+    public Future<Void> updateIndustry(long companyId, String industry) {
+        return db.preparedQuery("UPDATE companies SET industry = $1, updated_at = now() WHERE id = $2")
+            .execute(Tuple.of(industry, companyId))
+            .mapEmpty();
+    }
+
+    /**
+     * Companies still lacking an industry that actually appear in the directory (>=1 approved/ghost
+     * manager). Used by the one-time backfill so we never spend API calls on empty ghost shells.
+     */
+    public Future<RowSet<Row>> findUnclassified(int limit) {
+        return db.preparedQuery("""
+                SELECT c.id, c.name, c.domain
+                FROM companies c
+                JOIN company_stats_live cs ON cs.company_id = c.id AND cs.manager_count > 0
+                WHERE c.industry IS NULL
+                ORDER BY cs.manager_count DESC
+                LIMIT $1
+                """)
+            .execute(Tuple.of(limit));
+    }
+
+    /** Count of directory-visible companies still awaiting classification. */
+    public Future<Long> countUnclassified() {
+        return db.query("""
+                SELECT COUNT(*) FROM companies c
+                JOIN company_stats_live cs ON cs.company_id = c.id AND cs.manager_count > 0
+                WHERE c.industry IS NULL
+                """)
+            .execute()
+            .map(rs -> rs.iterator().next().getLong(0));
+    }
+
+    /**
+     * One tile per industry: number of companies, managers, reviews and the average manager rating
+     * across the industry. Aggregated straight from managers so the average is a true per-manager
+     * mean (not an average of per-company averages). Only approved/ghost, non-seed managers count.
+     */
+    public Future<RowSet<Row>> findIndustryListing() {
+        return db.query("""
+                SELECT c.industry AS industry,
+                       COUNT(DISTINCT c.id)                    AS company_count,
+                       COUNT(DISTINCT m.id)                    AS manager_count,
+                       COALESCE(SUM(m.reviews_count), 0)       AS total_reviews,
+                       ROUND(AVG(m.overall_rating) FILTER (WHERE m.overall_rating IS NOT NULL
+                             AND m.reviews_count > 0)::NUMERIC, 1) AS avg_rating
+                FROM companies c
+                JOIN managers m ON m.company_id = c.id
+                WHERE c.industry IS NOT NULL
+                  AND m.approval_status IN ('approved', 'ghost')
+                  AND (m.external_id IS NULL OR m.external_id NOT LIKE 'seed_%')
+                GROUP BY c.industry
+                ORDER BY manager_count DESC, company_count DESC, c.industry ASC
+                """)
+            .execute();
+    }
+
+    /** Aggregate stats for a single industry (same shape as one findIndustryListing row). */
+    public Future<Optional<Row>> findIndustryStats(String industry) {
+        return db.preparedQuery("""
+                SELECT c.industry AS industry,
+                       COUNT(DISTINCT c.id)                    AS company_count,
+                       COUNT(DISTINCT m.id)                    AS manager_count,
+                       COALESCE(SUM(m.reviews_count), 0)       AS total_reviews,
+                       ROUND(AVG(m.overall_rating) FILTER (WHERE m.overall_rating IS NOT NULL
+                             AND m.reviews_count > 0)::NUMERIC, 1) AS avg_rating
+                FROM companies c
+                JOIN managers m ON m.company_id = c.id
+                WHERE c.industry = $1
+                  AND m.approval_status IN ('approved', 'ghost')
+                  AND (m.external_id IS NULL OR m.external_id NOT LIKE 'seed_%')
+                GROUP BY c.industry
+                """)
+            .execute(Tuple.of(industry))
+            .map(rs -> rs.iterator().hasNext() ? Optional.of(rs.iterator().next()) : Optional.empty());
+    }
+
+    /** Per-manager category_averages for an industry, for aggregating the 10-category breakdown. */
+    public Future<RowSet<Row>> findManagerCategoriesByIndustry(String industry) {
+        return db.preparedQuery("""
+                SELECT m.category_averages
+                FROM managers m
+                JOIN companies c ON c.id = m.company_id
+                WHERE c.industry = $1
+                  AND m.approval_status IN ('approved', 'ghost')
+                  AND (m.external_id IS NULL OR m.external_id NOT LIKE 'seed_%')
+                  AND m.reviews_count > 0
+                  AND m.category_averages IS NOT NULL
+                """)
+            .execute(Tuple.of(industry));
+    }
+
+    /** Companies within an industry, same card shape as findCompanyListing(). */
+    public Future<RowSet<Row>> findCompaniesByIndustry(String industry) {
+        return db.preparedQuery("""
+                SELECT c.id, c.name, c.slug, cs.logo_url, cs.manager_count, cs.total_reviews, cs.avg_rating
+                FROM company_stats_live cs
+                JOIN companies c ON c.id = cs.company_id
+                WHERE cs.manager_count > 0 AND c.industry = $1
+                ORDER BY cs.total_reviews DESC, cs.manager_count DESC, c.name ASC
+                """)
+            .execute(Tuple.of(industry));
     }
 
     /**

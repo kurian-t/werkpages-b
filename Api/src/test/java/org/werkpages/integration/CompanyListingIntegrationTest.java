@@ -20,6 +20,7 @@ import org.werkpages.repository.ManagerRepository;
 import org.werkpages.repository.ReportRepository;
 import org.werkpages.repository.ReviewRepository;
 import org.werkpages.repository.UserRepository;
+import org.werkpages.service.IndustryService;
 import org.werkpages.service.ManagerService;
 import org.testcontainers.containers.PostgreSQLContainer;
 import org.testcontainers.junit.jupiter.Container;
@@ -554,6 +555,75 @@ class CompanyListingIntegrationTest {
                 VALUES ($1,$2,$3,'img','active',$4,$5,$6,'{}', $7, $8) RETURNING id
                 """)
             .execute(Tuple.of(name, company, title, status, overallRating, reviewsCount, companyId, externalId)));
+    }
+
+    // ── Industry listing / profile stats ─────────────────────────────────────────────────────
+
+    @Test
+    void industryListing_aggregatesStatsPerIndustry() throws Exception {
+        insertManager("Alice A", "Acme Tech", "Manager",  "approved", 4.0, 3);
+        insertManager("Bob B",   "Beta Tech", "Director", "approved", 2.0, 1);
+        insertManager("Carol C", "Shopland",  "Lead",     "ghost",    5.0, 2);
+        setIndustry("Acme Tech", "Technology");
+        setIndustry("Beta Tech", "Technology");
+        setIndustry("Shopland",  "Retail");
+        await(companyRepo.refreshCompanyStats());
+
+        IndustryService svc = new IndustryService(companyRepo, c -> null);
+        JsonArray data = await(svc.getIndustryListing()).getJsonArray("data");
+
+        JsonObject tech = findIndustry(data, "Technology");
+        assertNotNull(tech, "Technology industry must be listed");
+        assertEquals(2L, tech.getLong("companyCount"));
+        assertEquals(2L, tech.getLong("managerCount"));
+        assertEquals(4L, tech.getLong("totalReviews"));            // 3 + 1
+        assertEquals(3.0, tech.getDouble("avgRating"), 0.05); // (4.0 + 2.0) / 2
+        assertEquals("technology", tech.getString("slug"));
+
+        JsonObject retail = findIndustry(data, "Retail");
+        assertNotNull(retail);
+        assertEquals(1L, retail.getLong("companyCount"));
+        assertEquals(1L, retail.getLong("managerCount"));
+    }
+
+    @Test
+    void industryProfile_returnsStatsAndCompanies() throws Exception {
+        insertManager("Alice A", "Acme Tech", "Manager",  "approved", 4.0, 3);
+        insertManager("Bob B",   "Beta Tech", "Director", "approved", 2.0, 1);
+        setIndustry("Acme Tech", "Technology");
+        setIndustry("Beta Tech", "Technology");
+        await(companyRepo.refreshCompanyStats());
+
+        IndustryService svc = new IndustryService(companyRepo, c -> null);
+        JsonObject profile = await(svc.getIndustryProfile("technology"));
+        assertEquals("Technology", profile.getString("industry"));
+        assertEquals(2L, profile.getLong("companyCount"));
+        assertEquals(2, profile.getJsonArray("companies").size());
+    }
+
+    @Test
+    void industryProfile_unknownSlug_isNotFound() throws Exception {
+        IndustryService svc = new IndustryService(companyRepo, c -> null);
+        try {
+            await(svc.getIndustryProfile("no-such-industry"));
+            fail("expected a not-found ServiceException");
+        } catch (Exception e) {
+            // ServiceException(404) is wrapped by await(); just assert it did not silently succeed.
+            assertNotNull(e);
+        }
+    }
+
+    private void setIndustry(String companyName, String industry) throws Exception {
+        Long id = await(companyRepo.findByName(companyName)).orElseThrow().getLong("id");
+        await(companyRepo.updateIndustry(id, industry));
+    }
+
+    private static JsonObject findIndustry(JsonArray data, String industry) {
+        for (int i = 0; i < data.size(); i++) {
+            JsonObject o = data.getJsonObject(i);
+            if (industry.equals(o.getString("industry"))) return o;
+        }
+        return null;
     }
 
     private long insertApprovedManagerReturningId(String name, String company, String title, Long companyId) throws Exception {

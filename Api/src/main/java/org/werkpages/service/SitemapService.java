@@ -30,11 +30,19 @@ public class SitemapService {
     }
 
     public Future<String> generate() {
+        // Only pages with real content are indexable. Empty ghost/auto-created pages (0 reviews)
+        // are thin, near-duplicate templates — submitting them floods Google's crawl budget and
+        // produces "Discovered - currently not indexed" and "Duplicate" reports. A company/manager
+        // earns a sitemap entry only once it has at least one real review (reviews_count > 0).
         Future<RowSet<Row>> companiesFuture = db.query("""
-                SELECT slug FROM companies
-                WHERE status IN ('approved', 'ghost')
-                  AND slug IS NOT NULL
-                ORDER BY slug
+                SELECT DISTINCT c.slug
+                FROM companies c
+                JOIN managers m ON m.company_id = c.id
+                WHERE c.status IN ('approved', 'ghost')
+                  AND c.slug IS NOT NULL
+                  AND m.approval_status IN ('approved', 'ghost')
+                  AND m.reviews_count > 0
+                ORDER BY c.slug
                 """).execute();
 
         Future<RowSet<Row>> managersFuture = db.query("""
@@ -44,6 +52,7 @@ public class SitemapService {
                 WHERE m.approval_status IN ('approved', 'ghost')
                   AND m.slug IS NOT NULL
                   AND c.slug IS NOT NULL
+                  AND m.reviews_count > 0
                 ORDER BY c.slug, m.slug
                 """).execute();
 
