@@ -8,11 +8,14 @@ import io.vertx.pgclient.PgPool;
 import io.vertx.sqlclient.Pool;
 import io.vertx.sqlclient.PoolOptions;
 import io.vertx.sqlclient.Row;
+import io.vertx.sqlclient.RowSet;
 import io.vertx.sqlclient.Tuple;
 import org.flywaydb.core.Flyway;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.werkpages.repository.EditRepository;
 import org.werkpages.repository.ManagerRepository;
 import org.werkpages.repository.ReportRepository;
@@ -283,7 +286,7 @@ class ManagerServiceCoverage3IntegrationTest {
     void createManager_missingRequiredFields_returnsBadRequest() {
         try {
             await(service.createManager("auth0|any",
-                new JsonObject().put("name", "Jane Smith"),
+                new JsonObject().put("name", "Dana Whitfield"),
                 null));
             fail("expected bad request");
         } catch (Exception e) {
@@ -307,12 +310,63 @@ class ManagerServiceCoverage3IntegrationTest {
         }
     }
 
+    // ── name quality gate on the add-manager form (createManager) ─────────────
+    // Regression guard: these names reached the live directory through /add because
+    // createManager was the only manager-creating path that skipped NameValidator.
+
+    @ParameterizedTest(name = "createManager rejects junk name \"{0}\"")
+    @ValueSource(strings = {
+        "A B",              // single-letter first and last name — the name seen in production
+        "Ab C",             // single-letter last name
+        "A Bc",             // single-letter first name
+        "-- --",            // punctuation only, long enough to pass the length check
+        "'' Smith",         // punctuation-only first name
+        "A- Smith",         // one letter padded to the minimum length
+        "-Bob Smith",       // leading punctuation
+        "Bob- Smith",       // trailing punctuation
+        "Bo--b Smith",      // doubled punctuation
+        "John3 Smith",      // digit
+        "John@ Smith",      // symbol
+        "Jane Smith",       // known placeholder name
+        "Test User",        // known placeholder name
+        "Fuck Smith",       // profanity
+        "Margaret",         // no last name at all
+    })
+    void createManager_junkName_returnsBadRequest(String junkName) throws Exception {
+        String auth0Id = insertUser("auth0|junk" + Math.abs(junkName.hashCode()));
+        try {
+            await(service.createManager(auth0Id, validCreateBody().put("name", junkName), null));
+            fail("expected bad request for name: " + junkName);
+        } catch (Exception e) {
+            assertNotNull(e.getMessage(), "Expected a validation message for name: " + junkName);
+        }
+        // Nothing may be persisted for a rejected name.
+        RowSet<Row> rs = await(pool.query("SELECT COUNT(*) AS c FROM managers").execute());
+        assertEquals(0L, rs.iterator().next().getLong("c"),
+            "A rejected name must not create a manager row: " + junkName);
+    }
+
+    @ParameterizedTest(name = "createManager accepts real name \"{0}\"")
+    @ValueSource(strings = {
+        "Margaret Williams",
+        "Siobhan O'Brien",
+        "Mary-Jane Watson",
+        "José García",
+        "Al Kim",           // two letters per part is the minimum, and legitimate
+        "Mary Ann Fitzgerald",
+    })
+    void createManager_realName_succeeds(String realName) throws Exception {
+        String auth0Id = insertUser("auth0|real" + Math.abs(realName.hashCode()));
+        Row created = await(service.createManager(auth0Id, validCreateBody().put("name", realName), null));
+        assertNotNull(created.getLong("id"), "Expected the manager to be created for: " + realName);
+    }
+
     @Test
     void createManager_companyTooShort_returnsBadRequest() {
         try {
             await(service.createManager("auth0|any",
                 new JsonObject()
-                    .put("name", "Jane Smith")
+                    .put("name", "Dana Whitfield")
                     .put("company", "A")
                     .put("title", "Dev")
                     .put("image", "img"),
@@ -328,7 +382,7 @@ class ManagerServiceCoverage3IntegrationTest {
         try {
             await(service.createManager("auth0|any",
                 new JsonObject()
-                    .put("name", "Jane Smith")
+                    .put("name", "Dana Whitfield")
                     .put("company", "C".repeat(101))
                     .put("title", "Dev")
                     .put("image", "img"),
@@ -344,7 +398,7 @@ class ManagerServiceCoverage3IntegrationTest {
         try {
             await(service.createManager("auth0|any",
                 new JsonObject()
-                    .put("name", "Jane Smith")
+                    .put("name", "Dana Whitfield")
                     .put("company", "Valid Corp")
                     .put("title", "Engineer")
                     .put("image", "img"),
@@ -360,7 +414,7 @@ class ManagerServiceCoverage3IntegrationTest {
         try {
             await(service.createManager("auth0|any",
                 new JsonObject()
-                    .put("name", "Jane Smith")
+                    .put("name", "Dana Whitfield")
                     .put("company", "Valid Corp")
                     .put("title", "Engineer")
                     .put("image", "img")
@@ -378,7 +432,7 @@ class ManagerServiceCoverage3IntegrationTest {
         try {
             await(service.createManager("auth0|any",
                 new JsonObject()
-                    .put("name", "Jane Smith")
+                    .put("name", "Dana Whitfield")
                     .put("company", "Valid Corp")
                     .put("title", "Engineer")
                     .put("image", "img")
@@ -397,7 +451,7 @@ class ManagerServiceCoverage3IntegrationTest {
         try {
             await(service.createManager("auth0|any",
                 new JsonObject()
-                    .put("name", "Jane Smith")
+                    .put("name", "Dana Whitfield")
                     .put("company", "Valid Corp")
                     .put("title", "Engineer")
                     .put("image", "img")
@@ -417,7 +471,7 @@ class ManagerServiceCoverage3IntegrationTest {
         try {
             await(service.createManager("auth0|any",
                 new JsonObject()
-                    .put("name", "Jane Smith")
+                    .put("name", "Dana Whitfield")
                     .put("company", "Valid Corp")
                     .put("title", "Engineer")
                     .put("image", "img")
@@ -436,7 +490,7 @@ class ManagerServiceCoverage3IntegrationTest {
         try {
             await(service.createManager("auth0|any",
                 new JsonObject()
-                    .put("name", "Jane Smith")
+                    .put("name", "Dana Whitfield")
                     .put("company", "Valid Corp")
                     .put("title", "Engineer")
                     .put("image", "img")
@@ -460,7 +514,7 @@ class ManagerServiceCoverage3IntegrationTest {
         try {
             await(service.createManager("auth0|any",
                 new JsonObject()
-                    .put("name", "Jane Smith")
+                    .put("name", "Dana Whitfield")
                     .put("company", "Valid Corp")
                     .put("title", "Engineer")
                     .put("image", "img")
@@ -486,7 +540,7 @@ class ManagerServiceCoverage3IntegrationTest {
             JsonObject ratings = validRatings().put("Communication Style", 10.0);
             await(service.createManager("auth0|any",
                 new JsonObject()
-                    .put("name", "Jane Smith")
+                    .put("name", "Dana Whitfield")
                     .put("company", "Valid Corp")
                     .put("title", "Engineer")
                     .put("image", "img")
@@ -536,7 +590,7 @@ class ManagerServiceCoverage3IntegrationTest {
         // Submit 6 managers to hit the daily limit
         for (int i = 0; i < 6; i++) {
             JsonObject body = validCreateBody()
-                .put("name", "Limit Test Manager " + i)
+                .put("name", "Nadia Alvarez")
                 .put("company", "LimitCorp" + i);
             body.getJsonObject("review")
                 .put("managerCompany", "LimitCorp" + i);
@@ -544,7 +598,7 @@ class ManagerServiceCoverage3IntegrationTest {
         }
         try {
             JsonObject body = validCreateBody()
-                .put("name", "Limit Test Manager X")
+                .put("name", "Nadia Alvarez")
                 .put("company", "LimitCorpX");
             body.getJsonObject("review").put("managerCompany", "LimitCorpX");
             await(service.createManager(auth0Id, body, null));

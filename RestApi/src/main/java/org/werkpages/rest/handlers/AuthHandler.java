@@ -489,10 +489,13 @@ public class AuthHandler {
                 // Fetch user profile from Auth0 /userinfo
                 final String fAuth0Id     = auth0Id;
                 final String fAccessToken = accessToken;
-                // id_token is always a JWT (OIDC); access_token may be opaque when no audience is
-                // included in the authorization request, causing JWT validation to fail on subsequent
-                // API calls. Prefer id_token for the session cookie.
-                final String fTokenForCookie = (idToken != null && !idToken.isBlank()) ? idToken : accessToken;
+                // The session cookie must carry the access token: its `aud` is the API identifier,
+                // which is what the router's audience check validates. An id_token's `aud` is the
+                // client_id instead, so it would be rejected there.
+                // Auth0 only returns a JWT access token when /authorize named an audience; older
+                // frontend builds omit it and get an opaque string back, so fall back to the
+                // id_token rather than handing the router something it cannot decode.
+                final String fTokenForCookie = looksLikeJwt(accessToken) ? accessToken : idToken;
                 this.webClient.get(443, auth0Domain, "/userinfo")
                     .ssl(true).timeout(10_000)
                     .putHeader("Authorization", "Bearer " + accessToken)
@@ -608,6 +611,14 @@ public class AuthHandler {
                     internalError(ctx);
                 }
             });
+    }
+
+    /**
+     * Auth0 returns an opaque access token when the authorization request named no audience.
+     * A JWT is three dot-separated segments; anything else cannot be decoded or validated.
+     */
+    static boolean looksLikeJwt(String token) {
+        return token != null && !token.isBlank() && token.chars().filter(c -> c == '.').count() == 2;
     }
 
     private static void internalError(RoutingContext ctx) {

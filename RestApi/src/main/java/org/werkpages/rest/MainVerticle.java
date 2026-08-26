@@ -80,7 +80,7 @@ public class MainVerticle extends AbstractVerticle {
                     .map(obj -> JsonObject.mapFrom(obj))
                     .toList();
 
-                JWTAuth jwtAuth = JWTAuth.create(vertx, new JWTAuthOptions().setJwks(keys));
+                JWTAuth jwtAuth = JwtAuthFactory.create(vertx, keys, secrets.auth0Audience);
 
                 OpenAPI3RouterFactory.create(vertx, "openapi.yaml", routerFactoryAr -> {
                     if (routerFactoryAr.succeeded()) {
@@ -310,9 +310,12 @@ public class MainVerticle extends AbstractVerticle {
                         allowedMethods.add(HttpMethod.OPTIONS);
 
                         // CORS — updated to production domain
+                        // Dev origin is 8081 — it must track the Vite dev server port in
+                        // werkpages/vite.config.ts, which moved off 8080 so RateMyManagers'
+                        // frontend can run alongside this one.
                         String allowedOrigin = "true".equalsIgnoreCase(System.getenv("USE_AWS_SECRETS"))
-                        	    ? "https://werkpages.com|https://www\\.werkpages\\.com"
-                        	    : "http://localhost:8080";
+                        	    ? "https://werkpages\\.com|https://www\\.werkpages\\.com"
+                        	    : "http://localhost:8081";
                         
                         router.route().handler(
                             CorsHandler.create(allowedOrigin)
@@ -391,10 +394,17 @@ public class MainVerticle extends AbstractVerticle {
                                 })
                         );
 
+                        // Defaults to 8888, unchanged from what production has always used.
+                        // HTTP_PORT overrides it wherever the two backends share a host or network
+                        // namespace — local dev for certain, and production too if the containers
+                        // publish 8888 straight onto the EC2 host rather than remapping it.
+                        int httpPort = Integer.parseInt(
+                            System.getenv().getOrDefault("HTTP_PORT", "8888"));
+
                         vertx.createHttpServer()
                             .requestHandler(router)
-                            .listen(8888)
-                            .onSuccess(server -> System.out.println("✓ HTTP server started on port 8888"))
+                            .listen(httpPort)
+                            .onSuccess(server -> System.out.println("✓ HTTP server started on port " + httpPort))
                             .onFailure(err -> System.err.println("✗ Failed to start server: " + err.getMessage()));
 
                         }); // end Database.init onReady
