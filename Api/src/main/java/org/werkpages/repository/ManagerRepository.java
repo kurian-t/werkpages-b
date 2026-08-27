@@ -29,6 +29,7 @@ public class ManagerRepository {
                 m.category_averages, m.linkedin_url, m.company_logo_url, m.country,
                 m.created_at, m.submitted_by, m.company_id, m.slug,
                 c.slug AS company_slug,
+                c.industry AS industry,
                 COALESCE(ch.career_history, '[]') AS career_history,
                 COALESCE(r.reviews, '[]') AS reviews
             FROM managers m
@@ -75,6 +76,7 @@ public class ManagerRepository {
                 m.category_averages, m.linkedin_url, m.company_logo_url, m.country, m.created_at,
                 m.submitted_by, m.external_id, m.company_id, m.slug,
                 c.slug AS company_slug,
+                c.industry AS industry,
                 COALESCE(
                     json_agg(json_build_object(
                         'id', ch.id, 'company', ch.company, 'title', ch.title,
@@ -118,30 +120,30 @@ public class ManagerRepository {
 
         if (userId != null) {
             if (hasSearch && hasCompany) {
-                sql   = SELECT_BODY + "WHERE (m.name ILIKE $3 OR m.company ILIKE $3 OR m.title ILIKE $3) AND m.company ILIKE $4 AND (m.approval_status IN ('approved','ghost') OR (m.approval_status = 'pending_approval' AND m.search_created_by_user_id = $5)) GROUP BY m.id, c.slug " + orderBy + " LIMIT $1 OFFSET $2";
+                sql   = SELECT_BODY + "WHERE (m.name ILIKE $3 OR m.company ILIKE $3 OR m.title ILIKE $3) AND m.company ILIKE $4 AND (m.approval_status IN ('approved','ghost') OR (m.approval_status = 'pending_approval' AND m.search_created_by_user_id = $5)) GROUP BY m.id, c.slug, c.industry " + orderBy + " LIMIT $1 OFFSET $2";
                 tuple = Tuple.of(limit, offset, searchPattern, companyPattern, userId);
             } else if (hasSearch) {
-                sql   = SELECT_BODY + "WHERE (m.name ILIKE $3 OR m.company ILIKE $3 OR m.title ILIKE $3) AND (m.approval_status IN ('approved','ghost') OR (m.approval_status = 'pending_approval' AND m.search_created_by_user_id = $4)) GROUP BY m.id, c.slug " + orderBy + " LIMIT $1 OFFSET $2";
+                sql   = SELECT_BODY + "WHERE (m.name ILIKE $3 OR m.company ILIKE $3 OR m.title ILIKE $3) AND (m.approval_status IN ('approved','ghost') OR (m.approval_status = 'pending_approval' AND m.search_created_by_user_id = $4)) GROUP BY m.id, c.slug, c.industry " + orderBy + " LIMIT $1 OFFSET $2";
                 tuple = Tuple.of(limit, offset, searchPattern, userId);
             } else if (hasCompany) {
-                sql   = SELECT_BODY + "WHERE m.company ILIKE $3 AND (m.approval_status IN ('approved','ghost') OR (m.approval_status = 'pending_approval' AND m.search_created_by_user_id = $4)) GROUP BY m.id, c.slug " + orderBy + " LIMIT $1 OFFSET $2";
+                sql   = SELECT_BODY + "WHERE m.company ILIKE $3 AND (m.approval_status IN ('approved','ghost') OR (m.approval_status = 'pending_approval' AND m.search_created_by_user_id = $4)) GROUP BY m.id, c.slug, c.industry " + orderBy + " LIMIT $1 OFFSET $2";
                 tuple = Tuple.of(limit, offset, companyPattern, userId);
             } else {
-                sql   = SELECT_BODY + "WHERE (m.approval_status IN ('approved','ghost') OR (m.approval_status = 'pending_approval' AND m.search_created_by_user_id = $3)) GROUP BY m.id, c.slug " + orderBy + " LIMIT $1 OFFSET $2";
+                sql   = SELECT_BODY + "WHERE (m.approval_status IN ('approved','ghost') OR (m.approval_status = 'pending_approval' AND m.search_created_by_user_id = $3)) GROUP BY m.id, c.slug, c.industry " + orderBy + " LIMIT $1 OFFSET $2";
                 tuple = Tuple.of(limit, offset, userId);
             }
         } else {
             if (hasSearch && hasCompany) {
-                sql   = SELECT_BODY + "WHERE (m.name ILIKE $3 OR m.company ILIKE $3 OR m.title ILIKE $3) AND m.company ILIKE $4 AND m.approval_status IN ('approved','ghost') GROUP BY m.id, c.slug " + orderBy + " LIMIT $1 OFFSET $2";
+                sql   = SELECT_BODY + "WHERE (m.name ILIKE $3 OR m.company ILIKE $3 OR m.title ILIKE $3) AND m.company ILIKE $4 AND m.approval_status IN ('approved','ghost') GROUP BY m.id, c.slug, c.industry " + orderBy + " LIMIT $1 OFFSET $2";
                 tuple = Tuple.of(limit, offset, searchPattern, companyPattern);
             } else if (hasSearch) {
-                sql   = SELECT_BODY + "WHERE (m.name ILIKE $3 OR m.company ILIKE $3 OR m.title ILIKE $3) AND m.approval_status IN ('approved','ghost') GROUP BY m.id, c.slug " + orderBy + " LIMIT $1 OFFSET $2";
+                sql   = SELECT_BODY + "WHERE (m.name ILIKE $3 OR m.company ILIKE $3 OR m.title ILIKE $3) AND m.approval_status IN ('approved','ghost') GROUP BY m.id, c.slug, c.industry " + orderBy + " LIMIT $1 OFFSET $2";
                 tuple = Tuple.of(limit, offset, searchPattern);
             } else if (hasCompany) {
-                sql   = SELECT_BODY + "WHERE m.company ILIKE $3 AND m.approval_status IN ('approved','ghost') GROUP BY m.id, c.slug " + orderBy + " LIMIT $1 OFFSET $2";
+                sql   = SELECT_BODY + "WHERE m.company ILIKE $3 AND m.approval_status IN ('approved','ghost') GROUP BY m.id, c.slug, c.industry " + orderBy + " LIMIT $1 OFFSET $2";
                 tuple = Tuple.of(limit, offset, companyPattern);
             } else {
-                sql   = SELECT_BODY + "WHERE m.approval_status IN ('approved','ghost') GROUP BY m.id, c.slug " + orderBy + " LIMIT $1 OFFSET $2";
+                sql   = SELECT_BODY + "WHERE m.approval_status IN ('approved','ghost') GROUP BY m.id, c.slug, c.industry " + orderBy + " LIMIT $1 OFFSET $2";
                 tuple = Tuple.of(limit, offset);
             }
         }
@@ -628,7 +630,7 @@ public class ManagerRepository {
                 WHERE m.name ILIKE $1
                   AND m.company ILIKE $2
                   AND m.approval_status IN ('approved', 'ghost')
-                GROUP BY m.id, c.slug
+                GROUP BY m.id, c.slug, c.industry
                 ORDER BY m.reviews_count DESC, m.id ASC
                 LIMIT 5
                 """)

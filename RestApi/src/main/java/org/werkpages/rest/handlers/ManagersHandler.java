@@ -82,6 +82,9 @@ public class ManagersHandler {
                     .put("companyLogoUrl", logoUrl)
                     .put("createdAt", row.getOffsetDateTime("created_at").toString())
                     .put("careerHistory", row.getJsonArray("career_history"))
+                    // Industry of the manager's company — the third line on manager cards.
+                    // Null until the AI classifier has run for that company.
+                    .put("industry", row.getString("industry"))
                     .put("community", row.getValue("submitted_by") != null && row.getString("external_id") == null)
                 );
             }
@@ -142,7 +145,11 @@ public class ManagersHandler {
             .put("createdAt", row.getOffsetDateTime("created_at").toString())
             .put("careerHistory", row.getJsonArray("career_history"))
             .put("slug", row.getString("slug"))
-            .put("companySlug", row.getString("company_slug"));
+            .put("companySlug", row.getString("company_slug"))
+            // Industry of the manager's company. Null until the AI classifier has run for that
+            // company; the frontend renders the link only when it is present.
+            .put("industry", row.getString("industry"))
+            .put("industrySlug", org.werkpages.service.IndustryTaxonomy.slug(row.getString("industry")));
     }
 
     // ── GET /api/managers/similar ─────────────────────────────────────────────

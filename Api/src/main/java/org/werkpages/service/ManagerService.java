@@ -219,9 +219,12 @@ public class ManagerService {
                         ? storedLogoUrl
                         : logoResolver.apply(name);
                     String slug = row.getString("slug");
+                    String cardIndustry = row.getString("industry");
                     JsonObject co = new JsonObject()
                         .put("name",         name)
                         .put("slug",         slug)
+                        .put("industry",     cardIndustry)
+                        .put("industrySlug", IndustryTaxonomy.slug(cardIndustry))
                         .put("managerCount", row.getLong("manager_count"))
                         .put("totalReviews", row.getLong("total_reviews"))
                         .put("avgRating",    row.getBigDecimal("avg_rating"));
@@ -245,6 +248,7 @@ public class ManagerService {
                 long companyId = companyRow.getLong("id");
                 String canonicalName = companyRow.getString("name");
                 String companySlug   = companyRow.getString("slug");
+                String companyIndustry = companyRow.getString("industry");
                 String storedLogoUrl = companyRow.getString("logo_url");
                 String logoUrl = (storedLogoUrl != null && storedLogoUrl.contains("logo.dev"))
                     ? storedLogoUrl : resolvedLogoUrl;
@@ -255,6 +259,8 @@ public class ManagerService {
                                 .put("id",              companyId)
                                 .put("name",            canonicalName)
                                 .put("slug",            companySlug)
+                                .put("industry",        companyIndustry)
+                                .put("industrySlug",    IndustryTaxonomy.slug(companyIndustry))
                                 .put("managerCount",    0)
                                 .put("totalReviews",    0)
                                 .put("avgRating",       (Object) null)
@@ -323,6 +329,8 @@ public class ManagerService {
                             .put("id",              companyId)
                             .put("name",            canonicalName)
                             .put("slug",            companySlug)
+                            .put("industry",        companyIndustry)
+                            .put("industrySlug",    IndustryTaxonomy.slug(companyIndustry))
                             .put("managerCount",    managers.size())
                             .put("totalReviews",    totalReviews)
                             .put("avgRating",       ratingCount > 0
@@ -354,19 +362,24 @@ public class ManagerService {
                                : storedLogoUrl != null && storedLogoUrl.contains("logo.dev") ? storedLogoUrl
                                : resolvedLogoUrl;
                 long companyId = companyRow.getLong("id");
+                String companyIndustry = companyRow.getString("industry");
                 return companyRepo.findManagersByCompanyId(companyId)
-                    .map(rows -> buildCompanyProfileResponse(companyId, canonicalName, companySlug, logoUrl, rows));
+                    .map(rows -> buildCompanyProfileResponse(companyId, canonicalName, companySlug,
+                                                             companyIndustry, logoUrl, rows));
             });
     }
 
     private JsonObject buildCompanyProfileResponse(long companyId, String canonicalName,
-                                                   String companySlug, String logoUrl,
+                                                   String companySlug, String companyIndustry,
+                                                   String logoUrl,
                                                    io.vertx.sqlclient.RowSet<Row> rows) {
         if (!rows.iterator().hasNext()) {
             JsonObject empty = new JsonObject()
                 .put("id",               companyId)
                 .put("name",             canonicalName)
                 .put("slug",             companySlug)
+                .put("industry",         companyIndustry)
+                .put("industrySlug",     IndustryTaxonomy.slug(companyIndustry))
                 .put("managerCount",     0)
                 .put("totalReviews",     0)
                 .put("avgRating",        (Object) null)
@@ -435,6 +448,8 @@ public class ManagerService {
             .put("id",               companyId)
             .put("name",             canonicalName)
             .put("slug",             companySlug)
+            .put("industry",         companyIndustry)
+            .put("industrySlug",     IndustryTaxonomy.slug(companyIndustry))
             .put("managerCount",     managers.size())
             .put("totalReviews",     totalReviews)
             .put("avgRating",        ratingCount > 0 ? Math.round(ratingSum / ratingCount * 10.0) / 10.0 : null)
@@ -2269,6 +2284,9 @@ public class ManagerService {
             .put("status",         row.getString("status"))
             .put("country",        row.getString("country"))
             .put("companyLogoUrl", row.getString("company_logo_url"))
-            .put("approvalStatus", row.getString("approval_status"));
+            .put("approvalStatus", row.getString("approval_status"))
+            // Industry of the manager's company, for the third line on manager cards.
+            // Null until the AI classifier has run for that company.
+            .put("industry",       row.getString("industry"));
     }
 }

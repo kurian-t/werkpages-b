@@ -190,7 +190,7 @@ public class CompanyRepository {
     /** Companies within an industry, same card shape as findCompanyListing(). */
     public Future<RowSet<Row>> findCompaniesByIndustry(String industry) {
         return db.preparedQuery("""
-                SELECT c.id, c.name, c.slug, cs.logo_url, cs.manager_count, cs.total_reviews, cs.avg_rating
+                SELECT c.id, c.name, c.slug, c.industry, cs.logo_url, cs.manager_count, cs.total_reviews, cs.avg_rating
                 FROM company_stats_live cs
                 JOIN companies c ON c.id = cs.company_id
                 WHERE cs.manager_count > 0 AND c.industry = $1
@@ -205,7 +205,7 @@ public class CompanyRepository {
      */
     public Future<RowSet<Row>> findCompanyListing() {
         return db.query("""
-                SELECT c.id, c.name, c.slug, cs.logo_url, cs.manager_count, cs.total_reviews, cs.avg_rating
+                SELECT c.id, c.name, c.slug, c.industry, cs.logo_url, cs.manager_count, cs.total_reviews, cs.avg_rating
                 FROM company_stats_live cs
                 JOIN companies c ON c.id = cs.company_id
                 WHERE cs.manager_count > 0
@@ -302,7 +302,7 @@ public class CompanyRepository {
     /** Looks up a company by name (case-insensitive). */
     public Future<Optional<Row>> findByName(String name) {
         return db.preparedQuery("""
-                SELECT id, name, slug, logo_url, status
+                SELECT id, name, slug, logo_url, status, industry
                 FROM companies
                 WHERE LOWER(TRIM(name)) = LOWER(TRIM($1))
                 LIMIT 1
@@ -317,7 +317,7 @@ public class CompanyRepository {
      *  (which reflects only current FK-linked managers) as stats_logo_url. */
     public Future<Optional<Row>> findBySlug(String slug) {
         return db.preparedQuery("""
-                SELECT c.id, c.name, c.slug, c.logo_url, c.status,
+                SELECT c.id, c.name, c.slug, c.logo_url, c.status, c.industry,
                        cs.logo_url AS stats_logo_url
                 FROM companies c
                 LEFT JOIN company_stats_live cs ON cs.company_id = c.id
