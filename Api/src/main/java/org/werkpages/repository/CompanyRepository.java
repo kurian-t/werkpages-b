@@ -152,6 +152,15 @@ public class CompanyRepository {
             .execute();
     }
 
+    /**
+     * Every distinct industry actually stored on companies. Used to resolve an industry slug
+     * that is not in IndustryTaxonomy — the listing is built from this column, so anything it
+     * can display must also be openable, or a tile leads to "Industry not found".
+     */
+    public Future<RowSet<Row>> findDistinctIndustries() {
+        return db.query("SELECT DISTINCT industry FROM companies WHERE industry IS NOT NULL").execute();
+    }
+
     /** Aggregate stats for a single industry (same shape as one findIndustryListing row). */
     public Future<Optional<Row>> findIndustryStats(String industry) {
         return db.preparedQuery("""

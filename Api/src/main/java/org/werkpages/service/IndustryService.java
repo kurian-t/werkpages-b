@@ -47,9 +47,36 @@ public class IndustryService {
 
     /** One industry (resolved from its slug): headline stats plus the companies inside it. */
     public Future<JsonObject> getIndustryProfile(String slug) {
-        String industry = IndustryTaxonomy.fromSlug(slug);
-        if (industry == null) return Future.failedFuture(ServiceException.notFound("Industry not found"));
+        return resolveIndustry(slug).compose(industry -> {
+            if (industry == null) return Future.failedFuture(ServiceException.notFound("Industry not found"));
+            return buildProfile(slug, industry);
+        });
+    }
 
+    /**
+     * Slug -> industry name. Prefers the fixed taxonomy, then falls back to whatever is actually
+     * stored on companies.
+     *
+     * The fallback matters because the industry listing is built from companies.industry, not
+     * from the taxonomy: a value written before an industry was added to IndustryTaxonomy (or by
+     * a manual SQL correction) still produces a tile, and without this the tile would 404 with
+     * "Industry not found" while sitting in a list of working ones.
+     */
+    private Future<String> resolveIndustry(String slug) {
+        String canonical = IndustryTaxonomy.fromSlug(slug);
+        if (canonical != null) return Future.succeededFuture(canonical);
+        if (slug == null || slug.isBlank()) return Future.succeededFuture(null);
+
+        return companyRepo.findDistinctIndustries().map(rows -> {
+            for (Row row : rows) {
+                String stored = row.getString("industry");
+                if (stored != null && slug.equals(IndustryTaxonomy.slug(stored))) return stored;
+            }
+            return null;
+        });
+    }
+
+    private Future<JsonObject> buildProfile(String slug, String industry) {
         return companyRepo.findIndustryStats(industry).compose(statsOpt ->
             companyRepo.findManagerCategoriesByIndustry(industry).compose(catRows ->
             companyRepo.findCompaniesByIndustry(industry).map(rows -> {

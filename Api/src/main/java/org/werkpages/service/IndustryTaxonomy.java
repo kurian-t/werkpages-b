@@ -40,6 +40,8 @@ public final class IndustryTaxonomy {
         "Automotive",
         "Aerospace & Defense",
         "Legal",
+        "Mining & Metals",
+        "Consumer Services",
         "Other"
     );
 

@@ -2287,6 +2287,20 @@ public class ManagerService {
             .put("approvalStatus", row.getString("approval_status"))
             // Industry of the manager's company, for the third line on manager cards.
             // Null until the AI classifier has run for that company.
-            .put("industry",       row.getString("industry"));
+            .put("industry",       optionalString(row, "industry"));
+    }
+
+    /**
+     * Reads a column that may not be present in the result set at all.
+     *
+     * Rows reaching this mapper come from two shapes: SELECT_BODY, which joins companies and
+     * therefore has `industry`, and INSERT ... RETURNING * on `managers` alone, which does not.
+     * Vert.x throws NoSuchElementException for an absent column rather than returning null, so
+     * a plain getString() here breaks every findOrCreate path that returns a freshly created
+     * manager.
+     */
+    private static String optionalString(Row row, String column) {
+        int index = row.getColumnIndex(column);
+        return index < 0 ? null : row.getString(index);
     }
 }

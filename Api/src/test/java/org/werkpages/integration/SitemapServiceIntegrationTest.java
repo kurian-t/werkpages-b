@@ -111,6 +111,9 @@ class SitemapServiceIntegrationTest {
         assertTrue(xml.contains("https://werkpages.com/terms"));
     }
 
+    // URLs are the canonical industry-nested form: /industries/:industry/companies/:company.
+    // These fixtures never set companies.industry, so every one falls back to the "other"
+    // segment — matching UNCLASSIFIED_INDUSTRY_SLUG in the frontend's lib/urls.ts.
     @Test
     void generate_approvedCompanyWithReviewedManager_includesCompanyUrl() throws Exception {
         long id = insertCompany("Acme Corp", "acme-corp", "approved");
@@ -119,7 +122,7 @@ class SitemapServiceIntegrationTest {
         String xml = sitemapService.generate()
             .toCompletionStage().toCompletableFuture().get(10, TimeUnit.SECONDS);
 
-        assertTrue(xml.contains("https://werkpages.com/companies/acme-corp"));
+        assertTrue(xml.contains("https://werkpages.com/industries/other/companies/acme-corp"));
     }
 
     @Test
@@ -130,7 +133,7 @@ class SitemapServiceIntegrationTest {
         String xml = sitemapService.generate()
             .toCompletionStage().toCompletableFuture().get(10, TimeUnit.SECONDS);
 
-        assertTrue(xml.contains("https://werkpages.com/companies/ghost-inc"));
+        assertTrue(xml.contains("https://werkpages.com/industries/other/companies/ghost-inc"));
     }
 
     @Test
@@ -165,7 +168,7 @@ class SitemapServiceIntegrationTest {
         String xml = sitemapService.generate()
             .toCompletionStage().toCompletableFuture().get(10, TimeUnit.SECONDS);
 
-        assertTrue(xml.contains("https://werkpages.com/companies/acme-corp/managers/jane-doe"));
+        assertTrue(xml.contains("https://werkpages.com/industries/other/companies/acme-corp/managers/jane-doe"));
     }
 
     @Test
@@ -176,7 +179,7 @@ class SitemapServiceIntegrationTest {
         String xml = sitemapService.generate()
             .toCompletionStage().toCompletableFuture().get(10, TimeUnit.SECONDS);
 
-        assertTrue(xml.contains("https://werkpages.com/companies/globex/managers/bob-burns"));
+        assertTrue(xml.contains("https://werkpages.com/industries/other/companies/globex/managers/bob-burns"));
     }
 
     @Test

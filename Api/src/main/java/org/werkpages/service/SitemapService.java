@@ -35,7 +35,7 @@ public class SitemapService {
         // produces "Discovered - currently not indexed" and "Duplicate" reports. A company/manager
         // earns a sitemap entry only once it has at least one real review (reviews_count > 0).
         Future<RowSet<Row>> companiesFuture = db.query("""
-                SELECT DISTINCT c.slug
+                SELECT DISTINCT c.slug, c.industry
                 FROM companies c
                 JOIN managers m ON m.company_id = c.id
                 WHERE c.status IN ('approved', 'ghost')
@@ -46,7 +46,7 @@ public class SitemapService {
                 """).execute();
 
         Future<RowSet<Row>> managersFuture = db.query("""
-                SELECT m.slug AS manager_slug, c.slug AS company_slug
+                SELECT m.slug AS manager_slug, c.slug AS company_slug, c.industry
                 FROM managers m
                 JOIN companies c ON c.id = m.company_id
                 WHERE m.approval_status IN ('approved', 'ghost')
@@ -70,21 +70,36 @@ public class SitemapService {
             appendUrl(sb, BASE_URL + path, "weekly", path.equals("/") ? "1.0" : "0.7");
         }
 
-        // Company pages
+        // Company pages — canonical industry-nested form. The frontend redirects the older
+        // flat /companies/:slug URLs here, so only this shape belongs in the sitemap:
+        // submitting both would hand Google a duplicate of every page.
         for (Row row : companies) {
             String slug = row.getString("slug");
-            appendUrl(sb, BASE_URL + "/companies/" + slug, "daily", "0.9");
+            appendUrl(sb, BASE_URL + industryPath(row.getString("industry")) + "/companies/" + slug,
+                      "daily", "0.9");
         }
 
         // Manager pages
         for (Row row : managers) {
             String companySlug = row.getString("company_slug");
             String managerSlug = row.getString("manager_slug");
-            appendUrl(sb, BASE_URL + "/companies/" + companySlug + "/managers/" + managerSlug, "weekly", "0.8");
+            appendUrl(sb, BASE_URL + industryPath(row.getString("industry"))
+                          + "/companies/" + companySlug + "/managers/" + managerSlug,
+                      "weekly", "0.8");
         }
 
         sb.append("</urlset>");
         return sb.toString();
+    }
+
+    /**
+     * "/industries/<slug>" for the canonical URL prefix. Unclassified companies fall back to
+     * "other", matching UNCLASSIFIED_INDUSTRY_SLUG in the frontend's lib/urls.ts — the two must
+     * agree or the sitemap advertises URLs that immediately redirect.
+     */
+    private static String industryPath(String industry) {
+        String slug = IndustryTaxonomy.slug(industry);
+        return "/industries/" + (slug == null || slug.isBlank() ? "other" : slug);
     }
 
     private static void appendUrl(StringBuilder sb, String loc, String changefreq, String priority) {
