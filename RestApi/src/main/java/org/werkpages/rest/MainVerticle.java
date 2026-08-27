@@ -57,6 +57,22 @@ public class MainVerticle extends AbstractVerticle {
     // Loaded once at startup from AWS Secrets Manager
     private static SecretsConfig secrets;
 
+    /**
+     * Multiplier applied to every rate limit, from RATE_LIMIT_MULTIPLIER. Defaults to 1 so
+     * production is unchanged, and refuses values below 1 so this can only ever loosen limits
+     * locally, never tighten them by accident.
+     */
+    private static int rateLimitMultiplier() {
+        String raw = System.getenv("RATE_LIMIT_MULTIPLIER");
+        if (raw == null || raw.isBlank()) return 1;
+        try {
+            return Math.max(1, Integer.parseInt(raw.trim()));
+        } catch (NumberFormatException e) {
+            System.err.println("⚠ RATE_LIMIT_MULTIPLIER is not a number: " + raw + " — using 1");
+            return 1;
+        }
+    }
+
     public static void main(String[] args) {
         // Load secrets BEFORE Vert.x starts — intentionally blocking
         secrets = SecretsConfig.load();
@@ -325,9 +341,14 @@ public class MainVerticle extends AbstractVerticle {
                         );
 
                         // Rate limiting — applied in order before the API sub-router
-                        RateLimitHandler globalLimiter = new RateLimitHandler(200, 60_000); // 200 req/min per IP
-                        RateLimitHandler authLimiter   = new RateLimitHandler(10,  60_000); // 10 req/min  per IP on auth mutations
-                        RateLimitHandler writeLimiter  = new RateLimitHandler(30,  60_000); // 30 req/min  per IP on writes
+                        // Production values. Locally every browser tab, curl and Playwright run
+                        // shares 127.0.0.1, so a test suite alone exhausts the global budget and
+                        // the app starts 429ing mid-browse — indistinguishable from a real outage.
+                        // RATE_LIMIT_MULTIPLIER scales all three for local dev; unset means 1x.
+                        int rateMultiplier = rateLimitMultiplier();
+                        RateLimitHandler globalLimiter = new RateLimitHandler(200 * rateMultiplier, 60_000); // 200 req/min per IP
+                        RateLimitHandler authLimiter   = new RateLimitHandler(10  * rateMultiplier, 60_000); // 10 req/min  per IP on auth mutations
+                        RateLimitHandler writeLimiter  = new RateLimitHandler(30  * rateMultiplier, 60_000); // 30 req/min  per IP on writes
 
                         router.route().handler(globalLimiter::handle);
                         // Only apply the strict auth limiter to mutation endpoints (signin/signup/signout).
