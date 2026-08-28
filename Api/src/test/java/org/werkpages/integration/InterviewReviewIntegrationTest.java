@@ -26,6 +26,7 @@ import org.werkpages.service.ServiceException;
 
 import java.math.BigDecimal;
 import java.time.LocalDate;
+import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.ExecutionException;
@@ -85,7 +86,9 @@ class InterviewReviewIntegrationTest {
 
     @BeforeEach
     void cleanDb() throws Exception {
-        await(pool.query("TRUNCATE interview_reviews, company_interview_stats").execute());
+        // interview_review_rounds references interview_reviews, so it has to go in the same
+        // statement — TRUNCATE refuses to leave a referencing table behind.
+        await(pool.query("TRUNCATE interview_review_rounds, interview_review_deletions, interview_reviews, company_interview_stats").execute());
         await(pool.query("TRUNCATE managers, users, companies CASCADE").execute());
     }
 
@@ -114,8 +117,7 @@ class InterviewReviewIntegrationTest {
         assertEquals(2.5, created.getDouble("nextStepTransparency"));
         assertEquals(3, created.getInteger("difficulty"));
         assertEquals("offer", created.getString("outcome"));
-        assertEquals("video", created.getString("interviewType"));
-        assertEquals(4, created.getInteger("rounds"));
+        assertEquals(3, created.getInteger("rounds"), "count is derived from the round list");
         assertEquals("2_4_weeks", created.getString("processLength"));
         assertEquals("Engineering", created.getString("roleCategory"));
         assertEquals(YEAR, created.getInteger("interviewYear"));
@@ -134,7 +136,6 @@ class InterviewReviewIntegrationTest {
         assertEquals(3.0, created.getDouble("overallRating"));
         assertNull(created.getValue("communication"));
         assertNull(created.getValue("difficulty"));
-        assertNull(created.getValue("interviewType"));
         assertNull(created.getValue("roleCategory"));
     }
 
@@ -211,8 +212,10 @@ class InterviewReviewIntegrationTest {
             base().put("difficulty", 0))), "difficulty below 1");
         assertEquals(400, statusOfFailure(service.createReview(auth0Id, "range-co",
             base().put("difficulty", 6))), "difficulty above 5");
+        JsonArray tooMany = new JsonArray();
+        for (int i = 0; i < 11; i++) tooMany.add("phone");
         assertEquals(400, statusOfFailure(service.createReview(auth0Id, "range-co",
-            base().put("rounds", 11))), "rounds above 10");
+            base().put("rounds", tooMany))), "more rounds than a process plausibly has");
         assertEquals(400, statusOfFailure(service.createReview(auth0Id, "range-co",
             base().put("roleCategory", "x".repeat(101)))), "roleCategory over 100 chars");
     }
@@ -225,7 +228,7 @@ class InterviewReviewIntegrationTest {
         assertEquals(400, statusOfFailure(service.createReview(auth0Id, "enum-co",
             base().put("outcome", "ghosted"))));
         assertEquals(400, statusOfFailure(service.createReview(auth0Id, "enum-co",
-            base().put("interviewType", "telepathy"))));
+            base().put("rounds", new JsonArray().add("telepathy")))));
         assertEquals(400, statusOfFailure(service.createReview(auth0Id, "enum-co",
             base().put("processLength", "a_while"))));
     }
@@ -281,9 +284,7 @@ class InterviewReviewIntegrationTest {
             base().put("outcome", ""))), "outcome is required, so blank is a rejection");
 
         JsonObject created = await(service.createReview(auth0Id, "blank-co", base()
-            .put("interviewType", "")
             .put("processLength", "")));
-        assertNull(created.getValue("interviewType"), "a cleared optional field means not provided");
         assertNull(created.getValue("processLength"));
     }
 
@@ -311,7 +312,7 @@ class InterviewReviewIntegrationTest {
         submit("bg2", "blankgate-co", 4.0, "offer", YEAR);
         submit("bg3", "blankgate-co", 4.0, "offer", YEAR);
 
-        JsonObject json = await(service.getCompanyInterviews("blankgate-co", null, null, null, "   "));
+        JsonObject json = await(service.getCompanyInterviews("blankgate-co", null, null, "   "));
 
         assertTrue(json.getBoolean("gated"));
         assertFalse(json.getBoolean("hasContributed"));
@@ -359,6 +360,8 @@ class InterviewReviewIntegrationTest {
 
     @Test
     void softDeletedReviewsStillCountTowardTheDailyCeiling() throws Exception {
+        // Deleting does not refund the day's allowance. Each company here is different, so the
+        // per-company cooldown is not what is doing the work.
         String auth0Id = insertUser("churner");
         for (int i = 1; i <= 4; i++) insertCompany("Churn " + i, "churn-" + i);
 
@@ -372,8 +375,183 @@ class InterviewReviewIntegrationTest {
     }
 
     // ══════════════════════════════════════════════════════════════════════════
+    // Country, ownership and editing
+    // ══════════════════════════════════════════════════════════════════════════
+
+    @Test
+    void countryNarrowsOnlyTheComparison() throws Exception {
+        // Interviewing at a global company in Canada is not the same process as in the US.
+        insertCompany("Global Co", "global-co");
+        String viewer = null;
+        for (String[] row : new String[][] { {"c1","Canada","5.0"}, {"c2","Canada","5.0"},
+                                             {"c3","Canada","5.0"}, {"c4","United States","1.0"} }) {
+            String auth0Id = insertUser(row[0]);
+            await(service.createReview(auth0Id, "global-co", base()
+                .put("overallRating", Double.parseDouble(row[2]))
+                .put("country", row[1])));
+            viewer = auth0Id;
+        }
+
+        JsonObject all = await(service.getCompanyInterviews("global-co", null, null, viewer));
+        JsonObject canada = await(service.getCompanyInterviews("global-co", null, "Canada", viewer));
+
+        assertEquals(all.getDouble("avgRating"), canada.getDouble("avgRating"),
+            "the summary never moves when the chart is narrowed");
+        assertEquals(4, all.getJsonObject("categoryComparison").getJsonObject("overall").getInteger("count"));
+        assertEquals(3, canada.getJsonObject("categoryComparison").getJsonObject("overall").getInteger("count"));
+        assertEquals("Canada", canada.getString("country"));
+    }
+
+    @Test
+    void listsCountriesThatHaveInterviews() throws Exception {
+        insertCompany("Countries Co", "countries-co");
+        String viewer = insertUser("cc1");
+        await(service.createReview(viewer, "countries-co", base().put("country", "Canada")));
+        await(service.createReview(insertUser("cc2"), "countries-co", base().put("country", "Canada")));
+        await(service.createReview(insertUser("cc3"), "countries-co", base()));
+
+        JsonArray countries = await(service.getCompanyInterviews("countries-co", null, null, viewer))
+            .getJsonArray("countries");
+
+        assertEquals(1, countries.size(), "a review that did not say is not a country to filter to");
+        assertEquals("Canada", countries.getJsonObject(0).getString("country"));
+        assertEquals(2, countries.getJsonObject(0).getInteger("count"));
+    }
+
+    @Test
+    void tellsYouWhenTheReviewOnScreenIsYourOwn() throws Exception {
+        insertCompany("Mine Co", "mine-co");
+        String mine = insertUser("owner");
+        String stranger = insertUser("stranger");
+        JsonObject created = await(service.createReview(mine, "mine-co", base()));
+
+        JsonObject asOwner = await(service.getCompanyInterviews("mine-co", null, null, mine));
+        assertEquals(created.getString("id"), asOwner.getJsonObject("myInterview").getString("id"));
+
+        assertNull(await(service.getCompanyInterviews("mine-co", null, null, stranger)).getValue("myInterview"));
+        assertNull(await(service.getCompanyInterviews("mine-co", null, null, null)).getValue("myInterview"));
+    }
+
+    @Test
+    void editingReplacesTheContentAndTheRounds() throws Exception {
+        insertCompany("Edit Co", "edit-co");
+        String auth0Id = insertUser("editor");
+        JsonObject created = await(service.createReview(auth0Id, "edit-co", base()
+            .put("rounds", new JsonArray().add("phone").add("panel"))));
+
+        JsonObject updated = await(service.updateReview(auth0Id, created.getString("id"), base()
+            .put("overallRating", 2.0)
+            .put("outcome", "no_offer")
+            .put("country", "United States")
+            .put("rounds", new JsonArray().add("take_home"))));
+
+        assertEquals(2.0, updated.getDouble("overallRating"));
+        assertEquals("no_offer", updated.getString("outcome"));
+        assertEquals("United States", updated.getString("country"));
+        assertEquals(1, updated.getInteger("rounds"));
+        assertEquals(List.of("take_home"), roundTypesOf(created.getString("id")),
+            "an edit supplies the whole list; merging would strand old rounds inside the new process");
+    }
+
+    @Test
+    void editingRecalculatesTheCompanyAggregates() throws Exception {
+        insertCompany("Recalc Co", "recalc-co");
+        String auth0Id = insertUser("recalc");
+        JsonObject created = await(service.createReview(auth0Id, "recalc-co", base().put("overallRating", 5.0)));
+        assertEquals(5.0, await(service.getCompanyInterviews("recalc-co", null, null, null)).getDouble("avgRating"));
+
+        await(service.updateReview(auth0Id, created.getString("id"), base().put("overallRating", 1.0)));
+
+        assertEquals(1.0, await(service.getCompanyInterviews("recalc-co", null, null, null)).getDouble("avgRating"),
+            "the cached stats follow an edit without an application call");
+    }
+
+    @Test
+    void youCannotEditSomebodyElsesReview() throws Exception {
+        insertCompany("Theirs Co", "theirs-co");
+        String owner = insertUser("theowner");
+        String outsider = insertUser("theoutsider");
+        JsonObject created = await(service.createReview(owner, "theirs-co", base()));
+
+        assertEquals(404, statusOfFailure(service.updateReview(outsider, created.getString("id"), base())));
+        assertEquals(400, statusOfFailure(service.updateReview(owner, "not-a-uuid", base())));
+        assertEquals(400, statusOfFailure(service.updateReview(owner, created.getString("id"), null)));
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
     // Delete
     // ══════════════════════════════════════════════════════════════════════════
+
+    @Test
+    void deletingDetachesTheAuthorImmediately() throws Exception {
+        // What someone wrote is theirs to take their name off, and that should not wait three days.
+        String auth0Id = insertUser("detach");
+        insertCompany("Detach Co", "detach-co");
+        JsonObject created = await(service.createReview(auth0Id, "detach-co", base()));
+
+        await(service.deleteReview(auth0Id, created.getString("id")));
+
+        assertNull(await(pool.preparedQuery("SELECT user_id FROM interview_reviews WHERE id = $1")
+            .execute(Tuple.of(UUID.fromString(created.getString("id"))))
+            .map(rs -> rs.iterator().next().getValue("user_id"))));
+    }
+
+    @Test
+    void aDeletedReviewComesBackAnonymouslyOnceTheWindowPasses() throws Exception {
+        // A company should not be able to lose inconvenient feedback because one contributor was
+        // talked into removing it.
+        String auth0Id = insertUser("returner2");
+        insertCompany("Return Co", "return-co2");
+        JsonObject created = await(service.createReview(auth0Id, "return-co2", base()));
+        await(service.deleteReview(auth0Id, created.getString("id")));
+        assertEquals(0, await(service.getCompanyInterviews("return-co2", null, null, null))
+            .getInteger("reviewCount"));
+
+        // Age the deletion past the three-day window.
+        await(pool.preparedQuery(
+                "UPDATE interview_reviews SET deleted_at = now() - INTERVAL '4 days' WHERE id = $1")
+            .execute(Tuple.of(UUID.fromString(created.getString("id")))));
+        assertEquals(1, await(interviewRepo.restoreExpiredDeletions()));
+
+        assertEquals(1, await(service.getCompanyInterviews("return-co2", null, null, null))
+            .getInteger("reviewCount"), "back in the numbers, with nobody's name on it");
+    }
+
+    @Test
+    void aFreshDeletionIsNotRestoredEarly() throws Exception {
+        String auth0Id = insertUser("tooSoon");
+        insertCompany("Soon Co", "soon-co");
+        JsonObject created = await(service.createReview(auth0Id, "soon-co", base()));
+        await(service.deleteReview(auth0Id, created.getString("id")));
+
+        assertEquals(0, await(interviewRepo.restoreExpiredDeletions()));
+        assertEquals(0, await(service.getCompanyInterviews("soon-co", null, null, null))
+            .getInteger("reviewCount"));
+    }
+
+    @Test
+    void youCannotReplaceAReviewThatIsComingBack() throws Exception {
+        // Otherwise the restored anonymous copy and the replacement would count one person twice.
+        String auth0Id = insertUser("replacer");
+        insertCompany("Replace Co", "replace-co");
+        JsonObject created = await(service.createReview(auth0Id, "replace-co", base()));
+        await(service.deleteReview(auth0Id, created.getString("id")));
+
+        assertEquals(409, statusOfFailure(service.createReview(auth0Id, "replace-co", base())));
+    }
+
+    @Test
+    void deletingGivesUpTheAccessItBought() throws Exception {
+        String auth0Id = insertUser("gaveup");
+        insertCompany("Gave Co", "gave-co");
+        JsonObject created = await(service.createReview(auth0Id, "gave-co", base()));
+        assertTrue(await(service.hasContributed(auth0Id)).getBoolean("hasContributed"));
+
+        await(service.deleteReview(auth0Id, created.getString("id")));
+
+        assertFalse(await(service.hasContributed(auth0Id)).getBoolean("hasContributed"),
+            "the row survives anonymously, but it is no longer theirs to be credited for");
+    }
 
     @Test
     void deleteReview_removesItFromAggregatesButKeepsTheRow() throws Exception {
@@ -381,12 +559,12 @@ class InterviewReviewIntegrationTest {
         long companyId = insertCompany("Delete Co", "delete-co");
 
         JsonObject created = await(service.createReview(auth0Id, "delete-co", base()));
-        assertEquals(1, await(service.getCompanyInterviews("delete-co", null, null, null, null))
+        assertEquals(1, await(service.getCompanyInterviews("delete-co", null, null, null))
             .getInteger("reviewCount"));
 
         await(service.deleteReview(auth0Id, created.getString("id")));
 
-        assertEquals(0, await(service.getCompanyInterviews("delete-co", null, null, null, null))
+        assertEquals(0, await(service.getCompanyInterviews("delete-co", null, null, null))
             .getInteger("reviewCount"));
         assertEquals(1L, rowCount("SELECT COUNT(*) AS c FROM interview_reviews WHERE company_id = " + companyId),
             "soft delete keeps the row for moderation history");
@@ -406,18 +584,6 @@ class InterviewReviewIntegrationTest {
         assertEquals(404, statusOfFailure(service.deleteReview(owner, UUID.randomUUID().toString())));
     }
 
-    @Test
-    void deleteReview_freesTheOnePerYearSlot() throws Exception {
-        String auth0Id = insertUser("redoer");
-        insertCompany("Redo Co", "redo-co");
-
-        JsonObject created = await(service.createReview(auth0Id, "redo-co", base()));
-        await(service.deleteReview(auth0Id, created.getString("id")));
-
-        assertNotNull(await(service.createReview(auth0Id, "redo-co", base())).getString("id"),
-            "the unique index is partial on deleted_at, so a deleted review must not block a redo");
-    }
-
     // ══════════════════════════════════════════════════════════════════════════
     // Reads: outcome segmentation
     // ══════════════════════════════════════════════════════════════════════════
@@ -429,7 +595,7 @@ class InterviewReviewIntegrationTest {
         submit("bitter", "split-co", 1.0, "no_offer", YEAR);
         submit("gone",   "split-co", 3.0, "withdrew", YEAR);
 
-        JsonObject json = await(service.getCompanyInterviews("split-co", null, null, null, null));
+        JsonObject json = await(service.getCompanyInterviews("split-co", null, null, null));
         JsonObject split = json.getJsonObject("outcomeSplit");
 
         assertEquals(1, split.getJsonObject("offer").getInteger("count"));
@@ -445,7 +611,7 @@ class InterviewReviewIntegrationTest {
         insertCompany("Offers Only", "offers-only");
         submit("a", "offers-only", 4.0, "offer", YEAR);
 
-        JsonObject split = await(service.getCompanyInterviews("offers-only", null, null, null, null))
+        JsonObject split = await(service.getCompanyInterviews("offers-only", null, null, null))
             .getJsonObject("outcomeSplit");
 
         assertEquals(0, split.getJsonObject("pending").getInteger("count"),
@@ -455,7 +621,9 @@ class InterviewReviewIntegrationTest {
     }
 
     @Test
-    void companyInterviews_filtersBreakdownByOutcome() throws Exception {
+    void comparisonCarriesAllThreeSeriesAtOnce() throws Exception {
+        // Showing offers and rejections side by side is the point. Making someone filter to one,
+        // memorise a number, filter to the other and compare in their head is what this replaces.
         insertCompany("Filter Co", "filter-co");
         String contributor = submit("filterer", "filter-co", 5.0, "offer", YEAR);
         submit("b", "filter-co", 5.0, "offer",    YEAR);
@@ -464,32 +632,54 @@ class InterviewReviewIntegrationTest {
         submit("e", "filter-co", 1.0, "no_offer", YEAR);
         submit("f", "filter-co", 1.0, "no_offer", YEAR);
 
-        JsonObject offers = await(service.getCompanyInterviews("filter-co", "offer", null, null, contributor));
-        assertEquals(3, offers.getInteger("filteredCount"));
-        assertEquals(5.0, offers.getDouble("filteredOverall"));
+        JsonObject comparison = await(service.getCompanyInterviews("filter-co", null, null, contributor))
+            .getJsonObject("categoryComparison");
 
-        JsonObject rejections = await(service.getCompanyInterviews("filter-co", "no_offer", null, null, contributor));
-        assertEquals(3, rejections.getInteger("filteredCount"));
-        assertEquals(1.0, rejections.getDouble("filteredOverall"),
+        assertEquals(6, comparison.getJsonObject("overall").getInteger("count"));
+        assertEquals(3, comparison.getJsonObject("offer").getInteger("count"));
+        assertEquals(3, comparison.getJsonObject("noOffer").getInteger("count"));
+        assertEquals(5.0, comparison.getJsonObject("offer").getDouble("overallRating"));
+        assertEquals(1.0, comparison.getJsonObject("noOffer").getDouble("overallRating"),
             "rejected candidates rate lower; that is the signal, not noise to be averaged away");
+        assertEquals(3.0, comparison.getJsonObject("overall").getDouble("overallRating"));
     }
 
     @Test
-    void companyInterviews_filtersByRoleAndYear() throws Exception {
-        insertCompany("Segment Co", "segment-co");
-        String viewer = submit("s1", "segment-co", 4.0, "offer", YEAR, "Engineering");
-        submit("s2", "segment-co", 4.0, "offer", YEAR,     "Engineering");
-        submit("s3", "segment-co", 4.0, "offer", YEAR,     "Engineering");
-        submit("s4", "segment-co", 2.0, "offer", YEAR - 3, "Sales");
+    void aSeriesWithNobodyInItStillAppears() throws Exception {
+        // "Nobody who was rejected has reported here" is information. An absent key reads as zero.
+        insertCompany("Offers Only Co", "offers-only-co");
+        String viewer = submit("o1", "offers-only-co", 4.0, "offer", YEAR);
+        submit("o2", "offers-only-co", 4.0, "offer", YEAR);
+        submit("o3", "offers-only-co", 4.0, "offer", YEAR);
 
-        assertEquals(3, await(service.getCompanyInterviews("segment-co", null, "Engineering", null, viewer))
-            .getInteger("filteredCount"));
-        assertEquals(1, await(service.getCompanyInterviews("segment-co", null, "Sales", null, viewer))
-            .getInteger("filteredCount"));
-        assertEquals(3, await(service.getCompanyInterviews("segment-co", null, null, YEAR, viewer))
-            .getInteger("filteredCount"), "sinceYear excludes the older process");
-        assertEquals(4, await(service.getCompanyInterviews("segment-co", null, null, null, viewer))
-            .getInteger("filteredCount"));
+        JsonObject noOffer = await(service.getCompanyInterviews("offers-only-co", null, null, viewer))
+            .getJsonObject("categoryComparison").getJsonObject("noOffer");
+
+        assertEquals(0, noOffer.getInteger("count"));
+        assertNull(noOffer.getValue("overallRating"));
+    }
+
+    @Test
+    void theSummaryNeverMovesWhenTheChartIsNarrowedByRole() throws Exception {
+        // A company's headline rating changing because someone explored the chart below it reads
+        // as the page contradicting itself.
+        insertCompany("Stable Co", "stable-co");
+        String viewer = submit("s1", "stable-co", 5.0, "offer", YEAR, "Engineering");
+        submit("s2", "stable-co", 5.0, "offer", YEAR, "Engineering");
+        submit("s3", "stable-co", 5.0, "offer", YEAR, "Engineering");
+        submit("s4", "stable-co", 1.0, "offer", YEAR, "Sales");
+
+        JsonObject all = await(service.getCompanyInterviews("stable-co", null, null, viewer));
+        JsonObject engineering = await(service.getCompanyInterviews("stable-co", "Engineering", null, viewer));
+
+        assertEquals(all.getInteger("reviewCount"), engineering.getInteger("reviewCount"));
+        assertEquals(all.getDouble("avgRating"), engineering.getDouble("avgRating"));
+        assertEquals(all.getJsonObject("categoryAverages"), engineering.getJsonObject("categoryAverages"));
+
+        assertEquals(4, all.getJsonObject("categoryComparison").getJsonObject("overall").getInteger("count"));
+        assertEquals(3, engineering.getJsonObject("categoryComparison").getJsonObject("overall").getInteger("count"),
+            "only the comparison narrows");
+        assertEquals("Engineering", engineering.getString("role"));
     }
 
     @Test
@@ -500,7 +690,7 @@ class InterviewReviewIntegrationTest {
         submit("r3", "roles-co", 4.0, "offer", YEAR, "Design");
         submit("r4", "roles-co", 4.0, "offer", YEAR, null);
 
-        JsonArray roles = await(service.getCompanyInterviews("roles-co", null, null, null, null))
+        JsonArray roles = await(service.getCompanyInterviews("roles-co", null, null, null))
             .getJsonArray("roleCategories");
 
         assertEquals(2, roles.size(), "reviews with no role must not become a blank filter option");
@@ -509,21 +699,13 @@ class InterviewReviewIntegrationTest {
     }
 
     @Test
-    void companyInterviews_rejectsUnknownOutcomeFilter() throws Exception {
-        insertCompany("Strict Co", "strict-co");
-        assertEquals(400, statusOfFailure(
-            service.getCompanyInterviews("strict-co", "maybe", null, null, null)));
-    }
-
-    @Test
     void companyInterviews_returnsEmptyShapeForCompanyWithNoReviews() throws Exception {
         insertCompany("Quiet Co", "quiet-co");
 
-        JsonObject json = await(service.getCompanyInterviews("quiet-co", null, null, null, null));
+        JsonObject json = await(service.getCompanyInterviews("quiet-co", null, null, null));
 
         assertEquals(0, json.getInteger("reviewCount"));
         assertNull(json.getValue("avgRating"));
-        assertEquals(0, json.getInteger("filteredCount"));
         assertTrue(json.getJsonArray("roleCategories").isEmpty());
         assertEquals(0, json.getJsonObject("outcomeSplit").getJsonObject("offer").getInteger("count"));
     }
@@ -531,7 +713,7 @@ class InterviewReviewIntegrationTest {
     @Test
     void companyInterviews_rejectsUnknownCompany() {
         assertEquals(404, statusOfFailure(
-            service.getCompanyInterviews("no-such-company", null, null, null, null)));
+            service.getCompanyInterviews("no-such-company", null, null, null)));
     }
 
     // ══════════════════════════════════════════════════════════════════════════
@@ -545,7 +727,7 @@ class InterviewReviewIntegrationTest {
         submit("g2", "gated-co", 4.0, "offer", YEAR);
         submit("g3", "gated-co", 4.0, "offer", YEAR);
 
-        JsonObject json = await(service.getCompanyInterviews("gated-co", null, null, null, null));
+        JsonObject json = await(service.getCompanyInterviews("gated-co", null, null, null));
 
         assertNull(json.getValue("categoryAverages"));
         assertTrue(json.getBoolean("gated"));
@@ -562,7 +744,7 @@ class InterviewReviewIntegrationTest {
         submit("l3", "lurker-co", 4.0, "offer", YEAR);
         String lurker = insertUser("lurker");
 
-        JsonObject json = await(service.getCompanyInterviews("lurker-co", null, null, null, lurker));
+        JsonObject json = await(service.getCompanyInterviews("lurker-co", null, null, lurker));
 
         assertNull(json.getValue("categoryAverages"));
         assertTrue(json.getBoolean("gated"));
@@ -580,7 +762,7 @@ class InterviewReviewIntegrationTest {
         submit("o2", "open-co", 4.0, "offer", YEAR);
         submit("o3", "open-co", 4.0, "offer", YEAR);
 
-        JsonObject json = await(service.getCompanyInterviews("open-co", null, null, null, contributor));
+        JsonObject json = await(service.getCompanyInterviews("open-co", null, null, contributor));
 
         assertTrue(json.getBoolean("hasContributed"));
         assertFalse(json.getBoolean("gated"));
@@ -594,12 +776,12 @@ class InterviewReviewIntegrationTest {
         String contributor = submit("t1", "thin-co", 4.0, "offer", YEAR);
         submit("t2", "thin-co", 4.0, "offer", YEAR);
 
-        JsonObject json = await(service.getCompanyInterviews("thin-co", null, null, null, contributor));
+        JsonObject json = await(service.getCompanyInterviews("thin-co", null, null, contributor));
 
         assertNull(json.getValue("categoryAverages"));
         assertFalse(json.getBoolean("gated"), "the viewer contributed — this is a data problem, not a gate");
         assertTrue(json.getBoolean("belowThreshold"));
-        assertEquals(2, json.getInteger("filteredCount"));
+        assertNull(json.getValue("categoryComparison"), "withheld on the same gate as the averages");
     }
 
     @Test
@@ -620,7 +802,7 @@ class InterviewReviewIntegrationTest {
             viewer = auth0Id;
         }
 
-        JsonObject averages = await(service.getCompanyInterviews("detail-co", null, null, null, viewer))
+        JsonObject averages = await(service.getCompanyInterviews("detail-co", null, null, viewer))
             .getJsonObject("categoryAverages");
 
         assertEquals(5.0, averages.getDouble("communication"));
@@ -665,13 +847,101 @@ class InterviewReviewIntegrationTest {
             viewer = auth0Id;
         }
 
-        JsonObject json = await(service.getCompanyInterviews("hard-co", null, null, null, viewer));
+        JsonObject json = await(service.getCompanyInterviews("hard-co", null, null, viewer));
 
         assertEquals(5.0, json.getDouble("avgRating"),
             "a hard interview is not a bad one — difficulty must not drag the rating down");
         assertEquals(5.0, json.getDouble("avgDifficulty"));
         assertNull(json.getJsonObject("categoryAverages").getValue("difficulty"),
             "difficulty is not one of the rating categories");
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // The shape of a process
+    // ══════════════════════════════════════════════════════════════════════════
+
+    @Test
+    void recordsEachRoundInOrder() throws Exception {
+        String auth0Id = insertUser("shape");
+        insertCompany("Shape Co", "shape-co");
+
+        JsonObject created = await(service.createReview(auth0Id, "shape-co", base()
+            .put("rounds", new JsonArray().add("phone").add("panel").add("executive"))));
+
+        assertEquals(3, created.getInteger("rounds"));
+        assertEquals(List.of("phone", "panel", "executive"), roundTypesOf(created.getString("id")),
+            "order is the point — a take-home before a phone screen is a different experience");
+    }
+
+    @Test
+    void theRoundCountIsDerivedAndCannotContradictTheDetail() throws Exception {
+        // There is no separate way to state the count, so the two cannot disagree. V50's trigger
+        // keeps it true for any later change to the rounds.
+        String auth0Id = insertUser("derived");
+        long companyId = insertCompany("Derived Co", "derived-co");
+
+        JsonObject created = await(service.createReview(auth0Id, "derived-co", base()
+            .put("rounds", new JsonArray().add("phone").add("technical"))));
+        assertEquals(2, storedRoundCount(created.getString("id")));
+
+        await(pool.preparedQuery("""
+                INSERT INTO interview_review_rounds (interview_review_id, round_number, round_type)
+                VALUES ($1, 3, 'onsite')
+                """).execute(Tuple.of(UUID.fromString(created.getString("id")))));
+
+        assertEquals(3, storedRoundCount(created.getString("id")),
+            "the count follows the detail without an application call");
+        assertNotNull(companyId);
+    }
+
+    @Test
+    void aReviewNeedNotDescribeItsRounds() throws Exception {
+        String auth0Id = insertUser("noshape");
+        insertCompany("Vague Co", "vague-co");
+
+        JsonObject created = await(service.createReview(auth0Id, "vague-co", base()));
+
+        assertNull(created.getValue("rounds"), "saying nothing about the shape is allowed");
+        assertTrue(roundTypesOf(created.getString("id")).isEmpty());
+    }
+
+    @Test
+    void rejectsAnUnknownRoundFormatRatherThanDroppingIt() throws Exception {
+        // A process recorded with a round missing is worse than one recorded with none.
+        String auth0Id = insertUser("badround");
+        insertCompany("Bad Co", "bad-co");
+
+        assertEquals(400, statusOfFailure(service.createReview(auth0Id, "bad-co",
+            base().put("rounds", new JsonArray().add("phone").add("telepathy")))));
+        assertEquals(400, statusOfFailure(service.createReview(auth0Id, "bad-co",
+            base().put("rounds", new JsonArray().add(42)))));
+    }
+
+    @Test
+    void reportsTheUsualShapeOfACompanysProcess() throws Exception {
+        insertCompany("Pattern Co", "pattern-co");
+        String viewer = null;
+        for (String name : new String[] { "p1", "p2", "p3" }) {
+            String auth0Id = insertUser(name);
+            await(service.createReview(auth0Id, "pattern-co", base()
+                .put("rounds", new JsonArray().add("phone").add("technical").add("panel"))));
+            viewer = auth0Id;
+        }
+        // One outlier must not change the typical shape.
+        String odd = insertUser("p4");
+        await(service.createReview(odd, "pattern-co", base()
+            .put("rounds", new JsonArray().add("take_home").add("technical").add("onsite"))));
+
+        JsonArray typical = await(service.getCompanyInterviews("pattern-co", null, null, viewer))
+            .getJsonArray("typicalRounds");
+
+        assertEquals(3, typical.size());
+        assertEquals("phone",     typical.getJsonObject(0).getString("type"));
+        assertEquals("technical", typical.getJsonObject(1).getString("type"));
+        assertEquals("panel",     typical.getJsonObject(2).getString("type"),
+            "mode per position — a single different process does not redefine the usual one");
+        assertEquals(1, typical.getJsonObject(0).getInteger("round"));
+        assertEquals(4, typical.getJsonObject(0).getInteger("reportedBy"));
     }
 
     @Test
@@ -681,7 +951,7 @@ class InterviewReviewIntegrationTest {
         submitWithRounds("m2", "rounds-co", 4);
         submitWithRounds("m3", "rounds-co", 9);
 
-        JsonObject json = await(service.getCompanyInterviews("rounds-co", null, null, null, null));
+        JsonObject json = await(service.getCompanyInterviews("rounds-co", null, null, null));
 
         assertEquals(4, ((Number) json.getValue("medianRounds")).intValue(),
             "median resists the one company that ran nine rounds; a mean would not");
@@ -721,6 +991,23 @@ class InterviewReviewIntegrationTest {
     // Helpers
     // ══════════════════════════════════════════════════════════════════════════
 
+    private static List<String> roundTypesOf(String reviewId) throws Exception {
+        return await(interviewRepo.findRounds(UUID.fromString(reviewId)).map(rows -> {
+            List<String> types = new java.util.ArrayList<>();
+            for (Row r : rows) types.add(r.getString("round_type"));
+            return types;
+        }));
+    }
+
+    private static int storedRoundCount(String reviewId) throws Exception {
+        return await(pool.preparedQuery("SELECT rounds FROM interview_reviews WHERE id = $1")
+            .execute(Tuple.of(UUID.fromString(reviewId)))
+            .map(rs -> {
+                Short v = rs.iterator().next().getShort("rounds");
+                return v == null ? 0 : (int) v;
+            }));
+    }
+
     private static JsonObject base() {
         return new JsonObject()
             .put("overallRating", 4.0)
@@ -738,8 +1025,7 @@ class InterviewReviewIntegrationTest {
             .put("nextStepTransparency", 2.5)
             .put("difficulty", 3)
             .put("outcome", "offer")
-            .put("interviewType", "video")
-            .put("rounds", 4)
+            .put("rounds", new JsonArray().add("phone").add("panel").add("executive"))
             .put("processLength", "2_4_weeks")
             .put("roleCategory", "Engineering")
             .put("interviewYear", YEAR);
@@ -765,7 +1051,9 @@ class InterviewReviewIntegrationTest {
 
     private static void submitWithRounds(String username, String companySlug, int rounds) throws Exception {
         String auth0Id = insertUser(username);
-        await(service.createReview(auth0Id, companySlug, base().put("rounds", rounds)));
+        JsonArray types = new JsonArray();
+        for (int i = 0; i < rounds; i++) types.add("video");
+        await(service.createReview(auth0Id, companySlug, base().put("rounds", types)));
     }
 
     private static String insertUser(String username) throws Exception {

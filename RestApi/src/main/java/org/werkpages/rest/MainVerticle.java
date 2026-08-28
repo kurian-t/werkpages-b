@@ -141,11 +141,14 @@ public class MainVerticle extends AbstractVerticle {
                         SitemapService sitemapService = new SitemapService(Database.getClient());
 
                         // ── Soft-delete restore job (runs daily) ──────────────────────────────
-                        vertx.setPeriodic(86_400_000L, timerId ->
+                        vertx.setPeriodic(86_400_000L, timerId -> {
                             reviewRepo.restoreExpiredDeletions()
                                 .onSuccess(n -> { if (n > 0) System.out.println("✓ Restored " + n + " anonymised review(s)"); })
-                                .onFailure(err -> System.err.println("⚠ Review restore job failed: " + err.getMessage()))
-                        );
+                                .onFailure(err -> System.err.println("⚠ Review restore job failed: " + err.getMessage()));
+                            interviewRepo.restoreExpiredDeletions()
+                                .onSuccess(n -> { if (n > 0) System.out.println("✓ Restored " + n + " anonymised interview review(s)"); })
+                                .onFailure(err -> System.err.println("⚠ Interview restore job failed: " + err.getMessage()));
+                        });
 
                         // ── company_stats matview refresh (safety net — primary updates go through
                         //    updateCompanyStatsForManager/Company on each mutation) ──────────────
@@ -207,6 +210,7 @@ public class MainVerticle extends AbstractVerticle {
                         routerFactory.addHandlerByOperationId("getCompanyInterviews",   interviewsHandler::handleGetCompanyInterviews);
                         routerFactory.addHandlerByOperationId("createInterviewReview",  interviewsHandler::handleCreateInterviewReview);
                         routerFactory.addHandlerByOperationId("deleteInterviewReview",  interviewsHandler::handleDeleteInterviewReview);
+                        routerFactory.addHandlerByOperationId("updateInterviewReview",  interviewsHandler::handleUpdateInterviewReview);
                         routerFactory.addHandlerByOperationId("hasInterviewContributed", interviewsHandler::handleHasInterviewContributed);
                         routerFactory.addHandlerByOperationId("getIndustryInterviewAverages", interviewsHandler::handleGetIndustryInterviewAverages);
                         routerFactory.addHandlerByOperationId("getManagerBySlug",       managersHandler::handleGetManagerBySlug);

@@ -38,22 +38,26 @@ public class InterviewsHandler {
 
     public void handleGetCompanyInterviews(RoutingContext ctx) {
         String companySlug = ctx.pathParam("companySlug");
-
-        String outcome = blankToNull(ctx.queryParams().get("outcome"));
+        // Role is the only filter. Outcome is no longer one: the comparison chart shows every
+        // outcome at once, so filtering by it would hide the very thing being compared.
         String role    = blankToNull(ctx.queryParams().get("role"));
+        String country = blankToNull(ctx.queryParams().get("country"));
 
-        final Integer sinceYear;
-        try {
-            sinceYear = parseOptionalInt(ctx.queryParams().get("sinceYear"));
-        } catch (NumberFormatException e) {
-            respond(ctx, 400, new JsonObject().put("message", "sinceYear must be a number"));
-            return;
-        }
-
-        // Signed out is a valid state here — the headline count and rating are public, and only the
-        // category breakdown is gated. So this resolves to null rather than 401.
+        // Signed out is a valid state here: the headline count and rating are public, and only
+        // the category breakdown is gated. So this resolves to null rather than 401.
         verifiedAuth0Id(ctx)
-            .compose(auth0Id -> service.getCompanyInterviews(companySlug, outcome, role, sinceYear, auth0Id))
+            .compose(auth0Id -> service.getCompanyInterviews(companySlug, role, country, auth0Id))
+            .onSuccess(json -> respond(ctx, 200, json))
+            .onFailure(err -> ManagersHandler.handleError(ctx, err));
+    }
+
+    // ── PUT /api/interviews/{reviewId} ────────────────────────────────────────
+
+    public void handleUpdateInterviewReview(RoutingContext ctx) {
+        String auth0Id = ctx.get("auth0Id");
+        if (auth0Id == null) { respond(ctx, 401, new JsonObject().put("message", "Unauthorized")); return; }
+
+        service.updateReview(auth0Id, ctx.pathParam("reviewId"), ctx.body().asJsonObject())
             .onSuccess(json -> respond(ctx, 200, json))
             .onFailure(err -> ManagersHandler.handleError(ctx, err));
     }
@@ -111,7 +115,4 @@ public class InterviewsHandler {
         return (raw == null || raw.isBlank()) ? null : raw.trim();
     }
 
-    private static Integer parseOptionalInt(String raw) {
-        return (raw == null || raw.isBlank()) ? null : Integer.valueOf(raw.trim());
-    }
 }

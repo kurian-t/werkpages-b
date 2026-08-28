@@ -143,25 +143,38 @@ public class RoleAliasRepository {
                         trim(regexp_replace(lower($1), '[^a-z0-9]+', ' ', 'g')) AS loose,
                         -- Fully normalized, so typing "sr" still finds "senior manager".
                         normalize_role_title($1)                                AS strict
+                ),
+                -- A manager's title and the role someone interviewed for are the same vocabulary,
+                -- so both feed the same suggestions. Keeping them apart would let the two halves
+                -- of the product drift into different spellings of the same job.
+                used_titles AS (
+                    SELECT m.title_normalized AS norm, m.title AS display
+                    FROM managers m
+                    WHERE m.title_normalized IS NOT NULL
+                      AND m.approval_status IN ('approved','ghost')
+                      AND (m.external_id IS NULL OR m.external_id NOT LIKE 'seed_%')
+                    UNION ALL
+                    SELECT normalize_role_title(ir.role_category), ir.role_category
+                    FROM interview_reviews ir
+                    WHERE ir.role_category IS NOT NULL
+                      AND ir.deleted_at IS NULL
                 )
-                SELECT m.title_normalized,
-                       MODE() WITHIN GROUP (ORDER BY m.title) AS display_title,
-                       COUNT(*)                               AS manager_count
-                FROM managers m, q
-                WHERE m.title_normalized IS NOT NULL
-                  AND m.approval_status IN ('approved','ghost')
-                  AND (m.external_id IS NULL OR m.external_id NOT LIKE 'seed_%')
+                SELECT t.norm                             AS title_normalized,
+                       MODE() WITHIN GROUP (ORDER BY t.display) AS display_title,
+                       COUNT(*)                           AS usage_count
+                FROM used_titles t, q
+                WHERE t.norm IS NOT NULL
                   AND (
-                        (q.loose  <> '' AND m.title_normalized LIKE '%' || q.loose  || '%')
-                     OR (q.strict IS NOT NULL AND m.title_normalized LIKE '%' || q.strict || '%')
+                        (q.loose  <> '' AND t.norm LIKE '%' || q.loose  || '%')
+                     OR (q.strict IS NOT NULL AND t.norm LIKE '%' || q.strict || '%')
                   )
-                GROUP BY m.title_normalized, q.loose, q.strict
+                GROUP BY t.norm, q.loose, q.strict
                 -- Prefix matches first: someone typing "eng" means titles that start that way
                 -- before ones that merely contain it. Then by how many people use the spelling.
-                ORDER BY (m.title_normalized LIKE COALESCE(q.strict, q.loose) || '%'
-                          OR m.title_normalized LIKE q.loose || '%') DESC,
+                ORDER BY (t.norm LIKE COALESCE(q.strict, q.loose) || '%'
+                          OR t.norm LIKE q.loose || '%') DESC,
                          COUNT(*) DESC,
-                         m.title_normalized ASC
+                         t.norm ASC
                 LIMIT $2
                 """)
             .execute(Tuple.of(query, limit));

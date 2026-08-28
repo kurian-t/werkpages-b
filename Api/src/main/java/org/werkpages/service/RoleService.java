@@ -139,7 +139,7 @@ public class RoleService {
                 out.add(new JsonObject()
                     .put("title",        row.getString("display_title"))
                     .put("normalized",   row.getString("title_normalized"))
-                    .put("managerCount", row.getLong("manager_count").intValue()));
+                    .put("usageCount",   row.getLong("usage_count").intValue()));
             }
             return out;
         });

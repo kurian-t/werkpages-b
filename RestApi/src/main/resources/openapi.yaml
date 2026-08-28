@@ -359,24 +359,23 @@ paths:
           schema:
             type: string
         - in: query
-          name: outcome
-          description: Restrict the breakdown to one outcome. Omit for all outcomes combined.
+          name: country
+          description: >-
+            Restricts the comparison chart to interviews for positions in this country. Same scope
+            rule as role: the summary above the chart never moves.
           required: false
           schema:
             type: string
-            enum: [offer, no_offer, withdrew, pending]
         - in: query
           name: role
-          description: Restrict to one role category.
+          description: >-
+            Restricts the comparison chart only. Every other figure in the response describes all
+            interviews on record, so exploring the chart never moves the company's headline
+            numbers. There is deliberately no outcome filter: the chart carries all three series
+            at once, and filtering by outcome would hide what is being compared.
           required: false
           schema:
             type: string
-        - in: query
-          name: sinceYear
-          description: Lowest interview year to include.
-          required: false
-          schema:
-            type: integer
       responses:
         '200':
           description: Interview stats for the company
@@ -427,6 +426,41 @@ paths:
           description: Daily submission limit reached
 
   /api/interviews/{reviewId}:
+    put:
+      operationId: updateInterviewReview
+      summary: Replace one of your own interview reviews
+      description: >-
+        Ownership is enforced in the UPDATE itself, so there is no window between checking and
+        writing. Rounds are replaced wholesale rather than merged - an edit supplies the full list,
+        and merging would strand rounds from the old process inside the new one.
+      tags:
+        - Interviews
+      parameters:
+        - in: path
+          name: reviewId
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/InterviewReviewRequest'
+      responses:
+        '200':
+          description: Updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InterviewReview'
+        '400':
+          description: Validation failed
+        '401':
+          description: Unauthorized
+        '404':
+          description: Not found, or not yours
     delete:
       operationId: deleteInterviewReview
       summary: Soft-delete one of your own interview reviews
@@ -1921,7 +1955,8 @@ paths:
       summary: Title suggestions for the add-manager form (public)
       description: >-
         Offers the spellings other people already used, which is what stops new variants being
-        created. The query is normalized before matching, so "sr" finds "Senior Manager"; what
+        created. Draws on manager titles and interview roles together, since they are the same
+        vocabulary. The query is normalized before matching, so "sr" finds "Senior Manager"; what
         comes back is the most common real spelling in each normalized group.
       tags:
         - Managers
@@ -1947,7 +1982,10 @@ paths:
                       type: string
                     normalized:
                       type: string
-                    managerCount:
+                    usageCount:
+                      description: >-
+                        How many managers and interview reviews use this spelling. Drives the
+                        ordering so the most common form is first; not shown in the UI.
                       type: integer
 
   # ── Role normalization ──────────────────────────────────────────────────────
@@ -2668,20 +2706,39 @@ components:
             interviews. Collecting it lets the company page show the split instead.
           type: string
           enum: [offer, no_offer, withdrew, pending]
-        interviewType:
-          type: string
-          enum: [phone, video, onsite, technical, panel]
-          nullable: true
         rounds:
-          type: integer
-          minimum: 1
-          maximum: 10
-          nullable: true
+          description: >-
+            The shape of the process, in order — "phone screen, then a panel, then a VP
+            conversation". Replaces V48's single interviewType plus a count, which could not
+            express ordering or more than one format. The count on the stored review is derived
+            from this list.
+          type: array
+          maxItems: 10
+          items:
+            type: string
+            enum: [recruiter_screen, phone, video, hiring_manager, technical, take_home,
+                   pair_programming, case_study, panel, onsite, executive]
         processLength:
           type: string
           enum: [under_1_week, 1_2_weeks, 2_4_weeks, over_1_month]
           nullable: true
         roleCategory:
+          type: string
+          maxLength: 100
+          nullable: true
+        country:
+          description: >-
+            Country of the POSITION, not where the candidate lives. Someone in Toronto interviewing
+            for a US role went through the US process, and that is what comparisons are about.
+            Prefilled from the request's geo headers; the person can change it.
+          type: string
+          maxLength: 100
+          nullable: true
+        city:
+          description: >-
+            Inferred from geo rather than asked for, and cleared when the country is changed away
+            from the inferred one. Captured but not yet exposed as a filter: city-level slices need
+            sample sizes the site does not have.
           type: string
           maxLength: 100
           nullable: true
@@ -2714,10 +2771,8 @@ components:
         outcome:
           type: string
           enum: [offer, no_offer, withdrew, pending]
-        interviewType:
-          type: string
-          nullable: true
         rounds:
+          description: Number of rounds, derived from the per-round detail.
           type: integer
           nullable: true
         processLength:
@@ -2728,6 +2783,33 @@ components:
           nullable: true
         interviewYear:
           type: integer
+
+    InterviewCategorySeries:
+      description: >-
+        One population's ratings. A series nobody falls into still appears, with null averages -
+        "nobody who was rejected has reported here" is information, and an absent key reads as zero.
+      type: object
+      properties:
+        count:
+          type: integer
+        overallRating:
+          type: number
+          nullable: true
+        communication:
+          type: number
+          nullable: true
+        respectForTime:
+          type: number
+          nullable: true
+        roleClarity:
+          type: number
+          nullable: true
+        processFairness:
+          type: number
+          nullable: true
+        nextStepTransparency:
+          type: number
+          nullable: true
 
     InterviewOutcomeBucket:
       type: object
@@ -2776,18 +2858,48 @@ components:
                 type: string
               count:
                 type: integer
-        filteredCount:
-          description: Reviews matching the outcome/role/year filters on this request.
-          type: integer
-        filteredOverall:
-          type: number
+        countries:
+          description: Countries this company has interviews for, most reported first.
+          type: array
+          items:
+            type: object
+            properties:
+              country:
+                type: string
+              count:
+                type: integer
+        typicalRounds:
+          description: >-
+            The usual shape of this company's process, position by position. Mode per round rather
+            than an average, because averaging formats is meaningless.
+          type: array
+          items:
+            type: object
+            properties:
+              round:
+                type: integer
+              type:
+                type: string
+              reportedBy:
+                type: integer
+        role:
+          description: The role the comparison chart was narrowed to, or null for all roles.
+          type: string
           nullable: true
-        filteredDifficulty:
-          type: number
+        categoryComparison:
+          description: >-
+            Every category rated three ways at once - by everyone, by candidates who received an
+            offer, and by those who did not. Null when withheld, on the same gate as
+            categoryAverages. Narrowed by the role parameter.
           nullable: true
-        filteredMedianRounds:
-          type: integer
-          nullable: true
+          type: object
+          properties:
+            overall:
+              $ref: '#/components/schemas/InterviewCategorySeries'
+            offer:
+              $ref: '#/components/schemas/InterviewCategorySeries'
+            noOffer:
+              $ref: '#/components/schemas/InterviewCategorySeries'
         categoryAverages:
           description: >-
             Null when withheld. Two distinct reasons, distinguished by the flags below - gated
@@ -2816,6 +2928,14 @@ components:
           type: boolean
         belowThreshold:
           type: boolean
+        myInterview:
+          description: >-
+            The caller's own review for this company, if signed in and they have one. Drives the
+            ownership control: once you have contributed, the page offers to edit or remove what
+            you wrote instead of asking again.
+          nullable: true
+          allOf:
+            - $ref: '#/components/schemas/InterviewReview' 
 
     ManagerSummary:
       type: object

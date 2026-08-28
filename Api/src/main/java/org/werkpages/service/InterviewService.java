@@ -37,7 +37,18 @@ public class InterviewService {
     private static final List<String> OUTCOME_DISPLAY_ORDER = List.of("offer", "no_offer", "withdrew", "pending");
 
     private static final Set<String> OUTCOMES        = Set.copyOf(OUTCOME_DISPLAY_ORDER);
-    private static final Set<String> INTERVIEW_TYPES = Set.of("phone", "video", "onsite", "technical", "panel");
+    /**
+     * The formats a single round can take. A process is a list of these, in order — "phone screen,
+     * then a panel, then a VP conversation" is the shape a candidate actually wants to know, and
+     * one flat format field could not express it.
+     */
+    private static final Set<String> ROUND_TYPES = Set.of(
+        "recruiter_screen", "phone", "video", "hiring_manager",
+        "technical", "take_home", "pair_programming", "case_study",
+        "panel", "onsite", "executive");
+
+    /** A process longer than this is almost certainly a mistake, and the CHECK agrees. */
+    private static final int MAX_ROUNDS = 10;
     private static final Set<String> PROCESS_LENGTHS = Set.of("under_1_week", "1_2_weeks", "2_4_weeks", "over_1_month");
 
     /** Matches the manager-review ceiling's intent, set lower: an interview takes weeks to have. */
@@ -66,45 +77,119 @@ public class InterviewService {
 
         return resolveUser(auth0Id).compose(userId ->
             resolveCompanyId(companySlug).compose(companyId -> {
-
-                // Parse and validate before touching the database — a bad payload should cost one query.
-                final BigDecimal overall  = requiredRating(body, "overallRating");
-                final BigDecimal comm     = optionalRating(body, "communication");
-                final BigDecimal respect  = optionalRating(body, "respectForTime");
-                final BigDecimal clarity  = optionalRating(body, "roleClarity");
-                final BigDecimal fairness = optionalRating(body, "processFairness");
-                final BigDecimal nextStep = optionalRating(body, "nextStepTransparency");
-
-                final Integer difficulty = optionalInt(body, "difficulty", 1, 5);
-                final Integer rounds     = optionalInt(body, "rounds", 1, 10);
-
-                final String outcome       = requiredEnum(body, "outcome", OUTCOMES);
-                final String interviewType = optionalEnum(body, "interviewType", INTERVIEW_TYPES);
-                final String processLength = optionalEnum(body, "processLength", PROCESS_LENGTHS);
-                final String roleCategory  = optionalText(body, "roleCategory", 100);
-                final int    interviewYear = requiredYear(body);
+                Draft draft = parseDraft(body);
 
                 return interviewRepo.countSubmittedTodayByUser(userId)
                     .compose(todayCount -> {
                         if (todayCount >= DAILY_LIMIT) {
                             return Future.failedFuture(ServiceException.tooManyRequests("daily_limit_reached"));
                         }
-                        return interviewRepo.existsForYear(userId, companyId, interviewYear);
+                        return interviewRepo.findRecentDeletion(userId, companyId);
+                    })
+                    .compose(recentDeletion -> {
+                        if (recentDeletion.isPresent()) {
+                            // Their earlier review is coming back anonymously; a replacement now
+                            // would count the same person twice.
+                            String until = recentDeletion.get().plusDays(30).toLocalDate().toString();
+                            return Future.failedFuture(ServiceException.conflict("interview_cooldown:" + until));
+                        }
+                        return interviewRepo.existsForYear(userId, companyId, draft.interviewYear);
                     })
                     .compose(exists -> {
                         if (exists) {
                             return Future.failedFuture(ServiceException.conflict("interview_review_exists_for_year"));
                         }
-                        return interviewRepo.create(companyId, userId, overall, comm, respect, clarity,
-                                                    fairness, nextStep, difficulty, outcome, interviewType,
-                                                    rounds, processLength, roleCategory, interviewYear);
+                        return interviewRepo.create(companyId, userId, draft.overall, draft.communication,
+                            draft.respectForTime, draft.roleClarity, draft.processFairness,
+                            draft.nextStepTransparency, draft.difficulty, draft.outcome,
+                            draft.roundCount(), draft.processLength, draft.roleCategory,
+                            draft.country, draft.city, draft.interviewYear);
                     })
+                    .compose(row -> interviewRepo
+                        .insertRounds(row.getUUID("id"), draft.rounds)
+                        .map(ignored -> row))
                     .map(InterviewService::reviewToJson);
             }));
     }
 
+    /**
+     * Replaces a review the caller wrote.
+     *
+     * <p>Ownership is enforced in the UPDATE itself rather than by reading the row first, so there
+     * is no window between the check and the write in which the row could change hands.
+     */
+    public Future<JsonObject> updateReview(String auth0Id, String reviewId, JsonObject body) {
+        if (body == null) return Future.failedFuture(ServiceException.badRequest("Missing request body"));
+
+        UUID id;
+        try {
+            id = UUID.fromString(reviewId);
+        } catch (IllegalArgumentException e) {
+            return Future.failedFuture(ServiceException.badRequest("Invalid review id"));
+        }
+
+        return resolveUser(auth0Id).compose(userId -> {
+            Draft draft = parseDraft(body);
+            return interviewRepo.update(id, userId, draft.overall, draft.communication,
+                    draft.respectForTime, draft.roleClarity, draft.processFairness,
+                    draft.nextStepTransparency, draft.difficulty, draft.outcome,
+                    draft.roundCount(), draft.processLength, draft.roleCategory,
+                    draft.country, draft.city, draft.interviewYear)
+                .compose(updated -> {
+                    if (updated.isEmpty()) {
+                        return Future.failedFuture(ServiceException.notFound("Interview review not found"));
+                    }
+                    // Rounds are replaced wholesale: an edit supplies the full list, and merging
+                    // would leave rounds from the old process stranded in the middle of the new one.
+                    return interviewRepo.deleteRounds(id)
+                        .compose(ignored -> interviewRepo.insertRounds(id, draft.rounds))
+                        .map(ignored -> reviewToJson(updated.get()));
+                });
+        });
+    }
+
+    /** Everything a create or an edit needs, parsed and validated once. */
+    private record Draft(BigDecimal overall, BigDecimal communication, BigDecimal respectForTime,
+                         BigDecimal roleClarity, BigDecimal processFairness,
+                         BigDecimal nextStepTransparency, Integer difficulty, String outcome,
+                         String processLength, String roleCategory, String country, String city,
+                         int interviewYear, List<String> rounds) {
+        /** The count follows the list, so the two cannot contradict each other. */
+        Integer roundCount() {
+            return rounds.isEmpty() ? null : rounds.size();
+        }
+    }
+
+    private static Draft parseDraft(JsonObject body) {
+        return new Draft(
+            requiredRating(body, "overallRating"),
+            optionalRating(body, "communication"),
+            optionalRating(body, "respectForTime"),
+            optionalRating(body, "roleClarity"),
+            optionalRating(body, "processFairness"),
+            optionalRating(body, "nextStepTransparency"),
+            optionalInt(body, "difficulty", 1, 5),
+            requiredEnum(body, "outcome", OUTCOMES),
+            optionalEnum(body, "processLength", PROCESS_LENGTHS),
+            optionalText(body, "roleCategory", 100),
+            // The country of the POSITION, not where the candidate lives: someone in Toronto
+            // interviewing for a US role went through the US process.
+            optionalText(body, "country", 100),
+            optionalText(body, "city", 100),
+            requiredYear(body),
+            parseRounds(body));
+    }
+
     // ── Delete ────────────────────────────────────────────────────────────────
 
+    /**
+     * Removes a review the caller wrote.
+     *
+     * <p>Soft: the author is detached immediately, the row is hidden for three days, then it
+     * returns as an anonymous data point. What someone wrote is theirs to take their name off; a
+     * company should not be able to lose inconvenient feedback because one contributor was talked
+     * into removing it.
+     */
     public Future<Void> deleteReview(String auth0Id, String reviewId) {
         UUID id;
         try {
@@ -112,11 +197,15 @@ public class InterviewService {
         } catch (IllegalArgumentException e) {
             return Future.failedFuture(ServiceException.badRequest("Invalid review id"));
         }
-        return resolveUser(auth0Id)
-            .compose(userId -> interviewRepo.softDelete(id, userId))
-            .compose(deleted -> deleted
-                ? Future.succeededFuture()
-                : Future.failedFuture(ServiceException.notFound("Interview review not found")));
+        return resolveUser(auth0Id).compose(userId ->
+            interviewRepo.softDelete(id, userId).compose(companyId -> {
+                if (companyId.isEmpty()) {
+                    return Future.failedFuture(ServiceException.notFound("Interview review not found"));
+                }
+                // Recorded so the same person cannot replace what is going to come back, which
+                // would leave the company counting one contributor twice.
+                return interviewRepo.recordDeletion(userId, companyId.get());
+            }));
     }
 
     // ── Read ──────────────────────────────────────────────────────────────────
@@ -124,30 +213,43 @@ public class InterviewService {
     /**
      * The "Getting hired" panel for one company.
      *
-     * @param outcome   restrict the breakdown to one outcome, or null for all
-     * @param role      restrict to one role category, or null for all
-     * @param sinceYear lowest interview year to include, or null for all time
-     * @param auth0Id   viewer, or null when signed out — drives the contribution gate
+     * <p>The summary half is deliberately unfilterable. A company's headline rating jumping from
+     * 3.7 to 2.9 because someone clicked a filter reads as the page contradicting itself, so the
+     * figures, the strongest and weakest areas, and the confidence sentence always describe every
+     * interview on record.
+     *
+     * <p>Only {@code categoryComparison} responds to {@code role}. It carries all three series -
+     * everyone, offers, rejections - at once, which is what makes the difference legible without
+     * asking anyone to memorise a number and click again.
+     *
+     * @param role    restrict the comparison chart to one role category, or null for all
+     * @param auth0Id viewer, or null when signed out - drives the contribution gate
      */
-    public Future<JsonObject> getCompanyInterviews(String companySlug, String outcome, String role,
-                                                   Integer sinceYear, String auth0Id) {
-        if (outcome != null && !OUTCOMES.contains(outcome)) {
-            return Future.failedFuture(ServiceException.badRequest("Unknown outcome filter"));
-        }
-
+    public Future<JsonObject> getCompanyInterviews(String companySlug, String role, String country, String auth0Id) {
         return resolveCompanyId(companySlug).compose(companyId ->
             Future.all(
                 interviewRepo.findStats(companyId),
-                interviewRepo.findBreakdown(companyId, outcome, role, sinceYear),
-                interviewRepo.findOutcomeSplit(companyId, role, sinceYear),
+                interviewRepo.findBreakdown(companyId),
+                interviewRepo.findOutcomeSplit(companyId, null, null),
                 interviewRepo.findRoleCategories(companyId),
-                isInterviewContributor(auth0Id)
-            ).map(cf -> {
-                Optional<Row> stats      = cf.resultAt(0);
-                Row           breakdown  = cf.resultAt(1);
-                RowSet<Row>   split      = cf.resultAt(2);
-                RowSet<Row>   roles      = cf.resultAt(3);
+                isInterviewContributor(auth0Id),
+                interviewRepo.findTypicalRounds(companyId)
+            ).compose(cf -> Future.all(
+                interviewRepo.findCategoryComparison(companyId, role, country),
+                interviewRepo.findCountries(companyId),
+                findMine(auth0Id, companyId)
+            ).map(inner -> {
+                Row              comparison = inner.resultAt(0);
+                RowSet<Row>      countries  = inner.resultAt(1);
+                Optional<Row>    mine       = inner.resultAt(2);
+                Optional<Row> stats       = cf.resultAt(0);
+                Row           breakdown   = cf.resultAt(1);
+                RowSet<Row>   split       = cf.resultAt(2);
+                RowSet<Row>   roles       = cf.resultAt(3);
                 boolean       contributor = cf.resultAt(4);
+                RowSet<Row>   typicalRounds = cf.resultAt(5);
+
+                int reviewCount = countOf(breakdown, "review_count");
 
                 JsonObject out = new JsonObject()
                     .put("reviewCount",   stats.map(r -> r.getInteger("review_count")).orElse(0))
@@ -156,31 +258,42 @@ public class InterviewService {
                     .put("medianRounds",  stats.map(r -> r.getValue("median_rounds")).orElse(null))
                     .put("outcomeSplit",  outcomeSplitJson(split))
                     .put("roleCategories", roleCategoriesJson(roles))
-                    .put("hasContributed", contributor);
+                    .put("countries", countriesJson(countries))
+                    .put("typicalRounds", typicalRoundsJson(typicalRounds))
+                    .put("hasContributed", contributor)
+                    .put("role", role)
+                    .put("country", country)
+                    // Once you have contributed here, the page stops asking and starts offering
+                    // to edit or remove what you wrote.
+                    .put("myInterview", mine.map(InterviewService::reviewToJson).orElse(null));
 
-                // Category averages are the payoff for contributing, and the same gate the manager
-                // and company profiles use. The headline count and rating stay public so the page
-                // is still worth landing on from search.
-                int filteredCount = countOf(breakdown, "review_count");
-                out.put("filteredCount", filteredCount);
-
+                // Category data is the payoff for contributing, and that applies to both the
+                // strongest/weakest summary and the comparison chart - one gate, not two.
                 if (!contributor) {
                     out.put("categoryAverages", (Object) null);
+                    out.put("categoryComparison", (Object) null);
                     out.put("gated", true);
-                } else if (filteredCount < MIN_REVIEWS_TO_SHOW_AVERAGES) {
-                    // Not gated — just too thin to average honestly.
+                } else if (reviewCount < MIN_REVIEWS_TO_SHOW_AVERAGES) {
                     out.put("categoryAverages", (Object) null);
+                    out.put("categoryComparison", (Object) null);
                     out.put("gated", false);
                     out.put("belowThreshold", true);
                 } else {
                     out.put("categoryAverages", categoryAveragesJson(breakdown));
-                    out.put("filteredOverall",  numberOrNull(breakdown, "overall_rating"));
-                    out.put("filteredDifficulty", numberOrNull(breakdown, "difficulty"));
-                    out.put("filteredMedianRounds", breakdown.getValue("median_rounds"));
+                    out.put("categoryComparison", categoryComparisonJson(comparison));
                     out.put("gated", false);
                 }
                 return out;
-            }));
+            })));
+    }
+
+    /** The caller's own review for this company, if they are signed in and have one. */
+    private Future<Optional<Row>> findMine(String auth0Id, long companyId) {
+        if (auth0Id == null || auth0Id.isBlank()) return Future.succeededFuture(Optional.empty());
+        return userRepo.findByAuth0IdWithBan(auth0Id)
+            .compose(opt -> opt.isEmpty()
+                ? Future.succeededFuture(Optional.empty())
+                : interviewRepo.findMineForCompany(opt.get().getUUID("id"), companyId));
     }
 
     /** Has this user ever filed an interview review? Gates the category breakdown. */
@@ -255,11 +368,35 @@ public class InterviewService {
             .put("nextStepTransparency", numberOrNull(row, "next_step_transparency"))
             .put("difficulty",           row.getValue("difficulty"))
             .put("outcome",              row.getString("outcome"))
-            .put("interviewType",        row.getString("interview_type"))
             .put("rounds",               row.getValue("rounds"))
             .put("processLength",        row.getString("process_length"))
             .put("roleCategory",         row.getString("role_category"))
+            .put("country",              row.getString("country"))
+            .put("city",                 row.getString("city"))
             .put("interviewYear",        row.getValue("interview_year"));
+    }
+
+    /**
+     * The three series, each as a category -> average map, plus how many reviews back each one.
+     *
+     * <p>A series with no reviews behind it still appears, with null averages: "nobody who was
+     * rejected has reported here" is information, and an absent key would be read as zero.
+     */
+    private static JsonObject categoryComparisonJson(Row row) {
+        return new JsonObject()
+            .put("overall", seriesJson(row, "all"))
+            .put("offer",   seriesJson(row, "offer"))
+            .put("noOffer", seriesJson(row, "no_offer"));
+    }
+
+    private static JsonObject seriesJson(Row row, String suffix) {
+        JsonObject series = new JsonObject()
+            .put("count", countOf(row, suffix.equals("all") ? "all_count" : suffix + "_count"))
+            .put("overallRating", numberOrNull(row, "overall_rating_" + suffix));
+        for (String column : InterviewRepository.CATEGORIES) {
+            series.put(toCamelCase(column), numberOrNull(row, column + "_" + suffix));
+        }
+        return series;
     }
 
     private static JsonObject categoryAveragesJson(Row row) {
@@ -286,6 +423,27 @@ public class InterviewService {
                 .put("avgRating", numberOrNull(r, "overall_rating")));
         }
         return out;
+    }
+
+    private static JsonArray typicalRoundsJson(RowSet<Row> rows) {
+        JsonArray arr = new JsonArray();
+        for (Row r : rows) {
+            arr.add(new JsonObject()
+                .put("round",      (int) r.getShort("round_number"))
+                .put("type",       r.getString("round_type"))
+                .put("reportedBy", countOf(r, "reported_by")));
+        }
+        return arr;
+    }
+
+    private static JsonArray countriesJson(RowSet<Row> rows) {
+        JsonArray arr = new JsonArray();
+        for (Row r : rows) {
+            arr.add(new JsonObject()
+                .put("country", r.getString("country"))
+                .put("count",   countOf(r, "review_count")));
+        }
+        return arr;
     }
 
     private static JsonArray roleCategoriesJson(RowSet<Row> rows) {
@@ -317,6 +475,30 @@ public class InterviewService {
             upper = false;
         }
         return sb.toString();
+    }
+
+    /**
+     * Reads the ordered list of round formats.
+     *
+     * <p>Accepts an absent list — a review that says nothing about the shape of the process is
+     * still worth having — but rejects a malformed one rather than silently dropping rounds,
+     * because a process recorded with a round missing is worse than one recorded with none.
+     */
+    private static List<String> parseRounds(JsonObject body) {
+        JsonArray raw = body.getJsonArray("rounds");
+        if (raw == null || raw.isEmpty()) return List.of();
+        if (raw.size() > MAX_ROUNDS) {
+            throw ServiceException.badRequest("A process cannot have more than " + MAX_ROUNDS + " rounds");
+        }
+        List<String> types = new java.util.ArrayList<>();
+        for (int i = 0; i < raw.size(); i++) {
+            Object value = raw.getValue(i);
+            if (!(value instanceof String type) || !ROUND_TYPES.contains(type)) {
+                throw ServiceException.badRequest("Unknown interview round type at position " + (i + 1));
+            }
+            types.add(type);
+        }
+        return types;
     }
 
     // ── Validation ────────────────────────────────────────────────────────────

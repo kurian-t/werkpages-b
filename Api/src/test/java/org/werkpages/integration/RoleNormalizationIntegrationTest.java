@@ -240,7 +240,7 @@ class RoleNormalizationIntegrationTest {
         JsonObject top = results.getJsonObject(0);
         assertEquals("Senior Engineering Manager", top.getString("title"),
             "the most common real spelling, not the normalized string — nobody picks 'senior engineering manager'");
-        assertEquals(3, top.getInteger("managerCount"));
+        assertEquals(3, top.getInteger("usageCount"));
     }
 
     @Test
@@ -269,6 +269,32 @@ class RoleNormalizationIntegrationTest {
 
         assertEquals("Engineering Manager", results.getJsonObject(0).getString("title"),
             "a prefix match wins even though the other spelling is more common");
+    }
+
+    @Test
+    void suggestsRolesPeopleInterviewedFor_notJustManagerTitles() throws Exception {
+        // A manager's title and the role someone interviewed for are the same vocabulary. If only
+        // managers fed suggestions, the two halves of the product would drift into different
+        // spellings of the same job.
+        long companyId = insertCompanyRow("Suggest Co", "suggest-co");
+        insertInterviewRole(companyId, "Staff Designer");
+
+        JsonArray results = await(service.suggestTitles("designer"));
+
+        assertEquals(1, results.size());
+        assertEquals("Staff Designer", results.getJsonObject(0).getString("title"));
+    }
+
+    @Test
+    void countsOneSpellingAcrossBothSources() throws Exception {
+        long companyId = insertCompanyRow("Both Co", "both-co");
+        insertManager("A", "Engineering Manager", "approved", null);
+        insertInterviewRole(companyId, "Engineering Manager");
+
+        JsonArray results = await(service.suggestTitles("engineering"));
+
+        assertEquals(1, results.size(), "one spelling, two sources, one suggestion");
+        assertEquals(2, results.getJsonObject(0).getInteger("usageCount"));
     }
 
     @Test
@@ -445,6 +471,31 @@ class RoleNormalizationIntegrationTest {
 
     private static Optional<Row> aliasOptional(String titleNormalized) throws Exception {
         return await(roleAliasRepo.findByTitle(titleNormalized));
+    }
+
+    private static long insertCompanyRow(String name, String slug) throws Exception {
+        return await(pool.preparedQuery(
+                "INSERT INTO companies(name, slug, status) VALUES ($1,$2,'approved') RETURNING id")
+            .execute(Tuple.of(name, slug))
+            .map(rs -> rs.iterator().next().getLong("id")));
+    }
+
+    /** An interview review carrying a role, which suggestions must also draw on. */
+    private static void insertInterviewRole(long companyId, String role) throws Exception {
+        String suffix = UUID.randomUUID().toString().substring(0, 8);
+        UUID userId = await(pool.preparedQuery("""
+                INSERT INTO users(auth0_id, email, username, first_name, last_name)
+                VALUES ($1,$2,$3,'Test','User') RETURNING id
+                """)
+            .execute(Tuple.of("auth0|" + suffix, suffix + "@test.com", "user" + suffix))
+            .map(rs -> rs.iterator().next().getUUID("id")));
+
+        await(pool.preparedQuery("""
+                INSERT INTO interview_reviews
+                    (company_id, user_id, overall_rating, outcome, interview_year, role_category)
+                VALUES ($1,$2,4.0,'offer',2025,$3)
+                """)
+            .execute(Tuple.of(companyId, userId, role)));
     }
 
     private static long insertManager(String name, String title, String approvalStatus, String externalId)
