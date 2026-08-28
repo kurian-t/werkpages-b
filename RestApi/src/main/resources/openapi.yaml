@@ -1915,6 +1915,142 @@ paths:
         '503':
           description: Job not configured
 
+  /api/roles/suggest:
+    get:
+      operationId: suggestRoles
+      summary: Title suggestions for the add-manager form (public)
+      description: >-
+        Offers the spellings other people already used, which is what stops new variants being
+        created. The query is normalized before matching, so "sr" finds "Senior Manager"; what
+        comes back is the most common real spelling in each normalized group.
+      tags:
+        - Managers
+      security: []
+      parameters:
+        - in: query
+          name: query
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Matching titles, prefix matches and common spellings first
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    title:
+                      description: The most common real spelling, which is what a person expects to pick.
+                      type: string
+                    normalized:
+                      type: string
+                    managerCount:
+                      type: integer
+
+  # ── Role normalization ──────────────────────────────────────────────────────
+  # Titles are free text, so the same job arrives as "Senior Manager", "Sr. Manager" and "sr mgr".
+  # The database normalizes the string on write (V49); these endpoints assign meaning to the
+  # result and let an admin review and correct it.
+
+  /api/admin/roles:
+    get:
+      operationId: listRoleAliases
+      summary: Distinct normalized titles and what they were classified as, most common first
+      tags:
+        - Admin
+      parameters:
+        - in: query
+          name: limit
+          required: false
+          schema:
+            type: integer
+        - in: query
+          name: offset
+          required: false
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: Alias table plus corpus coverage
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RoleAliasListing'
+        '401':
+          description: Unauthorized
+        '403':
+          description: Not an admin
+
+    put:
+      operationId: setRoleAlias
+      summary: Correct one title mapping by hand
+      description: >-
+        Marks the row as manually classified, which puts it out of reach of every automated pass.
+        A human correction is the best signal available and must not be undone by the next sweep.
+      tags:
+        - Admin
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [titleNormalized]
+              properties:
+                titleNormalized:
+                  type: string
+                roleFamily:
+                  type: string
+                  nullable: true
+                  enum: [engineering, product, design, data, it, sales, marketing,
+                         customer_support, operations, finance, hr, legal,
+                         project_management, research, education, healthcare, general, other]
+                seniority:
+                  type: string
+                  nullable: true
+                  enum: [lead, manager, senior_manager, director, vp, executive]
+      responses:
+        '204':
+          description: Updated
+        '400':
+          description: Unknown family or seniority, or nothing to set
+        '401':
+          description: Unauthorized
+        '403':
+          description: Not an admin
+
+  /api/admin/roles/classify:
+    post:
+      operationId: classifyRoles
+      summary: Classify one batch of not-yet-seen titles using the rule engine
+      description: >-
+        Synchronous, unlike the AI jobs — the rules are pure string work over at most a few hundred
+        titles. Re-run until `remaining` reaches zero.
+      tags:
+        - Admin
+      responses:
+        '200':
+          description: What the pass did, plus resulting coverage
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/RoleCoverage'
+                  - type: object
+                    properties:
+                      classified:
+                        type: integer
+                      unreadable:
+                        description: Titles recorded with no family and no seniority — the work list for a later AI pass.
+                        type: integer
+        '401':
+          description: Unauthorized
+        '403':
+          description: Not an admin
+
   /api/admin/industries/classify:
     post:
       operationId: classifyIndustries
@@ -2437,6 +2573,55 @@ paths:
 
 components:
   schemas:
+    RoleCoverage:
+      type: object
+      properties:
+        distinctTitles:
+          type: integer
+        classifiedTitles:
+          type: integer
+        remaining:
+          type: integer
+        managersTotal:
+          type: integer
+        managersWithFamily:
+          type: integer
+        managersWithSeniority:
+          type: integer
+        familyCoveragePct:
+          description: Coverage counted by manager, not by title — a title ten thousand people hold matters more than a hundred one-offs.
+          type: integer
+        seniorityCoveragePct:
+          type: integer
+
+    RoleAliasListing:
+      allOf:
+        - $ref: '#/components/schemas/RoleCoverage'
+        - type: object
+          properties:
+            data:
+              type: array
+              items:
+                type: object
+                properties:
+                  titleNormalized:
+                    type: string
+                  roleFamily:
+                    type: string
+                    nullable: true
+                  seniority:
+                    type: string
+                    nullable: true
+                  source:
+                    type: string
+                    enum: [rule, ai, manual]
+                  managerCount:
+                    type: integer
+                  sampleTitle:
+                    description: One real title that normalized to this row, so the mapping can be sanity-checked against what someone actually typed.
+                    type: string
+                    nullable: true
+
     # ── Interview experience reviews ──────────────────────────────────────────
 
     InterviewRating:

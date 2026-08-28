@@ -12,6 +12,7 @@ import org.werkpages.repository.ManagerRepository;
 import org.werkpages.repository.NotificationRepository;
 import org.werkpages.repository.ReportRepository;
 import org.werkpages.repository.InterviewRepository;
+import org.werkpages.repository.RoleAliasRepository;
 import org.werkpages.repository.ReviewRepository;
 import org.werkpages.repository.UserRepository;
 import org.werkpages.rest.handlers.AdminHandler;
@@ -34,6 +35,7 @@ import org.werkpages.service.ReportService;
 import org.werkpages.service.ResumeService;
 import org.werkpages.service.IndustryService;
 import org.werkpages.service.InterviewService;
+import org.werkpages.service.RoleService;
 import org.werkpages.service.IndustryClassificationJob;
 import org.werkpages.service.SitemapService;
 import org.werkpages.repository.MergeSuggestionsRepository;
@@ -122,6 +124,7 @@ public class MainVerticle extends AbstractVerticle {
                         CompanyRepository      companyRepo = new CompanyRepository(Database.getClient());
                         ResumeRepository       resumeRepo  = new ResumeRepository(Database.getClient());
                         InterviewRepository    interviewRepo = new InterviewRepository(Database.getClient());
+                        RoleAliasRepository    roleAliasRepo = new RoleAliasRepository(Database.getClient());
 
                         // ── Services ──────────────────────────────────────────────────────────
                         MergeSuggestionsRepository mergeSuggestionsRepo = new MergeSuggestionsRepository(Database.getClient());
@@ -132,6 +135,7 @@ public class MainVerticle extends AbstractVerticle {
                         ResumeService       resumeService  = new ResumeService(userRepo, resumeRepo, companyRepo);
                         IndustryService     industryService = new IndustryService(companyRepo, CompanyLogoUtils::resolveLogoUrl);
                         InterviewService    interviewService = new InterviewService(interviewRepo, companyRepo, userRepo);
+                        RoleService         roleService      = new RoleService(roleAliasRepo);
 
                         // ── Sitemap ───────────────────────────────────────────────────────────
                         SitemapService sitemapService = new SitemapService(Database.getClient());
@@ -174,7 +178,7 @@ public class MainVerticle extends AbstractVerticle {
                         // ── Handlers ──────────────────────────────────────────────────────────
                         ManagersHandler      managersHandler      = new ManagersHandler(managerService, vertx, jwtAuth);
                         ReportsHandler       reportsHandler       = new ReportsHandler(reportService);
-                        AdminHandler         adminHandler         = new AdminHandler(adminService, deduplicationJob, industryJob);
+                        AdminHandler         adminHandler         = new AdminHandler(adminService, deduplicationJob, industryJob, roleService);
                         NotificationsHandler notificationsHandler = new NotificationsHandler(notifService);
                         ResumesHandler       resumesHandler       = new ResumesHandler(resumeService);
                         IndustriesHandler    industriesHandler    = new IndustriesHandler(industryService);
@@ -239,6 +243,10 @@ public class MainVerticle extends AbstractVerticle {
                         routerFactory.addHandlerByOperationId("dismissMergeSuggestion",   adminHandler::handleDismissMergeSuggestion);
                         routerFactory.addHandlerByOperationId("triggerDeduplication",     adminHandler::handleTriggerDeduplication);
                         routerFactory.addHandlerByOperationId("classifyIndustries",       adminHandler::handleClassifyIndustries);
+                        routerFactory.addHandlerByOperationId("suggestRoles",             adminHandler::handleSuggestRoles);
+                        routerFactory.addHandlerByOperationId("listRoleAliases",          adminHandler::handleListRoleAliases);
+                        routerFactory.addHandlerByOperationId("classifyRoles",            adminHandler::handleClassifyRoles);
+                        routerFactory.addHandlerByOperationId("setRoleAlias",             adminHandler::handleSetRoleAlias);
                         routerFactory.addHandlerByOperationId("adminUpdateCareerEntry",   adminHandler::handleUpdateCareerEntry);
                         routerFactory.addHandlerByOperationId("adminDeleteCareerEntry",   adminHandler::handleDeleteCareerEntry);
                         routerFactory.addHandlerByOperationId("getAdminCountryStats",     adminHandler::handleGetCountryStats);

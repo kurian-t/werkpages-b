@@ -1,10 +1,12 @@
 package org.werkpages.rest.handlers;
 
+import io.vertx.core.Future;
 import io.vertx.core.json.JsonObject;
 import io.vertx.ext.web.RoutingContext;
 import org.werkpages.service.AdminService;
 import org.werkpages.service.DeduplicationJob;
 import org.werkpages.service.IndustryClassificationJob;
+import org.werkpages.service.RoleService;
 
 import java.util.UUID;
 
@@ -17,6 +19,7 @@ public class AdminHandler {
     private final AdminService              service;
     private final DeduplicationJob          deduplicationJob;
     private final IndustryClassificationJob industryJob;
+    private final RoleService               roleService;
 
     public AdminHandler(AdminService service) {
         this(service, null, null);
@@ -28,9 +31,15 @@ public class AdminHandler {
 
     public AdminHandler(AdminService service, DeduplicationJob deduplicationJob,
                         IndustryClassificationJob industryJob) {
+        this(service, deduplicationJob, industryJob, null);
+    }
+
+    public AdminHandler(AdminService service, DeduplicationJob deduplicationJob,
+                        IndustryClassificationJob industryJob, RoleService roleService) {
         this.service          = service;
         this.deduplicationJob = deduplicationJob;
         this.industryJob      = industryJob;
+        this.roleService      = roleService;
     }
 
     // ── GET /api/admin/ghost-managers ────────────────────────────────────────
@@ -320,6 +329,79 @@ public class AdminHandler {
     }
 
     // ── Deduplication job trigger ─────────────────────────────────────────────
+
+    /**
+     * GET /api/roles/suggest — title suggestions for the add-manager form.
+     *
+     * <p>Public, and deliberately not an admin route despite living beside them: it is the part of
+     * normalization that stops new spellings being created, so it has to be available wherever a
+     * manager is added. Job titles are already public on every manager card.
+     */
+    public void handleSuggestRoles(RoutingContext ctx) {
+        roleService.suggestTitles(ctx.queryParams().get("query"))
+            .onSuccess(arr -> ctx.response().setStatusCode(200)
+                .putHeader("Content-Type", "application/json").end(arr.encode()))
+            .onFailure(err -> ManagersHandler.handleError(ctx, err));
+    }
+
+    // ── Role normalization ────────────────────────────────────────────────────
+
+    /** GET /api/admin/roles — the alias table in frequency order, plus coverage. */
+    public void handleListRoleAliases(RoutingContext ctx) {
+        String auth0Id = ctx.get("auth0Id");
+        int limit  = parseIntOr(ctx.queryParams().get("limit"), 50);
+        int offset = parseIntOr(ctx.queryParams().get("offset"), 0);
+
+        service.requireAdminPublic(auth0Id)
+            .compose(adminId -> roleService.listAliases(limit, offset))
+            .onSuccess(json -> ctx.response().setStatusCode(200)
+                .putHeader("Content-Type", "application/json").end(json.encode()))
+            .onFailure(err -> ManagersHandler.handleError(ctx, err));
+    }
+
+    /**
+     * POST /api/admin/roles/classify — classify one batch of not-yet-seen titles.
+     *
+     * <p>Unlike the AI jobs this is synchronous: the rules are pure string work over at most a few
+     * hundred titles, so it finishes in well under a request timeout, and returning the resulting
+     * coverage is far more useful than a fire-and-forget acknowledgement.
+     */
+    public void handleClassifyRoles(RoutingContext ctx) {
+        String auth0Id = ctx.get("auth0Id");
+        Future<String> authorized = "cron".equals(auth0Id)
+            ? Future.succeededFuture(auth0Id)
+            : service.requireAdminPublic(auth0Id).map(String::valueOf);
+
+        authorized
+            .compose(ignored -> roleService.classifyPending())
+            .onSuccess(json -> ctx.response().setStatusCode(200)
+                .putHeader("Content-Type", "application/json").end(json.encode()))
+            .onFailure(err -> ManagersHandler.handleError(ctx, err));
+    }
+
+    /** PUT /api/admin/roles — correct one mapping by hand; wins over every automated pass. */
+    public void handleSetRoleAlias(RoutingContext ctx) {
+        String auth0Id = ctx.get("auth0Id");
+        JsonObject body = ctx.body().asJsonObject();
+        if (body == null) {
+            ctx.response().setStatusCode(400).putHeader("Content-Type", "application/json")
+                .end(new JsonObject().put("message", "Missing request body").encode());
+            return;
+        }
+
+        service.requireAdminPublic(auth0Id)
+            .compose(adminId -> roleService.classifyManually(
+                body.getString("titleNormalized"),
+                body.getString("roleFamily"),
+                body.getString("seniority")))
+            .onSuccess(v -> ctx.response().setStatusCode(204).end())
+            .onFailure(err -> ManagersHandler.handleError(ctx, err));
+    }
+
+    private static int parseIntOr(String raw, int fallback) {
+        if (raw == null || raw.isBlank()) return fallback;
+        try { return Integer.parseInt(raw.trim()); } catch (NumberFormatException e) { return fallback; }
+    }
 
     public void handleTriggerDeduplication(RoutingContext ctx) {
         String auth0Id = ctx.get("auth0Id");
