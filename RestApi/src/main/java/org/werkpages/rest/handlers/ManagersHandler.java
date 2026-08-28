@@ -1,12 +1,10 @@
 package org.werkpages.rest.handlers;
 
-import com.auth0.jwt.JWT;
-import com.auth0.jwt.exceptions.JWTDecodeException;
-import com.auth0.jwt.interfaces.DecodedJWT;
 import io.vertx.core.Future;
 import io.vertx.core.Vertx;
 import io.vertx.core.json.JsonArray;
 import io.vertx.core.json.JsonObject;
+import io.vertx.ext.auth.jwt.JWTAuth;
 import io.vertx.ext.web.RoutingContext;
 import io.vertx.ext.web.client.WebClient;
 import io.vertx.sqlclient.Row;
@@ -23,9 +21,11 @@ import java.util.UUID;
 public class ManagersHandler {
 
     private final ManagerService service;
+    private final JWTAuth jwtAuth;
     private final WebClient      httpClient;
 
-    public ManagersHandler(ManagerService service, Vertx vertx) {
+    public ManagersHandler(ManagerService service, Vertx vertx, JWTAuth jwtAuth) {
+        this.jwtAuth = jwtAuth;
         this.service    = service;
         this.httpClient = WebClient.create(vertx);
     }
@@ -107,14 +107,14 @@ public class ManagersHandler {
         } catch (NumberFormatException e) {
             respond(ctx, 400, new JsonObject().put("error", "Invalid manager ID")); return;
         }
-        String auth0Id = extractAuth0IdFromRequest(ctx);
         final long finalId = managerId;
 
-        service.getManagerById(managerId, auth0Id)
-            .compose(row -> io.vertx.core.Future.all(
-                service.hasReported(finalId, auth0Id),
-                service.isContributor(auth0Id)
-            ).map(cf -> buildManagerResponse(row, cf.resultAt(0), cf.resultAt(1))))
+        AuthTokenUtils.verifiedAuth0Id(ctx, jwtAuth)
+            .compose(auth0Id -> service.getManagerById(finalId, auth0Id)
+                .compose(row -> io.vertx.core.Future.all(
+                    service.hasReported(finalId, auth0Id),
+                    service.isContributor(auth0Id)
+                ).map(cf -> buildManagerResponse(row, cf.resultAt(0), cf.resultAt(1)))))
             .onSuccess(json -> ctx.response().putHeader("Content-Type", "application/json").end(json.encode()))
             .onFailure(err -> handleError(ctx, err));
     }
@@ -174,11 +174,10 @@ public class ManagersHandler {
 
     public void handleGetCompanyProfile(RoutingContext ctx) {
         String company = ctx.queryParam("company").stream().findFirst().orElse(null);
-        String auth0Id = extractAuth0IdFromRequest(ctx);
-        io.vertx.core.Future.all(
+        AuthTokenUtils.verifiedAuth0Id(ctx, jwtAuth).compose(auth0Id -> io.vertx.core.Future.all(
             service.getCompanyProfile(company),
             service.isContributor(auth0Id)
-        ).onSuccess(cf -> {
+        )).onSuccess(cf -> {
             JsonObject json = cf.resultAt(0);
             boolean contributed = cf.resultAt(1);
             if (!contributed) json.put("categoryAverages", new JsonObject());
@@ -189,12 +188,11 @@ public class ManagersHandler {
     // ── GET /api/companies/by-slug/{companySlug} ──────────────────────────────
 
     public void handleGetCompanyBySlug(RoutingContext ctx) {
-        String slug    = ctx.pathParam("companySlug");
-        String auth0Id = extractAuth0IdFromRequest(ctx);
-        io.vertx.core.Future.all(
+        String slug = ctx.pathParam("companySlug");
+        AuthTokenUtils.verifiedAuth0Id(ctx, jwtAuth).compose(auth0Id -> io.vertx.core.Future.all(
             service.getCompanyBySlug(slug),
             service.isContributor(auth0Id)
-        ).onSuccess(cf -> {
+        )).onSuccess(cf -> {
             JsonObject json = cf.resultAt(0);
             boolean contributed = cf.resultAt(1);
             if (!contributed) json.put("categoryAverages", new JsonObject());
@@ -207,9 +205,9 @@ public class ManagersHandler {
     public void handleGetManagerBySlug(RoutingContext ctx) {
         String managerSlug         = ctx.pathParam("managerSlug");
         String expectedCompanySlug = ctx.queryParam("expectedCompanySlug").stream().findFirst().orElse(null);
-        String auth0Id             = extractAuth0IdFromRequest(ctx);
 
-        service.getManagerBySlug(managerSlug, auth0Id)
+        AuthTokenUtils.verifiedAuth0Id(ctx, jwtAuth).compose(auth0Id ->
+            service.getManagerBySlug(managerSlug, auth0Id)
             .compose(row -> io.vertx.core.Future.all(
                 service.hasReported(row.getLong("id"), auth0Id),
                 service.isContributor(auth0Id)
@@ -222,7 +220,7 @@ public class ManagersHandler {
                     }
                 }
                 return response;
-            }))
+            })))
             .onSuccess(json -> ctx.response().putHeader("Content-Type", "application/json").end(json.encode()))
             .onFailure(err -> handleError(ctx, err));
     }
@@ -566,8 +564,9 @@ public class ManagersHandler {
         } catch (NumberFormatException e) {
             respond(ctx, 400, new JsonObject().put("error", "Invalid manager ID")); return;
         }
-        String auth0Id = extractAuth0IdFromRequest(ctx);
-        service.getPendingEditsForManager(managerId, auth0Id)
+        final long finalManagerId = managerId;
+        AuthTokenUtils.verifiedAuth0Id(ctx, jwtAuth)
+            .compose(auth0Id -> service.getPendingEditsForManager(finalManagerId, auth0Id))
             .onSuccess(json -> ctx.response().setStatusCode(200).putHeader("Content-Type", "application/json").end(json.encode()))
             .onFailure(err -> handleError(ctx, err));
     }
@@ -718,30 +717,4 @@ public class ManagersHandler {
         catch (NumberFormatException e) { return defaultVal; }
     }
 
-    /** Extracts auth0Id from Authorization header or auth_token cookie (no signature check). */
-    static String extractAuth0IdFromRequest(RoutingContext ctx) {
-        String authHeader = ctx.request().getHeader("Authorization");
-        String token = null;
-        if (authHeader != null && authHeader.startsWith("Bearer ")) {
-            token = authHeader.substring("Bearer ".length());
-        } else {
-            String cookieHeader = ctx.request().getHeader("Cookie");
-            if (cookieHeader != null) {
-                for (String part : cookieHeader.split(";")) {
-                    String trimmed = part.trim();
-                    if (trimmed.startsWith("auth_token=")) {
-                        token = trimmed.substring("auth_token=".length());
-                        break;
-                    }
-                }
-            }
-        }
-        if (token == null) return null;
-        try {
-            DecodedJWT jwt = JWT.decode(token);
-            return jwt.getSubject();
-        } catch (JWTDecodeException e) {
-            return null;
-        }
-    }
 }

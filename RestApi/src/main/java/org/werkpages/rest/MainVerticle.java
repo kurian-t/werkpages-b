@@ -11,6 +11,7 @@ import org.werkpages.repository.EditRepository;
 import org.werkpages.repository.ManagerRepository;
 import org.werkpages.repository.NotificationRepository;
 import org.werkpages.repository.ReportRepository;
+import org.werkpages.repository.InterviewRepository;
 import org.werkpages.repository.ReviewRepository;
 import org.werkpages.repository.UserRepository;
 import org.werkpages.rest.handlers.AdminHandler;
@@ -21,6 +22,7 @@ import org.werkpages.rest.handlers.RateLimitHandler;
 import org.werkpages.rest.handlers.ReportsHandler;
 import org.werkpages.rest.handlers.ResumesHandler;
 import org.werkpages.rest.handlers.IndustriesHandler;
+import org.werkpages.rest.handlers.InterviewsHandler;
 import org.werkpages.service.AdminService;
 import org.werkpages.service.AnthropicClient;
 import org.werkpages.rest.handlers.CompanyLogoUtils;
@@ -31,6 +33,7 @@ import org.werkpages.service.NotificationService;
 import org.werkpages.service.ReportService;
 import org.werkpages.service.ResumeService;
 import org.werkpages.service.IndustryService;
+import org.werkpages.service.InterviewService;
 import org.werkpages.service.IndustryClassificationJob;
 import org.werkpages.service.SitemapService;
 import org.werkpages.repository.MergeSuggestionsRepository;
@@ -118,6 +121,7 @@ public class MainVerticle extends AbstractVerticle {
                         EditRepository         editRepo    = new EditRepository(Database.getClient());
                         CompanyRepository      companyRepo = new CompanyRepository(Database.getClient());
                         ResumeRepository       resumeRepo  = new ResumeRepository(Database.getClient());
+                        InterviewRepository    interviewRepo = new InterviewRepository(Database.getClient());
 
                         // ── Services ──────────────────────────────────────────────────────────
                         MergeSuggestionsRepository mergeSuggestionsRepo = new MergeSuggestionsRepository(Database.getClient());
@@ -127,6 +131,7 @@ public class MainVerticle extends AbstractVerticle {
                         ReportService       reportService  = new ReportService(userRepo, reportRepo);
                         ResumeService       resumeService  = new ResumeService(userRepo, resumeRepo, companyRepo);
                         IndustryService     industryService = new IndustryService(companyRepo, CompanyLogoUtils::resolveLogoUrl);
+                        InterviewService    interviewService = new InterviewService(interviewRepo, companyRepo, userRepo);
 
                         // ── Sitemap ───────────────────────────────────────────────────────────
                         SitemapService sitemapService = new SitemapService(Database.getClient());
@@ -167,12 +172,13 @@ public class MainVerticle extends AbstractVerticle {
                         }
 
                         // ── Handlers ──────────────────────────────────────────────────────────
-                        ManagersHandler      managersHandler      = new ManagersHandler(managerService, vertx);
+                        ManagersHandler      managersHandler      = new ManagersHandler(managerService, vertx, jwtAuth);
                         ReportsHandler       reportsHandler       = new ReportsHandler(reportService);
                         AdminHandler         adminHandler         = new AdminHandler(adminService, deduplicationJob, industryJob);
                         NotificationsHandler notificationsHandler = new NotificationsHandler(notifService);
                         ResumesHandler       resumesHandler       = new ResumesHandler(resumeService);
                         IndustriesHandler    industriesHandler    = new IndustriesHandler(industryService);
+                        InterviewsHandler    interviewsHandler    = new InterviewsHandler(interviewService, jwtAuth);
 
                         routerFactory.addHandlerByOperationId("getManagers",           managersHandler::handleGetManagers);
                         routerFactory.addHandlerByOperationId("getManagerById",        managersHandler::handleGetManagerById);
@@ -194,6 +200,11 @@ public class MainVerticle extends AbstractVerticle {
                         routerFactory.addHandlerByOperationId("getCompanyBySlug",       managersHandler::handleGetCompanyBySlug);
                         routerFactory.addHandlerByOperationId("getIndustryListing",     industriesHandler::handleGetIndustryListing);
                         routerFactory.addHandlerByOperationId("getIndustryProfile",     industriesHandler::handleGetIndustryProfile);
+                        routerFactory.addHandlerByOperationId("getCompanyInterviews",   interviewsHandler::handleGetCompanyInterviews);
+                        routerFactory.addHandlerByOperationId("createInterviewReview",  interviewsHandler::handleCreateInterviewReview);
+                        routerFactory.addHandlerByOperationId("deleteInterviewReview",  interviewsHandler::handleDeleteInterviewReview);
+                        routerFactory.addHandlerByOperationId("hasInterviewContributed", interviewsHandler::handleHasInterviewContributed);
+                        routerFactory.addHandlerByOperationId("getIndustryInterviewAverages", interviewsHandler::handleGetIndustryInterviewAverages);
                         routerFactory.addHandlerByOperationId("getManagerBySlug",       managersHandler::handleGetManagerBySlug);
                         routerFactory.addHandlerByOperationId("getCompanies",           managersHandler::handleGetCompanies);
                         routerFactory.addHandlerByOperationId("suggestCompanies",       managersHandler::handleSuggestCompanies);
