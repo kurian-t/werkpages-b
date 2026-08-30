@@ -313,6 +313,40 @@ public class CompanyRepository {
     }
 
     /** Targeted upsert for the company that owns the given manager. Fast — one indexed lookup. */
+    /**
+     * Updates the cached company stats and waits for it, turning failure into a logged no-op.
+     *
+     * Replaces the fire-and-forget pattern this used to be called with: the future was created
+     * inside a .map() and abandoned, so the request returned while the write was still running.
+     * Two consequences, both real. In tests, a background write outlived the test that triggered
+     * it and deadlocked against the next test's TRUNCATE - the statement holds company_stats_live
+     * and wants managers, TRUNCATE holds managers and wants company_stats_live through its cascade.
+     * In production the failure was swallowed, so the visible symptom was company stats quietly
+     * going stale rather than an error anyone would see.
+     *
+     * Awaited, so the write is finished before the response and its ordering is deterministic.
+     * Recovered, so a stats problem still cannot fail the user's actual operation - that part of
+     * the original intent was right and is kept.
+     */
+    public Future<Void> syncStatsForManager(long managerId) {
+        return updateCompanyStatsForManager(managerId)
+            .recover(err -> {
+                System.err.println("company_stats_live update failed for manager " + managerId
+                                   + ": " + err.getMessage());
+                return Future.succeededFuture();
+            });
+    }
+
+    /** Company-keyed counterpart of {@link #syncStatsForManager}. Same await-and-recover contract. */
+    public Future<Void> syncStatsForCompany(long companyId) {
+        return updateCompanyStatsForCompany(companyId)
+            .recover(err -> {
+                System.err.println("company_stats_live update failed for company " + companyId
+                                   + ": " + err.getMessage());
+                return Future.succeededFuture();
+            });
+    }
+
     public Future<Void> updateCompanyStatsForManager(long managerId) {
         return db.preparedQuery("""
                 INSERT INTO company_stats_live (company_id, manager_count, total_reviews, avg_rating, logo_url, updated_at)

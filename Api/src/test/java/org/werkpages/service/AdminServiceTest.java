@@ -55,6 +55,9 @@ class AdminServiceTest {
         companyRepo = mock(CompanyRepository.class);
         when(companyRepo.refreshCompanyStats()).thenReturn(Future.succeededFuture());
         when(companyRepo.updateCompanyStatsForManager(anyLong())).thenReturn(Future.succeededFuture());
+        // The stats write is awaited now rather than fired and forgotten, so the mock has
+        // to answer with a real future instead of Mockito's default null.
+        when(companyRepo.syncStatsForManager(anyLong())).thenReturn(Future.succeededFuture());
         when(companyRepo.updateCompanyStatsForCompany(anyLong())).thenReturn(Future.succeededFuture());
         when(managerRepo.findSlugs(anyLong())).thenReturn(Future.succeededFuture(Optional.empty()));
         when(managerRepo.findCurrentRoleStart(anyLong())).thenReturn(Future.succeededFuture(Optional.empty()));

@@ -1169,6 +1169,13 @@ paths:
               properties:
                 company:
                   type: string
+                # Identity of a company chosen from the typeahead. When present the server
+                # uses it directly and treats `company` as display text, so correcting a name
+                # cannot silently mint a duplicate company.
+                companyId:
+                  type: integer
+                  format: int64
+                  nullable: true
                 title:
                   type: string
                 image:
@@ -1859,6 +1866,13 @@ paths:
                   type: string
                 company:
                   type: string
+                # Identity of a company chosen from the typeahead. When present the server
+                # uses it directly and treats `company` as display text, so correcting a name
+                # cannot silently mint a duplicate company.
+                companyId:
+                  type: integer
+                  format: int64
+                  nullable: true
                 linkedinUrl:
                   type: string
       responses:

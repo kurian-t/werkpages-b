@@ -113,13 +113,14 @@ public class AdminService {
     public Future<JsonObject> markGhostReviewed(String auth0Id, long managerId) {
         return requireAdmin(auth0Id)
             .compose(adminId -> managerRepo.approveGhost(managerId))
-            .map(opt -> {
-                if (opt.isEmpty()) return new JsonObject().put("success", false).put("message", "Ghost manager not found");
+            .compose(opt -> {
+                if (opt.isEmpty())
+                    return Future.succeededFuture(new JsonObject().put("success", false).put("message", "Ghost manager not found"));
+                JsonObject ok = new JsonObject().put("success", true).put("message", "Manager marked as reviewed");
                 Long companyId = opt.get().getLong("company_id");
-                if (companyId != null && companyRepo != null)
-                    companyRepo.updateCompanyStatsForManager(managerId)
-                        .onFailure(err -> System.err.println("company_stats_live update failed: " + err.getMessage()));
-                return new JsonObject().put("success", true).put("message", "Manager marked as reviewed");
+                if (companyId == null || companyRepo == null) return Future.succeededFuture(ok);
+                // Awaited: the stats write must not outlive the request that triggered it.
+                return companyRepo.syncStatsForManager(managerId).map(statsDone -> ok);
             });
     }
 
@@ -168,16 +169,15 @@ public class AdminService {
                 }
                 // Compute the real rating from submitted reviews now that the manager is live.
                 managerRepo.recalculateInBackground(managerId);
-                if (companyRepo != null)
-                    companyRepo.updateCompanyStatsForManager(managerId)
-                        .onFailure(err -> System.err.println("company_stats_live update failed: " + err.getMessage()));
-                return Future.succeededFuture(new JsonObject()
+                JsonObject ok = new JsonObject()
                     .put("success", true)
                     .put("message", "Manager approved")
                     .put("_managerId", managerId)
                     .put("_needsLogo", existingLogo == null)
-                    .put("_company", company)
-                );
+                    .put("_company", company);
+                if (companyRepo == null) return Future.succeededFuture(ok);
+                // Awaited: the stats write must not outlive the request that triggered it.
+                return companyRepo.syncStatsForManager(managerId).map(statsDone -> ok);
             });
     }
 
@@ -347,16 +347,16 @@ public class AdminService {
                         "Your edit request for " + managerName + " has been approved. The manager's profile has been updated.",
                         managerId);
                 }
-                if (companyRepo != null)
-                    companyRepo.updateCompanyStatsForManager(managerId)
-                        .onFailure(err -> System.err.println("company_stats_live update failed: " + err.getMessage()));
+                Future<Void> statsFuture = companyRepo != null
+                    ? companyRepo.syncStatsForManager(managerId)
+                    : Future.succeededFuture();
                 JsonObject result = new JsonObject().put("success", true).put("message", "Edit approved and applied")
                     .put("managerId", managerId);
                 if (newCompany != null) {
                     result.put("newCompany", newCompany);
                     if (newCompanyLogoUrl != null) result.put("newCompanyLogoUrl", newCompanyLogoUrl);
                 }
-                return Future.succeededFuture(result);
+                return statsFuture.map(statsDone -> result);
             });
     }
 
@@ -457,9 +457,26 @@ public class AdminService {
 
     // ── Admin direct edit ────────────────────────────────────────────────────
 
+    /**
+     * Overload for callers with no picker selection: identity is resolved from the company name,
+     * as it was before company IDs existed.
+     */
     public Future<JsonObject> adminEditManager(String auth0Id, long managerId,
                                                String name, String title,
                                                String company, String linkedinUrl) {
+        return adminEditManager(auth0Id, managerId, name, title, company, linkedinUrl, null);
+    }
+
+    /**
+     * @param companyId the company an admin picked from the typeahead, when they picked one.
+     *                  Non-null means identity is settled and {@code company} is display text.
+     *                  Without it an admin correcting a company name silently creates a duplicate,
+     *                  which is the opposite of what an admin edit is usually trying to achieve.
+     */
+    public Future<JsonObject> adminEditManager(String auth0Id, long managerId,
+                                               String name, String title,
+                                               String company, String linkedinUrl,
+                                               Long companyId) {
         if (name        != null && name.isBlank())        return Future.failedFuture(ServiceException.badRequest("Name cannot be blank"));
         if (title       != null && title.isBlank())       return Future.failedFuture(ServiceException.badRequest("Title cannot be blank"));
         if (company     != null && company.isBlank())     return Future.failedFuture(ServiceException.badRequest("Company cannot be blank"));
@@ -469,7 +486,7 @@ public class AdminService {
         final String effLinkedinUrl = linkedinUrl != null ? linkedinUrl.trim() : null;
         // When company changes, ensure a companies row exists and link company_id
         Future<Long> companyIdFuture = (effCompany != null && companyRepo != null)
-            ? companyRepo.findOrCreate(effCompany, null, null).map(row -> row.getLong("id"))
+            ? companyRepo.resolve(companyId, effCompany, null, null).map(row -> row.getLong("id"))
             : Future.succeededFuture(null);
         return requireAdmin(auth0Id)
             .compose(adminId -> companyIdFuture)
@@ -510,10 +527,9 @@ public class AdminService {
             .compose(v -> managerRepo.delete(mergeId))
             .compose(v -> managerRepo.mergeInlineRecalculate(keepId))
             .compose(v -> {
-                if (companyRepo != null)
-                    companyRepo.updateCompanyStatsForManager(keepId)
-                        .onFailure(err -> System.err.println("company_stats_live update failed: " + err.getMessage()));
-                return Future.succeededFuture(new JsonObject().put("success", true).put("keepId", keepId));
+                JsonObject ok = new JsonObject().put("success", true).put("keepId", keepId);
+                if (companyRepo == null) return Future.succeededFuture(ok);
+                return companyRepo.syncStatsForManager(keepId).map(statsDone -> ok);
             });
     }
 

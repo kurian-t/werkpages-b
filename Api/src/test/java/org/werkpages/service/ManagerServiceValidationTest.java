@@ -71,6 +71,9 @@ class ManagerServiceValidationTest {
         pool        = mock(Pool.class);
         when(companyRepo.refreshCompanyStats()).thenReturn(Future.succeededFuture());
         when(companyRepo.updateCompanyStatsForManager(anyLong())).thenReturn(Future.succeededFuture());
+        // The stats write is awaited now rather than fired and forgotten, so the mock has
+        // to answer with a real future instead of Mockito's default null.
+        when(companyRepo.syncStatsForManager(anyLong())).thenReturn(Future.succeededFuture());
         service     = new ManagerService(managerRepo, reviewRepo, userRepo, editRepo, reportRepo, companyRepo, pool, company -> null);
 
         // Build mock data BEFORE any when() chains to avoid nested stubbing

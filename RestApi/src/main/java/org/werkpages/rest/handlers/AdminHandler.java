@@ -244,7 +244,9 @@ public class AdminHandler {
         String company        = body.getString("company");
         String linkedinUrl    = body.getString("linkedinUrl");
         String companyLogoUrl = body.getString("companyLogoUrl");
-        service.adminEditManager(auth0Id, managerId, name, title, company, linkedinUrl)
+        // Present when the admin picked the company from the typeahead rather than retyping it.
+        Long companyId = body.getLong("companyId");
+        service.adminEditManager(auth0Id, managerId, name, title, company, linkedinUrl, companyId)
             .onSuccess(json -> {
                 if (company != null && !company.isBlank()) {
                     String logoUrl = (companyLogoUrl != null && !companyLogoUrl.isBlank())

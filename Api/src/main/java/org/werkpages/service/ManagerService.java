@@ -986,10 +986,9 @@ public class ManagerService {
             .compose(opt -> {
                 if (opt.isEmpty()) return Future.failedFuture(ServiceException.notFound("Manager not found"));
                 Row row = opt.get();
-                companyRepo.updateCompanyStatsForManager(managerId)
-                    .onFailure(err -> System.err.println("company_stats_live update failed after manager edit: " + err.getMessage()));
-                return managerRepo.getCareerHistory(managerId)
-                    .map(chRows -> buildManagerUpdateJson(row, chRows));
+                return companyRepo.syncStatsForManager(managerId)
+                    .compose(statsDone -> managerRepo.getCareerHistory(managerId)
+                    .map(chRows -> buildManagerUpdateJson(row, chRows)));
             });
     }
 
@@ -1285,10 +1284,11 @@ public class ManagerService {
                                 .map(ignored -> reviewRow);
                         });
                 });
-        }).onSuccess(row -> {
+        }).compose(row -> {
             managerRepo.recalculateInBackground(managerId);
-            companyRepo.updateCompanyStatsForManager(managerId)
-                .onFailure(err -> System.err.println("company_stats_live update failed: " + err.getMessage()));
+            // .compose rather than .onSuccess: a void success handler cannot await, which is how
+            // this write used to outlive the request that started it.
+            return companyRepo.syncStatsForManager(managerId).map(statsDone -> row);
         });
     }
 
@@ -2065,16 +2065,14 @@ public class ManagerService {
                                 return reviewRepo.createSeedReview(newId, company, title)
                                     .compose(ignored -> {
                                         managerRepo.recalculateInBackground(newId);
-                                        companyRepo.updateCompanyStatsForManager(newId)
-                                            .onFailure(err -> System.err.println("company_stats_live update failed after auto-approved creation: " + err.getMessage()));
-                                        return Future.succeededFuture(row);
+                                        return companyRepo.syncStatsForManager(newId)
+                                            .compose(statsDone -> Future.succeededFuture(row));
                                     })
                                     .recover(err -> {
                                         System.err.println("Seed review creation failed for auto-approved manager " + newId + ": " + err.getMessage());
                                         err.printStackTrace(System.err);
-                                        companyRepo.updateCompanyStatsForManager(newId)
-                                            .onFailure(e -> System.err.println("company_stats_live update failed after auto-approved creation: " + e.getMessage()));
-                                        return Future.succeededFuture(row);
+                                        return companyRepo.syncStatsForManager(newId)
+                                            .compose(statsDone -> Future.succeededFuture(row));
                                     });
                             })
                             .recover(err -> {
@@ -2150,15 +2148,13 @@ public class ManagerService {
                         return reviewRepo.createSeedReview(newId, company, title)
                             .compose(ignored -> {
                                 managerRepo.recalculateInBackground(newId);
-                                companyRepo.updateCompanyStatsForManager(newId)
-                                    .onFailure(err -> System.err.println("company_stats_live update failed after ghost creation: " + err.getMessage()));
-                                return Future.succeededFuture(row);
+                                return companyRepo.syncStatsForManager(newId)
+                                    .compose(statsDone -> Future.succeededFuture(row));
                             })
                             .recover(err -> {
                                 System.err.println("Seed review creation failed for ghost manager " + newId + ": " + err.getMessage());
-                                companyRepo.updateCompanyStatsForManager(newId)
-                                    .onFailure(e -> System.err.println("company_stats_live update failed after ghost creation: " + e.getMessage()));
-                                return Future.succeededFuture(row);
+                                return companyRepo.syncStatsForManager(newId)
+                                    .compose(statsDone -> Future.succeededFuture(row));
                             });
                     })
                     .map(row -> new JsonObject()
