@@ -695,9 +695,16 @@ paths:
                 items:
                   type: object
                   properties:
+                    # The company's identity. A client that selects a suggestion sends this back
+                    # on write, so the display name is never re-resolved into an identity.
+                    id:
+                      type: integer
+                      format: int64
                     name:
                       type: string
                     logoUrl:
+                      type: string
+                    industry:
                       type: string
 
   /api/geo:
@@ -778,6 +785,13 @@ paths:
                   type: string
                 company:
                   type: string
+                # Identity of a company chosen from the typeahead. When present the server
+                # uses it directly and treats `company` as display text, so two spellings of
+                # one company can no longer create two.
+                companyId:
+                  type: integer
+                  format: int64
+                  nullable: true
                 country:
                   type: string
                 state:
@@ -824,6 +838,13 @@ paths:
                   type: string
                 company:
                   type: string
+                # Identity of a company chosen from the typeahead. When present the server
+                # uses it directly and treats `company` as display text, so two spellings of
+                # one company can no longer create two.
+                companyId:
+                  type: integer
+                  format: int64
+                  nullable: true
                 title:
                   type: string
                 country:
@@ -925,6 +946,13 @@ paths:
                   type: string
                 company:
                   type: string
+                # Identity of a company chosen from the typeahead. When present the server
+                # uses it directly and treats `company` as display text, so two spellings of
+                # one company can no longer create two.
+                companyId:
+                  type: integer
+                  format: int64
+                  nullable: true
                 title:
                   type: string
                 country:
@@ -1057,6 +1085,13 @@ paths:
                   type: string
                 company:
                   type: string
+                # Identity of a company chosen from the typeahead. When present the server
+                # uses it directly and treats `company` as display text, so two spellings of
+                # one company can no longer create two.
+                companyId:
+                  type: integer
+                  format: int64
+                  nullable: true
                 title:
                   type: string
                 image:

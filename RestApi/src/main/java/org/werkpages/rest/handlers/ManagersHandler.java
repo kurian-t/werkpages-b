@@ -664,7 +664,10 @@ public class ManagersHandler {
         String city      = bodyStr(body, "city");
 
         String logoUrl = CompanyLogoUtils.resolveLogoUrl(company);
-        service.findOrCreate(auth0Id, firstName, lastName, title, company, country, state, city, logoUrl)
+        // Present when the user picked a company from the typeahead rather than typing a name
+        // nobody has stored yet. Identity comes from here; `company` is what gets displayed.
+        Long companyId = body.getLong("companyId");
+        service.findOrCreate(auth0Id, firstName, lastName, title, company, country, state, city, logoUrl, companyId)
             .onSuccess(json -> {
                 // Back-fill logo on any rows that don't already have one (existing managers)
                 io.vertx.core.json.JsonArray data = json.getJsonArray("data");

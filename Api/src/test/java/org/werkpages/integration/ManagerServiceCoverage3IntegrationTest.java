@@ -819,12 +819,26 @@ class ManagerServiceCoverage3IntegrationTest {
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
+    /**
+     * Creates the company row alongside the manager. Production always does: every manager-writing
+     * path calls findOrCreate first, so a manager with no companies row is a state no live code can
+     * produce. It mattered once the company picker started reading companies rather than manager
+     * name strings - without the company row, a manager inserted here is invisible to search.
+     */
     private long insertManager(String name, String company, String title, String status) throws Exception {
+        Long companyId = pool.preparedQuery(
+                "INSERT INTO companies(name, status, slug) VALUES ($1,'approved',$2) " +
+                "ON CONFLICT DO NOTHING")
+            .execute(Tuple.of(company, company.toLowerCase().replaceAll("[^a-z0-9]+", "-")))
+            .compose(v -> pool.preparedQuery("SELECT id FROM companies WHERE LOWER(TRIM(name)) = LOWER(TRIM($1))")
+                .execute(Tuple.of(company))
+                .map(rs -> rs.iterator().hasNext() ? rs.iterator().next().getLong("id") : null))
+            .toCompletionStage().toCompletableFuture().get(5, TimeUnit.SECONDS);
         return pool.preparedQuery(
-                "INSERT INTO managers(name, company, title, image, status, approval_status, " +
+                "INSERT INTO managers(name, company, company_id, title, image, status, approval_status, " +
                 "overall_rating, reviews_count, category_averages) " +
-                "VALUES ($1,$2,$3,'img','active',$4,0,0,'{}') RETURNING id")
-            .execute(Tuple.of(name, company, title, status))
+                "VALUES ($1,$2,$3,$4,'img','active',$5,0,0,'{}') RETURNING id")
+            .execute(Tuple.of(name, company, companyId, title, status))
             .toCompletionStage().toCompletableFuture().get(5, TimeUnit.SECONDS)
             .iterator().next().getLong("id");
     }

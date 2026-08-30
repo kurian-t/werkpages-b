@@ -461,21 +461,42 @@ public class ManagerService {
 
     // ── GET company suggestions ───────────────────────────────────────────────
 
+    /**
+     * Company suggestions for the picker.
+     *
+     * Each suggestion now carries the company ID. That is the whole point: a caller that selects a
+     * suggestion can persist the ID, so the company's display name never has to be re-resolved into
+     * an identity on the write path. The name is display data from here on.
+     *
+     * `industry` rides along because the picker needs it to tell two similarly-named companies
+     * apart before the user commits to one.
+     */
     public Future<JsonArray> suggestCompanies(String query) {
         if (query == null || query.isBlank()) return Future.succeededFuture(new JsonArray());
-        return managerRepo.findCompaniesByQuery(query.trim())
+        return companyRepo.searchForPicker(query.trim())
             .map(rows -> {
                 JsonArray result = new JsonArray();
                 for (Row row : rows) {
-                    String name = row.getString("company");
+                    String name = row.getString("name");
                     if (name != null && !name.isBlank()) {
                         JsonObject suggestion = new JsonObject().put("name", name);
+                        // Omitted rather than null for a name that has no company row yet: a
+                        // client checks for the key's presence to decide between "select this
+                        // company" and "create it", and `"id": null` reads as a broken record.
+                        Long id = row.getLong("id");
+                        if (id != null) suggestion.put("id", id);
+                        // Resolver first, stored logo second - unchanged precedence, so a company
+                        // whose logo was resolved from its domain keeps the better image.
                         String logoUrl = logoResolver.apply(name);
                         if (logoUrl == null || logoUrl.isBlank()) {
-                            logoUrl = row.getString("company_logo_url");
+                            logoUrl = row.getString("logo_url");
                         }
                         if (logoUrl != null && !logoUrl.isBlank()) {
                             suggestion.put("logoUrl", logoUrl);
+                        }
+                        String industry = row.getString("industry");
+                        if (industry != null && !industry.isBlank()) {
+                            suggestion.put("industry", industry);
                         }
                         result.add(suggestion);
                     }
@@ -706,7 +727,7 @@ public class ManagerService {
                                 OffsetDateTime startDt = fStartDate.atStartOfDay(ZoneOffset.UTC).toOffsetDateTime();
                                 OffsetDateTime endDt   = fEndDate != null ? fEndDate.atStartOfDay(ZoneOffset.UTC).toOffsetDateTime() : null;
                                 final String fCompany = company;
-                                return companyRepo.findOrCreate(company, null, resolvedLogoUrl)
+                                return companyRepo.resolve(body.getLong("companyId"), company, null, resolvedLogoUrl)
                                     .compose(companyRow -> {
                                 long companyId = companyRow.getLong("id");
                                 return managerRepo.generateUniqueSlug(name, company)
@@ -897,7 +918,7 @@ public class ManagerService {
                     Long   oldCompanyId = current.getLong("company_id");
 
                     // Resolve the company row (and company_id) for the new effective company.
-                    return companyRepo.findOrCreate(effectiveCo, null, logoResolver.apply(effectiveCo))
+                    return companyRepo.resolve(body.getLong("companyId"), effectiveCo, null, logoResolver.apply(effectiveCo))
                         .compose(effectiveCoRow -> {
                             long newCompanyId = effectiveCoRow.getLong("id");
                             LocalDate oldStartLocal = parseYearMonth(startDateStr);
@@ -1887,11 +1908,31 @@ public class ManagerService {
 
     // ── Find-or-create ────────────────────────────────────────────────────────
 
+    /**
+     * Overload for callers with no picker selection to pass on: identity is then resolved from the
+     * company name, exactly as it was before IDs existed. Kept explicit rather than making the
+     * parameter optional so that "no company was chosen" is stated at the call site rather than
+     * being an accident of a shorter argument list.
+     */
     public Future<JsonObject> findOrCreate(String auth0Id,
                                            String firstName, String lastName,
                                            String title, String company, String country,
                                            String state, String city,
                                            String resolvedLogoUrl) {
+        return findOrCreate(auth0Id, firstName, lastName, title, company, country,
+                            state, city, resolvedLogoUrl, null);
+    }
+
+    /**
+     * @param companyId the company the user actually picked, when they picked one. Non-null means
+     *                  identity is already settled and {@code company} is display text only, which
+     *                  is what stops a second spelling becoming a second company.
+     */
+    public Future<JsonObject> findOrCreate(String auth0Id,
+                                           String firstName, String lastName,
+                                           String title, String company, String country,
+                                           String state, String city,
+                                           String resolvedLogoUrl, Long companyId) {
         NameValidator.ValidationResult validation =
             NameValidator.validate(firstName, lastName, title, company, country);
         if (!validation.valid())
@@ -1983,7 +2024,7 @@ public class ManagerService {
                     if (!firstNamePassesVowelCheck(firstName)) {
                         final String fState2 = trimmedState;
                         final String fCity2  = trimmedCity;
-                        return companyRepo.findOrCreate(company, null, resolvedLogoUrl)
+                        return companyRepo.resolve(companyId, company, null, resolvedLogoUrl)
                             .compose(cRow -> managerRepo.createSearchPending(
                                 fullName, company, title, country,
                                 fState2, fCity2, resolvedLogoUrl, cRow.getLong("id"), userId))
@@ -2004,7 +2045,7 @@ public class ManagerService {
                             // about a submission they aren't aware of.
                             final String fState3 = trimmedState;
                             final String fCity3  = trimmedCity;
-                            return companyRepo.findOrCreate(company, null, resolvedLogoUrl)
+                            return companyRepo.resolve(companyId, company, null, resolvedLogoUrl)
                                 .compose(cRow -> managerRepo.createSearchPending(
                                     fullName, company, title, country,
                                     fState3, fCity3, resolvedLogoUrl, cRow.getLong("id"), userId))
@@ -2016,7 +2057,7 @@ public class ManagerService {
 
                         // Slot claimed — create ghost. If the insert fails, release the slot so
                         // the user can try again on their next search.
-                        return companyRepo.findOrCreate(company, null, resolvedLogoUrl)
+                        return companyRepo.resolve(companyId, company, null, resolvedLogoUrl)
                             .compose(companyRow -> managerRepo.createAutoApproved(fullName, company, title, country,
                                 trimmedState, trimmedCity, userId, resolvedLogoUrl, companyRow.getLong("id")))
                             .compose(row -> {
@@ -2102,7 +2143,7 @@ public class ManagerService {
                             .put("created", false)
                     );
                 }
-                return companyRepo.findOrCreate(company, null, resolvedLogoUrl)
+                return companyRepo.resolve(body.getLong("companyId"), company, null, resolvedLogoUrl)
                     .compose(companyRow -> managerRepo.createGhost(name, company, title, country, fState, fCity, resolvedLogoUrl, companyRow.getLong("id")))
                     .compose(row -> {
                         long newId = row.getLong("id");
@@ -2165,7 +2206,7 @@ public class ManagerService {
                 if (rows.iterator().hasNext()) return Future.<Void>succeededFuture(); // already exists
                 final String fCompany = company;
                 final String fTitle   = title;
-                return companyRepo.findOrCreate(company, null, resolvedLogoUrl)
+                return companyRepo.resolve(body.getLong("companyId"), company, null, resolvedLogoUrl)
                     .compose(companyRow -> managerRepo.createPending(
                         name, fCompany, fTitle, "active", country, fState, resolvedLogoUrl, companyRow.getLong("id")))
                     .mapEmpty();
@@ -2235,7 +2276,7 @@ public class ManagerService {
                             .map(ignored -> new JsonObject().put("id", existingId).put("created", false));
                     }
                 } else {
-                    return companyRepo.findOrCreate(company, null, resolvedLogoUrl)
+                    return companyRepo.resolve(body.getLong("companyId"), company, null, resolvedLogoUrl)
                         .compose(companyRow -> managerRepo.createPending(name, company, title, fStatus, country, fState, resolvedLogoUrl, companyRow.getLong("id")))
                         .compose(managerRow -> {
                             long managerId = managerRow.getLong("id");
