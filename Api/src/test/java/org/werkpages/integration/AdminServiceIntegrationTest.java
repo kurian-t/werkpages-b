@@ -1163,12 +1163,88 @@ class AdminServiceIntegrationTest {
             .map(rs -> rs.iterator().next().getLong("id")));
     }
 
+    // ── Company identity on edit requests (Phase 2.5A) ────────────────────────
+
+    @Test
+    void approveEdit_usesTheRequestedCompanyIdNotTheName() throws Exception {
+        // Two companies whose names are easy to confuse. The request points at one by ID, so
+        // approval must land there even though resolving the *name* would be ambiguous and could
+        // just as easily have created a third company.
+        String adminAuth0 = insertUser("auth0|admin_ci1", "AdminCI1", "admin");
+        String userAuth   = insertUser("auth0|editor_ci1", "EditorCI1", "user");
+        UUID   userId     = findUserId(userAuth);
+        long   managerId  = insertApprovedManager("Ada Lovelace", "OldCorp", "Engineer");
+        Long   decoy      = companyIdFor("Crumbl");
+        Long   picked     = companyIdFor("Crumbl Bakery");
+
+        UUID editId = await(pool.preparedQuery(
+            "INSERT INTO manager_edits(manager_id, proposed_by, new_company, requested_company_id, new_title) " +
+            "VALUES ($1,$2,$3,$4,$5) RETURNING id")
+            .execute(Tuple.of(managerId, userId, "Crumbl Bakery", picked, "Engineer"))
+            .map(rs -> rs.iterator().next().getUUID("id")));
+
+        await(service.approveEdit(adminAuth0, editId));
+
+        Long linked = await(pool.preparedQuery("SELECT company_id FROM managers WHERE id = $1")
+            .execute(Tuple.of(managerId))
+            .map(rs -> rs.iterator().next().getLong("company_id")));
+        assertEquals(picked, linked, "approval must use the company the user picked");
+        assertNotEquals(decoy, linked, "approval must not land on the similarly named company");
+    }
+
+    @Test
+    void approveEdit_refusesALegacyRequestWithNoCompanyIdentity() throws Exception {
+        // Rows written before V56 carry only a name. Resolving it would be a guess, and guessing is
+        // exactly what produced duplicate companies, so approval stops and asks a human.
+        String adminAuth0 = insertUser("auth0|admin_ci2", "AdminCI2", "admin");
+        String userAuth   = insertUser("auth0|editor_ci2", "EditorCI2", "user");
+        UUID   userId     = findUserId(userAuth);
+        long   managerId  = insertApprovedManager("Grace Hopper", "OldCorp", "Engineer");
+
+        UUID editId = await(pool.preparedQuery(
+            "INSERT INTO manager_edits(manager_id, proposed_by, new_company, new_title) " +
+            "VALUES ($1,$2,$3,$4) RETURNING id")
+            .execute(Tuple.of(managerId, userId, "Some New Company", "Engineer"))
+            .map(rs -> rs.iterator().next().getUUID("id")));
+
+        ServiceException ex = assertServiceException(service.approveEdit(adminAuth0, editId));
+        assertTrue(ex.getMessage().contains("identified by ID"),
+                   "expected a refusal naming the missing identity, got: " + ex.getMessage());
+
+        // And nothing was written on the way out: no company invented, no manager repointed.
+        Long created = await(pool.preparedQuery(
+            "SELECT count(*) AS c FROM companies WHERE LOWER(TRIM(name)) = 'some new company'")
+            .execute().map(rs -> rs.iterator().next().getLong("c")));
+        assertEquals(0L, created, "a refused approval must not create the company anyway");
+    }
+
+    @Test
+    void approveEdit_withoutACompanyChangeStillWorksWithoutIdentity() throws Exception {
+        // Title-only requests never had a company to identify, so the guard must not block them.
+        String adminAuth0 = insertUser("auth0|admin_ci3", "AdminCI3", "admin");
+        String userAuth   = insertUser("auth0|editor_ci3", "EditorCI3", "user");
+        UUID   userId     = findUserId(userAuth);
+        long   managerId  = insertApprovedManager("Alan Turing", "OldCorp", "Engineer");
+
+        UUID editId = await(pool.preparedQuery(
+            "INSERT INTO manager_edits(manager_id, proposed_by, new_title) VALUES ($1,$2,$3) RETURNING id")
+            .execute(Tuple.of(managerId, userId, "Principal Engineer"))
+            .map(rs -> rs.iterator().next().getUUID("id")));
+
+        await(service.approveEdit(adminAuth0, editId));
+
+        String title = await(pool.preparedQuery("SELECT title FROM managers WHERE id = $1")
+            .execute(Tuple.of(managerId))
+            .map(rs -> rs.iterator().next().getString("title")));
+        assertEquals("Principal Engineer", title);
+    }
+
     private UUID insertPendingEdit(long managerId, UUID proposedBy, String newCompany,
                                     String newTitle, String newStatus, String newLinkedinUrl) throws Exception {
         return await(pool.preparedQuery(
-            "INSERT INTO manager_edits(manager_id, proposed_by, new_company, new_title, new_status, new_linkedin_url) " +
-            "VALUES ($1,$2,$3,$4,$5,$6) RETURNING id")
-            .execute(Tuple.of(managerId, proposedBy, newCompany, newTitle, newStatus, newLinkedinUrl))
+            "INSERT INTO manager_edits(manager_id, proposed_by, new_company, requested_company_id, new_title, new_status, new_linkedin_url) " +
+            "VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id")
+            .execute(Tuple.of(managerId, proposedBy, newCompany, companyIdFor(newCompany), newTitle, newStatus, newLinkedinUrl))
             .map(rs -> rs.iterator().next().getUUID("id")));
     }
 
@@ -1176,9 +1252,9 @@ class AdminServiceIntegrationTest {
                                                String newCompanyLogoUrl, String newTitle,
                                                String newStatus, String newLinkedinUrl) throws Exception {
         return await(pool.preparedQuery(
-            "INSERT INTO manager_edits(manager_id, proposed_by, new_company, new_company_logo_url, new_title, new_status, new_linkedin_url) " +
-            "VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id")
-            .execute(Tuple.of(managerId, proposedBy, newCompany, newCompanyLogoUrl, newTitle, newStatus, newLinkedinUrl))
+            "INSERT INTO manager_edits(manager_id, proposed_by, new_company, requested_company_id, new_company_logo_url, new_title, new_status, new_linkedin_url) " +
+            "VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id")
+            .execute(Tuple.of(managerId, proposedBy, newCompany, companyIdFor(newCompany), newCompanyLogoUrl, newTitle, newStatus, newLinkedinUrl))
             .map(rs -> rs.iterator().next().getUUID("id")));
     }
 
@@ -1187,9 +1263,9 @@ class AdminServiceIntegrationTest {
                                              java.time.OffsetDateTime newStartDate,
                                              java.time.OffsetDateTime newEndDate) throws Exception {
         return await(pool.preparedQuery(
-            "INSERT INTO manager_edits(manager_id, proposed_by, new_company, new_title, new_status, new_start_date, new_end_date) " +
-            "VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id")
-            .execute(Tuple.of(managerId, proposedBy, newCompany, newTitle, newStatus, newStartDate, newEndDate))
+            "INSERT INTO manager_edits(manager_id, proposed_by, new_company, requested_company_id, new_title, new_status, new_start_date, new_end_date) " +
+            "VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id")
+            .execute(Tuple.of(managerId, proposedBy, newCompany, companyIdFor(newCompany), newTitle, newStatus, newStartDate, newEndDate))
             .map(rs -> rs.iterator().next().getUUID("id")));
     }
 
@@ -1225,5 +1301,19 @@ class AdminServiceIntegrationTest {
 
     private static <T> T await(Future<T> future) throws Exception {
         return future.toCompletionStage().toCompletableFuture().get(10, TimeUnit.SECONDS);
+    }
+
+    /**
+     * The company an edit request points at. Requests carry identity now, so approval never has to
+     * guess which company a name meant - the fixture mirrors what the live form sends.
+     */
+    private Long companyIdFor(String companyName) throws Exception {
+        if (companyName == null) return null;
+        String slug = companyName.toLowerCase().replaceAll("[^a-z0-9]+", "-");
+        await(pool.preparedQuery("INSERT INTO companies(name,status,slug) VALUES ($1,'approved',$2) ON CONFLICT DO NOTHING")
+            .execute(Tuple.of(companyName, slug)).mapEmpty());
+        return await(pool.preparedQuery("SELECT id FROM companies WHERE LOWER(TRIM(name)) = LOWER(TRIM($1))")
+            .execute(Tuple.of(companyName))
+            .map(rs -> rs.iterator().hasNext() ? rs.iterator().next().getLong("id") : null));
     }
 }

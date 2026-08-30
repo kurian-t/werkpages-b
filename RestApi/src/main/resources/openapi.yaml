@@ -1520,6 +1520,12 @@ paths:
               properties:
                 company:
                   type: string
+                # Identity of the company the user picked. Approval uses this directly; the
+                # `company` name beside it is an audit snapshot, never re-resolved.
+                companyId:
+                  type: integer
+                  format: int64
+                  nullable: true
                 title:
                   type: string
       responses:

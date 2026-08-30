@@ -27,15 +27,34 @@ public class EditRepository {
             .map(rows -> rows.iterator().next().getLong(0));
     }
 
+    /**
+     * Overload for callers that have no selected company. Records the request with no identity,
+     * which an admin must resolve through the picker before it can be approved.
+     */
     public Future<Row> upsert(long managerId, UUID proposedBy, String newCompany, String newCompanyLogoUrl,
                                String newTitle, String newStatus, String newCountry,
                                String newLinkedinUrl,
                                OffsetDateTime newStartDate, OffsetDateTime newEndDate) {
+        return upsert(managerId, proposedBy, newCompany, null, newCompanyLogoUrl, newTitle,
+                      newStatus, newCountry, newLinkedinUrl, newStartDate, newEndDate);
+    }
+
+    /**
+     * @param requestedCompanyId the company the user picked. Identity. Approval uses this directly.
+     * @param newCompany         the name they saw when they picked it - a snapshot for audit and
+     *                           display, never used to decide which company row is meant.
+     */
+    public Future<Row> upsert(long managerId, UUID proposedBy, String newCompany, Long requestedCompanyId,
+                               String newCompanyLogoUrl,
+                               String newTitle, String newStatus, String newCountry,
+                               String newLinkedinUrl,
+                               OffsetDateTime newStartDate, OffsetDateTime newEndDate) {
         return db.preparedQuery("""
-                INSERT INTO manager_edits(manager_id, proposed_by, new_company, new_company_logo_url, new_title, new_status, new_country, new_linkedin_url, new_start_date, new_end_date)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                INSERT INTO manager_edits(manager_id, proposed_by, new_company, requested_company_id, new_company_logo_url, new_title, new_status, new_country, new_linkedin_url, new_start_date, new_end_date)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
                 ON CONFLICT (manager_id, proposed_by) WHERE status = 'pending'
                 DO UPDATE SET new_company          = EXCLUDED.new_company,
+                              requested_company_id = EXCLUDED.requested_company_id,
                               new_company_logo_url = EXCLUDED.new_company_logo_url,
                               new_title            = EXCLUDED.new_title,
                               new_status           = EXCLUDED.new_status,
@@ -46,7 +65,7 @@ public class EditRepository {
                               created_at           = now()
                 RETURNING id, created_at
                 """)
-            .execute(Tuple.of(managerId, proposedBy, newCompany, newCompanyLogoUrl, newTitle, newStatus, newCountry, newLinkedinUrl, newStartDate, newEndDate))
+            .execute(Tuple.of(managerId, proposedBy, newCompany, requestedCompanyId, newCompanyLogoUrl, newTitle, newStatus, newCountry, newLinkedinUrl, newStartDate, newEndDate))
             .map(rows -> rows.iterator().next());
     }
 
@@ -79,7 +98,7 @@ public class EditRepository {
 
     public Future<Optional<Row>> findByIdWithManager(UUID editId) {
         return db.preparedQuery("""
-                SELECT pe.id, pe.manager_id, pe.new_company, pe.new_company_logo_url, pe.new_title, pe.new_status,
+                SELECT pe.id, pe.manager_id, pe.new_company, pe.requested_company_id, pe.new_company_logo_url, pe.new_title, pe.new_status,
                        pe.new_country, pe.new_linkedin_url, pe.new_start_date, pe.new_end_date,
                        pe.status, pe.proposed_by,
                        m.company AS current_company, m.title AS current_title,

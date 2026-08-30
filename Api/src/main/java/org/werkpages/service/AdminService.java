@@ -259,8 +259,23 @@ public class AdminService {
                     // Use the user-specified start date for the new career entry; fall back to now.
                     OffsetDateTime careerStart = newStartDate != null ? newStartDate : now;
 
-                    Future<Long> newCompanyIdFuture = (companyRepo != null)
-                        ? companyRepo.findOrCreate(effectiveCo, null, null).map(r -> r.getLong("id"))
+                    // Identity comes from what the user selected, never from re-resolving the name
+                    // they typed. A request that carries no identity is one written before V56 (or
+                    // by a client that did not send one), and it is refused rather than guessed:
+                    // matching "Crumbl" to whichever row currently holds that string is the exact
+                    // assumption that created duplicate companies. The admin resolves it once
+                    // through the picker and re-approves.
+                    Long requestedCompanyId = row.getLong("requested_company_id");
+                    boolean companyChanging = newCompany != null
+                        && !newCompany.equalsIgnoreCase(currentCompany == null ? "" : currentCompany);
+                    if (companyChanging && requestedCompanyId == null) {
+                        return Future.failedFuture(ServiceException.badRequest(
+                            "This edit request was made before companies were identified by ID, so "
+                            + "approving it cannot tell which \"" + newCompany + "\" is meant. "
+                            + "Set the company on the manager directly, then reject this request."));
+                    }
+                    Future<Long> newCompanyIdFuture = requestedCompanyId != null
+                        ? Future.succeededFuture(requestedCompanyId)
                         : Future.succeededFuture(currentCompanyId);
 
                     // Snapshot current slugs before update so we can record URL history if company changes

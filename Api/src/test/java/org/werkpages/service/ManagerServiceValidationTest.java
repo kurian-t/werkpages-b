@@ -1203,7 +1203,8 @@ class ManagerServiceValidationTest {
         Row editRow = mock(Row.class);
         when(editRow.getUUID("id")).thenReturn(editId);
         when(editRow.getOffsetDateTime("created_at")).thenReturn(createdAt);
-        when(editRepo.upsert(eq(MANAGER_ID), eq(USER_ID), any(), any(), any(), any(), any(), any(), any(), any()))
+        // 11-arg overload: the edit request now carries the picked company's ID.
+        when(editRepo.upsert(eq(MANAGER_ID), eq(USER_ID), any(), any(), any(), any(), any(), any(), any(), any(), any()))
             .thenReturn(Future.succeededFuture(editRow));
 
         JsonObject result = (JsonObject) await(

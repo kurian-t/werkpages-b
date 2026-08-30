@@ -1690,7 +1690,9 @@ public class ManagerService {
                         return managerRepo.findById(managerId)
                             .compose(mgrOpt -> {
                                 if (mgrOpt.isEmpty()) return Future.failedFuture(ServiceException.notFound("Manager not found"));
-                                return editRepo.upsert(managerId, userId, effectiveCompany, effectiveCompanyLogoUrl, effectiveTitle, effectiveStatus, effectiveCountry, effectiveLinkedinUrl, newStartDate, newEndDate)
+                                // The company the user picked travels with the request. The name
+                                // beside it is a snapshot for the admin to read, not identity.
+                                return editRepo.upsert(managerId, userId, effectiveCompany, body.getLong("companyId"), effectiveCompanyLogoUrl, effectiveTitle, effectiveStatus, effectiveCountry, effectiveLinkedinUrl, newStartDate, newEndDate)
                                     .map(row -> new JsonObject()
                                         .put("id", row.getUUID("id").toString())
                                         .put("managerId", managerId)
