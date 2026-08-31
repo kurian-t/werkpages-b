@@ -653,6 +653,51 @@ paths:
           description: Company not found
 
   /api/companies:
+    post:
+      operationId: createCompany
+      summary: Create a company, or return the existing one that name resolves to
+      description: >
+        The single place a company is brought into existence from a name. Every other write path
+        takes a company ID, so this is what a client calls when the user explicitly chooses to add
+        a company the picker did not offer. Returns the ID the caller then uses.
+
+
+        Idempotent by design: an existing company with the same normalised name is returned rather
+        than duplicated, so a double submit cannot create two.
+      tags:
+        - Managers
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - name
+              properties:
+                name:
+                  type: string
+      responses:
+        '200':
+          description: The company, existing or newly created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id:
+                    type: integer
+                    format: int64
+                  name:
+                    type: string
+                  created:
+                    type: boolean
+                    description: False when an existing company was returned.
+        '400':
+          description: Missing or invalid name
+        '401':
+          description: Unauthorized
+
     get:
       operationId: getCompanies
       summary: Get distinct company names (public)
@@ -896,20 +941,25 @@ paths:
           application/json:
             schema:
               type: object
+              # Only the name is required here. This endpoint captures a search somebody made and
+              # did not complete, so requiring every field rejected exactly the searches worth
+              # keeping: a name plus a company, or a name plus a job title. The service then
+              # requires the name and at least one of company or title - the line between "an
+              # admin can act on this" and "two strangers happen to share a name".
               required:
                 - name
-                - company
-                - title
-                - country
               properties:
                 name:
                   type: string
                 company:
                   type: string
+                  nullable: true
                 title:
                   type: string
+                  nullable: true
                 country:
                   type: string
+                  nullable: true
                 state:
                   type: string
                   nullable: true
@@ -1370,11 +1420,13 @@ paths:
           application/json:
             schema:
               type: object
+              # Only the ratings are required. This endpoint exists to capture a review somebody
+              # started and did not finish, so requiring the fields they had not reached yet threw
+              # away precisely the submissions it was built to keep: the router rejected the
+              # request with a 400 and the client swallowed it. The service already treats these
+              # as optional and reviews.worked_from is nullable, so partial captures store fine.
               required:
                 - ratings
-                - managerCompany
-                - managerTitle
-                - workedFrom
               properties:
                 author:
                   type: string
@@ -1384,10 +1436,13 @@ paths:
                   type: object
                 managerCompany:
                   type: string
+                  nullable: true
                 managerTitle:
                   type: string
+                  nullable: true
                 workedFrom:
                   type: string
+                  nullable: true
                 workedUntil:
                   type: string
                   nullable: true

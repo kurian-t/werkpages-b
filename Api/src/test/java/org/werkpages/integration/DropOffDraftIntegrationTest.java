@@ -343,6 +343,75 @@ class DropOffDraftIntegrationTest {
     }
 
     @Test
+    void createDropOffReview_ratingsButNoDates_isStillCaptured() throws Exception {
+        // The reported bug: someone rated a manager and left before saying when they worked with
+        // them. The rating was silently thrown away - the spec required the very fields they had
+        // not reached, and the client swallows the resulting error. Half a review is worth keeping.
+        long managerId = insertReviewableManager("Partial Corp", "Nina Partial");
+
+        JsonObject body = new JsonObject()
+            .put("overallRating", 4.5)
+            .put("ratings", new JsonObject().put("communication", 4).put("support", 5))
+            .put("managerCompany", "Partial Corp")
+            .put("managerTitle", "VP");
+        // No workedFrom, no workedUntil: the fields they never reached.
+        await(service.createDropOffReview(managerId, body, null));
+
+        var row = await(pool.preparedQuery(
+            "SELECT author, user_id, worked_from FROM reviews WHERE manager_id = $1")
+            .execute(Tuple.of(managerId)).map(rs -> rs.iterator().next()));
+        assertNull(row.getValue("worked_from"), "the date they never gave stays empty");
+        assertNull(row.getValue("user_id"), "captured anonymously");
+        assertNotNull(row.getString("author"), "a pseudonym stands in for the missing author");
+    }
+
+    @Test
+    void createDropOffReview_withoutCompanyOrTitle_isStillCaptured() throws Exception {
+        // Someone who rated before filling anything else in at all.
+        long managerId = insertReviewableManager("Bare Corp", "Otto Bare");
+
+        JsonObject body = new JsonObject()
+            .put("overallRating", 3.0)
+            .put("ratings", new JsonObject().put("communication", 3));
+        await(service.createDropOffReview(managerId, body, null));
+
+        long count = await(pool.preparedQuery(
+            "SELECT COUNT(*) FROM reviews WHERE manager_id = $1 AND user_id IS NULL")
+            .execute(Tuple.of(managerId)).map(rs -> rs.iterator().next().getLong(0)));
+        assertEquals(1L, count);
+    }
+
+    @Test
+    void submitReview_withoutDates_isStillRejected() throws Exception {
+        // The tolerance is scoped to capture. A real submission must still say when.
+        long managerId = insertReviewableManager("Strict Corp", "Pat Strict");
+
+        JsonObject body = reviewData()
+            .put("managerCompany", "Strict Corp")
+            .put("managerTitle", "VP");
+        body.remove("workedFrom");
+
+        assertThrows(Exception.class,
+            () -> await(service.createReview("auth0|nobody", managerId, body, null)),
+            "a completed review still requires the dates a capture may omit");
+    }
+
+    /** A manager that can receive reviews, with its company row, as production always creates. */
+    private long insertReviewableManager(String company, String managerName) throws Exception {
+        var companyRows = await(pool.preparedQuery(
+            "INSERT INTO companies (name, status, slug, created_at, updated_at) " +
+            "VALUES ($1, 'ghost', $2, now(), now()) RETURNING id")
+            .execute(Tuple.of(company, company.toLowerCase().replaceAll("[^a-z0-9]+", "-"))));
+        long companyId = companyRows.iterator().next().getLong("id");
+        var mgRows = await(pool.preparedQuery(
+            "INSERT INTO managers (name, company, title, status, approval_status, country, " +
+            "overall_rating, reviews_count, category_averages, company_id, created_at, updated_at) " +
+            "VALUES ($1, $2, 'VP', 'active', 'approved', 'United States', 0, 0, '{}'::jsonb, $3, now(), now()) RETURNING id")
+            .execute(Tuple.of(managerName, company, companyId)));
+        return mgRows.iterator().next().getLong("id");
+    }
+
+    @Test
     void createDropOffReview_withDraftToken_storesToken() throws Exception {
         var companyRows = await(pool.query(
             "INSERT INTO companies (name, status, created_at, updated_at) " +

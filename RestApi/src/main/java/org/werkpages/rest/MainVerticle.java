@@ -141,6 +141,7 @@ public class MainVerticle extends AbstractVerticle {
                         SitemapService sitemapService = new SitemapService(Database.getClient());
 
                         // ── Soft-delete restore job (runs daily) ──────────────────────────────
+                        final CompanyRepository companyRepoForWeights = companyRepo;
                         vertx.setPeriodic(86_400_000L, timerId -> {
                             reviewRepo.restoreExpiredDeletions()
                                 .onSuccess(n -> { if (n > 0) System.out.println("✓ Restored " + n + " anonymised review(s)"); })
@@ -148,6 +149,34 @@ public class MainVerticle extends AbstractVerticle {
                             interviewRepo.restoreExpiredDeletions()
                                 .onSuccess(n -> { if (n > 0) System.out.println("✓ Restored " + n + " anonymised interview review(s)"); })
                                 .onFailure(err -> System.err.println("⚠ Interview restore job failed: " + err.getMessage()));
+
+                            // ── Expired placeholder weights ───────────────────────────────
+                            //
+                            // A placeholder review stops counting 14 days after it is written, but
+                            // that happens because a date passes, not because anything writes. No
+                            // request fires, so nothing recalculated the manager, and the cached
+                            // rating and review count stayed at yesterday's numbers indefinitely
+                            // while the reviews list had already stopped showing those reviews.
+                            //
+                            // This closes that gap once a day. The query returns only managers
+                            // whose cached count actually disagrees with reality, so on a normal
+                            // day it finds nothing and does nothing.
+                            managerRepo.findManagersWithExpiredWeights()
+                                .compose(rows -> {
+                                    io.vertx.core.Future<Void> chain = io.vertx.core.Future.succeededFuture();
+                                    int stale = 0;
+                                    for (io.vertx.sqlclient.Row row : rows) {
+                                        long managerId = row.getLong("id");
+                                        stale++;
+                                        chain = chain
+                                            .compose(v -> managerRepo.recalculate(managerId))
+                                            .compose(v -> companyRepoForWeights.syncStatsForManager(managerId));
+                                    }
+                                    final int total = stale;
+                                    return chain.map(v -> total);
+                                })
+                                .onSuccess(n -> { if (n > 0) System.out.println("✓ Recalculated " + n + " manager(s) whose placeholder reviews expired"); })
+                                .onFailure(err -> System.err.println("⚠ Expired-weight recalculation failed: " + err.getMessage()));
                         });
 
                         // ── company_stats matview refresh (safety net — primary updates go through
@@ -215,6 +244,7 @@ public class MainVerticle extends AbstractVerticle {
                         routerFactory.addHandlerByOperationId("getIndustryInterviewAverages", interviewsHandler::handleGetIndustryInterviewAverages);
                         routerFactory.addHandlerByOperationId("getManagerBySlug",       managersHandler::handleGetManagerBySlug);
                         routerFactory.addHandlerByOperationId("getCompanies",           managersHandler::handleGetCompanies);
+                        routerFactory.addHandlerByOperationId("createCompany",           managersHandler::handleCreateCompany);
                         routerFactory.addHandlerByOperationId("suggestCompanies",       managersHandler::handleSuggestCompanies);
                         routerFactory.addHandlerByOperationId("getGeo",                 managersHandler::handleGetGeo);
                         routerFactory.addHandlerByOperationId("getSimilarManagers",     managersHandler::handleGetSimilarManagers);

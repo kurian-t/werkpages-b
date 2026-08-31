@@ -48,7 +48,7 @@ class GeoNullableValidationTest {
     /** Every operationId whose request body accepts geo state/city. */
     static final List<String> GEO_OPS = List.of(
         "findOrCreateManager", "createGhostManager", "captureAnonymousSearch",
-        "createDropOffDraft", "createManager");
+        "createDropOffDraft", "createManager", "createDropOffReview");
 
     @BeforeAll
     static void setUp() throws Exception {
@@ -175,5 +175,43 @@ class GeoNullableValidationTest {
             .put("city", 12345); // a number — neither string nor null
         assertEquals(400, post("/api/managers/find-or-create", body),
             "a non-string, non-null city must still 400 — nullable must not disable type checking");
+    }
+
+    // ── Partial review capture ────────────────────────────────────────────────
+    //
+    // Same class of bug as the geo fields above, and it cost real submissions. The drop-off
+    // review endpoint exists to keep a review somebody started and abandoned, but the spec listed
+    // managerCompany, managerTitle and workedFrom as required - the very fields an abandoned
+    // review has not reached. The router rejected those requests with a 400 before the handler
+    // saw them, and the client swallows the error, so the rating was lost in silence.
+
+    @Test
+    void dropOffReview_ratingsOnly_passesValidation() throws Exception {
+        // Someone rated the manager and closed the page before saying when they worked there.
+        JsonObject body = new JsonObject()
+            .put("ratings", new JsonObject().put("communication", 4).put("support", 5))
+            .put("overallRating", 4.5);
+        assertEquals(200, post("/api/managers/7/reviews/drop-off", body),
+            "a review with ratings but no dates is exactly what this endpoint is for");
+    }
+
+    @Test
+    void dropOffReview_nullCompanyTitleAndDates_passesValidation() throws Exception {
+        JsonObject body = new JsonObject()
+            .put("ratings", new JsonObject().put("communication", 4))
+            .put("managerCompany", (String) null)
+            .put("managerTitle", (String) null)
+            .put("workedFrom", (String) null)
+            .put("workedUntil", (String) null);
+        assertEquals(200, post("/api/managers/7/reviews/drop-off", body),
+            "explicit nulls must be accepted, not just omitted fields");
+    }
+
+    @Test
+    void dropOffReview_withoutRatings_isRejected() throws Exception {
+        // The negative control: a capture with no ratings holds nothing worth keeping, and this
+        // proves the validator is still switched on for this endpoint.
+        JsonObject body = new JsonObject().put("managerCompany", "Acme");
+        assertEquals(400, post("/api/managers/7/reviews/drop-off", body));
     }
 }

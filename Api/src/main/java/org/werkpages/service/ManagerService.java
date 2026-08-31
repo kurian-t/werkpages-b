@@ -459,6 +459,40 @@ public class ManagerService {
         return result;
     }
 
+    // ── POST create company ───────────────────────────────────────────────────
+
+    /**
+     * Brings a company into existence from a name, or returns the one that name already resolves to.
+     *
+     * The single sanctioned place that happens. Everything else in the write path takes an ID, so
+     * a caller that wants to add a company the picker did not offer comes here first and carries
+     * the returned ID onward. Keeping creation in one visible, deliberate step is what stops a
+     * company name quietly becoming a company as a side effect of some other operation.
+     *
+     * Idempotent, because the alternative is worse: a double-clicked submit or a retried request
+     * would otherwise create the second Crumbl this whole effort exists to prevent.
+     */
+    public Future<JsonObject> createCompany(String name) {
+        if (name == null || name.trim().length() < 2) {
+            return Future.failedFuture(ServiceException.badRequest("Company name must be at least 2 characters"));
+        }
+        String trimmed = name.trim();
+        return companyRepo.findByNormalizedName(trimmed).compose(existing -> {
+            if (existing.isPresent()) {
+                Row row = existing.get();
+                return Future.succeededFuture(new JsonObject()
+                    .put("id", row.getLong("id"))
+                    .put("name", row.getString("name"))
+                    .put("created", false));
+            }
+            return companyRepo.findOrCreate(trimmed, null, logoResolver.apply(trimmed))
+                .map(row -> new JsonObject()
+                    .put("id", row.getLong("id"))
+                    .put("name", row.getString("name"))
+                    .put("created", true));
+        });
+    }
+
     // ── GET company suggestions ───────────────────────────────────────────────
 
     /**
@@ -1055,11 +1089,35 @@ public class ManagerService {
         }
         final UUID fDraftToken = draftToken;
 
-        return validateAndInsertReview(body, managerId, null, fAuthor, resolvedLogoUrl, fDraftToken)
-            .mapEmpty();
+        // allowIncomplete: this is the capture path. Someone rated a manager and left before
+        // saying when they worked with them, and half a review is worth keeping.
+        //
+        // reviews.manager_company and manager_title are NOT NULL, and someone who stopped at the
+        // stars may not have reached either. Rather than relax a real constraint or invent an
+        // employer, fall back to what the manager record already says - the likeliest answer, and
+        // the same thing the page was showing the person as they rated.
+        return managerRepo.findById(managerId).compose(mgrOpt -> {
+            if (mgrOpt.isPresent()) {
+                Row mgr = mgrOpt.get();
+                if (isBlank(body.getString("managerCompany"))) body.put("managerCompany", mgr.getString("company"));
+                if (isBlank(body.getString("managerTitle")))   body.put("managerTitle",   mgr.getString("title"));
+            }
+            return validateAndInsertReview(body, managerId, null, fAuthor, resolvedLogoUrl, fDraftToken, true);
+        }).mapEmpty();
     }
 
     private Future<Row> validateAndInsertReview(JsonObject body, long managerId, UUID userId, String author, String resolvedLogoUrl, UUID draftToken) {
+        return validateAndInsertReview(body, managerId, userId, author, resolvedLogoUrl, draftToken, false);
+    }
+
+    /**
+     * @param allowIncomplete true only for drop-off capture, where the point is to keep what
+     *                        somebody had when they walked away. A real submission must still state
+     *                        when they worked with the manager; a capture cannot, because the
+     *                        person never reached that field. Requiring it there threw away exactly
+     *                        the submissions the capture exists to save.
+     */
+    private Future<Row> validateAndInsertReview(JsonObject body, long managerId, UUID userId, String author, String resolvedLogoUrl, UUID draftToken, boolean allowIncomplete) {
         Double overallRating      = body.getDouble("overallRating");
         JsonObject ratings        = body.getJsonObject("ratings");
         String managerCompany     = body.getString("managerCompany") != null ? body.getString("managerCompany").trim() : null;
@@ -1081,26 +1139,37 @@ public class ManagerService {
         }
 
         // ── User work date validation ─────────────────────────────────────────────
-        if (workedFrom == null) return Future.failedFuture(ServiceException.badRequest("Your start date working with this manager is required"));
-        if (workedFrom.isAfter(today)) return Future.failedFuture(ServiceException.badRequest("Your 'from' date cannot be in the future"));
+        if (workedFrom == null && !allowIncomplete) return Future.failedFuture(ServiceException.badRequest("Your start date working with this manager is required"));
+        if (workedFrom != null && workedFrom.isAfter(today)) return Future.failedFuture(ServiceException.badRequest("Your 'from' date cannot be in the future"));
         if (workedUntil != null && workedUntil.isAfter(today)) return Future.failedFuture(ServiceException.badRequest("Your 'to' date cannot be in the future"));
-        if (workedUntil != null && workedFrom.isAfter(workedUntil)) return Future.failedFuture(ServiceException.badRequest("Your 'from' date cannot be later than your 'to' date"));
+        if (workedFrom != null && workedUntil != null && workedFrom != null && workedFrom.isAfter(workedUntil)) return Future.failedFuture(ServiceException.badRequest("Your 'from' date cannot be later than your 'to' date"));
 
         // ── Cross-validation: user dates vs manager role period (only when provided) ─
         if (managerRoleStart != null) {
-            if (workedFrom.isBefore(managerRoleStart)) return Future.failedFuture(ServiceException.badRequest("Your start date cannot be before the manager started this role (" + formatYM(managerRoleStart) + ")"));
-            if (managerRoleEnd != null && workedFrom.isAfter(managerRoleEnd)) return Future.failedFuture(ServiceException.badRequest("Your start date cannot be after the manager left this role (" + formatYM(managerRoleEnd) + ")"));
+            if (workedFrom != null && workedFrom.isBefore(managerRoleStart)) return Future.failedFuture(ServiceException.badRequest("Your start date cannot be before the manager started this role (" + formatYM(managerRoleStart) + ")"));
+            if (managerRoleEnd != null && workedFrom != null && workedFrom.isAfter(managerRoleEnd)) return Future.failedFuture(ServiceException.badRequest("Your start date cannot be after the manager left this role (" + formatYM(managerRoleEnd) + ")"));
             if (managerRoleEnd != null && workedUntil != null && workedUntil.isAfter(managerRoleEnd)) return Future.failedFuture(ServiceException.badRequest("Your end date cannot be after the manager left this role (" + formatYM(managerRoleEnd) + ")"));
         }
 
-        if (overallRating == null || ratings == null || isBlank(managerCompany) || isBlank(managerTitle)) return Future.failedFuture(ServiceException.badRequest("Missing required fields"));
-        if (managerCompany.length() < 2)   return Future.failedFuture(ServiceException.badRequest("Company name must be at least 2 characters"));
-        if (managerCompany.length() > 100) return Future.failedFuture(ServiceException.badRequest("Manager company must be at most 100 characters"));
-        if (managerTitle.length()   > 100) return Future.failedFuture(ServiceException.badRequest("Manager title must be at most 100 characters"));
+        // A capture keeps whatever the person had. The one thing it cannot do without is a rating:
+        // with no rating there is nothing to keep, and an empty row would just be noise for an
+        // admin to wade through. Company and title are frequently blank because the form asks for
+        // them after the stars.
+        if (allowIncomplete) {
+            if (ratings == null && overallRating == null) return Future.failedFuture(ServiceException.badRequest("Nothing to capture"));
+        } else if (overallRating == null || ratings == null || isBlank(managerCompany) || isBlank(managerTitle)) {
+            return Future.failedFuture(ServiceException.badRequest("Missing required fields"));
+        }
+        if (managerCompany != null && managerCompany.length() < 2 && !allowIncomplete)   return Future.failedFuture(ServiceException.badRequest("Company name must be at least 2 characters"));
+        if (managerCompany != null && managerCompany.length() > 100) return Future.failedFuture(ServiceException.badRequest("Manager company must be at most 100 characters"));
+        if (managerTitle != null && managerTitle.length()   > 100) return Future.failedFuture(ServiceException.badRequest("Manager title must be at most 100 characters"));
         if (text != null && text.length() > 2000) return Future.failedFuture(ServiceException.badRequest("Review text must be at most 2000 characters"));
-        if (!isValidRating(overallRating)) return Future.failedFuture(ServiceException.badRequest("Overall rating must be between 1 and 5"));
+        if (overallRating != null && !isValidRating(overallRating)) return Future.failedFuture(ServiceException.badRequest("Overall rating must be between 1 and 5"));
         for (int i = 0; i < RATING_KEYS.length; i++) {
             Double v = getRating(ratings, i);
+            // A capture keeps the categories the person got to and ignores the ones they did not.
+            // Anything they did rate still has to be a real rating.
+            if (allowIncomplete && !hasRating(ratings, i)) continue;
             if (!isValidRating(v)) return Future.failedFuture(ServiceException.badRequest("Rating for '" + RATING_KEYS[i] + "' must be between 1 and 5"));
         }
 
@@ -1129,9 +1198,11 @@ public class ManagerService {
                 }
 
                 // ── 2. Role duplicate: same normalised title+company under same manager ─
-                String normTitle   = managerTitle.trim().toLowerCase();
-                String normCompany = managerCompany.trim().toLowerCase();
-                boolean roleTaken = existing.stream()
+                // A capture may hold neither, because the form asks for them after the stars.
+                // With nothing to compare, there is no role to have already reviewed.
+                String normTitle   = managerTitle   != null ? managerTitle.trim().toLowerCase()   : null;
+                String normCompany = managerCompany != null ? managerCompany.trim().toLowerCase() : null;
+                boolean roleTaken = normTitle != null && normCompany != null && existing.stream()
                     .filter(r -> r.getLong("manager_id") == managerId)
                     .anyMatch(r -> {
                         String t = r.getString("manager_title");
@@ -1902,6 +1973,13 @@ public class ManagerService {
     }
 
     /** Returns the rating value, trying the pretty key first then the snake_case fallback. */
+    /** Whether the caller actually supplied this category, as opposed to leaving it out. */
+    private static boolean hasRating(JsonObject ratings, int index) {
+        if (ratings == null) return false;
+        return ratings.getValue(RATING_KEYS[index]) != null
+            || ratings.getValue(RATING_KEYS_SNAKE[index]) != null;
+    }
+
     private static double getRating(JsonObject ratings, int index) {
         Double v = ratings.getDouble(RATING_KEYS[index]);
         if (v == null) v = ratings.getDouble(RATING_KEYS_SNAKE[index]);
@@ -2178,33 +2256,46 @@ public class ManagerService {
         String title   = body.getString("title")   != null ? body.getString("title").trim()   : null;
         String country = body.getString("country") != null ? body.getString("country").trim() : null;
         String state   = body.getString("state")   != null ? body.getString("state").trim()   : null;
-        if (isBlank(name) || isBlank(company) || isBlank(title) || isBlank(country))
+        // A name plus at least one identifying detail. Requiring all four threw away the searches
+        // most worth keeping: someone who typed a name and a company, or a name and a job title,
+        // was rejected outright. A bare first and last name is not worth an admin's time - there is
+        // nothing to tell two people of that name apart - so that one is still declined.
+        //
+        // Country comes from geolocation rather than the person, and is frequently absent, so it
+        // never counts as the identifying detail.
+        boolean hasDetail = !isBlank(company) || !isBlank(title);
+        if (isBlank(name) || !hasDetail)
             return Future.failedFuture(ServiceException.badRequest("Missing required fields"));
         if (name.length()    > 100) return Future.failedFuture(ServiceException.badRequest("Name too long"));
-        if (company.length() > 100) return Future.failedFuture(ServiceException.badRequest("Company too long"));
-        if (title.length()   > 100) return Future.failedFuture(ServiceException.badRequest("Title too long"));
-        if (country.length() > 100) return Future.failedFuture(ServiceException.badRequest("Country too long"));
+        if (company != null && company.length() > 100) return Future.failedFuture(ServiceException.badRequest("Company too long"));
+        if (title   != null && title.length()   > 100) return Future.failedFuture(ServiceException.badRequest("Title too long"));
+        if (country != null && country.length() > 100) return Future.failedFuture(ServiceException.badRequest("Country too long"));
         if (isBlank(state)) state = null;
         if (state != null && state.length() > 100) return Future.failedFuture(ServiceException.badRequest("State too long"));
 
         String[] nameParts = name.trim().split("\\s+", 2);
         String firstName = nameParts[0];
         String lastName  = nameParts.length > 1 ? nameParts[1] : "";
+        // Partial: the name is held to the full standard, the fields they did not reach are not.
         NameValidator.ValidationResult nameValidation =
-            NameValidator.validate(firstName, lastName, title, company, country);
+            NameValidator.validatePartial(firstName, lastName, title, company, country);
         if (!nameValidation.valid())
             return Future.failedFuture(ServiceException.badRequest(nameValidation.reason()));
 
         final String fState = state;
+        // managers.company and managers.title are NOT NULL, and a partial capture may hold only
+        // one of them. Empty rather than invented: these rows land in the admin queue as
+        // pending_approval and are never public, so a blank is a visible gap for the admin to
+        // fill rather than a wrong answer presented as fact.
+        final String fCompany = company != null ? company : "";
+        final String fTitle   = title   != null ? title   : "";
 
         // If an approved/ghost manager already exists, skip — it's already visible.
         // If it's already pending (from a prior anonymous capture), skip — don't duplicate.
-        return managerRepo.findByNameAndCompany(name, company)
+        return managerRepo.findByNameAndCompany(name, fCompany)
             .compose(rows -> {
                 if (rows.iterator().hasNext()) return Future.<Void>succeededFuture(); // already exists
-                final String fCompany = company;
-                final String fTitle   = title;
-                return companyRepo.resolve(body.getLong("companyId"), company, null, resolvedLogoUrl)
+                return companyRepo.resolve(body.getLong("companyId"), fCompany, null, resolvedLogoUrl)
                     .compose(companyRow -> managerRepo.createPending(
                         name, fCompany, fTitle, "active", country, fState, resolvedLogoUrl, companyRow.getLong("id")))
                     .mapEmpty();

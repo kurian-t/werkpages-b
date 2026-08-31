@@ -101,6 +101,21 @@ public class CompanyRepository {
     }
 
     /**
+     * Looks a company up by name without creating one. Used by the explicit creation endpoint to
+     * tell "this already exists" from "this is new", which is the difference between returning an
+     * ID and minting one.
+     *
+     * Matches on the normalised form, so "Acme, Inc." finds "Acme" rather than adding a near-twin.
+     * Distinct from findByName, which matches the raw name exactly and would miss that.
+     */
+    public Future<Optional<Row>> findByNormalizedName(String name) {
+        return db.preparedQuery(
+                "SELECT * FROM companies WHERE normalized_name = normalize_company_name($1) LIMIT 1")
+            .execute(Tuple.of(name))
+            .map(rows -> rows.iterator().hasNext() ? Optional.of(rows.iterator().next()) : Optional.empty());
+    }
+
+    /**
      * Resolves a company the caller has already identified, or falls back to resolving by name.
      *
      * This is the write path's entry point now that the picker returns IDs. When an ID is supplied

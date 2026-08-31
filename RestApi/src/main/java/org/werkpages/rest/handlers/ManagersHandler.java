@@ -235,6 +235,27 @@ public class ManagersHandler {
 
     // ── GET /api/companies/suggest ────────────────────────────────────────────
 
+    /**
+     * POST /api/companies - the only route that turns a company name into a company.
+     *
+     * Exists so that every other write path can take an ID and nothing else. A client that lets
+     * someone add a company the picker did not offer calls this first, gets an ID back, and sends
+     * the ID onward. That is what makes "the name is display text, the ID is identity" enforceable
+     * rather than merely intended.
+     */
+    public void handleCreateCompany(RoutingContext ctx) {
+        JsonObject body = ctx.getBodyAsJson();
+        if (body == null) { respond(ctx, 400, new JsonObject().put("message", "Request body required")); return; }
+        String name = bodyStr(body, "name");
+
+        // Authenticated: creating a company is a write, and an anonymous caller could otherwise
+        // fill the directory with names nobody chose.
+        AuthTokenUtils.verifiedAuth0Id(ctx, jwtAuth)
+            .compose(auth0Id -> service.createCompany(name))
+            .onSuccess(json -> respond(ctx, 200, json))
+            .onFailure(err -> handleError(ctx, err));
+    }
+
     public void handleSuggestCompanies(RoutingContext ctx) {
         String query = ctx.queryParam("query").stream().findFirst().orElse("").trim();
         if (query.isBlank()) {

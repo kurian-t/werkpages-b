@@ -66,6 +66,26 @@ public class NameValidator {
     }
 
     /**
+     * Name rules in full, optional fields checked only when they are present.
+     *
+     * For capturing a partial search. Someone who typed a name and a company but no job title has
+     * still told us something an admin can act on, and {@link #validate} would reject them for the
+     * field they did not fill. The name itself is held to exactly the same standard - a capture is
+     * still a manager record, so the rules that keep junk out of the directory all apply.
+     */
+    public static ValidationResult validatePartial(String firstName, String lastName,
+                                                   String title, String company, String country) {
+        ValidationResult r;
+        if ((r = validateNamePart(firstName, "First name")).valid == false) return r;
+        if ((r = validateNamePart(lastName,  "Last name")).valid  == false) return r;
+        if (title   != null && !title.isBlank()   && (r = validateField(title,   "Title",   100)).valid == false) return r;
+        if (company != null && !company.isBlank() && (r = validateField(company, "Company", 100)).valid == false) return r;
+        if (country != null && !country.isBlank() && (r = validateField(country, "Country", 100)).valid == false) return r;
+
+        return validateNameContent(firstName, lastName);
+    }
+
+    /**
      * Name-only validation, for callers that submit a single "First Last" name and validate the
      * other fields themselves (e.g. the add-manager form). Applies exactly the same name rules as
      * {@link #validate} — every path that creates a manager must go through one of the two.

@@ -26,6 +26,7 @@ import org.testcontainers.containers.PostgreSQLContainer;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
 
+import java.math.BigDecimal;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 
@@ -255,6 +256,89 @@ class GhostSeedDeletionIntegrationTest {
             .put("status",    "active")
             .put("startDate", "2020-01")
             .put("review",    review);
+    }
+
+    // ── Expired placeholder weights stop counting ─────────────────────────────
+
+    @Test
+    void recalculate_stopsCountingAPlaceholderWhoseWeightHasExpired() throws Exception {
+        // The reported bug: the review vanishes from the list on day 14, but the count on the card
+        // never moves. The list query filtered expired placeholders; the cached count did not.
+        long managerId = insertManagerWithExpiredSeed("Expiry Corp", "Vera Expired");
+
+        await(managerRepo.recalculate(managerId));
+
+        Integer cached = await(pool.preparedQuery("SELECT reviews_count FROM managers WHERE id = $1")
+            .execute(Tuple.of(managerId))
+            .map(rs -> rs.iterator().next().getInteger("reviews_count")));
+        assertEquals(0, cached, "an expired placeholder must stop counting toward the cached total");
+
+        BigDecimal rating = await(pool.preparedQuery("SELECT overall_rating FROM managers WHERE id = $1")
+            .execute(Tuple.of(managerId))
+            .map(rs -> rs.iterator().next().getBigDecimal("overall_rating")));
+        assertNull(rating, "and the rating it produced goes with it");
+    }
+
+    @Test
+    void recalculate_keepsAPlaceholderThatHasNotExpiredYet() throws Exception {
+        long managerId = insertManagerWithSeed("Fresh Corp", "Frank Fresh", "now() + INTERVAL '14 days'");
+
+        await(managerRepo.recalculate(managerId));
+
+        Integer cached = await(pool.preparedQuery("SELECT reviews_count FROM managers WHERE id = $1")
+            .execute(Tuple.of(managerId))
+            .map(rs -> rs.iterator().next().getInteger("reviews_count")));
+        assertEquals(1, cached, "a placeholder inside its 14 days still counts");
+    }
+
+    @Test
+    void findManagersWithExpiredWeights_returnsOnlyTheStaleOnes() throws Exception {
+        // What the daily job iterates. It must find the manager whose cached count is now wrong,
+        // and must not keep returning one it has already fixed, or the job never goes quiet.
+        long stale = insertManagerWithExpiredSeed("Stale Corp", "Sam Stale");
+        long fresh = insertManagerWithSeed("Current Corp", "Cara Current", "now() + INTERVAL '14 days'");
+
+        var before = await(managerRepo.findManagersWithExpiredWeights());
+        java.util.Set<Long> ids = new java.util.HashSet<>();
+        before.forEach(r -> ids.add(r.getLong("id")));
+        assertTrue(ids.contains(stale), "the manager with an expired placeholder is stale");
+        assertFalse(ids.contains(fresh), "one still inside its window is not");
+
+        await(managerRepo.recalculate(stale));
+
+        var after = await(managerRepo.findManagersWithExpiredWeights());
+        java.util.Set<Long> afterIds = new java.util.HashSet<>();
+        after.forEach(r -> afterIds.add(r.getLong("id")));
+        assertFalse(afterIds.contains(stale), "once recalculated it must stop being reported");
+    }
+
+    private long insertManagerWithExpiredSeed(String company, String managerName) throws Exception {
+        return insertManagerWithSeed(company, managerName, "now() - INTERVAL '1 day'");
+    }
+
+    /** A manager carrying one weighted placeholder review whose expiry is the given SQL expression. */
+    private long insertManagerWithSeed(String company, String managerName, String expiresSql) throws Exception {
+        long companyId = await(pool.preparedQuery(
+                "INSERT INTO companies(name,status,slug) VALUES ($1,'ghost',$2) ON CONFLICT DO NOTHING RETURNING id")
+            .execute(Tuple.of(company, company.toLowerCase().replaceAll("[^a-z0-9]+", "-")))
+            .compose(rs -> rs.iterator().hasNext()
+                ? Future.succeededFuture(rs.iterator().next().getLong("id"))
+                : pool.preparedQuery("SELECT id FROM companies WHERE LOWER(TRIM(name)) = LOWER(TRIM($1))")
+                      .execute(Tuple.of(company)).map(r2 -> r2.iterator().next().getLong("id"))));
+
+        long managerId = await(pool.preparedQuery(
+                "INSERT INTO managers(name, company, company_id, title, image, status, approval_status, " +
+                "overall_rating, reviews_count, category_averages) " +
+                "VALUES ($1,$2,$3,'VP','img','active','approved',4.0,1,'{}') RETURNING id")
+            .execute(Tuple.of(managerName, company, companyId))
+            .map(rs -> rs.iterator().next().getLong("id")));
+
+        await(pool.preparedQuery(
+                "INSERT INTO reviews(manager_id, author, overall_rating, manager_company, manager_title, " +
+                "worked_from, weight, weight_expires_on, created_at) " +
+                "VALUES ($1,'Placeholder',4.0,$2,'VP',CURRENT_DATE - 30, TRUE, " + expiresSql + ", now())")
+            .execute(Tuple.of(managerId, company)).mapEmpty());
+        return managerId;
     }
 
     private static <T> T await(Future<T> future) throws Exception {

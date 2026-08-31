@@ -628,6 +628,68 @@ public class ManagerServiceCoverage6IntegrationTest {
         assertNotNull(result);
     }
 
+    // ── captureAnonymousSearch — partial searches reach the admin queue ────────
+    //
+    // The endpoint required name AND company AND title AND country, so a search with a name and a
+    // company, or a name and a job title, was rejected outright - the searches most worth an
+    // admin's attention were the ones being thrown away.
+
+    @Test
+    void captureAnonymousSearch_nameAndCompanyOnly_isCaptured() throws Exception {
+        JsonObject body = new JsonObject()
+            .put("name", "Nadia Partial").put("company", "PartialCo Holdings");
+        await(service.captureAnonymousSearch(body, null));
+
+        Long count = await(pool.preparedQuery(
+                "SELECT COUNT(*) AS c FROM managers WHERE name = $1 AND approval_status = 'pending_approval'")
+            .execute(Tuple.of("Nadia Partial"))
+            .map(rs -> rs.iterator().next().getLong("c")));
+        assertEquals(1L, count, "a name plus a company is a lead an admin can act on");
+    }
+
+    @Test
+    void captureAnonymousSearch_nameAndTitleOnly_isCaptured() throws Exception {
+        JsonObject body = new JsonObject()
+            .put("name", "Owen Titleonly").put("title", "Head of Engineering");
+        await(service.captureAnonymousSearch(body, null));
+
+        Long count = await(pool.preparedQuery(
+                "SELECT COUNT(*) AS c FROM managers WHERE name = $1 AND approval_status = 'pending_approval'")
+            .execute(Tuple.of("Owen Titleonly"))
+            .map(rs -> rs.iterator().next().getLong("c")));
+        assertEquals(1L, count, "a name plus a job title is also actionable");
+    }
+
+    @Test
+    void captureAnonymousSearch_bareNameOnly_isDeclined() throws Exception {
+        // Deliberately still refused. Two strangers share a name and there is nothing to tell
+        // them apart, so this would be noise in the queue rather than a lead.
+        JsonObject body = new JsonObject().put("name", "Sam Nameonly");
+
+        assertThrows(Exception.class, () -> await(service.captureAnonymousSearch(body, null)));
+
+        Long count = await(pool.preparedQuery(
+                "SELECT COUNT(*) AS c FROM managers WHERE name = $1")
+            .execute(Tuple.of("Sam Nameonly"))
+            .map(rs -> rs.iterator().next().getLong("c")));
+        assertEquals(0L, count, "and nothing is written on the way out");
+    }
+
+    @Test
+    void captureAnonymousSearch_missingCountry_isStillCaptured() throws Exception {
+        // Country comes from geolocation, not from the person, and is frequently absent. It must
+        // never be the reason a real lead is dropped.
+        JsonObject body = new JsonObject()
+            .put("name", "Gina Nogeo").put("company", "NogeoCo").put("title", "Director");
+        await(service.captureAnonymousSearch(body, null));
+
+        Long count = await(pool.preparedQuery(
+                "SELECT COUNT(*) AS c FROM managers WHERE name = $1 AND approval_status = 'pending_approval'")
+            .execute(Tuple.of("Gina Nogeo"))
+            .map(rs -> rs.iterator().next().getLong("c")));
+        assertEquals(1L, count);
+    }
+
     // ── captureAnonymousSearch — additional branches ──────────────────────────
 
     @Test

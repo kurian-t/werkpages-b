@@ -451,6 +451,39 @@ public class ManagerRepository {
 
     // ── Stats recalculation ───────────────────────────────────────────────────
 
+    /**
+     * Managers whose cached stats are stale because a placeholder review's weight has expired.
+     *
+     * Expiry is a date passing, not a write, so nothing in the request path ever fires for it. A
+     * manager rated only by an expired placeholder would otherwise keep showing that rating and
+     * that review count forever, while the reviews list beneath it showed nothing - until some
+     * unrelated write happened to recalculate them.
+     *
+     * Compares the cached count against what the count should be, so a manager is returned only
+     * while it is actually wrong, and the job goes quiet once it has caught up.
+     */
+    public Future<RowSet<Row>> findManagersWithExpiredWeights() {
+        return db.query("""
+                SELECT m.id
+                FROM managers m
+                WHERE EXISTS (
+                    SELECT 1 FROM reviews r
+                    WHERE r.manager_id = m.id
+                      AND r.deleted_at IS NULL
+                      AND r.weight = TRUE
+                      AND r.weight_expires_on IS NOT NULL
+                      AND r.weight_expires_on <= CURRENT_DATE
+                )
+                AND m.reviews_count <> (
+                    SELECT COUNT(*) FROM reviews r2
+                    WHERE r2.manager_id = m.id
+                      AND r2.deleted_at IS NULL
+                      AND (r2.weight = FALSE OR r2.weight_expires_on IS NULL OR r2.weight_expires_on > CURRENT_DATE)
+                )
+                """)
+            .execute();
+    }
+
     /** Fire-and-forget: recalculates and persists rating stats without blocking. */
     public void recalculateInBackground(long managerId) {
         recalculate(managerId).onFailure(err ->
@@ -473,7 +506,14 @@ public class ManagerRepository {
                 ROUND(AVG(delegation_style)::NUMERIC, 1) AS delegation_style,
                 ROUND(AVG(perceived_professional_demeanor)::NUMERIC, 1) AS perceived_professional_demeanor,
                 ROUND(AVG(overall_working_experience)::NUMERIC, 1) AS overall_working_experience
-            FROM reviews WHERE manager_id = $1 AND deleted_at IS NULL
+            FROM reviews
+            WHERE manager_id = $1
+              AND deleted_at IS NULL
+              -- Same filter the review list and count use. Without it the cached reviews_count and
+              -- overall_rating kept counting placeholder reviews whose 14-day weight had expired,
+              -- while the list below them had already stopped showing those reviews. The number on
+              -- the card and the reviews on the page were answering different questions.
+              AND (weight = FALSE OR weight_expires_on IS NULL OR weight_expires_on > CURRENT_DATE)
             """;
 
         return db.preparedQuery(recalcSql)
@@ -709,7 +749,14 @@ public class ManagerRepository {
                             $7,$8,$9,now(),now())
                     RETURNING *
                     """)
-                .execute(Tuple.of(name, company.trim(), title.trim(), status, country.trim(), state, logoUrl, companyId, slug))
+                // Null-safe: a captured partial search may carry no country (geolocation failed)
+                // and no title, and those absences must not cost us the record.
+                .execute(Tuple.of(name,
+                                  company != null ? company.trim() : "",
+                                  title   != null ? title.trim()   : "",
+                                  status,
+                                  country != null ? country.trim() : "",
+                                  state, logoUrl, companyId, slug))
                 .map(rows -> rows.iterator().next()));
     }
 
