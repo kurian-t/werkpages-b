@@ -1049,11 +1049,34 @@ public class CompanyRepository {
                             .execute(Tuple.of(mergeId)))
 
                         // Review snapshots on the moved managers show the surviving name.
+                        //
+                        // Scoped to the managers this merge actually moved, read from the manifest,
+                        // rather than to everyone currently sitting at the target. The difference
+                        // matters twice over. A manager who was already at the survivor never had
+                        // anything to do with the source, so rewriting their review history is
+                        // simply false - the review really was written about them under the name it
+                        // records. And reviews.manager_company is not decoration: findManagersByCompanyId
+                        // matches on it, so an over-broad rewrite drags unrelated managers onto the
+                        // surviving company's page and there is no way back.
+                        //
+                        // Recorded per review, because that is the only way an undo can restore a
+                        // name it did not choose.
                         .compose(v -> conn.preparedQuery("""
-                                UPDATE reviews SET manager_company = $1
-                                WHERE manager_id IN (SELECT id FROM managers WHERE company_id = $2)
+                                INSERT INTO company_merge_records (merge_id, entity_type, record_id, old_company_id, new_company_id, old_company_text)
+                                SELECT $1, 'review', r.id::TEXT, $3, $2, r.manager_company
+                                FROM reviews r
+                                JOIN company_merge_records rec
+                                  ON rec.merge_id = $1 AND rec.entity_type = 'manager'
+                                 AND r.manager_id = rec.record_id::BIGINT
                                 """)
-                            .execute(Tuple.of(keepName, keepId)))
+                            .execute(Tuple.of(mergeUuid, keepId, mergeId)))
+                        .compose(v -> conn.preparedQuery("""
+                                UPDATE reviews r SET manager_company = $2
+                                FROM company_merge_records rec
+                                WHERE rec.merge_id = $1 AND rec.entity_type = 'manager'
+                                  AND r.manager_id = rec.record_id::BIGINT
+                                """)
+                            .execute(Tuple.of(mergeUuid, keepName)))
                         .map(v -> mergeUuid)));
         });
     }
@@ -1145,6 +1168,20 @@ public class CompanyRepository {
                                 USING company_merge_records r
                                 WHERE r.merge_id = $1 AND r.entity_type = 'company_alias_added'
                                   AND a.id = r.record_id::BIGINT
+                                """)
+                            .execute(Tuple.of(mergeRecordId)))
+
+                        // Review snapshots get their original company name back, per review, from
+                        // the manifest. Without this an undo leaves every review of the restored
+                        // company's managers still naming the survivor - and because that column
+                        // is one of the things findManagersByCompanyId matches on, those managers
+                        // would keep appearing on the survivor's page forever.
+                        .compose(v -> conn.preparedQuery("""
+                                UPDATE reviews r SET manager_company = rec.old_company_text
+                                FROM company_merge_records rec
+                                WHERE rec.merge_id = $1 AND rec.entity_type = 'review'
+                                  AND r.id = rec.record_id::UUID
+                                  AND rec.old_company_text IS NOT NULL
                                 """)
                             .execute(Tuple.of(mergeRecordId)))
 

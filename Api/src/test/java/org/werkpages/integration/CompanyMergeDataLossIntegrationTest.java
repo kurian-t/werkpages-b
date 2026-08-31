@@ -486,6 +486,49 @@ class CompanyMergeDataLossIntegrationTest {
         assertEquals(1L, stillThere, "the restored company kept the alias it arrived with");
     }
 
+    // ── review snapshots ──────────────────────────────────────────────────────
+    //
+    // reviews.manager_company is a snapshot of the company a review was written about, and
+    // findManagersByCompanyId matches on it - so it decides which managers appear on a company
+    // page, not just what the page prints.
+
+    @Test
+    void aMergeDoesNotRewriteReviewsOfManagersItDidNotMove() throws Exception {
+        // The survivor's own manager was never part of this merge. Their review really was written
+        // under the name it records, and a merge of some other company does not change that.
+        long keep  = insertCompany("Snapshot Keep");
+        long merge = insertCompany("Snapshot Gone");
+        long settled = insertManager("Already Here", "Snapshot Keep", keep);
+        long moved   = insertManager("Coming Over", "Snapshot Gone", merge);
+        insertReview(settled, "An Older Name");
+        insertReview(moved, "Snapshot Gone");
+
+        await(companyRepo.mergeCompanies(keep, merge, adminId));
+
+        assertEquals("An Older Name", reviewCompany(settled),
+            "a manager who was already here kept their own review history");
+        assertEquals("Snapshot Keep", reviewCompany(moved),
+            "the manager who actually moved shows the surviving name");
+    }
+
+    @Test
+    void undoRestoresReviewSnapshots() throws Exception {
+        // Without this the restored company's managers keep naming the survivor in their reviews,
+        // and go on appearing on the survivor's page for good.
+        long keep  = insertCompany("Restore Keep");
+        long merge = insertCompany("Restore Gone");
+        long moved = insertManager("Goes Back", "Restore Gone", merge);
+        insertReview(moved, "Restore Gone");
+
+        UUID mergeUuid = await(companyRepo.mergeCompanies(keep, merge, adminId));
+        assertEquals("Restore Keep", reviewCompany(moved), "rewritten by the merge");
+
+        await(companyRepo.undoMerge(mergeUuid));
+
+        assertEquals("Restore Gone", reviewCompany(moved),
+            "the review names the company it was actually written about again");
+    }
+
     // ── fixtures ──────────────────────────────────────────────────────────────
 
     private long insertCompany(String name) throws Exception {
@@ -516,6 +559,19 @@ class CompanyMergeDataLossIntegrationTest {
                 "INSERT INTO interview_reviews(company_id,user_id,interview_year,overall_rating," +
                 "difficulty,outcome) VALUES ($1,$2,$3,4,3,'offer')")
             .execute(Tuple.of(companyId, userId, year)).mapEmpty());
+    }
+
+    private void insertReview(long managerId, String company) throws Exception {
+        await(pool.preparedQuery("""
+                INSERT INTO reviews(manager_id,user_id,author,overall_rating,manager_company,manager_title,weight)
+                VALUES ($1,NULL,'Anon',3.0,$2,'Manager',FALSE)
+                """)
+            .execute(Tuple.of(managerId, company)).mapEmpty());
+    }
+
+    private String reviewCompany(long managerId) throws Exception {
+        return await(pool.preparedQuery("SELECT manager_company FROM reviews WHERE manager_id = $1 LIMIT 1")
+            .execute(Tuple.of(managerId)).map(rs -> rs.iterator().next().getString("manager_company")));
     }
 
     private static <T> T await(Future<T> f) throws Exception {
