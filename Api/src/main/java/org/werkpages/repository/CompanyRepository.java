@@ -694,6 +694,52 @@ public class CompanyRepository {
     }
 
     /**
+     * Management across a whole corporate group: the company plus everything beneath it.
+     *
+     * A second, separate figure - never a replacement for the company's own. Loblaw's rating means
+     * Loblaw's managers; the group rating means Loblaw's managers and Zehrs' and Shoppers'. Folding
+     * hundreds of store managers into a corporate average would flatter or damn either one for the
+     * wrong reason, so both numbers exist and both are labelled.
+     *
+     * The average is computed the same way as a single company's - an unweighted mean of manager
+     * ratings - specifically so the two numbers displayed side by side are comparable. Averaging
+     * the companies' averages instead would let a two-manager brand pull as hard as a
+     * two-hundred-manager one.
+     *
+     * Walks the tree, so a group three levels deep counts all of it. The depth cap mirrors the
+     * cycle trigger's: loops are already impossible, and this is the backstop that keeps a bug
+     * from becoming a hang.
+     */
+    public Future<Optional<Row>> findGroupStats(long parentId) {
+        return db.preparedQuery("""
+                WITH RECURSIVE tree AS (
+                    SELECT id, 0 AS depth FROM companies WHERE id = $1
+                    UNION ALL
+                    SELECT r.child_company_id, t.depth + 1
+                    FROM company_relationships r
+                    JOIN tree t ON r.parent_company_id = t.id
+                    WHERE t.depth < 10
+                )
+                -- Each manager belongs to exactly one company, and the tree holds each company
+                -- once, so no manager is counted twice and a plain SUM is correct.
+                SELECT COUNT(DISTINCT c.id)              AS company_count,
+                       COUNT(DISTINCT m.id)              AS manager_count,
+                       COALESCE(SUM(m.reviews_count), 0) AS total_reviews,
+                       ROUND(AVG(m.overall_rating) FILTER (
+                           WHERE m.overall_rating IS NOT NULL AND m.reviews_count > 0
+                       )::NUMERIC, 1)                    AS avg_rating
+                FROM tree
+                JOIN companies c ON c.id = tree.id AND c.status <> 'merged'
+                LEFT JOIN managers m
+                       ON m.company_id = c.id
+                      AND m.approval_status IN ('approved', 'ghost')
+                      AND (m.external_id IS NULL OR m.external_id NOT LIKE 'seed_%')
+                """)
+            .execute(Tuple.of(parentId))
+            .map(rows -> rows.iterator().hasNext() ? Optional.of(rows.iterator().next()) : Optional.empty());
+    }
+
+    /**
      * A read-only assessment of what merging {@code mergeId} into {@code keepId} would do.
      *
      * Runs before anything is written, so an admin sees the size of the operation and, more

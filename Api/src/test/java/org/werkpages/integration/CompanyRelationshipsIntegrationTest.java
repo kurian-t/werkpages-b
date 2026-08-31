@@ -200,6 +200,92 @@ class CompanyRelationshipsIntegrationTest {
         assertEquals(0L, children.iterator().next().getLong("manager_count"));
     }
 
+    // ── Group-wide figures (Phase 5) ──────────────────────────────────────────
+    //
+    // A second number, never a replacement. The company's own rating keeps meaning its own
+    // managers; the group rating is the whole tree, and both are labelled where they are shown.
+
+    @Test
+    void groupStatsCoverTheParentAndEveryCompanyBeneathIt() throws Exception {
+        long parent = insertCompany("Group Parent");
+        long childA = insertCompany("Group Child A");
+        long childB = insertCompany("Group Child B");
+        await(companyRepo.setCompanyParent(childA, parent, "BRAND_OF"));
+        await(companyRepo.setCompanyParent(childB, parent, "BRAND_OF"));
+
+        insertRatedManager("P One",  "Group Parent",  parent, 4.0, 2);
+        insertRatedManager("A One",  "Group Child A", childA, 2.0, 3);
+        insertRatedManager("B One",  "Group Child B", childB, 3.0, 5);
+
+        var stats = await(companyRepo.findGroupStats(parent));
+        assertTrue(stats.isPresent());
+        assertEquals(3L, stats.get().getLong("company_count"), "the parent counts as part of its own group");
+        assertEquals(3L, stats.get().getLong("manager_count"));
+        assertEquals(10L, stats.get().getLong("total_reviews"));
+        assertEquals(0, new java.math.BigDecimal("3.0").compareTo(stats.get().getBigDecimal("avg_rating")),
+            "an unweighted mean of manager ratings, the same way a single company's is computed, "
+            + "so the two numbers on screen are comparable");
+    }
+
+    @Test
+    void groupStatsReachThroughMultipleLevels() throws Exception {
+        // Loblaw -> Shoppers -> a brand beneath it. A group is not only its direct children.
+        long top    = insertCompany("Deep Top");
+        long middle = insertCompany("Deep Middle");
+        long bottom = insertCompany("Deep Bottom");
+        await(companyRepo.setCompanyParent(middle, top,    "SUBSIDIARY_OF"));
+        await(companyRepo.setCompanyParent(bottom, middle, "BRAND_OF"));
+        insertRatedManager("Deep One", "Deep Bottom", bottom, 5.0, 1);
+
+        var stats = await(companyRepo.findGroupStats(top));
+        assertEquals(3L, stats.get().getLong("company_count"));
+        assertEquals(1L, stats.get().getLong("manager_count"),
+            "a manager three levels down still belongs to the group");
+    }
+
+    @Test
+    void aChildsOwnFiguresAreUnaffectedByTheGroup() throws Exception {
+        // The distinction the whole feature rests on: being part of a group adds a number, it
+        // never changes the company's own.
+        long parent = insertCompany("Umbrella Parent");
+        long child  = insertCompany("Umbrella Child");
+        await(companyRepo.setCompanyParent(child, parent, "BRAND_OF"));
+        insertRatedManager("Parent Star", "Umbrella Parent", parent, 5.0, 4);
+        insertRatedManager("Child Poor",  "Umbrella Child",  child,  1.0, 2);
+
+        var childStats = await(companyRepo.findGroupStats(child));
+        assertEquals(1L, childStats.get().getLong("company_count"), "a leaf company's group is itself");
+        assertEquals(0, new java.math.BigDecimal("1.0").compareTo(childStats.get().getBigDecimal("avg_rating")),
+            "the child keeps its own rating; the parent's good score does not lift it");
+    }
+
+    @Test
+    void aMergedCompanyIsNotCountedInItsGroup() throws Exception {
+        long parent = insertCompany("Tidy Parent");
+        long live   = insertCompany("Tidy Live");
+        long gone   = insertCompany("Tidy Gone");
+        await(companyRepo.setCompanyParent(live, parent, "BRAND_OF"));
+        await(companyRepo.setCompanyParent(gone, parent, "BRAND_OF"));
+        insertRatedManager("Live One", "Tidy Live", live, 4.0, 1);
+
+        await(pool.preparedQuery("UPDATE companies SET status = 'merged' WHERE id = $1")
+            .execute(Tuple.of(gone)).mapEmpty());
+
+        var stats = await(companyRepo.findGroupStats(parent));
+        assertEquals(2L, stats.get().getLong("company_count"), "the retired company is not part of the group");
+    }
+
+    /** A manager with a rating and a review count, so group averages have something to average. */
+    private long insertRatedManager(String name, String company, long companyId,
+                                    double rating, int reviews) throws Exception {
+        return await(pool.preparedQuery(
+                "INSERT INTO managers(name,company,company_id,title,image,status,approval_status," +
+                "overall_rating,reviews_count,category_averages) " +
+                "VALUES ($1,$2,$3,'VP','img','active','approved',$4,$5,'{}') RETURNING id")
+            .execute(Tuple.of(name, company, companyId, java.math.BigDecimal.valueOf(rating), reviews))
+            .map(rs -> rs.iterator().next().getLong("id")));
+    }
+
     // ── fixtures ──────────────────────────────────────────────────────────────
 
     private long insertCompany(String name) throws Exception {

@@ -386,6 +386,24 @@ public class ManagerService {
                 if (!children.isEmpty()) profile.put("companiesInGroup", children);
                 return profile;
             }))
+            // The group figure is attached only when the company actually heads a group. For a
+            // company with no children it would be the company's own rating printed twice under a
+            // grander heading, which is noise dressed as insight.
+            .compose(withGroup -> withGroup.containsKey("companiesInGroup")
+                ? companyRepo.findGroupStats(companyId).map(statsOpt -> {
+                    statsOpt.ifPresent(s -> {
+                        Long managerCount = s.getLong("manager_count");
+                        if (managerCount != null && managerCount > 0) {
+                            withGroup.put("groupStats", new JsonObject()
+                                .put("companyCount", s.getLong("company_count"))
+                                .put("managerCount", managerCount)
+                                .put("totalReviews", s.getLong("total_reviews"))
+                                .put("avgRating",    s.getBigDecimal("avg_rating")));
+                        }
+                    });
+                    return withGroup;
+                })
+                : Future.succeededFuture(withGroup))
             .recover(err -> {
                 System.err.println("Corporate structure lookup failed for company " + companyId
                                    + ": " + err.getMessage());
