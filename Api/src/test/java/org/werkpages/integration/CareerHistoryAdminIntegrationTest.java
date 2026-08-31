@@ -327,6 +327,38 @@ class CareerHistoryAdminIntegrationTest {
         return auth0Id;
     }
 
+    @Test
+    void update_movingCompanyRepointsTheForeignKey() throws Exception {
+        // The bug this guards. The edit wrote the new company NAME and left company_id pointing at
+        // the old company, so the row said one thing and referenced another. Every query deciding
+        // which managers appear on a company page matches the id, not the text - so the manager
+        // stayed listed under the old company with nothing on screen explaining why, and editing
+        // them again did nothing either.
+        String adminAuth = insertUser("auth0|ch-admin-fk", "ChAdminFk", "admin");
+        long oldCo     = insertCompany("Loblaw Companies Limited");
+        long newCo     = insertCompany("Zehrs Markets");
+        long managerId = insertManager("Danielle", "Loblaw Companies Limited", "Assistant Store Manager");
+        long entryId   = insertCareerEntry(managerId, "Loblaw Companies Limited", "Assistant Store Manager", "2020");
+        await(pool.preparedQuery("UPDATE career_history SET company_id = $1 WHERE id = $2")
+            .execute(Tuple.of(oldCo, entryId)).mapEmpty());
+
+        await(service.adminUpdateCareerEntry(
+            adminAuth, managerId, entryId, "Zehrs Markets", "Assistant Store Manager", "2020", null));
+
+        Row row = await(pool.preparedQuery("SELECT company, company_id FROM career_history WHERE id = $1")
+            .execute(Tuple.of(entryId)).map(rs -> rs.iterator().next()));
+        assertEquals("Zehrs Markets", row.getString("company"));
+        assertNotEquals(oldCo, row.getLong("company_id"), "the entry no longer points at the old company");
+        assertEquals(newCo, row.getLong("company_id"),
+            "the id follows the name, or the manager keeps appearing under the old company");
+    }
+    private long insertCompany(String name) throws Exception {
+        return await(pool.preparedQuery(
+                "INSERT INTO companies(name,status,slug) VALUES ($1,'approved',$2) RETURNING id")
+            .execute(Tuple.of(name, name.toLowerCase().replaceAll("[^a-z0-9]+", "-")))
+            .map(rs -> rs.iterator().next().getLong("id")));
+    }
+
     private long insertManager(String name, String company, String title) throws Exception {
         return await(pool.preparedQuery("""
                 INSERT INTO managers(name,company,title,image,status,approval_status,

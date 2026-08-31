@@ -401,7 +401,7 @@ class ManagerRepositoryCoverageIntegrationTest {
         OffsetDateTime start = OffsetDateTime.of(2020, 1, 1, 0, 0, 0, 0, ZoneOffset.UTC);
         await(managerRepo.insertCareerEntry(managerId, "OldCorp", "OldTitle", start, null, null));
 
-        await(managerRepo.updateOpenCareerEntry(managerId, "UpdatedCorp", "UpdatedTitle"));
+        await(managerRepo.updateOpenCareerEntry(managerId, "UpdatedCorp", "UpdatedTitle", null));
 
         Row entry = await(pool
             .preparedQuery("SELECT company, title FROM career_history WHERE manager_id = $1 AND end_date IS NULL")
