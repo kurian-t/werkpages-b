@@ -723,7 +723,17 @@ public class AdminService {
                 } catch (Exception e) {
                     return Future.failedFuture(ServiceException.badRequest("Invalid date format"));
                 }
-                return managerRepo.updateCareerEntry(entryId, managerId, company.trim(), title.trim(), start, end);
+                // Resolve the company to an id so the entry's FK moves with its name. Without this
+                // an admin correcting the company on a career entry changes only the text, and the
+                // manager keeps appearing under the old company - which is decided by the id.
+                OffsetDateTime finalStart = start, finalEnd = end;
+                Future<Long> companyIdFuture = companyRepo != null
+                    ? companyRepo.resolve(null, company.trim(), null, null).map(row -> row.getLong("id"))
+                        .otherwise((Long) null)
+                    : Future.succeededFuture(null);
+                return companyIdFuture.compose(companyId ->
+                    managerRepo.updateCareerEntry(entryId, managerId, company.trim(), title.trim(),
+                                                  finalStart, finalEnd, companyId));
             })
             .map(count -> new JsonObject().put("success", true).put("updated", count));
     }

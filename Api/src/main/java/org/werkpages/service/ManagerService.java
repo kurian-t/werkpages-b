@@ -1051,7 +1051,7 @@ public class ManagerService {
                             if (oldStartLocal == null) {
                                 // No start date provided — treat as a spelling/typo correction.
                                 // Update the existing open career entry in place; don't fork a new segment.
-                                return managerRepo.updateOpenCareerEntry(managerId, effectiveCo, effectiveTit)
+                                return managerRepo.updateOpenCareerEntry(managerId, effectiveCo, effectiveTit, newCompanyId)
                                     .compose(v -> doUpdate(managerId, newCompany, newTitle, newImage, newBio, newStatus, newCountry, newLinkedinUrl, newLogoUrl, newCompanyId));
                             }
 

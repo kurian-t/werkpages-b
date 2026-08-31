@@ -422,14 +422,27 @@ public class ManagerRepository {
             .map(RowSet::rowCount);
     }
 
+    /**
+     * Edits one career entry.
+     *
+     * company_id moves with the company name. Leaving it behind produces a row that says one
+     * company and points at another - and since the queries that decide which managers appear on a
+     * company page match on the id, the display name is the half that does not count. A manager
+     * corrected onto a new company would keep showing up under the old one with no visible reason.
+     *
+     * COALESCE so a caller that could not resolve an id leaves the existing one alone rather than
+     * nulling it.
+     */
     public Future<Integer> updateCareerEntry(long entryId, long managerId, String company, String title,
-                                              OffsetDateTime startDate, OffsetDateTime endDate) {
+                                              OffsetDateTime startDate, OffsetDateTime endDate,
+                                              Long companyId) {
         return db.preparedQuery("""
                 UPDATE career_history
-                SET company = $3, title = $4, start_date = $5, end_date = $6, updated_at = now()
+                SET company = $3, title = $4, start_date = $5, end_date = $6,
+                    company_id = COALESCE($7::BIGINT, company_id), updated_at = now()
                 WHERE id = $1 AND manager_id = $2
                 """)
-            .execute(Tuple.of(entryId, managerId, company, title, startDate, endDate))
+            .execute(Tuple.of(entryId, managerId, company, title, startDate, endDate, companyId))
             .map(RowSet::rowCount);
     }
 
@@ -439,13 +452,20 @@ public class ManagerRepository {
             .map(RowSet::rowCount);
     }
 
-    /** Updates the open (current) career entry in place — used for typo/spelling corrections. */
-    public Future<Void> updateOpenCareerEntry(long managerId, String company, String title) {
+    /**
+     * Updates the open (current) career entry in place — used for typo/spelling corrections.
+     *
+     * Carries company_id for the same reason as updateCareerEntry above: the caller has already
+     * resolved the company and written it to the manager row, so leaving the history row pointing
+     * at the previous company makes the two disagree about the same fact.
+     */
+    public Future<Void> updateOpenCareerEntry(long managerId, String company, String title, Long companyId) {
         return db.preparedQuery("""
-                UPDATE career_history SET company = $2, title = $3
+                UPDATE career_history
+                SET company = $2, title = $3, company_id = COALESCE($4::BIGINT, company_id)
                 WHERE manager_id = $1 AND end_date IS NULL
                 """)
-            .execute(Tuple.of(managerId, company, title))
+            .execute(Tuple.of(managerId, company, title, companyId))
             .mapEmpty();
     }
 
