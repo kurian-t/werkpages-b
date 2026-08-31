@@ -529,6 +529,37 @@ class CompanyMergeDataLossIntegrationTest {
             "the review names the company it was actually written about again");
     }
 
+    @Test
+    void aMergedCompanysUrlStillLoadsItsPage() throws Exception {
+        // The promise the redirect table exists to keep, exercised end to end rather than by
+        // checking that a redirect row was written.
+        //
+        // The row was always written correctly. What broke was the shape of what came back:
+        // findRedirectTargetBySlug selected c.*, which carries no stats_logo_url - that is a
+        // computed alias, not a column - so the page built from it threw and every merged
+        // company's URL returned a 500. A test asserting the redirect row existed passed the
+        // whole time.
+        long keep  = insertCompany("Redirect Keep");
+        long merge = insertCompany("Redirect Gone");
+        insertManager("Someone There", "Redirect Gone", merge);
+
+        await(companyRepo.mergeCompanies(keep, merge, adminId));
+
+        var target = await(companyRepo.findRedirectTargetBySlug("redirect-gone"));
+        assertTrue(target.isPresent(), "the old slug still resolves");
+        assertEquals(keep, target.get().getLong("id"), "and it resolves to the survivor");
+        // Every column the company page reads must be present, not merely the ones a redirect
+        // needs. Reading an absent column is what threw.
+        assertDoesNotThrow(() -> {
+            target.get().getString("name");
+            target.get().getString("slug");
+            target.get().getString("industry");
+            target.get().getString("logo_url");
+            target.get().getString("status");
+            target.get().getString("stats_logo_url");
+        }, "the redirect row carries the same columns as a direct slug lookup");
+    }
+
     // ── fixtures ──────────────────────────────────────────────────────────────
 
     private long insertCompany(String name) throws Exception {

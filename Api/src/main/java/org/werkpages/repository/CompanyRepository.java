@@ -608,9 +608,18 @@ public class CompanyRepository {
      * 404, because it looks like the company simply has nothing.
      */
     public Future<Optional<Row>> findRedirectTargetBySlug(String oldSlug) {
+        // Same projection as findBySlug, deliberately. Callers use the two interchangeably - a
+        // company page takes whichever one answers - so a row from here has to carry every column
+        // a row from there does. This was SELECT c.*, which looks broader and is narrower: it has
+        // no stats_logo_url, that being a computed alias rather than a column on companies, so
+        // reading it threw and every merged company's URL returned a 500. The redirect existed and
+        // pointed at the right company; the row shape was what broke.
         return db.preparedQuery("""
-                SELECT c.* FROM company_redirects r
+                SELECT c.id, c.name, c.slug, c.logo_url, c.status, c.industry,
+                       cs.logo_url AS stats_logo_url
+                FROM company_redirects r
                 JOIN companies c ON c.id = r.company_id
+                LEFT JOIN company_stats_live cs ON cs.company_id = c.id
                 WHERE r.old_slug = $1 AND c.status <> 'merged'
                 """)
             .execute(Tuple.of(oldSlug))
