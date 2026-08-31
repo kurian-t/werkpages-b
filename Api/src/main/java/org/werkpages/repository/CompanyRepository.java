@@ -898,8 +898,19 @@ public class CompanyRepository {
                         // can name it and the reverse is a straight UPDATE.
                         //
                         // An alias the target already has cannot move onto it - the unique index
-                        // forbids two rows with the same normalised alias under one company - so
-                        // those are archived instead, recorded as such, and restored on undo.
+                        // forbids two rows with the same normalised alias under one company. Those
+                        // stay where they are, on the retired source, rather than being deleted.
+                        //
+                        // Leaving them is not laziness, it is the only version that survives an
+                        // undo. A deleted row cannot be updated back, so undo would have to
+                        // re-create it from the manifest - and the manifest does not carry the
+                        // alias text or its type, so what came back would not be what was lost.
+                        // A row left on a merged company is already invisible: every read filters
+                        // status <> 'merged'. It costs nothing while the merge stands and is
+                        // simply correct again the moment the source is restored.
+                        //
+                        // Recorded anyway, with no undo action attached, so the manifest still
+                        // explains what the merge decided about every alias it saw.
                         .compose(v -> conn.preparedQuery("""
                                 INSERT INTO company_merge_records (merge_id, entity_type, record_id, old_company_id, new_company_id, conflict_action)
                                 SELECT $1, 'company_alias', a.id::TEXT, $3, $2, 'archived_duplicate'
@@ -910,19 +921,20 @@ public class CompanyRepository {
                                 """)
                             .execute(Tuple.of(mergeUuid, keepId, mergeId)))
                         .compose(v -> conn.preparedQuery("""
-                                DELETE FROM company_aliases a
-                                WHERE a.company_id = $2
-                                  AND EXISTS (SELECT 1 FROM company_aliases t
-                                              WHERE t.company_id = $1 AND t.normalized_alias = a.normalized_alias)
-                                """)
-                            .execute(Tuple.of(keepId, mergeId)))
-                        .compose(v -> conn.preparedQuery("""
                                 INSERT INTO company_merge_records (merge_id, entity_type, record_id, old_company_id, new_company_id)
                                 SELECT $1, 'company_alias', a.id::TEXT, $3, $2
-                                FROM company_aliases a WHERE a.company_id = $3
+                                FROM company_aliases a
+                                WHERE a.company_id = $3
+                                  AND NOT EXISTS (SELECT 1 FROM company_aliases t
+                                                  WHERE t.company_id = $2 AND t.normalized_alias = a.normalized_alias)
                                 """)
                             .execute(Tuple.of(mergeUuid, keepId, mergeId)))
-                        .compose(v -> conn.preparedQuery("UPDATE company_aliases SET company_id = $1 WHERE company_id = $2")
+                        .compose(v -> conn.preparedQuery("""
+                                UPDATE company_aliases a SET company_id = $1
+                                WHERE a.company_id = $2
+                                  AND NOT EXISTS (SELECT 1 FROM company_aliases t
+                                                  WHERE t.company_id = $1 AND t.normalized_alias = a.normalized_alias)
+                                """)
                             .execute(Tuple.of(keepId, mergeId)))
 
                         // The source's own name, added to the target. Recorded separately because
@@ -943,6 +955,77 @@ public class CompanyRepository {
                                     .execute(Tuple.of(mergeUuid, String.valueOf(rs.iterator().next().getLong("id")), mergeId, keepId))
                                     .mapEmpty()
                                 : Future.succeededFuture()))
+
+                        // Corporate structure follows the survivor.
+                        //
+                        // Without this a merge quietly costs you a relationship: absorb "Zehrs
+                        // Markets" into "Zehrs" and the link saying it is part of Loblaw is left
+                        // pointing at a retired company, where every reader filters it out. Nothing
+                        // breaks and nothing complains - the group silently loses a member, and the
+                        // admin who set it up has to notice and redo it.
+                        //
+                        // Two directions, handled separately because they fail differently.
+                        //
+                        // First, who the source belongs to. This is blocked when the survivor
+                        // already has a parent of its own, which is the common case and not an
+                        // error: the survivor's own answer to "what is this part of?" wins, and one
+                        // parent per company is the point of the unique index.
+                        .compose(v -> conn.preparedQuery("""
+                                WITH RECURSIVE ds AS (
+                                    SELECT $2::BIGINT AS id, 0 AS depth
+                                    UNION ALL
+                                    SELECT r.child_company_id, d.depth + 1
+                                    FROM company_relationships r JOIN ds d ON r.parent_company_id = d.id
+                                    WHERE d.depth < 20
+                                )
+                                INSERT INTO company_merge_records (merge_id, entity_type, record_id, old_company_id, new_company_id)
+                                SELECT $1, 'company_relationship_child', r.id::TEXT, $3, $2
+                                FROM company_relationships r
+                                WHERE r.child_company_id = $3
+                                  AND NOT EXISTS (SELECT 1 FROM company_relationships k WHERE k.child_company_id = $2)
+                                  AND r.parent_company_id NOT IN (SELECT id FROM ds)
+                                """)
+                            .execute(Tuple.of(mergeUuid, keepId, mergeId)))
+                        .compose(v -> conn.preparedQuery("""
+                                UPDATE company_relationships r SET child_company_id = $2
+                                FROM company_merge_records rec
+                                WHERE rec.merge_id = $1 AND rec.entity_type = 'company_relationship_child'
+                                  AND r.id = rec.record_id::BIGINT
+                                """)
+                            .execute(Tuple.of(mergeUuid, keepId)))
+
+                        // Then what belongs to the source. Its children become the survivor's, one
+                        // row each, so a group keeps its members when one of its own companies is
+                        // absorbed. Evaluated after the step above, because that step may just have
+                        // given the survivor a parent and so changed what would close a loop.
+                        //
+                        // The NOT IN guards are cycle guards. The database rejects loops with a
+                        // trigger, but a trigger firing here would abort the whole merge over an
+                        // edge case, so the impossible rows are left behind instead of attempted.
+                        // A relationship left on a retired company is inert - every read filters
+                        // status <> 'merged' - and becomes live again if the merge is undone.
+                        .compose(v -> conn.preparedQuery("""
+                                WITH RECURSIVE anc AS (
+                                    SELECT $2::BIGINT AS id, 0 AS depth
+                                    UNION ALL
+                                    SELECT r.parent_company_id, a.depth + 1
+                                    FROM company_relationships r JOIN anc a ON r.child_company_id = a.id
+                                    WHERE a.depth < 20
+                                )
+                                INSERT INTO company_merge_records (merge_id, entity_type, record_id, old_company_id, new_company_id)
+                                SELECT $1, 'company_relationship_parent', r.id::TEXT, $3, $2
+                                FROM company_relationships r
+                                WHERE r.parent_company_id = $3
+                                  AND r.child_company_id NOT IN (SELECT id FROM anc)
+                                """)
+                            .execute(Tuple.of(mergeUuid, keepId, mergeId)))
+                        .compose(v -> conn.preparedQuery("""
+                                UPDATE company_relationships r SET parent_company_id = $2
+                                FROM company_merge_records rec
+                                WHERE rec.merge_id = $1 AND rec.entity_type = 'company_relationship_parent'
+                                  AND r.id = rec.record_id::BIGINT
+                                """)
+                            .execute(Tuple.of(mergeUuid, keepId)))
 
                         // The stats tables are keyed by company_id as a primary key, so their rows
                         // cannot be moved onto a target that already has one. Drop the source's and
@@ -1062,6 +1145,24 @@ public class CompanyRepository {
                                 USING company_merge_records r
                                 WHERE r.merge_id = $1 AND r.entity_type = 'company_alias_added'
                                   AND a.id = r.record_id::BIGINT
+                                """)
+                            .execute(Tuple.of(mergeRecordId)))
+
+                        // Corporate structure goes back the way it came. Only the rows the merge
+                        // actually moved are listed, so a parent link the survivor had before the
+                        // merge, or gained after it, stays exactly where it is.
+                        .compose(v -> conn.preparedQuery("""
+                                UPDATE company_relationships r SET child_company_id = rec.old_company_id
+                                FROM company_merge_records rec
+                                WHERE rec.merge_id = $1 AND rec.entity_type = 'company_relationship_child'
+                                  AND r.id = rec.record_id::BIGINT
+                                """)
+                            .execute(Tuple.of(mergeRecordId)))
+                        .compose(v -> conn.preparedQuery("""
+                                UPDATE company_relationships r SET parent_company_id = rec.old_company_id
+                                FROM company_merge_records rec
+                                WHERE rec.merge_id = $1 AND rec.entity_type = 'company_relationship_parent'
+                                  AND r.id = rec.record_id::BIGINT
                                 """)
                             .execute(Tuple.of(mergeRecordId)))
 

@@ -373,6 +373,119 @@ class CompanyMergeDataLossIntegrationTest {
         assertTrue(idsAfter.contains(merge), "selectable again once restored");
     }
 
+    // ── corporate structure survives a merge ──────────────────────────────────
+    //
+    // Merging a duplicate must not quietly cost you a relationship. These are the cases that come
+    // up cleaning real data: the same company entered four times, one of the copies being the one
+    // somebody already linked into a group.
+
+    @Test
+    void theSurvivorInheritsWhatTheSourceWasPartOf() throws Exception {
+        // "Zehrs Markets" is linked to Loblaw; it is then merged into "Zehrs". The link has to
+        // follow, or the group silently loses a member and nothing says so.
+        long loblaw = insertCompany("Structure Loblaw");
+        long keep   = insertCompany("Structure Zehrs");
+        long merge  = insertCompany("Structure Zehrs Markets");
+        await(companyRepo.setCompanyParent(merge, loblaw, "BRAND_OF"));
+
+        await(companyRepo.mergeCompanies(keep, merge, adminId));
+
+        var parent = await(companyRepo.findCompanyParent(keep));
+        assertTrue(parent.isPresent(), "the survivor inherited the group membership");
+        assertEquals(loblaw, parent.get().getLong("id"));
+    }
+
+    @Test
+    void theSurvivorInheritsWhatBelongedToTheSource() throws Exception {
+        // The other direction: the absorbed company was itself a parent.
+        long keep  = insertCompany("Parent Keep");
+        long merge = insertCompany("Parent Gone");
+        long child = insertCompany("Parent Child");
+        await(companyRepo.setCompanyParent(child, merge, "SUBSIDIARY_OF"));
+
+        await(companyRepo.mergeCompanies(keep, merge, adminId));
+
+        var children = await(companyRepo.findCompanyChildren(keep));
+        assertEquals(1, children.size(), "the child moved to the surviving parent");
+        assertEquals(child, children.iterator().next().getLong("id"));
+    }
+
+    @Test
+    void theSurvivorsOwnParentIsNotOverwritten() throws Exception {
+        // One parent per company. When both companies have one, the survivor's own answer wins -
+        // a merge tidies up a duplicate, it does not get to re-file the company that remains.
+        long keepParent  = insertCompany("Owner Keep");
+        long mergeParent = insertCompany("Owner Gone");
+        long keep  = insertCompany("Child Keep");
+        long merge = insertCompany("Child Gone");
+        await(companyRepo.setCompanyParent(keep, keepParent, "SUBSIDIARY_OF"));
+        await(companyRepo.setCompanyParent(merge, mergeParent, "SUBSIDIARY_OF"));
+
+        await(companyRepo.mergeCompanies(keep, merge, adminId));
+
+        var parent = await(companyRepo.findCompanyParent(keep));
+        assertTrue(parent.isPresent());
+        assertEquals(keepParent, parent.get().getLong("id"),
+            "the survivor kept its own parent rather than adopting the source's");
+    }
+
+    @Test
+    void undoPutsCorporateStructureBack() throws Exception {
+        long loblaw = insertCompany("Undo Loblaw");
+        long keep   = insertCompany("Undo Keep");
+        long merge  = insertCompany("Undo Gone");
+        await(companyRepo.setCompanyParent(merge, loblaw, "BRAND_OF"));
+
+        UUID mergeUuid = await(companyRepo.mergeCompanies(keep, merge, adminId));
+        assertTrue(await(companyRepo.findCompanyParent(keep)).isPresent(), "carried by the merge");
+
+        await(companyRepo.undoMerge(mergeUuid));
+
+        assertTrue(await(companyRepo.findCompanyParent(keep)).isEmpty(),
+            "the survivor gave the membership back");
+        var restored = await(companyRepo.findCompanyParent(merge));
+        assertTrue(restored.isPresent(), "the restored company is in the group again");
+        assertEquals(loblaw, restored.get().getLong("id"));
+    }
+
+    @Test
+    void mergingAParentIntoItsOwnChildDoesNotLoop() throws Exception {
+        // The pathological case. Absorbing a parent into its own child would make the child its
+        // own parent; the database would reject the loop and take the entire merge down with it.
+        // The merge is expected to succeed and simply leave that one relationship behind.
+        long child  = insertCompany("Loop Child");
+        long parent = insertCompany("Loop Parent");
+        await(companyRepo.setCompanyParent(child, parent, "SUBSIDIARY_OF"));
+
+        await(companyRepo.mergeCompanies(child, parent, adminId));
+
+        assertTrue(await(companyRepo.findCompanyParent(child)).isEmpty(),
+            "the survivor is not its own parent");
+        Long selfLoops = await(pool.preparedQuery(
+                "SELECT COUNT(*) AS c FROM company_relationships WHERE child_company_id = parent_company_id")
+            .execute().map(rs -> rs.iterator().next().getLong("c")));
+        assertEquals(0L, selfLoops, "no self-referencing relationship was written");
+    }
+
+    @Test
+    void anAliasTheSurvivorAlreadyHasIsNotDestroyed() throws Exception {
+        // Both companies answer to "Structure Twin". The duplicate cannot move onto the survivor,
+        // so it stays on the retired company - invisible while merged, intact for an undo.
+        long keep  = insertCompany("Alias Keep");
+        long merge = insertCompany("Alias Gone");
+        await(pool.preparedQuery(
+                "INSERT INTO company_aliases(company_id, alias, alias_type) VALUES ($1,$2,'TRADE_NAME'),($3,$2,'TRADE_NAME')")
+            .execute(Tuple.of(keep, "Structure Twin", merge)).mapEmpty());
+
+        UUID mergeUuid = await(companyRepo.mergeCompanies(keep, merge, adminId));
+        await(companyRepo.undoMerge(mergeUuid));
+
+        Long stillThere = await(pool.preparedQuery(
+                "SELECT COUNT(*) AS c FROM company_aliases WHERE company_id = $1 AND alias = $2")
+            .execute(Tuple.of(merge, "Structure Twin")).map(rs -> rs.iterator().next().getLong("c")));
+        assertEquals(1L, stillThere, "the restored company kept the alias it arrived with");
+    }
+
     // ── fixtures ──────────────────────────────────────────────────────────────
 
     private long insertCompany(String name) throws Exception {
