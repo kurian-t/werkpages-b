@@ -273,17 +273,21 @@ class CompanyAdminIntegrationTest {
     }
 
     @Test
-    void adminMergeCompanies_deletesSourceCompany() throws Exception {
+    void adminMergeCompanies_retiresSourceCompany() throws Exception {
         String adminAuth = insertUser("auth0|co-admin11", "CoAdmin11", "admin");
         long keepId      = insertCompany("Keep Corp");
         long mergeId     = insertCompany("Merge Corp");
 
         await(service.adminMergeCompanies(adminAuth, keepId, mergeId));
 
-        long mergeExists = await(pool.preparedQuery("SELECT COUNT(*) FROM companies WHERE id = $1")
+        // CHANGED DELIBERATELY. This asserted the source company was deleted. That delete cascaded
+        // into interview_reviews, interview_review_deletions and company_aliases, so merging a
+        // company destroyed every interview review written about it. It is retired instead:
+        // nothing cascades, its URL keeps resolving, and the merge leaves a manifest to undo.
+        String mergeStatus = await(pool.preparedQuery("SELECT status FROM companies WHERE id = $1")
             .execute(Tuple.of(mergeId))
-            .map(rs -> rs.iterator().next().getLong(0)));
-        assertEquals(0L, mergeExists, "Source company must be deleted after merge");
+            .map(rs -> rs.iterator().next().getString("status")));
+        assertEquals("merged", mergeStatus, "Source company must be retired, not deleted");
 
         long keepExists = await(pool.preparedQuery("SELECT COUNT(*) FROM companies WHERE id = $1")
             .execute(Tuple.of(keepId))

@@ -96,11 +96,14 @@ class RepositoryCoverageIntegrationTest {
     // ── CompanyRepository.mergeCompanies ─────────────────────────────────────
 
     @Test
-    void mergeCompanies_reassignsManagersAndDeletesSource() throws Exception {
+    void mergeCompanies_reassignsManagersAndRetiresSource() throws Exception {
         Row keep  = await(companyRepo.findOrCreate("KeepCo",  null, null));
         Row merge = await(companyRepo.findOrCreate("MergeCo", null, null));
         long keepId  = keep.getLong("id");
         long mergeId = merge.getLong("id");
+        java.util.UUID admin = await(pool.preparedQuery(
+                "INSERT INTO users(auth0_id,email,username) VALUES ('auth0|mergeadmin','mergeadmin@test.com','mergeadmin') RETURNING id")
+            .execute().map(rs -> rs.iterator().next().getUUID("id")));
 
         // Insert a manager linked to the merge company
         long managerId = await(pool.preparedQuery(
@@ -109,13 +112,16 @@ class RepositoryCoverageIntegrationTest {
             .execute(Tuple.of(mergeId))
             .map(rs -> rs.iterator().next().getLong("id")));
 
-        await(companyRepo.mergeCompanies(keepId, mergeId));
+        await(companyRepo.mergeCompanies(keepId, mergeId, admin));
 
-        // The source company row must be gone
-        Long mergeCount = await(pool.preparedQuery("SELECT COUNT(*) FROM companies WHERE id = $1")
+        // CHANGED DELIBERATELY. This asserted the source company row was deleted. Deleting it
+        // cascaded into interview_reviews, interview_review_deletions and company_aliases, so a
+        // merge destroyed every interview review written about that company. The source is now
+        // retired instead: nothing cascades, its URL still resolves, and the merge can be undone.
+        String mergeStatus = await(pool.preparedQuery("SELECT status FROM companies WHERE id = $1")
             .execute(Tuple.of(mergeId))
-            .map(rs -> rs.iterator().next().getLong(0)));
-        assertEquals(0L, mergeCount, "source company must be deleted after merge");
+            .map(rs -> rs.iterator().next().getString("status")));
+        assertEquals("merged", mergeStatus, "source company must be retired, not deleted");
 
         // The manager must now point to keepId and carry the keep company name
         Row mgr = await(pool.preparedQuery("SELECT company_id, company FROM managers WHERE id = $1")
@@ -127,7 +133,7 @@ class RepositoryCoverageIntegrationTest {
 
     @Test
     void mergeCompanies_targetNotFound_fails() {
-        Future<Void> result = companyRepo.mergeCompanies(Long.MAX_VALUE, Long.MAX_VALUE - 1);
+        var result = companyRepo.mergeCompanies(Long.MAX_VALUE, Long.MAX_VALUE - 1, java.util.UUID.randomUUID());
         assertThrows(Exception.class, () -> await(result));
     }
 

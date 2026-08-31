@@ -1,6 +1,7 @@
 package org.werkpages.repository;
 
 import io.vertx.core.Future;
+import io.vertx.sqlclient.Pool;
 import io.vertx.sqlclient.Row;
 import io.vertx.sqlclient.RowSet;
 import io.vertx.sqlclient.SqlClient;
@@ -10,6 +11,7 @@ import org.werkpages.service.AnthropicClient;
 
 import java.util.List;
 import java.util.Optional;
+import java.util.UUID;
 
 /**
  * Data-access layer for the {@code companies} table.
@@ -546,28 +548,270 @@ public class CompanyRepository {
             .mapEmpty();
     }
 
+    // ── Corporate relationships ───────────────────────────────────────────────
+    //
+    // Two real companies where one owns the other, as opposed to two rows describing one company.
+    // Nothing here merges anything: the child keeps its page, its managers and its ratings, and a
+    // relationship only adds navigation between them.
+
     /**
-     * Merges {@code mergeId} into {@code keepId}: reassigns all managers, career history
-     * entries, and review snapshots, then deletes the source company row.
+     * Records that {@code childId} is part of {@code parentId}, replacing any existing parent.
+     *
+     * A company has one parent, so this is an upsert rather than an insert - re-pointing a
+     * subsidiary is a correction, not a second relationship. Loops are rejected by a database
+     * trigger rather than checked here, so a future caller cannot route around the check.
      */
-    public Future<Void> mergeCompanies(long keepId, long mergeId) {
-        return db.preparedQuery("SELECT name FROM companies WHERE id = $1").execute(Tuple.of(keepId))
-            .compose(rows -> {
-                if (!rows.iterator().hasNext())
-                    return Future.failedFuture("Target company not found");
-                String keepName = rows.iterator().next().getString("name");
-                return db.preparedQuery("UPDATE managers SET company_id = $1, company = $2 WHERE company_id = $3")
-                    .execute(Tuple.of(keepId, keepName, mergeId))
-                    .compose(v -> db.preparedQuery("UPDATE career_history SET company_id = $1, company = $2 WHERE company_id = $3")
-                        .execute(Tuple.of(keepId, keepName, mergeId)))
-                    .compose(v -> db.preparedQuery("""
-                            UPDATE reviews SET manager_company = $1
-                            WHERE manager_id IN (SELECT id FROM managers WHERE company_id = $2)
-                            """)
-                        .execute(Tuple.of(keepName, keepId)))
-                    .compose(v -> db.preparedQuery("DELETE FROM companies WHERE id = $1")
-                        .execute(Tuple.of(mergeId)))
-                    .mapEmpty();
+    public Future<Void> setCompanyParent(long childId, long parentId, String relationshipType) {
+        return db.preparedQuery("""
+                INSERT INTO company_relationships (child_company_id, parent_company_id, relationship_type)
+                VALUES ($1, $2, $3)
+                ON CONFLICT (child_company_id)
+                DO UPDATE SET parent_company_id = EXCLUDED.parent_company_id,
+                              relationship_type = EXCLUDED.relationship_type,
+                              created_at        = now()
+                """)
+            .execute(Tuple.of(childId, parentId, relationshipType))
+            .mapEmpty();
+    }
+
+    /** Detaches a company from its parent. The company itself is untouched. */
+    public Future<Boolean> removeCompanyParent(long childId) {
+        return db.preparedQuery("DELETE FROM company_relationships WHERE child_company_id = $1")
+            .execute(Tuple.of(childId))
+            .map(rs -> rs.rowCount() > 0);
+    }
+
+    /**
+     * The company this one is part of, if any.
+     *
+     * Excludes a merged parent: a retired company is not something to send a reader to, and
+     * showing "Part of" a company that no longer exists as its own entity would be worse than
+     * showing nothing.
+     */
+    public Future<Optional<Row>> findCompanyParent(long childId) {
+        return db.preparedQuery("""
+                SELECT p.id, p.name, p.slug, p.logo_url, r.relationship_type
+                FROM company_relationships r
+                JOIN companies p ON p.id = r.parent_company_id
+                WHERE r.child_company_id = $1
+                  AND p.status <> 'merged'
+                """)
+            .execute(Tuple.of(childId))
+            .map(rows -> rows.iterator().hasNext() ? Optional.of(rows.iterator().next()) : Optional.empty());
+    }
+
+    /**
+     * The companies that are part of this one, with the stats needed to list them.
+     *
+     * Ordered by size so the brands a reader recognises come first. Stats are LEFT JOINed, never
+     * INNER: a subsidiary with no managers yet is still part of the group and still belongs in
+     * the list, which is the same reasoning that keeps company_stats_live out of the picker's
+     * WHERE clause.
+     */
+    public Future<RowSet<Row>> findCompanyChildren(long parentId) {
+        return db.preparedQuery("""
+                SELECT c.id, c.name, c.slug, c.logo_url, r.relationship_type,
+                       COALESCE(s.manager_count, 0) AS manager_count,
+                       COALESCE(s.total_reviews, 0) AS total_reviews,
+                       s.avg_rating
+                FROM company_relationships r
+                JOIN companies c ON c.id = r.child_company_id
+                LEFT JOIN company_stats_live s ON s.company_id = c.id
+                WHERE r.parent_company_id = $1
+                  AND c.status <> 'merged'
+                ORDER BY COALESCE(s.manager_count, 0) DESC, c.name ASC
+                """)
+            .execute(Tuple.of(parentId));
+    }
+
+    /**
+     * A read-only assessment of what merging {@code mergeId} into {@code keepId} would do.
+     *
+     * Runs before anything is written, so an admin sees the size of the operation and, more
+     * importantly, whether it is safe to perform at all. Nothing here modifies data.
+     *
+     * The blocking case is a unique-index collision on interview reviews: the index is
+     * (user_id, company_id, interview_year) WHERE deleted_at IS NULL, so if one person reviewed
+     * interviewing at both companies in the same year, moving their reviews together makes two rows
+     * that cannot coexist. There is no correct automatic answer - both are genuine contributions
+     * from the same person - so the merge refuses and a human decides which stands.
+     */
+    public Future<io.vertx.core.json.JsonObject> previewMerge(long keepId, long mergeId) {
+        if (keepId == mergeId) {
+            return Future.failedFuture("Cannot merge a company into itself");
+        }
+        return db.preparedQuery("""
+                SELECT
+                  (SELECT COUNT(*) FROM managers          WHERE company_id = $2) AS managers,
+                  (SELECT COUNT(*) FROM career_history    WHERE company_id = $2) AS career_entries,
+                  (SELECT COUNT(*) FROM interview_reviews WHERE company_id = $2 AND deleted_at IS NULL) AS interviews,
+                  (SELECT COUNT(*) FROM company_aliases   WHERE company_id = $2) AS aliases,
+                  (SELECT COUNT(*) FROM manager_edits     WHERE requested_company_id = $2) AS pending_edits,
+                  (SELECT name FROM companies WHERE id = $1) AS keep_name,
+                  (SELECT name FROM companies WHERE id = $2) AS merge_name,
+                  (SELECT slug FROM companies WHERE id = $2) AS merge_slug,
+                  -- The blocking conflict: the same person, the same year, both companies.
+                  (SELECT COUNT(*) FROM interview_reviews a
+                     JOIN interview_reviews b
+                       ON a.user_id = b.user_id
+                      AND a.interview_year = b.interview_year
+                    WHERE a.company_id = $2 AND b.company_id = $1
+                      AND a.deleted_at IS NULL AND b.deleted_at IS NULL
+                      AND a.user_id IS NOT NULL) AS interview_conflicts,
+                  -- Not blocking, but the admin should see it: the same person may now appear
+                  -- twice under one company. Company identity and manager identity are separate
+                  -- problems and this merge deliberately does not touch the second one.
+                  (SELECT COUNT(*) FROM managers a
+                     JOIN managers b ON LOWER(TRIM(a.name)) = LOWER(TRIM(b.name))
+                    WHERE a.company_id = $2 AND b.company_id = $1) AS duplicate_managers
+                """)
+            .execute(Tuple.of(keepId, mergeId))
+            .map(rows -> {
+                Row r = rows.iterator().next();
+                if (r.getString("keep_name") == null)  throw new IllegalArgumentException("Target company not found");
+                if (r.getString("merge_name") == null) throw new IllegalArgumentException("Source company not found");
+                return new io.vertx.core.json.JsonObject()
+                    .put("keepName",           r.getString("keep_name"))
+                    .put("mergeName",          r.getString("merge_name"))
+                    .put("managers",           r.getLong("managers"))
+                    .put("careerEntries",      r.getLong("career_entries"))
+                    .put("interviews",         r.getLong("interviews"))
+                    .put("aliases",            r.getLong("aliases"))
+                    .put("pendingEdits",       r.getLong("pending_edits"))
+                    .put("interviewConflicts", r.getLong("interview_conflicts"))
+                    .put("duplicateManagers",  r.getLong("duplicate_managers"))
+                    .put("blocked",            r.getLong("interview_conflicts") > 0);
             });
+    }
+
+    /**
+     * Merges {@code mergeId} into {@code keepId}.
+     *
+     * Replaces an earlier version that finished with {@code DELETE FROM companies}. That delete
+     * cascaded: interview_reviews, interview_review_deletions and company_aliases all reference
+     * companies with ON DELETE CASCADE, so merging a company silently destroyed every interview
+     * review written about it. It also left no record of what had moved, which meant no undo, and
+     * it ran as loose statements rather than a transaction, so a failure halfway through left the
+     * data split between two companies.
+     *
+     * This version:
+     *   - runs in one transaction, so it either all happens or none of it does;
+     *   - moves interview data instead of letting it be deleted;
+     *   - retires the source rather than deleting it, so nothing cascades and its URL survives;
+     *   - writes a manifest of every row it moved, by id, which is what makes an undo possible;
+     *   - refuses outright when moving the data would violate a unique index.
+     */
+    public Future<UUID> mergeCompanies(long keepId, long mergeId, UUID adminUserId) {
+        if (keepId == mergeId) return Future.failedFuture("Cannot merge a company into itself");
+
+        return previewMerge(keepId, mergeId).compose(preview -> {
+            if (preview.getBoolean("blocked")) {
+                return Future.failedFuture(
+                    "Cannot merge: " + preview.getLong("interviewConflicts") + " interview review(s) "
+                    + "would collide, because the same person reviewed interviewing at both companies "
+                    + "in the same year. Both are real contributions and neither should be discarded "
+                    + "automatically. Resolve them first, then merge.");
+            }
+            String keepName  = preview.getString("keepName");
+            String mergeName = preview.getString("mergeName");
+
+            return ((Pool) db).withTransaction(conn ->
+                // The manifest header first: every moved row references it.
+                conn.preparedQuery("""
+                        INSERT INTO company_merges (source_company_id, target_company_id, merged_by, source_snapshot)
+                        VALUES ($1, $2, $3, $4::JSONB)
+                        RETURNING id
+                        """)
+                    .execute(Tuple.of(mergeId, keepId, adminUserId,
+                        new io.vertx.core.json.JsonObject()
+                            .put("name", mergeName)
+                            .put("preview", preview).encode()))
+                    .map(rs -> rs.iterator().next().getUUID("id"))
+
+                    // Managers: the FK and the denormalised name move together. Recording the old
+                    // text is what lets an undo put the picker back the way it was.
+                    .compose(mergeUuid -> conn.preparedQuery("""
+                            INSERT INTO company_merge_records (merge_id, entity_type, record_id, old_company_id, new_company_id, old_company_text)
+                            SELECT $1, 'manager', m.id::TEXT, $3, $2, m.company
+                            FROM managers m WHERE m.company_id = $3
+                            """)
+                        .execute(Tuple.of(mergeUuid, keepId, mergeId))
+                        .compose(v -> conn.preparedQuery("UPDATE managers SET company_id = $1, company = $2 WHERE company_id = $3")
+                            .execute(Tuple.of(keepId, keepName, mergeId)))
+
+                        // Career history: same shape, same reasoning.
+                        .compose(v -> conn.preparedQuery("""
+                                INSERT INTO company_merge_records (merge_id, entity_type, record_id, old_company_id, new_company_id, old_company_text)
+                                SELECT $1, 'career_history', ch.id::TEXT, $3, $2, ch.company
+                                FROM career_history ch WHERE ch.company_id = $3
+                                """)
+                            .execute(Tuple.of(mergeUuid, keepId, mergeId)))
+                        .compose(v -> conn.preparedQuery("UPDATE career_history SET company_id = $1, company = $2 WHERE company_id = $3")
+                            .execute(Tuple.of(keepId, keepName, mergeId)))
+
+                        // Interview reviews: moved, not destroyed. The preview has already proved
+                        // no two of them will collide.
+                        .compose(v -> conn.preparedQuery("""
+                                INSERT INTO company_merge_records (merge_id, entity_type, record_id, old_company_id, new_company_id)
+                                SELECT $1, 'interview_review', ir.id::TEXT, $3, $2
+                                FROM interview_reviews ir WHERE ir.company_id = $3
+                                """)
+                            .execute(Tuple.of(mergeUuid, keepId, mergeId)))
+                        .compose(v -> conn.preparedQuery("UPDATE interview_reviews SET company_id = $1 WHERE company_id = $2")
+                            .execute(Tuple.of(keepId, mergeId)))
+                        .compose(v -> conn.preparedQuery("UPDATE interview_review_deletions SET company_id = $1 WHERE company_id = $2")
+                            .execute(Tuple.of(keepId, mergeId)))
+
+                        // Pending edit requests that pointed at the source now point at the target,
+                        // so an admin approving one afterwards lands on the surviving company.
+                        .compose(v -> conn.preparedQuery("UPDATE manager_edits SET requested_company_id = $1 WHERE requested_company_id = $2")
+                            .execute(Tuple.of(keepId, mergeId)))
+
+                        // Aliases move, and the source's own name becomes one. That is the whole
+                        // point: someone searching the old name must now find the surviving company
+                        // rather than a blank, or they will simply create it again.
+                        .compose(v -> conn.preparedQuery("""
+                                INSERT INTO company_aliases (company_id, alias, alias_type)
+                                SELECT $1, a.alias, a.alias_type FROM company_aliases a WHERE a.company_id = $2
+                                ON CONFLICT DO NOTHING
+                                """)
+                            .execute(Tuple.of(keepId, mergeId)))
+                        .compose(v -> conn.preparedQuery("DELETE FROM company_aliases WHERE company_id = $1")
+                            .execute(Tuple.of(mergeId)))
+                        .compose(v -> conn.preparedQuery("""
+                                INSERT INTO company_aliases (company_id, alias, alias_type)
+                                VALUES ($1, $2, 'MERGED_NAME') ON CONFLICT DO NOTHING
+                                """)
+                            .execute(Tuple.of(keepId, mergeName)))
+
+                        // The stats tables are keyed by company_id as a primary key, so their rows
+                        // cannot be moved onto a target that already has one. Drop the source's and
+                        // let the target's be recomputed after the transaction.
+                        .compose(v -> conn.preparedQuery("DELETE FROM company_stats_live WHERE company_id = $1")
+                            .execute(Tuple.of(mergeId)))
+                        .compose(v -> conn.preparedQuery("DELETE FROM company_interview_stats WHERE company_id = $1")
+                            .execute(Tuple.of(mergeId)))
+
+                        // The old address keeps working. People share company links.
+                        .compose(v -> conn.preparedQuery("""
+                                INSERT INTO company_redirects (old_slug, company_id)
+                                SELECT c.slug, $1 FROM companies c WHERE c.id = $2 AND c.slug IS NOT NULL
+                                ON CONFLICT (old_slug) DO UPDATE SET company_id = EXCLUDED.company_id
+                                """)
+                            .execute(Tuple.of(keepId, mergeId)))
+
+                        // Retired, not deleted. Nothing cascades, the history stays readable, and
+                        // the row is still there to be pointed at by the redirect above.
+                        .compose(v -> conn.preparedQuery("UPDATE companies SET status = 'merged', updated_at = now() WHERE id = $1")
+                            .execute(Tuple.of(mergeId)))
+
+                        // Review snapshots on the moved managers show the surviving name.
+                        .compose(v -> conn.preparedQuery("""
+                                UPDATE reviews SET manager_company = $1
+                                WHERE manager_id IN (SELECT id FROM managers WHERE company_id = $2)
+                                """)
+                            .execute(Tuple.of(keepName, keepId)))
+                        .map(v -> mergeUuid)));
+        });
     }
 }

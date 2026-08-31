@@ -581,13 +581,62 @@ public class AdminService {
             .map(v -> new JsonObject().put("success", true));
     }
 
+    /** What a merge would move, and whether it can safely run. Reads only; writes nothing. */
+    public Future<JsonObject> previewCompanyMerge(String auth0Id, long keepId, long mergeId) {
+        return requireAdmin(auth0Id)
+            .compose(adminId -> companyRepo.previewMerge(keepId, mergeId))
+            .recover(err -> Future.failedFuture(ServiceException.badRequest(err.getMessage())));
+    }
+
+    // ── Corporate relationships ───────────────────────────────────────────────
+
+    private static final java.util.Set<String> RELATIONSHIP_TYPES = java.util.Set.of(
+        "SUBSIDIARY_OF", "BRAND_OF", "DIVISION_OF", "OWNED_BY", "FRANCHISE_OF", "JOINT_VENTURE_OF");
+
+    /**
+     * Records that one company is part of another. Not a merge: both keep their pages, managers
+     * and ratings, and the child stays independently searchable.
+     */
+    public Future<JsonObject> setCompanyParent(String auth0Id, long childId, long parentId, String type) {
+        if (childId == parentId)
+            return Future.failedFuture(ServiceException.badRequest("A company cannot be part of itself"));
+        String relationshipType = (type == null || type.isBlank()) ? "SUBSIDIARY_OF" : type.trim().toUpperCase();
+        if (!RELATIONSHIP_TYPES.contains(relationshipType))
+            return Future.failedFuture(ServiceException.badRequest("Unknown relationship type: " + relationshipType));
+
+        return requireAdmin(auth0Id)
+            .compose(adminId -> companyRepo.setCompanyParent(childId, parentId, relationshipType))
+            // The loop check lives in a database trigger, so it fires for any writer. Translating
+            // it here turns an opaque constraint violation into something an admin can act on.
+            .recover(err -> {
+                String msg = err.getMessage() == null ? "" : err.getMessage();
+                if (msg.contains("loop in the ownership chain"))
+                    return Future.failedFuture(ServiceException.badRequest(
+                        "That would create a loop: the parent is already somewhere beneath this company."));
+                return Future.failedFuture(err);
+            })
+            .map(v -> new JsonObject().put("success", true));
+    }
+
+    public Future<JsonObject> removeCompanyParent(String auth0Id, long childId) {
+        return requireAdmin(auth0Id)
+            .compose(adminId -> companyRepo.removeCompanyParent(childId))
+            .map(removed -> new JsonObject().put("success", true).put("removed", removed));
+    }
+
     public Future<JsonObject> adminMergeCompanies(String auth0Id, long keepId, long mergeId) {
         if (keepId == mergeId)
             return Future.failedFuture(ServiceException.badRequest("Cannot merge a company into itself"));
         return requireAdmin(auth0Id)
-            .compose(adminId -> companyRepo.mergeCompanies(keepId, mergeId))
-            .compose(v -> companyRepo.updateCompanyStatsForCompany(keepId))
-            .map(v -> new JsonObject().put("success", true).put("keepId", keepId));
+            .compose(adminId -> companyRepo.mergeCompanies(keepId, mergeId, adminId)
+                // A refusal here is a decision the admin has to make, not a server fault: surface
+                // it as a 400 with the reason rather than a 500.
+                .recover(err -> Future.failedFuture(ServiceException.badRequest(err.getMessage()))))
+            .compose(mergeUuid -> companyRepo.syncStatsForCompany(keepId).map(v -> mergeUuid))
+            .map(mergeUuid -> new JsonObject()
+                .put("success", true)
+                .put("keepId", keepId)
+                .put("mergeId", mergeUuid.toString()));
     }
 
     // ── Merge suggestions ─────────────────────────────────────────────────────

@@ -1991,6 +1991,66 @@ paths:
         '409':
           description: Name already taken — use the merge tool
 
+  /api/admin/companies/{childId}/parent:
+    put:
+      operationId: setCompanyParent
+      summary: Record that one company is part of another (admin only)
+      description: >
+        Corporate structure, not a merge. Both companies keep their own page, managers, ratings and
+        search presence; this only records that one belongs to the other. A company has one parent,
+        so setting it again re-points an existing relationship rather than adding a second.
+
+
+        Loops are rejected: a company cannot be made part of something already beneath it.
+      tags:
+        - Admin
+      parameters:
+        - in: path
+          name: childId
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - parentId
+              properties:
+                parentId:
+                  type: integer
+                  format: int64
+                relationshipType:
+                  type: string
+                  enum: [SUBSIDIARY_OF, BRAND_OF, DIVISION_OF, OWNED_BY, FRANCHISE_OF, JOINT_VENTURE_OF]
+                  description: Defaults to SUBSIDIARY_OF. Not shown to readers; the page says "Part of X".
+      responses:
+        '200':
+          description: Relationship recorded
+        '400':
+          description: Invalid request, unknown relationship type, or would create a loop
+        '403':
+          description: Forbidden
+
+    delete:
+      operationId: removeCompanyParent
+      summary: Detach a company from its parent (admin only)
+      tags:
+        - Admin
+      parameters:
+        - in: path
+          name: childId
+          required: true
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: Relationship removed
+        '403':
+          description: Forbidden
+
   /api/admin/companies/{keepId}/merge/{mergeId}:
     post:
       operationId: adminMergeCompanies

@@ -339,7 +339,57 @@ public class ManagerService {
                             .put("managers",        managers);
                         if (finalLogoUrl != null && !finalLogoUrl.isBlank()) result.put("logoUrl", finalLogoUrl);
                         return result;
-                    });
+                    })
+                    // Corporate structure, attached last so a failure to load it cannot cost the
+                    // reader the company page itself. "Part of Loblaw" is useful context; it is
+                    // not worth a 500 if the relationship tables are unavailable.
+                    .compose(result -> withCorporateStructure(result, companyId));
+            });
+    }
+
+    /**
+     * Adds a company's parent and children to its profile.
+     *
+     * Navigation only. The company's own rating and review count are untouched by anything here:
+     * a subsidiary's score is its own, and a parent's score is the parent's. A combined group
+     * figure, if it ever exists, is an additional and explicitly labelled number rather than a
+     * quiet redefinition of what a company's rating means.
+     */
+    private Future<JsonObject> withCorporateStructure(JsonObject profile, long companyId) {
+        return companyRepo.findCompanyParent(companyId)
+            .compose(parentOpt -> companyRepo.findCompanyChildren(companyId).map(childRows -> {
+                parentOpt.ifPresent(p -> {
+                    JsonObject parent = new JsonObject()
+                        .put("id",   p.getLong("id"))
+                        .put("name", p.getString("name"))
+                        .put("slug", p.getString("slug"))
+                        .put("relationshipType", p.getString("relationship_type"));
+                    String logo = p.getString("logo_url");
+                    if (logo != null && !logo.isBlank()) parent.put("logoUrl", logo);
+                    profile.put("partOf", parent);
+                });
+
+                JsonArray children = new JsonArray();
+                for (Row c : childRows) {
+                    JsonObject child = new JsonObject()
+                        .put("id",           c.getLong("id"))
+                        .put("name",         c.getString("name"))
+                        .put("slug",         c.getString("slug"))
+                        .put("managerCount", c.getLong("manager_count"))
+                        .put("totalReviews", c.getLong("total_reviews"))
+                        .put("avgRating",    c.getBigDecimal("avg_rating"))
+                        .put("relationshipType", c.getString("relationship_type"));
+                    String logo = c.getString("logo_url");
+                    if (logo != null && !logo.isBlank()) child.put("logoUrl", logo);
+                    children.add(child);
+                }
+                if (!children.isEmpty()) profile.put("companiesInGroup", children);
+                return profile;
+            }))
+            .recover(err -> {
+                System.err.println("Corporate structure lookup failed for company " + companyId
+                                   + ": " + err.getMessage());
+                return Future.succeededFuture(profile);
             });
     }
 
@@ -365,7 +415,10 @@ public class ManagerService {
                 String companyIndustry = companyRow.getString("industry");
                 return companyRepo.findManagersByCompanyId(companyId)
                     .map(rows -> buildCompanyProfileResponse(companyId, canonicalName, companySlug,
-                                                             companyIndustry, logoUrl, rows));
+                                                             companyIndustry, logoUrl, rows))
+                    // The slug route is the one people actually reach from a link, so it needs the
+                    // corporate structure just as much as the by-name route.
+                    .compose(result -> withCorporateStructure(result, companyId));
             });
     }
 

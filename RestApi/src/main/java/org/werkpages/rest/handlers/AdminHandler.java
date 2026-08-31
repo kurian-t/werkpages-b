@@ -300,6 +300,39 @@ public class AdminHandler {
 
     // ── POST /api/admin/companies/:keepId/merge/:mergeId ────────────────────
 
+    // ── PUT/DELETE /api/admin/companies/:childId/parent ───────────────────────
+
+    public void handleSetCompanyParent(RoutingContext ctx) {
+        String auth0Id = ctx.get("auth0Id");
+        long childId;
+        try {
+            childId = Long.parseLong(ctx.pathParam("childId"));
+        } catch (NumberFormatException e) {
+            bad(ctx, "Invalid company ID"); return;
+        }
+        JsonObject body = ctx.getBodyAsJson();
+        if (body == null) { bad(ctx, "Request body required"); return; }
+        Long parentId = body.getLong("parentId");
+        if (parentId == null) { bad(ctx, "parentId is required"); return; }
+
+        service.setCompanyParent(auth0Id, childId, parentId, body.getString("relationshipType"))
+            .onSuccess(json -> ok(ctx, json))
+            .onFailure(err -> ManagersHandler.handleError(ctx, err));
+    }
+
+    public void handleRemoveCompanyParent(RoutingContext ctx) {
+        String auth0Id = ctx.get("auth0Id");
+        long childId;
+        try {
+            childId = Long.parseLong(ctx.pathParam("childId"));
+        } catch (NumberFormatException e) {
+            bad(ctx, "Invalid company ID"); return;
+        }
+        service.removeCompanyParent(auth0Id, childId)
+            .onSuccess(json -> ok(ctx, json))
+            .onFailure(err -> ManagersHandler.handleError(ctx, err));
+    }
+
     public void handleMergeCompanies(RoutingContext ctx) {
         String auth0Id = ctx.get("auth0Id");
         long keepId, mergeId;
