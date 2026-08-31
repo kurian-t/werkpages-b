@@ -393,11 +393,31 @@ public class ManagerService {
             });
     }
 
-    /** Same as getCompanyProfile but looked up by URL slug. */
+    /**
+     * Same as getCompanyProfile but looked up by URL slug.
+     *
+     * A slug belonging to a merged company serves the surviving company instead. The retired row
+     * still owns its slug, so without this a shared link would render a company page with no
+     * managers on it - which reads as "this company has nothing" rather than "this company is now
+     * part of another one". Because the response carries the survivor's own slug, the client's
+     * existing canonical-URL redirect rewrites the address on its own; no new frontend code, and
+     * the link the person followed still works.
+     */
     public Future<JsonObject> getCompanyBySlug(String slug) {
         if (slug == null || slug.isBlank())
             return Future.failedFuture(ServiceException.badRequest("companySlug is required"));
-        return companyRepo.findBySlug(slug.trim())
+        String trimmedSlug = slug.trim();
+        return companyRepo.findBySlug(trimmedSlug)
+            .compose(found -> {
+                boolean retired = found.isPresent() && "merged".equals(found.get().getString("status"));
+                if (!found.isPresent() || retired) {
+                    // Either the slug is unknown, or it belongs to a company that has been
+                    // absorbed. Both are answered the same way: follow the redirect if one exists.
+                    return companyRepo.findRedirectTargetBySlug(trimmedSlug)
+                        .map(target -> target.isPresent() ? target : found);
+                }
+                return Future.succeededFuture(found);
+            })
             .compose(opt -> {
                 if (opt.isEmpty()) return Future.failedFuture(ServiceException.notFound("Company not found"));
                 Row companyRow = opt.get();

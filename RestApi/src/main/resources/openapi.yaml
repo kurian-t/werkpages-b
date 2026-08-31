@@ -1991,6 +1991,75 @@ paths:
         '409':
           description: Name already taken — use the merge tool
 
+  /api/admin/companies/{keepId}/merge/{mergeId}/preview:
+    get:
+      operationId: previewCompanyMerge
+      summary: What a merge would move, and whether it can run (admin only)
+      description: >
+        Read-only. Reports how much would move and flags anything that blocks the merge, so an
+        admin is never running one blind. `blocked` is true when interview reviews would collide -
+        the same person having reviewed interviewing at both companies in the same year - which has
+        no correct automatic answer and must be resolved by a human first.
+      tags:
+        - Admin
+      parameters:
+        - in: path
+          name: keepId
+          required: true
+          schema:
+            type: integer
+        - in: path
+          name: mergeId
+          required: true
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: Merge assessment
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  keepName:           { type: string }
+                  mergeName:          { type: string }
+                  managers:           { type: integer, format: int64 }
+                  careerEntries:      { type: integer, format: int64 }
+                  interviews:         { type: integer, format: int64 }
+                  aliases:            { type: integer, format: int64 }
+                  pendingEdits:       { type: integer, format: int64 }
+                  interviewConflicts: { type: integer, format: int64 }
+                  duplicateManagers:  { type: integer, format: int64 }
+                  blocked:            { type: boolean }
+        '400':
+          description: Invalid request or company not found
+        '403':
+          description: Forbidden
+
+  /api/admin/company-merges/{mergeRecordId}/undo:
+    post:
+      operationId: undoCompanyMerge
+      summary: Reverse a completed company merge (admin only)
+      description: >
+        Puts back exactly the rows the merge moved, using the manifest it recorded. Anything added
+        to the surviving company after the merge stays there. A merge can be reverted once.
+      tags:
+        - Admin
+      parameters:
+        - in: path
+          name: mergeRecordId
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Merge reverted
+        '400':
+          description: Unknown merge, or one that has already been reverted
+        '403':
+          description: Forbidden
+
   /api/admin/companies/{childId}/parent:
     put:
       operationId: setCompanyParent

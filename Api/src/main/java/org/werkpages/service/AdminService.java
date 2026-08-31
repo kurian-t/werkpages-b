@@ -581,6 +581,23 @@ public class AdminService {
             .map(v -> new JsonObject().put("success", true));
     }
 
+    /**
+     * Reverses a completed merge.
+     *
+     * Restores exactly the rows the merge moved, from its manifest. Anything added to the surviving
+     * company since the merge stays there, because it was never on the list.
+     */
+    public Future<JsonObject> undoCompanyMerge(String auth0Id, UUID mergeRecordId) {
+        return requireAdmin(auth0Id)
+            .compose(adminId -> companyRepo.undoMerge(mergeRecordId)
+                .recover(err -> Future.failedFuture(ServiceException.badRequest(err.getMessage()))))
+            // Both companies' cached figures are wrong until they are recomputed: one has just
+            // lost data and the other has just got it back.
+            .compose(result -> companyRepo.syncStatsForCompany(result.getLong("restoredCompanyId"))
+                .compose(v -> companyRepo.syncStatsForCompany(result.getLong("targetCompanyId")))
+                .map(v -> result));
+    }
+
     /** What a merge would move, and whether it can safely run. Reads only; writes nothing. */
     public Future<JsonObject> previewCompanyMerge(String auth0Id, long keepId, long mergeId) {
         return requireAdmin(auth0Id)

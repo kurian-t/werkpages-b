@@ -300,6 +300,37 @@ public class AdminHandler {
 
     // ── POST /api/admin/companies/:keepId/merge/:mergeId ────────────────────
 
+    // ── GET /api/admin/companies/:keepId/merge/:mergeId/preview ───────────────
+
+    public void handlePreviewCompanyMerge(RoutingContext ctx) {
+        String auth0Id = ctx.get("auth0Id");
+        long keepId, mergeId;
+        try {
+            keepId  = Long.parseLong(ctx.pathParam("keepId"));
+            mergeId = Long.parseLong(ctx.pathParam("mergeId"));
+        } catch (NumberFormatException e) {
+            bad(ctx, "Invalid company ID"); return;
+        }
+        service.previewCompanyMerge(auth0Id, keepId, mergeId)
+            .onSuccess(json -> ok(ctx, json))
+            .onFailure(err -> ManagersHandler.handleError(ctx, err));
+    }
+
+    // ── POST /api/admin/company-merges/:mergeRecordId/undo ────────────────────
+
+    public void handleUndoCompanyMerge(RoutingContext ctx) {
+        String auth0Id = ctx.get("auth0Id");
+        java.util.UUID mergeRecordId;
+        try {
+            mergeRecordId = java.util.UUID.fromString(ctx.pathParam("mergeRecordId"));
+        } catch (IllegalArgumentException e) {
+            bad(ctx, "Invalid merge ID"); return;
+        }
+        service.undoCompanyMerge(auth0Id, mergeRecordId)
+            .onSuccess(json -> ok(ctx, json))
+            .onFailure(err -> ManagersHandler.handleError(ctx, err));
+    }
+
     // ── PUT/DELETE /api/admin/companies/:childId/parent ───────────────────────
 
     public void handleSetCompanyParent(RoutingContext ctx) {

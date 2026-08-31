@@ -177,6 +177,202 @@ class CompanyMergeDataLossIntegrationTest {
         assertEquals("approved", status, "preview must not write anything");
     }
 
+    // ── After the merge: the retired company must behave like one ─────────────
+
+    @Test
+    void aMergedCompanyIsNoLongerOfferedInThePicker() throws Exception {
+        // Selecting it would attach a new manager to a company that has been absorbed - the exact
+        // thing the merge was for. Its name still reaches the survivor, via the alias the merge
+        // left behind.
+        long keep  = insertCompany("Vandelay");
+        long merge = insertCompany("Vandelay Industries");
+        insertManager("Art Vandelay", "Vandelay Industries", merge);
+
+        await(companyRepo.mergeCompanies(keep, merge, adminId));
+
+        var results = await(companyRepo.searchForPicker("Vandelay Industries"));
+        java.util.Set<Long> ids = new java.util.HashSet<>();
+        results.forEach(r -> ids.add(r.getLong("id")));
+        assertFalse(ids.contains(merge), "the retired company must not be selectable");
+        assertTrue(ids.contains(keep), "and its old name must still find the survivor");
+    }
+
+    @Test
+    void anIdPointingAtAMergedCompanyFollowsTheMerge() throws Exception {
+        // Somebody had the form open when an admin merged the company underneath them. Their
+        // submission belongs on the survivor, not on a headstone.
+        long keep  = insertCompany("Tyrell");
+        long merge = insertCompany("Tyrell Corporation");
+        await(companyRepo.mergeCompanies(keep, merge, adminId));
+
+        var resolved = await(companyRepo.resolve(merge, "Tyrell Corporation", null, null));
+        assertEquals(keep, resolved.getLong("id"),
+            "a stale ID resolves to the surviving company rather than the retired one");
+    }
+
+    @Test
+    void aMergedCompanysLinkStillLeadsSomewhereUseful() throws Exception {
+        long keep  = insertCompany("Cyberdyne");
+        long merge = insertCompany("Cyberdyne Systems");
+        await(companyRepo.mergeCompanies(keep, merge, adminId));
+
+        var target = await(companyRepo.findRedirectTargetBySlug("cyberdyne-systems"));
+        assertTrue(target.isPresent(), "the old slug resolves");
+        assertEquals(keep, target.get().getLong("id"), "and it leads to the surviving company");
+    }
+
+    @Test
+    void aChainOfMergesLeadsToTheLastSurvivor() throws Exception {
+        // A into B, later B into C. Somebody holding A's link should reach C, not a retired B.
+        long a = insertCompany("Chain One");
+        long b = insertCompany("Chain Two");
+        long c = insertCompany("Chain Three");
+
+        await(companyRepo.mergeCompanies(b, a, adminId));   // A -> B
+        await(companyRepo.mergeCompanies(c, b, adminId));   // B -> C
+
+        var survivor = await(companyRepo.resolveMergeTarget(a));
+        assertTrue(survivor.isPresent());
+        assertEquals(c, survivor.get().getLong("id"),
+            "following one hop would have landed on the retired middle company");
+    }
+
+    // ── Undo ──────────────────────────────────────────────────────────────────
+    //
+    // The manifest exists so a merge can be taken back. These prove it actually can, and that it
+    // takes back only what the merge moved.
+
+    @Test
+    void undoPutsEveryMovedRowBack() throws Exception {
+        long keep  = insertCompany("Weyland");
+        long merge = insertCompany("Weyland Yutani");
+        long managerId = insertManager("Ellen Ripley", "Weyland Yutani", merge);
+        UUID user = insertUser("undo1@test.com");
+        insertInterviewReview(merge, user, 2023);
+
+        UUID mergeUuid = await(companyRepo.mergeCompanies(keep, merge, adminId));
+        await(companyRepo.undoMerge(mergeUuid));
+
+        var mgr = await(pool.preparedQuery("SELECT company_id, company FROM managers WHERE id = $1")
+            .execute(Tuple.of(managerId)).map(rs -> rs.iterator().next()));
+        assertEquals(merge, mgr.getLong("company_id"), "the manager went back to its company");
+        assertEquals("Weyland Yutani", mgr.getString("company"),
+            "and so did the denormalised name, or the picker would still show the survivor's");
+
+        Long interviews = await(pool.preparedQuery(
+                "SELECT COUNT(*) AS c FROM interview_reviews WHERE company_id = $1")
+            .execute(Tuple.of(merge)).map(rs -> rs.iterator().next().getLong("c")));
+        assertEquals(1L, interviews, "the interview review came back too");
+
+        String status = await(pool.preparedQuery("SELECT status FROM companies WHERE id = $1")
+            .execute(Tuple.of(merge)).map(rs -> rs.iterator().next().getString("status")));
+        assertEquals("approved", status, "and the company is live again");
+    }
+
+    @Test
+    void undoRestoresAGhostCompanyAsAGhost() throws Exception {
+        // Being restored is not a promotion.
+        long keep  = insertCompany("Real Corp");
+        long merge = await(pool.preparedQuery(
+                "INSERT INTO companies(name,status,slug) VALUES ('Ghosty Corp','ghost','ghosty-corp') RETURNING id")
+            .execute().map(rs -> rs.iterator().next().getLong("id")));
+
+        UUID mergeUuid = await(companyRepo.mergeCompanies(keep, merge, adminId));
+        await(companyRepo.undoMerge(mergeUuid));
+
+        String status = await(pool.preparedQuery("SELECT status FROM companies WHERE id = $1")
+            .execute(Tuple.of(merge)).map(rs -> rs.iterator().next().getString("status")));
+        assertEquals("ghost", status);
+    }
+
+    @Test
+    void undoLeavesAloneWhatArrivedAfterTheMerge() throws Exception {
+        // The manifest names the rows the merge moved. A manager added to the survivor afterwards
+        // is not on that list and must stay where it is.
+        long keep  = insertCompany("Survivor Ltd");
+        long merge = insertCompany("Absorbed Ltd");
+        long moved = insertManager("Moved Person", "Absorbed Ltd", merge);
+
+        UUID mergeUuid = await(companyRepo.mergeCompanies(keep, merge, adminId));
+        long arrivedLater = insertManager("Later Person", "Survivor Ltd", keep);
+
+        await(companyRepo.undoMerge(mergeUuid));
+
+        Long movedBack = await(pool.preparedQuery("SELECT company_id FROM managers WHERE id = $1")
+            .execute(Tuple.of(moved)).map(rs -> rs.iterator().next().getLong("company_id")));
+        assertEquals(merge, movedBack);
+
+        Long stayed = await(pool.preparedQuery("SELECT company_id FROM managers WHERE id = $1")
+            .execute(Tuple.of(arrivedLater)).map(rs -> rs.iterator().next().getLong("company_id")));
+        assertEquals(keep, stayed, "someone who joined the survivor later is not swept back");
+    }
+
+    @Test
+    void undoRemovesTheAliasTheMergeAddedAndReturnsTheOnesItMoved() throws Exception {
+        long keep  = insertCompany("Kept Co");
+        long merge = insertCompany("Gone Co");
+        await(pool.preparedQuery("INSERT INTO company_aliases(company_id, alias) VALUES ($1,$2)")
+            .execute(Tuple.of(merge, "Gone Company")).mapEmpty());
+
+        UUID mergeUuid = await(companyRepo.mergeCompanies(keep, merge, adminId));
+        await(companyRepo.undoMerge(mergeUuid));
+
+        Long returned = await(pool.preparedQuery(
+                "SELECT COUNT(*) AS c FROM company_aliases WHERE company_id = $1 AND alias = $2")
+            .execute(Tuple.of(merge, "Gone Company")).map(rs -> rs.iterator().next().getLong("c")));
+        assertEquals(1L, returned, "the moved alias went home");
+
+        Long addedName = await(pool.preparedQuery(
+                "SELECT COUNT(*) AS c FROM company_aliases WHERE company_id = $1 AND alias = $2")
+            .execute(Tuple.of(keep, "Gone Co")).map(rs -> rs.iterator().next().getLong("c")));
+        assertEquals(0L, addedName,
+            "and the survivor no longer claims the restored company's name, which is once again its own");
+    }
+
+    @Test
+    void undoRemovesTheRedirectSoTheCompanyOwnsItsUrlAgain() throws Exception {
+        long keep  = insertCompany("Alpha Group");
+        long merge = insertCompany("Beta Group");
+
+        UUID mergeUuid = await(companyRepo.mergeCompanies(keep, merge, adminId));
+        await(companyRepo.undoMerge(mergeUuid));
+
+        assertTrue(await(companyRepo.findRedirectTargetBySlug("beta-group")).isEmpty());
+    }
+
+    @Test
+    void aMergeCannotBeUndoneTwice() throws Exception {
+        long keep  = insertCompany("Once Co");
+        long merge = insertCompany("Twice Co");
+        UUID mergeUuid = await(companyRepo.mergeCompanies(keep, merge, adminId));
+
+        await(companyRepo.undoMerge(mergeUuid));
+
+        Exception thrown = assertThrows(Exception.class, () -> await(companyRepo.undoMerge(mergeUuid)));
+        assertTrue(thrown.getMessage().contains("already been reverted"),
+            "expected a clear refusal, got: " + thrown.getMessage());
+    }
+
+    @Test
+    void aRestoredCompanyIsSelectableAgain() throws Exception {
+        // The round trip that matters: merged out of the picker, undone back into it.
+        long keep  = insertCompany("Pick Keep");
+        long merge = insertCompany("Pick Gone");
+        insertManager("Someone", "Pick Gone", merge);
+
+        UUID mergeUuid = await(companyRepo.mergeCompanies(keep, merge, adminId));
+        var during = await(companyRepo.searchForPicker("Pick Gone"));
+        java.util.Set<Long> idsDuring = new java.util.HashSet<>();
+        during.forEach(r -> idsDuring.add(r.getLong("id")));
+        assertFalse(idsDuring.contains(merge), "not selectable while merged");
+
+        await(companyRepo.undoMerge(mergeUuid));
+        var after = await(companyRepo.searchForPicker("Pick Gone"));
+        java.util.Set<Long> idsAfter = new java.util.HashSet<>();
+        after.forEach(r -> idsAfter.add(r.getLong("id")));
+        assertTrue(idsAfter.contains(merge), "selectable again once restored");
+    }
+
     // ── fixtures ──────────────────────────────────────────────────────────────
 
     private long insertCompany(String name) throws Exception {

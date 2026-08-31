@@ -88,7 +88,11 @@ public class CompanyRepository {
                 SELECT c.id, c.name, c.logo_url, c.industry,
                        (best.tier <= 4) AS starts_with
                 FROM best
-                JOIN companies c ON c.id = best.id
+                -- Never offer a retired company. Selecting one would attach a new manager to a
+                -- company that has been absorbed, which is the one thing a merge is supposed to
+                -- have ended. Its name still finds the survivor, because the merge left that name
+                -- behind as an alias on the target.
+                JOIN companies c ON c.id = best.id AND c.status <> 'merged'
                 -- LEFT, never INNER: stats decide ordering, never whether a company exists. An
                 -- INNER JOIN here would quietly reinstate "only companies with managers are
                 -- findable", which is the bug this whole change exists to remove.
@@ -128,14 +132,23 @@ public class CompanyRepository {
      * have been holding the page open across a merge or a deletion, and refusing the submission
      * would lose a contribution over a stale identifier. Falling back resolves it the old way,
      * which is no worse than before the ID existed.
+     *
+     * An ID pointing at a company that has since been merged follows the merge. That is precisely
+     * the stale-page case: somebody opened the form, an admin merged the company underneath them,
+     * and their submission should land on the surviving company rather than on a headstone.
      */
     public Future<Row> resolve(Long companyId, String name, String domain, String logoUrl) {
         if (companyId == null) return findOrCreate(name, domain, logoUrl);
         return db.preparedQuery("SELECT * FROM companies WHERE id = $1")
             .execute(Tuple.of(companyId))
-            .compose(rs -> rs.iterator().hasNext()
-                ? Future.succeededFuture(rs.iterator().next())
-                : findOrCreate(name, domain, logoUrl));
+            .compose(rs -> {
+                if (!rs.iterator().hasNext()) return findOrCreate(name, domain, logoUrl);
+                Row row = rs.iterator().next();
+                if (!"merged".equals(row.getString("status"))) return Future.succeededFuture(row);
+                return resolveMergeTarget(companyId)
+                    .compose(target -> target.<Future<Row>>map(Future::succeededFuture)
+                        .orElseGet(() -> findOrCreate(name, domain, logoUrl)));
+            });
     }
 
     /**
@@ -548,6 +561,62 @@ public class CompanyRepository {
             .mapEmpty();
     }
 
+    // ── Living with merged companies ──────────────────────────────────────────
+    //
+    // A merged company is retired, not deleted: its row survives so its URL resolves and its
+    // history stays readable. That survival has a cost, which these two methods pay. Every surface
+    // that offers a company to write against, or resolves one from a name or a slug, has to know
+    // the difference between a company and a headstone.
+
+    /**
+     * Follows a merged company to whatever survived it.
+     *
+     * Merges chain: A is merged into B, and later B into C. Somebody holding A's link deserves to
+     * land on C rather than on a retired B, so this walks the chain rather than taking one step.
+     * The hop cap is a backstop; the merge itself refuses to create a loop.
+     */
+    public Future<Optional<Row>> resolveMergeTarget(long companyId) {
+        return db.preparedQuery("""
+                WITH RECURSIVE chain AS (
+                    SELECT c.id, c.status, 0 AS hops
+                    FROM companies c WHERE c.id = $1
+
+                    UNION ALL
+
+                    SELECT target.id, target.status, chain.hops + 1
+                    FROM chain
+                    JOIN company_merges m ON m.source_company_id = chain.id AND m.status = 'completed'
+                    JOIN companies target ON target.id = m.target_company_id
+                    WHERE chain.status = 'merged' AND chain.hops < 10
+                )
+                SELECT c.* FROM chain
+                JOIN companies c ON c.id = chain.id
+                WHERE chain.status <> 'merged'
+                ORDER BY chain.hops DESC
+                LIMIT 1
+                """)
+            .execute(Tuple.of(companyId))
+            .map(rows -> rows.iterator().hasNext() ? Optional.of(rows.iterator().next()) : Optional.empty());
+    }
+
+    /**
+     * The company a retired slug should lead to, if any.
+     *
+     * Reads the redirect written at merge time. Without this the merge's promise that old links
+     * keep working is only a promise: the retired company still owns its slug, so the link would
+     * render an empty page for a company whose managers have all moved elsewhere - worse than a
+     * 404, because it looks like the company simply has nothing.
+     */
+    public Future<Optional<Row>> findRedirectTargetBySlug(String oldSlug) {
+        return db.preparedQuery("""
+                SELECT c.* FROM company_redirects r
+                JOIN companies c ON c.id = r.company_id
+                WHERE r.old_slug = $1 AND c.status <> 'merged'
+                """)
+            .execute(Tuple.of(oldSlug))
+            .map(rows -> rows.iterator().hasNext() ? Optional.of(rows.iterator().next()) : Optional.empty());
+    }
+
     // ── Corporate relationships ───────────────────────────────────────────────
     //
     // Two real companies where one owns the other, as opposed to two rows describing one company.
@@ -650,6 +719,7 @@ public class CompanyRepository {
                   (SELECT name FROM companies WHERE id = $1) AS keep_name,
                   (SELECT name FROM companies WHERE id = $2) AS merge_name,
                   (SELECT slug FROM companies WHERE id = $2) AS merge_slug,
+                  (SELECT status FROM companies WHERE id = $2) AS merge_status,
                   -- The blocking conflict: the same person, the same year, both companies.
                   (SELECT COUNT(*) FROM interview_reviews a
                      JOIN interview_reviews b
@@ -673,6 +743,7 @@ public class CompanyRepository {
                 return new io.vertx.core.json.JsonObject()
                     .put("keepName",           r.getString("keep_name"))
                     .put("mergeName",          r.getString("merge_name"))
+                    .put("mergeStatus",        r.getString("merge_status"))
                     .put("managers",           r.getLong("managers"))
                     .put("careerEntries",      r.getLong("career_entries"))
                     .put("interviews",         r.getLong("interviews"))
@@ -722,9 +793,13 @@ public class CompanyRepository {
                         VALUES ($1, $2, $3, $4::JSONB)
                         RETURNING id
                         """)
+                    // The snapshot carries the source's status because undo has to put it back.
+                    // A ghost company that was merged must return as a ghost, not be promoted to
+                    // approved by the act of being restored.
                     .execute(Tuple.of(mergeId, keepId, adminUserId,
                         new io.vertx.core.json.JsonObject()
                             .put("name", mergeName)
+                            .put("status", preview.getString("mergeStatus"))
                             .put("preview", preview).encode()))
                     .map(rs -> rs.iterator().next().getUUID("id"))
 
@@ -770,19 +845,58 @@ public class CompanyRepository {
                         // Aliases move, and the source's own name becomes one. That is the whole
                         // point: someone searching the old name must now find the surviving company
                         // rather than a blank, or they will simply create it again.
+                        //
+                        // Moved by UPDATE rather than copy-and-delete. Copying would give the
+                        // target brand new alias rows and destroy the originals, leaving an undo
+                        // nothing to put back. Updating keeps each row's identity, so the manifest
+                        // can name it and the reverse is a straight UPDATE.
+                        //
+                        // An alias the target already has cannot move onto it - the unique index
+                        // forbids two rows with the same normalised alias under one company - so
+                        // those are archived instead, recorded as such, and restored on undo.
                         .compose(v -> conn.preparedQuery("""
-                                INSERT INTO company_aliases (company_id, alias, alias_type)
-                                SELECT $1, a.alias, a.alias_type FROM company_aliases a WHERE a.company_id = $2
-                                ON CONFLICT DO NOTHING
+                                INSERT INTO company_merge_records (merge_id, entity_type, record_id, old_company_id, new_company_id, conflict_action)
+                                SELECT $1, 'company_alias', a.id::TEXT, $3, $2, 'archived_duplicate'
+                                FROM company_aliases a
+                                WHERE a.company_id = $3
+                                  AND EXISTS (SELECT 1 FROM company_aliases t
+                                              WHERE t.company_id = $2 AND t.normalized_alias = a.normalized_alias)
+                                """)
+                            .execute(Tuple.of(mergeUuid, keepId, mergeId)))
+                        .compose(v -> conn.preparedQuery("""
+                                DELETE FROM company_aliases a
+                                WHERE a.company_id = $2
+                                  AND EXISTS (SELECT 1 FROM company_aliases t
+                                              WHERE t.company_id = $1 AND t.normalized_alias = a.normalized_alias)
                                 """)
                             .execute(Tuple.of(keepId, mergeId)))
-                        .compose(v -> conn.preparedQuery("DELETE FROM company_aliases WHERE company_id = $1")
-                            .execute(Tuple.of(mergeId)))
+                        .compose(v -> conn.preparedQuery("""
+                                INSERT INTO company_merge_records (merge_id, entity_type, record_id, old_company_id, new_company_id)
+                                SELECT $1, 'company_alias', a.id::TEXT, $3, $2
+                                FROM company_aliases a WHERE a.company_id = $3
+                                """)
+                            .execute(Tuple.of(mergeUuid, keepId, mergeId)))
+                        .compose(v -> conn.preparedQuery("UPDATE company_aliases SET company_id = $1 WHERE company_id = $2")
+                            .execute(Tuple.of(keepId, mergeId)))
+
+                        // The source's own name, added to the target. Recorded separately because
+                        // undo has to remove it rather than move it back: it never belonged to the
+                        // source as an alias, it WAS the source.
                         .compose(v -> conn.preparedQuery("""
                                 INSERT INTO company_aliases (company_id, alias, alias_type)
-                                VALUES ($1, $2, 'MERGED_NAME') ON CONFLICT DO NOTHING
+                                VALUES ($1, $2, 'MERGED_NAME')
+                                ON CONFLICT (company_id, normalized_alias) DO NOTHING
+                                RETURNING id
                                 """)
-                            .execute(Tuple.of(keepId, mergeName)))
+                            .execute(Tuple.of(keepId, mergeName))
+                            .compose(rs -> rs.iterator().hasNext()
+                                ? conn.preparedQuery("""
+                                        INSERT INTO company_merge_records (merge_id, entity_type, record_id, old_company_id, new_company_id)
+                                        VALUES ($1, 'company_alias_added', $2, $3, $4)
+                                        """)
+                                    .execute(Tuple.of(mergeUuid, String.valueOf(rs.iterator().next().getLong("id")), mergeId, keepId))
+                                    .mapEmpty()
+                                : Future.succeededFuture()))
 
                         // The stats tables are keyed by company_id as a primary key, so their rows
                         // cannot be moved onto a target that already has one. Drop the source's and
@@ -813,5 +927,120 @@ public class CompanyRepository {
                             .execute(Tuple.of(keepName, keepId)))
                         .map(v -> mergeUuid)));
         });
+    }
+
+    /**
+     * Reverses a merge, putting every row back where it came from.
+     *
+     * This is why the merge writes a manifest of row ids rather than a summary. Undo does not
+     * reason about what "probably" belonged to the source: it reads the list of rows the merge
+     * moved and moves exactly those back. Anything added to the target after the merge stays with
+     * the target, because it is not on the list.
+     *
+     * Runs in one transaction. A half-undone merge would be worse than either state.
+     */
+    public Future<io.vertx.core.json.JsonObject> undoMerge(UUID mergeRecordId) {
+        return db.preparedQuery("""
+                SELECT m.id, m.source_company_id, m.target_company_id, m.status, m.source_snapshot
+                FROM company_merges m WHERE m.id = $1
+                """)
+            .execute(Tuple.of(mergeRecordId))
+            .compose(rs -> {
+                if (!rs.iterator().hasNext())
+                    return Future.failedFuture("Merge not found");
+                Row merge = rs.iterator().next();
+                if (!"completed".equals(merge.getString("status")))
+                    return Future.failedFuture("This merge has already been reverted");
+
+                long sourceId = merge.getLong("source_company_id");
+                long targetId = merge.getLong("target_company_id");
+                // JSONB arrives as either a JsonObject or its string form depending on how the
+                // column was written, so it is parsed rather than cast - the same defensive read
+                // the category_averages column needs elsewhere.
+                Object rawSnapshot = merge.getValue("source_snapshot");
+                io.vertx.core.json.JsonObject snapshot =
+                    rawSnapshot instanceof io.vertx.core.json.JsonObject
+                        ? (io.vertx.core.json.JsonObject) rawSnapshot
+                        : rawSnapshot != null
+                            ? new io.vertx.core.json.JsonObject(rawSnapshot.toString())
+                            : new io.vertx.core.json.JsonObject();
+                // A ghost company that was merged comes back as a ghost. Being restored is not a
+                // promotion.
+                String restoredStatus = snapshot.getString("status", "approved");
+
+                return ((Pool) db).withTransaction(conn ->
+                    // Managers and career history: the foreign key and the denormalised name both
+                    // go back, or the picker would keep showing the surviving company's name for a
+                    // manager that no longer belongs to it.
+                    conn.preparedQuery("""
+                            UPDATE managers m
+                            SET company_id = r.old_company_id::BIGINT,
+                                company    = COALESCE(r.old_company_text, m.company)
+                            FROM company_merge_records r
+                            WHERE r.merge_id = $1 AND r.entity_type = 'manager'
+                              AND m.id = r.record_id::BIGINT
+                            """)
+                        .execute(Tuple.of(mergeRecordId))
+                        .compose(v -> conn.preparedQuery("""
+                                UPDATE career_history ch
+                                SET company_id = r.old_company_id::BIGINT,
+                                    company    = COALESCE(r.old_company_text, ch.company)
+                                FROM company_merge_records r
+                                WHERE r.merge_id = $1 AND r.entity_type = 'career_history'
+                                  AND ch.id = r.record_id::BIGINT
+                                """)
+                            .execute(Tuple.of(mergeRecordId)))
+                        .compose(v -> conn.preparedQuery("""
+                                UPDATE interview_reviews ir
+                                SET company_id = r.old_company_id::BIGINT
+                                FROM company_merge_records r
+                                WHERE r.merge_id = $1 AND r.entity_type = 'interview_review'
+                                  AND ir.id = r.record_id::UUID
+                                """)
+                            .execute(Tuple.of(mergeRecordId)))
+
+                        // Aliases that moved go back; the source's own name, which the merge added
+                        // to the target, is removed rather than moved - it was never an alias of
+                        // the source, it was the source.
+                        .compose(v -> conn.preparedQuery("""
+                                UPDATE company_aliases a
+                                SET company_id = r.old_company_id::BIGINT
+                                FROM company_merge_records r
+                                WHERE r.merge_id = $1 AND r.entity_type = 'company_alias'
+                                  AND r.conflict_action IS NULL
+                                  AND a.id = r.record_id::BIGINT
+                                """)
+                            .execute(Tuple.of(mergeRecordId)))
+                        .compose(v -> conn.preparedQuery("""
+                                DELETE FROM company_aliases a
+                                USING company_merge_records r
+                                WHERE r.merge_id = $1 AND r.entity_type = 'company_alias_added'
+                                  AND a.id = r.record_id::BIGINT
+                                """)
+                            .execute(Tuple.of(mergeRecordId)))
+
+                        // Pending edit requests follow their company back.
+                        .compose(v -> conn.preparedQuery(
+                                "UPDATE manager_edits SET requested_company_id = $1 WHERE requested_company_id = $2")
+                            .execute(Tuple.of(sourceId, targetId)))
+
+                        // The redirect goes: the source is a real company again and owns its URL.
+                        .compose(v -> conn.preparedQuery(
+                                "DELETE FROM company_redirects WHERE old_slug IN (SELECT slug FROM companies WHERE id = $1)")
+                            .execute(Tuple.of(sourceId)))
+
+                        .compose(v -> conn.preparedQuery("UPDATE companies SET status = $2, updated_at = now() WHERE id = $1")
+                            .execute(Tuple.of(sourceId, restoredStatus)))
+
+                        // Marked rather than deleted, so the history of what was done and undone
+                        // survives. The manifest stays too: it is the evidence.
+                        .compose(v -> conn.preparedQuery("UPDATE company_merges SET status = 'reverted' WHERE id = $1")
+                            .execute(Tuple.of(mergeRecordId)))
+
+                        .map(v -> new io.vertx.core.json.JsonObject()
+                            .put("success", true)
+                            .put("restoredCompanyId", sourceId)
+                            .put("targetCompanyId", targetId)));
+            });
     }
 }
