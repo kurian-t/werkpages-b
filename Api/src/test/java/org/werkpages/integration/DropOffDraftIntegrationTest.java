@@ -500,6 +500,80 @@ class DropOffDraftIntegrationTest {
             .map(rs -> rs.iterator().next().getLong(0)));
     }
 
+    // ── Incomplete captures ───────────────────────────────────────────────────
+    //
+    // The whole point of a drop-off. Somebody who walked away at the sign-in step never reached
+    // the "when did you work with them" field, so their review is necessarily incomplete - and
+    // this path was validating it as though it were a finished submission and rejecting it. Every
+    // existing test above sends a complete review, which is why the bug survived them.
+
+    @Test
+    void createDropOffDraft_newManager_withoutWorkedFrom_stillCapturesTheReview() throws Exception {
+        JsonObject body = dropOffBody("Syed Peer", "Amazon", "System Development Manager", "Canada");
+        body.getJsonObject("review").remove("workedFrom");
+
+        JsonObject result = await(service.createDropOffDraft(body, null));
+
+        long managerId = result.getLong("id");
+        Long reviews = await(pool.preparedQuery("SELECT COUNT(*) AS c FROM reviews WHERE manager_id = $1")
+            .execute(Tuple.of(managerId)).map(rs -> rs.iterator().next().getLong("c")));
+        assertEquals(1L, reviews, "the review someone walked away from is kept, not discarded");
+    }
+
+    @Test
+    void createDropOffDraft_repeatedCapture_losesNoReview() throws Exception {
+        // Two captures for the same new manager, which is what a retry looks like.
+        //
+        // findByNameAndCompany only matches approved/ghost, so the pending manager the first
+        // capture created is invisible to the second and a second manager row appears. That
+        // duplication is a separate problem - and the reason one abandoned review produced three
+        // manager rows in production. What must hold here is that neither review is lost.
+        await(service.createDropOffDraft(dropOffBody("Ada Byron", "Analytical Co", "Lead", "Canada"), null));
+
+        JsonObject second = dropOffBody("Ada Byron", "Analytical Co", "Lead", "Canada");
+        second.getJsonObject("review").remove("workedFrom");
+        await(service.createDropOffDraft(second, null));
+
+        Long reviews = await(pool.preparedQuery("""
+                SELECT COUNT(*) AS c FROM reviews r
+                JOIN managers m ON m.id = r.manager_id WHERE m.name = $1
+                """)
+            .execute(Tuple.of("Ada Byron")).map(rs -> rs.iterator().next().getLong("c")));
+        assertEquals(2L, reviews, "both captures are kept, complete or not");
+    }
+
+    @Test
+    void createDropOffDraft_withoutCompanyOrTitleOnTheReview_stillCaptures() throws Exception {
+        // Not something the real form produces - it collects both on step one and will not fire a
+        // capture until step one is valid. This guards the public endpoint against a payload that
+        // omits them, where the NOT NULL columns would otherwise reject the whole capture.
+        JsonObject body = dropOffBody("Grace Hopper", "Naval Systems", "Rear Admiral", "Canada");
+        body.getJsonObject("review").remove("managerCompany");
+        body.getJsonObject("review").remove("managerTitle");
+
+        JsonObject result = await(service.createDropOffDraft(body, null));
+
+        Long reviews = await(pool.preparedQuery("SELECT COUNT(*) AS c FROM reviews WHERE manager_id = $1")
+            .execute(Tuple.of(result.getLong("id"))).map(rs -> rs.iterator().next().getLong("c")));
+        assertEquals(1L, reviews);
+    }
+
+    @Test
+    void createDropOffDraft_withNothingToCapture_leavesNoOrphanManager() throws Exception {
+        // A rating is the one thing a capture cannot do without. The failure has to happen before
+        // the manager row is written - otherwise a rejected review leaves a manager nobody
+        // submitted sitting in the admin queue, which is how one abandoned review produced three.
+        JsonObject body = dropOffBody("Nobody Here", "Empty Corp", "Manager", "Canada");
+        body.getJsonObject("review").remove("ratings");
+        body.getJsonObject("review").remove("overallRating");
+
+        assertThrows(Exception.class, () -> await(service.createDropOffDraft(body, null)));
+
+        Long managers = await(pool.preparedQuery("SELECT COUNT(*) AS c FROM managers WHERE name = $1")
+            .execute(Tuple.of("Nobody Here")).map(rs -> rs.iterator().next().getLong("c")));
+        assertEquals(0L, managers, "no manager row is left behind by a capture that could not be kept");
+    }
+
     private static JsonObject createManagerBody(String name, String company, String title) {
         JsonObject ratings = new JsonObject()
             .put("communication_style", 4)

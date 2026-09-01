@@ -2444,6 +2444,20 @@ public class ManagerService {
         final String fAuthor = author;
         final UUID   fDropOffToken = dropOffToken;
 
+        // reviews.manager_company and manager_title are NOT NULL. The form asks for both on step
+        // one and the capture only fires once step one is valid, so a genuine submission always
+        // carries them - this is a guard on a public endpoint, not the usual case. Falls back to
+        // the top-level company and title the request already validated, rather than relaxing a
+        // real constraint or inventing an employer.
+        if (isBlank(review.getString("managerCompany"))) review.put("managerCompany", company);
+        if (isBlank(review.getString("managerTitle")))   review.put("managerTitle",   title);
+
+        // Nothing to keep, so nothing to create. Checked before any write: the failure below used
+        // to happen after the manager row had already been committed, which is how three orphan
+        // managers appeared for one abandoned review.
+        if (review.getJsonObject("ratings") == null && review.getDouble("overallRating") == null)
+            return Future.failedFuture(ServiceException.badRequest("Nothing to capture"));
+
         return managerRepo.findByNameAndCompany(name, company)
             .compose(rows -> {
                 if (rows.iterator().hasNext()) {
@@ -2451,12 +2465,17 @@ public class ManagerService {
                     long existingId = existing.getLong("id");
                     String approvalStatus = existing.getString("approval_status");
 
+                    // allowIncomplete, because this is a capture. Somebody who walked away at the
+                    // sign-in step never reached the "when did you work with them" field, and
+                    // demanding it here discards the exact submission the capture exists to save.
+                    // This path was calling the strict overload, so every abandoned review for a
+                    // new manager was validated as though it were a finished one, and rejected.
                     if ("ghost".equals(approvalStatus)) {
-                        return validateAndInsertReview(review, existingId, null, fAuthor, resolvedLogoUrl, fDropOffToken)
+                        return validateAndInsertReview(review, existingId, null, fAuthor, resolvedLogoUrl, fDropOffToken, true)
                             .compose(ignored -> reviewRepo.scheduleSeedExpiry(existingId))
                             .map(ignored -> new JsonObject().put("id", existingId).put("created", false));
                     } else {
-                        return validateAndInsertReview(review, existingId, null, fAuthor, resolvedLogoUrl, fDropOffToken)
+                        return validateAndInsertReview(review, existingId, null, fAuthor, resolvedLogoUrl, fDropOffToken, true)
                             .map(ignored -> new JsonObject().put("id", existingId).put("created", false));
                     }
                 } else {
@@ -2464,11 +2483,33 @@ public class ManagerService {
                         .compose(companyRow -> managerRepo.createPending(name, company, title, fStatus, country, fState, resolvedLogoUrl, companyRow.getLong("id")))
                         .compose(managerRow -> {
                             long managerId = managerRow.getLong("id");
-                            return validateAndInsertReview(review, managerId, null, fAuthor, resolvedLogoUrl, fDropOffToken)
-                                .map(ignored -> new JsonObject().put("id", managerId).put("created", true));
+                            return validateAndInsertReview(review, managerId, null, fAuthor, resolvedLogoUrl, fDropOffToken, true)
+                                .map(ignored -> new JsonObject().put("id", managerId).put("created", true))
+                                // The manager row is already committed by the time the review can
+                                // fail, and there is no transaction spanning the two. Rather than
+                                // leave a manager nobody submitted sitting in the admin queue,
+                                // take it back out. Safe to delete unconditionally: it was created
+                                // by this request, moments ago, and nothing else can reference it.
+                                .recover(err -> {
+                                    System.err.println("Drop-off capture failed for new manager " + managerId
+                                        + " (" + name + " @ " + company + "): " + err.getMessage()
+                                        + " - removing the orphaned manager row");
+                                    return managerRepo.delete(managerId)
+                                        .recover(cleanupErr -> {
+                                            System.err.println("Could not remove orphaned manager " + managerId
+                                                + ": " + cleanupErr.getMessage());
+                                            return Future.succeededFuture();
+                                        })
+                                        .compose(v -> Future.<JsonObject>failedFuture(err));
+                                });
                         });
                 }
-            });
+            })
+            // Logged here, never returned to the client. A capture is fire-and-forget by design and
+            // the response tells an anonymous caller nothing about why it failed; this is so the
+            // failure is visible to us rather than silent on both ends.
+            .onFailure(err -> System.err.println(
+                "Drop-off capture failed for " + name + " @ " + company + ": " + err.getMessage()));
     }
 
     private static final String[] PSEUDO_ADJ = {
