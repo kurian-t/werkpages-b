@@ -610,6 +610,10 @@ public class ManagerService {
                         // company" and "create it", and `"id": null` reads as a broken record.
                         Long id = row.getLong("id");
                         if (id != null) suggestion.put("id", id);
+                        // Same omit-rather-than-null rule: a caller that needs the company's URL
+                        // checks for the key. Older rows predate slugs and legitimately have none.
+                        String slug = row.getString("slug");
+                        if (slug != null && !slug.isBlank()) suggestion.put("slug", slug);
                         // Resolver first, stored logo second - unchanged precedence, so a company
                         // whose logo was resolved from its domain keeps the better image.
                         String logoUrl = logoResolver.apply(name);

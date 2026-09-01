@@ -85,7 +85,11 @@ public class CompanyRepository {
                 -- A company reached by several tiers keeps only its best one, so an exact name
                 -- match is not diluted by also matching an alias further down.
                 best AS (SELECT id, MIN(tier) AS tier FROM matches GROUP BY id)
-                SELECT c.id, c.name, c.logo_url, c.industry,
+                -- slug travels with the suggestion because a picker result is an identity, and
+                -- some callers need the company's address rather than its number: submitting an
+                -- interview posts to /api/companies/{slug}/interviews. Without it the caller has
+                -- to make a second round trip to turn a chosen company into a URL.
+                SELECT c.id, c.name, c.slug, c.logo_url, c.industry,
                        (best.tier <= 4) AS starts_with
                 FROM best
                 -- Never offer a retired company. Selecting one would attach a new manager to a
