@@ -560,6 +560,41 @@ class CompanyMergeDataLossIntegrationTest {
         }, "the redirect row carries the same columns as a direct slug lookup");
     }
 
+    @Test
+    void thePreviewDoesNotWarnAboutManagersNobodyCanSee() throws Exception {
+        // A rejected manager appears on no public surface. Warning that one "appears under both
+        // companies" is a false alarm about a row nobody will ever encounter, and a warning that
+        // fires on every merge is one an admin learns to click past.
+        long keep  = insertCompany("Warn Keep");
+        long merge = insertCompany("Warn Gone");
+        insertManager("Aaron Hack", "Warn Gone", merge);
+        long hidden = insertManager("Aaron Hack", "Warn Keep", keep);
+        await(pool.preparedQuery("UPDATE managers SET approval_status = 'rejected' WHERE id = $1")
+            .execute(Tuple.of(hidden)).mapEmpty());
+
+        var preview = await(companyRepo.previewMerge(keep, merge));
+
+        assertEquals(0L, preview.getLong("duplicateManagers"),
+            "a rejected manager is not a collision anyone will see");
+        assertFalse(preview.getBoolean("blocked"), "and it certainly does not block the merge");
+    }
+
+    @Test
+    void thePreviewCountsNamesNotMatchingRows() throws Exception {
+        // One person listed three times at the target is one name, not three. COUNT(*) over the
+        // join counts pairs, which reported "3 manager names appear under both" for a single name.
+        long keep  = insertCompany("Count Keep");
+        long merge = insertCompany("Count Gone");
+        insertManager("Aaron Hack", "Count Gone", merge);
+        insertManager("Aaron Hack", "Count Keep", keep);
+        insertManager("Aaron Hack", "Count Keep", keep);
+        insertManager("Aaron Hack", "Count Keep", keep);
+
+        var preview = await(companyRepo.previewMerge(keep, merge));
+
+        assertEquals(1L, preview.getLong("duplicateManagers"), "one name, however many rows carry it");
+    }
+
     // ── fixtures ──────────────────────────────────────────────────────────────
 
     private long insertCompany(String name) throws Exception {

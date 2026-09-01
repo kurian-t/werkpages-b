@@ -786,9 +786,20 @@ public class CompanyRepository {
                   -- Not blocking, but the admin should see it: the same person may now appear
                   -- twice under one company. Company identity and manager identity are separate
                   -- problems and this merge deliberately does not touch the second one.
-                  (SELECT COUNT(*) FROM managers a
+                  --
+                  -- DISTINCT names, not matching rows. COUNT(*) here counts pairs, so one person
+                  -- listed four times at the target reported "4 manager names appear under both"
+                  -- when the answer was one name.
+                  --
+                  -- And only managers anyone can actually see. Rejected and pending rows appear on
+                  -- no public surface, so warning that they "appear under both companies" is a
+                  -- false alarm about rows nobody will ever encounter - which is how a real
+                  -- warning gets trained out of an admin's attention.
+                  (SELECT COUNT(DISTINCT LOWER(TRIM(a.name))) FROM managers a
                      JOIN managers b ON LOWER(TRIM(a.name)) = LOWER(TRIM(b.name))
-                    WHERE a.company_id = $2 AND b.company_id = $1) AS duplicate_managers
+                    WHERE a.company_id = $2 AND b.company_id = $1
+                      AND a.approval_status IN ('approved', 'ghost')
+                      AND b.approval_status IN ('approved', 'ghost')) AS duplicate_managers
                 """)
             .execute(Tuple.of(keepId, mergeId))
             .map(rows -> {
