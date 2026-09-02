@@ -167,6 +167,45 @@ class ReviewSoftDeleteIntegrationTest {
         assertEquals(0L, count, "review within 3-day window must remain hidden");
     }
 
+    // ── The daily allowance is not refundable ─────────────────────────────────
+
+    @Test
+    void deletingAReviewDoesNotRefundTheDailyAllowance() throws Exception {
+        // The bypass. Soft delete nullifies user_id and sets deleted_at, so a deleted review is
+        // invisible to a count that only looks at live rows - and the allowance resets. The
+        // 30-day cooldown does not close it, because that is keyed per manager: review one
+        // manager, delete, review the next, and the limit never binds.
+        long managerId = insertManager("Refund Target", "Corp", "Title");
+        String auth0Id = insertUser("auth0|refund-1", "RefundUser1");
+        UUID userId    = findUserId(auth0Id);
+
+        Row review = await(service.createReview(auth0Id, managerId,
+            validBody("Corp", "Title", "2022-01", null), null));
+        assertEquals(1L, await(reviewRepo.countSubmittedTodayByUser(userId)),
+            "the submission counts");
+
+        await(service.deleteReview(auth0Id, managerId, review.getUUID("id")));
+
+        assertEquals(1L, await(reviewRepo.countSubmittedTodayByUser(userId)),
+            "and it still counts after being deleted - otherwise the day's limit refunds itself");
+    }
+
+    @Test
+    void aDeletionOnAnEarlierDayDoesNotCountAgainstToday() throws Exception {
+        // The other half: the count is today's allowance, not a permanent tally. A deletion from
+        // last week must not consume any of it.
+        long managerId = insertManager("Old Deletion Mgr", "Corp", "Title");
+        String auth0Id = insertUser("auth0|refund-2", "RefundUser2");
+        UUID userId    = findUserId(auth0Id);
+
+        await(pool.preparedQuery(
+                "INSERT INTO review_deletions (user_id, manager_id, deleted_at) VALUES ($1, $2, now() - INTERVAL '7 days')")
+            .execute(Tuple.of(userId, managerId)).mapEmpty());
+
+        assertEquals(0L, await(reviewRepo.countSubmittedTodayByUser(userId)),
+            "a deletion from another day is not part of today's count");
+    }
+
     // ── Helpers ───────────────────────────────────────────────────────────────
 
     private long insertManager(String name, String company, String title) throws Exception {

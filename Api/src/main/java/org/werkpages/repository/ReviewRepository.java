@@ -149,10 +149,29 @@ public class ReviewRepository {
             .execute(Tuple.of(managerId));
     }
 
+    /**
+     * How much of today's allowance this user has spent.
+     *
+     * Deletions count. Without them the daily limit refunds itself: a deleted review no longer
+     * satisfies {@code deleted_at IS NULL}, so the count drops and another submission is allowed.
+     * The 30-day cooldown does not close that, because it is keyed per manager - review one
+     * manager, delete, review the next, and the limit never binds.
+     *
+     * The same reasoning, and the same fix, as InterviewRepository.countSubmittedTodayByUser.
+     * That one was written correctly and this one was not, which is what two copies of a rule do.
+     */
     public Future<Long> countSubmittedTodayByUser(UUID userId) {
-        return db.preparedQuery("SELECT COUNT(*) FROM reviews WHERE user_id = $1 AND created_at >= current_date AND deleted_at IS NULL")
+        return db.preparedQuery("""
+                SELECT (
+                    SELECT COUNT(*) FROM reviews
+                    WHERE user_id = $1 AND created_at >= current_date AND deleted_at IS NULL
+                ) + (
+                    SELECT COUNT(*) FROM review_deletions
+                    WHERE user_id = $1 AND deleted_at >= current_date
+                ) AS c
+                """)
             .execute(Tuple.of(userId))
-            .map(rows -> rows.iterator().next().getLong(0));
+            .map(rows -> rows.iterator().next().getLong("c"));
     }
 
     // ── Mutations ─────────────────────────────────────────────────────────────
