@@ -672,9 +672,11 @@ public class CompanyRepository {
      */
     public Future<Optional<Row>> findCompanyParent(long childId) {
         return db.preparedQuery("""
-                SELECT p.id, p.name, p.slug, p.logo_url, r.relationship_type
+                SELECT p.id, p.name, p.slug, p.logo_url, r.relationship_type,
+                       ps.logo_url AS stats_logo_url
                 FROM company_relationships r
                 JOIN companies p ON p.id = r.parent_company_id
+                LEFT JOIN company_stats_live ps ON ps.company_id = p.id
                 WHERE r.child_company_id = $1
                   AND p.status <> 'merged'
                 """)
@@ -693,6 +695,11 @@ public class CompanyRepository {
     public Future<RowSet<Row>> findCompanyChildren(long parentId) {
         return db.preparedQuery("""
                 SELECT c.id, c.name, c.slug, c.logo_url, r.relationship_type,
+                       -- The stats logo, same as findBySlug exposes. A company page resolves its
+                       -- logo from this first and companies.logo_url second; a group tile that
+                       -- reads only the second shows a letter for any company whose stored column
+                       -- is null, while that same company's own page shows its logo.
+                       s.logo_url AS stats_logo_url,
                        COALESCE(s.manager_count, 0) AS manager_count,
                        COALESCE(s.total_reviews, 0) AS total_reviews,
                        s.avg_rating

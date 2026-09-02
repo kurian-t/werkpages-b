@@ -355,6 +355,24 @@ public class ManagerService {
      * figure, if it ever exists, is an additional and explicitly labelled number rather than a
      * quiet redefinition of what a company's rating means.
      */
+    /**
+     * The logo a company should show, by the same precedence the company page itself uses.
+     *
+     * stats first (computed from the company's own managers), then the stored column, then the
+     * resolver. Group tiles used to read the stored column alone, so a company with a null
+     * logo_url showed a letter in its parent's group list while its own page showed its logo -
+     * the same component, fed worse data.
+     */
+    private String bestCompanyLogo(Row row, String name) {
+        String stats  = row.getString("stats_logo_url");
+        String stored = row.getString("logo_url");
+        if (stats  != null && stats.contains("logo.dev"))  return stats;
+        if (stored != null && stored.contains("logo.dev")) return stored;
+        String resolved = logoResolver.apply(name);
+        if (resolved != null && !resolved.isBlank()) return resolved;
+        return stored != null && !stored.isBlank() ? stored : stats;
+    }
+
     private Future<JsonObject> withCorporateStructure(JsonObject profile, long companyId) {
         return companyRepo.findCompanyParent(companyId)
             .compose(parentOpt -> companyRepo.findCompanyChildren(companyId).map(childRows -> {
@@ -364,7 +382,7 @@ public class ManagerService {
                         .put("name", p.getString("name"))
                         .put("slug", p.getString("slug"))
                         .put("relationshipType", p.getString("relationship_type"));
-                    String logo = p.getString("logo_url");
+                    String logo = bestCompanyLogo(p, p.getString("name"));
                     if (logo != null && !logo.isBlank()) parent.put("logoUrl", logo);
                     profile.put("partOf", parent);
                 });
@@ -379,7 +397,7 @@ public class ManagerService {
                         .put("totalReviews", c.getLong("total_reviews"))
                         .put("avgRating",    c.getBigDecimal("avg_rating"))
                         .put("relationshipType", c.getString("relationship_type"));
-                    String logo = c.getString("logo_url");
+                    String logo = bestCompanyLogo(c, c.getString("name"));
                     if (logo != null && !logo.isBlank()) child.put("logoUrl", logo);
                     children.add(child);
                 }

@@ -595,6 +595,50 @@ class CompanyMergeDataLossIntegrationTest {
         assertEquals(1L, preview.getLong("duplicateManagers"), "one name, however many rows carry it");
     }
 
+    @Test
+    void groupChildrenCarryTheSameLogoTheirOwnPageWouldShow() throws Exception {
+        // A company in a group used to read only companies.logo_url, while its own page resolved
+        // from company_stats_live first. So a company with a null stored column showed its logo on
+        // its own page and a bare letter in its parent's group list - the same component, fed
+        // worse data. This is the exact BlackBerry QNX case.
+        long parent = insertCompany("Logo Parent");
+        long child  = insertCompany("Logo Child");
+        await(pool.preparedQuery("UPDATE companies SET logo_url = NULL WHERE id = $1")
+            .execute(Tuple.of(child)).mapEmpty());
+        await(pool.preparedQuery("""
+                INSERT INTO company_stats_live (company_id, manager_count, total_reviews, avg_rating, logo_url)
+                VALUES ($1, 1, 2, 4.3, 'https://img.logo.dev/qnx.com?token=x')
+                ON CONFLICT (company_id) DO UPDATE SET logo_url = EXCLUDED.logo_url
+                """)
+            .execute(Tuple.of(child)).mapEmpty());
+        await(companyRepo.setCompanyParent(child, parent, "SUBSIDIARY_OF"));
+
+        var rows = await(companyRepo.findCompanyChildren(parent));
+        var row = rows.iterator().next();
+        assertNull(row.getString("logo_url"), "the stored column really is empty");
+        assertEquals("https://img.logo.dev/qnx.com?token=x", row.getString("stats_logo_url"),
+            "the stats logo is exposed, so the service can resolve it the same way a company page does");
+    }
+
+    @Test
+    void groupChildrenCarryTheirReviewCount() throws Exception {
+        // The count was queried and returned all along; the tile never rendered it. Guarding the
+        // data here so the two cannot drift apart again.
+        long parent = insertCompany("Count Parent");
+        long child  = insertCompany("Count Child");
+        await(pool.preparedQuery("""
+                INSERT INTO company_stats_live (company_id, manager_count, total_reviews, avg_rating)
+                VALUES ($1, 1, 2, 4.3)
+                ON CONFLICT (company_id) DO UPDATE SET total_reviews = EXCLUDED.total_reviews
+                """)
+            .execute(Tuple.of(child)).mapEmpty());
+        await(companyRepo.setCompanyParent(child, parent, "SUBSIDIARY_OF"));
+
+        var row = await(companyRepo.findCompanyChildren(parent)).iterator().next();
+        assertEquals(2L, row.getLong("total_reviews"));
+        assertEquals(1L, row.getLong("manager_count"));
+    }
+
     // ── fixtures ──────────────────────────────────────────────────────────────
 
     private long insertCompany(String name) throws Exception {
