@@ -118,7 +118,6 @@ public class BackfillEncryption {
     }
 
     private static String getEnv(String name, String def) {
-        String v = System.getenv(name);
-        return (v != null && !v.isBlank()) ? v : def;
+        return org.werkpages.service.Fields.env(name, def);
     }
 }

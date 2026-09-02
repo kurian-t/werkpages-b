@@ -187,7 +187,6 @@ public class SecretsConfig {
     }
 
     private static String getEnv(String name, String defaultValue) {
-        String value = System.getenv(name);
-        return (value != null && !value.isBlank()) ? value : defaultValue;
+        return org.werkpages.service.Fields.env(name, defaultValue);
     }
 }

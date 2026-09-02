@@ -83,6 +83,32 @@ class CompanyListingIntegrationTest {
 
     // ── getCompanyListing ────────────────────────────────────────────────────
 
+
+    /**
+     * The last row of CLAUDE.md's filter table that nothing was guarding.
+     *
+     * findManagersByCompanyId admits approved and ghost only. It matters more than most: the
+     * method is a four-way OR (company_id, the denormalised company text, career history, and a
+     * review's company snapshot), so there are four separate routes by which a manager that
+     * should be invisible could arrive on a public company page.
+     */
+    @Test
+    void findManagersByCompanyId_returnsApprovedAndGhostOnly() throws Exception {
+        insertManager("Visible Approved", "Filter Corp", "Manager",  "approved",         4.0, 2);
+        insertManager("Visible Ghost",    "Filter Corp", "Director", "ghost",            3.0, 1);
+        insertManager("Hidden Pending",   "Filter Corp", "Lead",     "pending_approval", null, 0);
+        insertManager("Hidden Rejected",  "Filter Corp", "VP",       "rejected",         null, 0);
+
+        long companyId = await(companyRepo.findOrCreate("Filter Corp", null, null)).getLong("id");
+        java.util.Set<String> names = new java.util.HashSet<>();
+        await(companyRepo.findManagersByCompanyId(companyId)).forEach(r -> names.add(r.getString("name")));
+
+        assertTrue(names.contains("Visible Approved"), "approved managers are public");
+        assertTrue(names.contains("Visible Ghost"),    "ghost managers are public - that is the point of ghost");
+        assertFalse(names.contains("Hidden Pending"),  "a pending manager must not reach a company page");
+        assertFalse(names.contains("Hidden Rejected"), "nor a rejected one");
+    }
+
     @Test
     void getCompanyListing_returnsAllApprovedAndGhostCompanies() throws Exception {
         insertManager("Alice A", "Acme Corp",    "Manager",  "approved", 4.0, 2);

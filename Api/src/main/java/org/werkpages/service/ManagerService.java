@@ -851,9 +851,8 @@ public class ManagerService {
                     author = dbUsername;
                 }
                 return managerRepo.countSubmittedTodayByUser(userId)
-                    .compose(todayCount -> {
-                        if (todayCount >= 6) return Future.failedFuture(ServiceException.tooManyRequests("daily_limit_reached"));
-
+                    .compose(todayCount -> SubmissionLimits.checkDailyLimit(todayCount, SubmissionLimits.DAILY_MANAGERS))
+                    .compose(withinLimit -> {
                         // Check for an existing manager with the same company and a fuzzy-matching name
                         // (Levenshtein distance ≤ 1). If found, attach the review there instead of
                         // creating a duplicate pending_approval entry.
@@ -1162,19 +1161,10 @@ public class ManagerService {
                 }
 
                 return reviewRepo.countSubmittedTodayByUser(userId)
-                    .compose(todayCount -> {
-                        if (todayCount >= 6) return Future.failedFuture(ServiceException.tooManyRequests("daily_limit_reached"));
-                        return reviewRepo.findRecentDeletion(userId, managerId);
-                    })
-                    .compose(recentDeletion -> {
-                        if (recentDeletion.isPresent()) {
-                            OffsetDateTime deletedAt = recentDeletion.get();
-                            OffsetDateTime cooldownEnd = deletedAt.plusDays(30);
-                            if (OffsetDateTime.now(ZoneOffset.UTC).isBefore(cooldownEnd)) {
-                                String cooldownEndStr = cooldownEnd.toLocalDate().toString(); // YYYY-MM-DD
-                                return Future.failedFuture(ServiceException.conflict("review_cooldown:" + cooldownEndStr));
-                            }
-                        }
+                    .compose(todayCount -> SubmissionLimits.checkDailyLimit(todayCount, SubmissionLimits.DAILY_REVIEWS))
+                    .compose(v -> reviewRepo.findRecentDeletion(userId, managerId))
+                    .compose(recentDeletion -> SubmissionLimits.checkCooldown(recentDeletion, "review"))
+                    .compose(v -> {
                         UUID draftToken = null;
                         String draftTokenStr = body.getString("draftToken");
                         if (draftTokenStr != null && !draftTokenStr.isBlank()) {
@@ -1866,9 +1856,8 @@ public class ManagerService {
                 if (userRow.getBoolean("is_banned")) return Future.failedFuture(ServiceException.forbidden("account_suspended"));
                 UUID userId = userRow.getUUID("id");
                 return editRepo.countSubmittedTodayByUser(userId)
-                    .compose(todayEdits -> {
-                        if (todayEdits >= 6) return Future.failedFuture(ServiceException.tooManyRequests("daily_limit_reached"));
-                        return managerRepo.findById(managerId)
+                    .compose(todayEdits -> SubmissionLimits.checkDailyLimit(todayEdits, SubmissionLimits.DAILY_EDITS))
+                    .compose(v -> managerRepo.findById(managerId)
                             .compose(mgrOpt -> {
                                 if (mgrOpt.isEmpty()) return Future.failedFuture(ServiceException.notFound("Manager not found"));
                                 // The company the user picked travels with the request. The name
@@ -1885,8 +1874,7 @@ public class ManagerService {
                                         .put("status", "pending")
                                         .put("createdAt", row.getOffsetDateTime("created_at").toString())
                                     );
-                            });
-                    });
+                            }));
             });
     }
 
@@ -2009,7 +1997,7 @@ public class ManagerService {
 
     // ── Validation helpers ────────────────────────────────────────────────────
 
-    private static boolean isBlank(String s) { return s == null || s.isBlank(); }
+    private static boolean isBlank(String s) { return Fields.isBlank(s); }
 
     private static boolean isValidRating(Double v) { return v != null && v >= 1 && v <= 5; }
 
@@ -2300,14 +2288,18 @@ public class ManagerService {
         if (isBlank(name) || isBlank(company) || isBlank(title) || isBlank(country)) {
             return Future.failedFuture(ServiceException.badRequest("Missing required fields"));
         }
-        if (name.length()    > 100) return Future.failedFuture(ServiceException.badRequest("Name too long"));
-        if (company.length() > 100) return Future.failedFuture(ServiceException.badRequest("Company too long"));
-        if (title.length()   > 100) return Future.failedFuture(ServiceException.badRequest("Title too long"));
-        if (country.length() > 100) return Future.failedFuture(ServiceException.badRequest("Country too long"));
+        String tooLong = Fields.firstProblem(
+            Fields.maxLength(name,    "Name"),
+            Fields.maxLength(company, "Company"),
+            Fields.maxLength(title,   "Title"),
+            Fields.maxLength(country, "Country"));
+        if (tooLong != null) return Future.failedFuture(ServiceException.badRequest(tooLong));
         if (isBlank(state)) state = null;
         if (isBlank(city))  city  = null;
-        if (state != null && state.length() > 100) return Future.failedFuture(ServiceException.badRequest("State too long"));
-        if (city  != null && city.length()  > 100) return Future.failedFuture(ServiceException.badRequest("City too long"));
+        String geoTooLong = Fields.firstProblem(
+            Fields.maxLength(state, "State"),
+            Fields.maxLength(city,  "City"));
+        if (geoTooLong != null) return Future.failedFuture(ServiceException.badRequest(geoTooLong));
 
         String[] nameParts = name.trim().split("\\s+", 2);
         String firstName = nameParts[0];
@@ -2376,12 +2368,15 @@ public class ManagerService {
         boolean hasDetail = !isBlank(company) || !isBlank(title);
         if (isBlank(name) || !hasDetail)
             return Future.failedFuture(ServiceException.badRequest("Missing required fields"));
-        if (name.length()    > 100) return Future.failedFuture(ServiceException.badRequest("Name too long"));
-        if (company != null && company.length() > 100) return Future.failedFuture(ServiceException.badRequest("Company too long"));
-        if (title   != null && title.length()   > 100) return Future.failedFuture(ServiceException.badRequest("Title too long"));
-        if (country != null && country.length() > 100) return Future.failedFuture(ServiceException.badRequest("Country too long"));
+        String tooLong = Fields.firstProblem(
+            Fields.maxLength(name,    "Name"),
+            Fields.maxLength(company, "Company"),
+            Fields.maxLength(title,   "Title"),
+            Fields.maxLength(country, "Country"));
+        if (tooLong != null) return Future.failedFuture(ServiceException.badRequest(tooLong));
         if (isBlank(state)) state = null;
-        if (state != null && state.length() > 100) return Future.failedFuture(ServiceException.badRequest("State too long"));
+        String stateTooLong = Fields.maxLength(state, "State");
+        if (stateTooLong != null) return Future.failedFuture(ServiceException.badRequest(stateTooLong));
 
         String[] nameParts = name.trim().split("\\s+", 2);
         String firstName = nameParts[0];
@@ -2429,12 +2424,15 @@ public class ManagerService {
 
         if (isBlank(name) || isBlank(company) || isBlank(title) || isBlank(country))
             return Future.failedFuture(ServiceException.badRequest("Missing required fields: name, company, title, country"));
-        if (name.length()    > 100) return Future.failedFuture(ServiceException.badRequest("Name too long"));
-        if (company.length() > 100) return Future.failedFuture(ServiceException.badRequest("Company too long"));
-        if (title.length()   > 100) return Future.failedFuture(ServiceException.badRequest("Title too long"));
-        if (country.length() > 100) return Future.failedFuture(ServiceException.badRequest("Country too long"));
+        String tooLong = Fields.firstProblem(
+            Fields.maxLength(name,    "Name"),
+            Fields.maxLength(company, "Company"),
+            Fields.maxLength(title,   "Title"),
+            Fields.maxLength(country, "Country"));
+        if (tooLong != null) return Future.failedFuture(ServiceException.badRequest(tooLong));
         if (isBlank(state)) state = null;
-        if (state != null && state.length() > 100) return Future.failedFuture(ServiceException.badRequest("State too long"));
+        String stateTooLong = Fields.maxLength(state, "State");
+        if (stateTooLong != null) return Future.failedFuture(ServiceException.badRequest(stateTooLong));
 
         JsonObject review = body.getJsonObject("review");
         if (review == null) return Future.failedFuture(ServiceException.badRequest("Missing review data"));

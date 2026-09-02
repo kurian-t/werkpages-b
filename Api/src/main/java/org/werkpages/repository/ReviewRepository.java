@@ -291,11 +291,13 @@ public class ReviewRepository {
         return db.preparedQuery("""
                 SELECT deleted_at FROM review_deletions
                 WHERE user_id = $1 AND manager_id = $2
-                  AND deleted_at > now() - INTERVAL '30 days'
+                  -- Bound, not written out: the cooldown is one number, and it lives in
+                  -- SubmissionLimits. It used to appear here and again in the caller's Java.
+                  AND deleted_at > now() - make_interval(days => $3)
                 ORDER BY deleted_at DESC
                 LIMIT 1
                 """)
-            .execute(Tuple.of(userId, managerId))
+            .execute(Tuple.of(userId, managerId, org.werkpages.service.SubmissionLimits.COOLDOWN_DAYS))
             .map(rows -> {
                 if (!rows.iterator().hasNext()) return Optional.empty();
                 return Optional.of(rows.iterator().next().getOffsetDateTime("deleted_at"));

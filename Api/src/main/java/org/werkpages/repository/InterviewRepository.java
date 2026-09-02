@@ -158,11 +158,11 @@ public class InterviewRepository {
         return db.preparedQuery("""
                 SELECT deleted_at FROM interview_review_deletions
                 WHERE user_id = $1 AND company_id = $2
-                  AND deleted_at > now() - INTERVAL '30 days'
+                  AND deleted_at > now() - make_interval(days => $3)
                 ORDER BY deleted_at DESC
                 LIMIT 1
                 """)
-            .execute(Tuple.of(userId, companyId))
+            .execute(Tuple.of(userId, companyId, org.werkpages.service.SubmissionLimits.COOLDOWN_DAYS))
             .map(rows -> rows.iterator().hasNext()
                 ? Optional.of(rows.iterator().next().getOffsetDateTime("deleted_at"))
                 : Optional.empty());

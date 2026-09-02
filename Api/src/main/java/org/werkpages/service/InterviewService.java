@@ -80,21 +80,12 @@ public class InterviewService {
                 Draft draft = parseDraft(body);
 
                 return interviewRepo.countSubmittedTodayByUser(userId)
-                    .compose(todayCount -> {
-                        if (todayCount >= DAILY_LIMIT) {
-                            return Future.failedFuture(ServiceException.tooManyRequests("daily_limit_reached"));
-                        }
-                        return interviewRepo.findRecentDeletion(userId, companyId);
-                    })
-                    .compose(recentDeletion -> {
-                        if (recentDeletion.isPresent()) {
-                            // Their earlier review is coming back anonymously; a replacement now
-                            // would count the same person twice.
-                            String until = recentDeletion.get().plusDays(30).toLocalDate().toString();
-                            return Future.failedFuture(ServiceException.conflict("interview_cooldown:" + until));
-                        }
-                        return interviewRepo.existsForYear(userId, companyId, draft.interviewYear);
-                    })
+                    .compose(todayCount -> SubmissionLimits.checkDailyLimit(todayCount, SubmissionLimits.DAILY_INTERVIEWS))
+                    .compose(v -> interviewRepo.findRecentDeletion(userId, companyId))
+                    // Their earlier review is coming back anonymously; a replacement now would
+                    // count the same person twice.
+                    .compose(recentDeletion -> SubmissionLimits.checkCooldown(recentDeletion, "interview"))
+                    .compose(v -> interviewRepo.existsForYear(userId, companyId, draft.interviewYear))
                     .compose(exists -> {
                         if (exists) {
                             return Future.failedFuture(ServiceException.conflict("interview_review_exists_for_year"));
