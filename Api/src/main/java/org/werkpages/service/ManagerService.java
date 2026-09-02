@@ -249,9 +249,7 @@ public class ManagerService {
                 String canonicalName = companyRow.getString("name");
                 String companySlug   = companyRow.getString("slug");
                 String companyIndustry = companyRow.getString("industry");
-                String storedLogoUrl = companyRow.getString("logo_url");
-                String logoUrl = (storedLogoUrl != null && storedLogoUrl.contains("logo.dev"))
-                    ? storedLogoUrl : resolvedLogoUrl;
+                String logoUrl = bestCompanyLogo(companyRow, canonicalName);
                 return companyRepo.findManagersByCompanyId(companyId)
                     .map(rows -> {
                         if (!rows.iterator().hasNext()) {
@@ -269,17 +267,7 @@ public class ManagerService {
                             if (logoUrl != null && !logoUrl.isBlank()) empty.put("logoUrl", logoUrl);
                             return empty;
                         }
-                        // Prefer a logo.dev URL from managers — it was set via autocomplete
-                        // and uses the real domain (e.g. stchas.edu, not a guessed one).
-                        String bestLogoUrl = logoUrl;
-                        for (Row row : rows) {
-                            String mgrLogo = row.getString("company_logo_url");
-                            if (mgrLogo != null && mgrLogo.contains("logo.dev")) {
-                                bestLogoUrl = mgrLogo;
-                                break;
-                            }
-                        }
-                        final String finalLogoUrl = bestLogoUrl;
+                        final String finalLogoUrl = managerSuppliedLogo(rows, logoUrl);
                         JsonArray managers   = new JsonArray();
                         long   totalReviews  = 0;
                         double ratingSum     = 0.0;
@@ -363,9 +351,30 @@ public class ManagerService {
      * logo_url showed a letter in its parent's group list while its own page showed its logo -
      * the same component, fed worse data.
      */
+    /**
+     * A real logo.dev URL borrowed from one of the company's managers.
+     *
+     * Only ever a fallback. A manager reached through career history may still carry the logo of
+     * a different employer, so letting a manager override a logo the company already has puts
+     * someone else's brand on the page - which is what the by-name route used to do while the
+     * by-slug route guarded against it.
+     */
+    private static String managerSuppliedLogo(RowSet<Row> rows, String existing) {
+        if (existing != null && !existing.isBlank()) return existing;
+        for (Row row : rows) {
+            String mgrLogo = row.getString("company_logo_url");
+            if (mgrLogo != null && mgrLogo.contains("logo.dev")) return mgrLogo;
+        }
+        return existing;
+    }
+
     private String bestCompanyLogo(Row row, String name) {
-        String stats  = row.getString("stats_logo_url");
-        String stored = row.getString("logo_url");
+        // Column-safe: not every query that produces a company row selects the stats logo, and
+        // reading an absent column throws rather than returning null. That is precisely how every
+        // merged company's URL came to return a 500 - a row from the redirect lookup was handed to
+        // code expecting the shape of a row from the slug lookup.
+        String stats  = row.getColumnIndex("stats_logo_url") >= 0 ? row.getString("stats_logo_url") : null;
+        String stored = row.getColumnIndex("logo_url") >= 0 ? row.getString("logo_url") : null;
         if (stats  != null && stats.contains("logo.dev"))  return stats;
         if (stored != null && stored.contains("logo.dev")) return stored;
         String resolved = logoResolver.apply(name);
@@ -461,12 +470,7 @@ public class ManagerService {
                 String companySlug      = companyRow.getString("slug");
                 // Prefer stats_logo_url (computed from current FK-linked managers only) so
                 // career-history-linked managers from other companies don't bleed their logos in.
-                String statsLogoUrl     = companyRow.getString("stats_logo_url");
-                String storedLogoUrl    = companyRow.getString("logo_url");
-                String resolvedLogoUrl  = logoResolver.apply(canonicalName);
-                String logoUrl = statsLogoUrl != null && statsLogoUrl.contains("logo.dev") ? statsLogoUrl
-                               : storedLogoUrl != null && storedLogoUrl.contains("logo.dev") ? storedLogoUrl
-                               : resolvedLogoUrl;
+                String logoUrl = bestCompanyLogo(companyRow, canonicalName);
                 long companyId = companyRow.getLong("id");
                 String companyIndustry = companyRow.getString("industry");
                 return companyRepo.findManagersByCompanyId(companyId)
@@ -500,14 +504,7 @@ public class ManagerService {
         // Only fall back to manager logo scan when we have no authoritative logo from
         // company_stats_live. If we already have a logo, don't override it — career-history
         // managers may have logos from their current (different) company.
-        String bestLogoUrl = logoUrl;
-        if (bestLogoUrl == null || bestLogoUrl.isBlank()) {
-            for (Row row : rows) {
-                String mgrLogo = row.getString("company_logo_url");
-                if (mgrLogo != null && mgrLogo.contains("logo.dev")) { bestLogoUrl = mgrLogo; break; }
-            }
-        }
-        final String finalLogoUrl = bestLogoUrl;
+        final String finalLogoUrl = managerSuppliedLogo(rows, logoUrl);
         JsonArray managers  = new JsonArray();
         long   totalReviews = 0;
         double ratingSum    = 0.0;
