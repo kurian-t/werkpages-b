@@ -425,6 +425,322 @@ paths:
         '429':
           description: Daily submission limit reached
 
+  /api/managers/{managerId}/proof-challenge:
+    get:
+      operationId: getMyProofChallenge
+      summary: The proof challenge standing against your rating of this manager
+      description: >-
+        Returns {"challenge": null} when nothing is being asked of you, which is the normal case
+        and not an error - the proof screen asks this on every visit.
+
+
+        A challenge means the rating was saved and is being withheld until we know its author
+        actually worked there. It is never lost, and contributing stays open even while reading is
+        gated.
+      tags:
+        - ProofChallenges
+      parameters:
+        - in: path
+          name: managerId
+          required: true
+          schema:
+            type: integer
+            format: int64
+      responses:
+        '200':
+          description: The live challenge, or null
+        '401':
+          description: Unauthorized
+
+  /api/proof-challenges/{challengeId}/evidence:
+    post:
+      operationId: submitProofEvidence
+      summary: Tell us how you worked with them
+      description: >-
+        The path for somebody who cannot verify a work email - most people who genuinely reported
+        to a well-known figure have long since left. Never publishes: a person reads it, whatever
+        the dates say. The claim is shown to admins to judge the rating and is never displayed on
+        the site.
+      tags:
+        - ProofChallenges
+      parameters:
+        - in: path
+          name: challengeId
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [workedFrom, claimedTitle, relationship]
+              properties:
+                workedFrom:
+                  type: string
+                  description: Month precision, "2019-03" - nobody remembers the day.
+                workedUntil:
+                  type: string
+                  nullable: true
+                claimedTitle:
+                  type: string
+                claimedOrg:
+                  type: string
+                  nullable: true
+                relationship:
+                  type: string
+                  enum: [direct_report, skip_level, other_team]
+                evidenceNote:
+                  type: string
+                  nullable: true
+      responses:
+        '200':
+          description: Submitted for review
+        '400':
+          description: Validation failed
+        '401':
+          description: Unauthorized
+        '404':
+          description: No open challenge
+
+  /api/admin/proof-challenges:
+    get:
+      operationId: adminGetProofChallenges
+      summary: Ratings held pending proof
+      description: >-
+        Covers challenges nobody has answered as well as submitted evidence. Without the former, a
+        challenge somebody walked away from would flag its author indefinitely while never
+        appearing in front of anyone who could lift it.
+      tags:
+        - Admin
+      parameters:
+        - in: query
+          name: limit
+          schema:
+            type: integer
+            default: 20
+        - in: query
+          name: offset
+          schema:
+            type: integer
+            default: 0
+      responses:
+        '200':
+          description: The queue
+        '401':
+          description: Unauthorized
+        '403':
+          description: Forbidden
+
+  /api/admin/proof-challenges/{challengeId}/resolve:
+    post:
+      operationId: adminResolveProofChallenge
+      summary: Decide one held rating
+      description: >-
+        Separate from approving a manager, and deliberately so. "Is this a real person who belongs
+        in the directory?" and "did this author work with them?" are different questions decided on
+        different evidence, and often only one of them exists.
+      tags:
+        - Admin
+      parameters:
+        - in: path
+          name: challengeId
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [approve]
+              properties:
+                approve:
+                  type: boolean
+                reason:
+                  type: string
+                  nullable: true
+      responses:
+        '200':
+          description: Decided
+        '401':
+          description: Unauthorized
+        '403':
+          description: Forbidden
+        '404':
+          description: Challenge not found
+
+  /api/admin/high-profile-figures:
+    get:
+      operationId: adminListHighProfileFigures
+      summary: The figures whose raters are asked for proof
+      description: >-
+        Identity, never a bare name: an entry is either a specific manager row, or a name AND a
+        company. Matching on the name alone would challenge every unrelated person who happens to
+        share it.
+      tags:
+        - Admin
+      responses:
+        '200':
+          description: The list
+        '401':
+          description: Unauthorized
+        '403':
+          description: Forbidden
+    post:
+      operationId: adminAddHighProfileFigure
+      summary: Add a figure
+      description: >-
+        In a table rather than a constant because an anti-abuse list churns - the point is adding
+        whoever is being typed this week without waiting on a deploy.
+      tags:
+        - Admin
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                managerId:
+                  type: integer
+                  format: int64
+                  nullable: true
+                fullName:
+                  type: string
+                  nullable: true
+                companyId:
+                  type: integer
+                  format: int64
+                  nullable: true
+                note:
+                  type: string
+                  nullable: true
+      responses:
+        '200':
+          description: Added
+        '400':
+          description: A name with no company identifies nobody
+        '401':
+          description: Unauthorized
+        '403':
+          description: Forbidden
+
+  /api/admin/high-profile-figures/{figureId}:
+    delete:
+      operationId: adminRemoveHighProfileFigure
+      summary: Remove a figure
+      tags:
+        - Admin
+      parameters:
+        - in: path
+          name: figureId
+          required: true
+          schema:
+            type: integer
+            format: int64
+      responses:
+        '200':
+          description: Removed
+        '401':
+          description: Unauthorized
+        '403':
+          description: Forbidden
+        '404':
+          description: Figure not found
+
+  /api/companies/{companySlug}/rating:
+    post:
+      operationId: submitCompanyRating
+      summary: Rate a company as a workplace
+      description: >-
+        What the employer is like to work for, as distinct from what its managers are like. All ten
+        categories are required and the overall rating is asked separately rather than derived from
+        them, because somebody's summary judgement is not the mean of its parts.
+
+
+        One rating per person per company. Submitting again replaces the previous answer rather
+        than being refused - somebody revisiting the form means to change their mind.
+
+
+        Not gated on having rated a manager first: anyone can rate any manager, so such a gate
+        buys friction rather than proof.
+      tags:
+        - CompanyRatings
+      parameters:
+        - in: path
+          name: companySlug
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CompanyRatingRequest'
+      responses:
+        '200':
+          description: Rating recorded
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CompanyRating'
+        '400':
+          description: Validation failed
+        '401':
+          description: Unauthorized
+        '403':
+          description: Account suspended
+        '404':
+          description: Company not found
+    get:
+      operationId: getMyCompanyRating
+      summary: Your own rating of this company, if you have one
+      description: >-
+        Used to pre-fill the form and to show the done state on the company page. Returns
+        {"review": null} when the caller has not rated it.
+      tags:
+        - CompanyRatings
+      parameters:
+        - in: path
+          name: companySlug
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Your rating, or null
+        '401':
+          description: Unauthorized
+        '404':
+          description: Company not found
+
+  /api/company-ratings/{ratingId}:
+    delete:
+      operationId: deleteCompanyRating
+      summary: Withdraw your rating of a company
+      tags:
+        - CompanyRatings
+      parameters:
+        - in: path
+          name: ratingId
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Withdrawn
+        '401':
+          description: Unauthorized
+        '404':
+          description: Not found, or not yours
+
   /api/interviews/{reviewId}:
     put:
       operationId: updateInterviewReview
@@ -2907,6 +3223,60 @@ components:
       minimum: 0
       maximum: 5
       nullable: true
+
+    CompanyRatingRequest:
+      type: object
+      required: [overallRating, ratings, workedFrom]
+      properties:
+        overallRating:
+          type: number
+          minimum: 0
+          maximum: 5
+          description: >-
+            Asked explicitly, never derived. "The pay was poor and it was chaotic, but I loved
+            working there" is a real position that averaging the ten below would erase.
+        ratings:
+          type: object
+          description: All ten are required. There is no N/A - see the migration for why.
+          required:
+            - work_life_balance
+            - compensation_benefits
+            - career_growth
+            - job_security
+            - workload_sustainability
+            - senior_leadership
+            - company_communication
+            - flexibility
+            - inclusion_belonging
+            - tools_resources
+          properties:
+            work_life_balance:       { type: number, minimum: 0, maximum: 5 }
+            compensation_benefits:   { type: number, minimum: 0, maximum: 5 }
+            career_growth:           { type: number, minimum: 0, maximum: 5 }
+            job_security:            { type: number, minimum: 0, maximum: 5 }
+            workload_sustainability: { type: number, minimum: 0, maximum: 5 }
+            senior_leadership:       { type: number, minimum: 0, maximum: 5 }
+            company_communication:   { type: number, minimum: 0, maximum: 5 }
+            flexibility:             { type: number, minimum: 0, maximum: 5 }
+            inclusion_belonging:     { type: number, minimum: 0, maximum: 5 }
+            tools_resources:         { type: number, minimum: 0, maximum: 5 }
+        workedFrom:
+          type: string
+          description: YYYY-MM. An employer in 2019 says little about it now, so the period is data.
+        workedUntil:
+          type: string
+          nullable: true
+          description: YYYY-MM, or null while still there.
+
+    CompanyRating:
+      type: object
+      properties:
+        id:            { type: string, format: uuid }
+        companyId:     { type: integer, format: int64 }
+        overallRating: { type: number }
+        ratings:       { type: object }
+        workedFrom:    { type: string, nullable: true }
+        workedUntil:   { type: string, nullable: true }
 
     InterviewReviewRequest:
       type: object

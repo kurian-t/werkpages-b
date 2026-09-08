@@ -1,0 +1,806 @@
+package org.werkpages.integration;
+
+import io.vertx.core.Future;
+import io.vertx.pgclient.PgConnectOptions;
+import io.vertx.pgclient.PgPool;
+import io.vertx.sqlclient.Pool;
+import io.vertx.sqlclient.PoolOptions;
+import io.vertx.sqlclient.Row;
+import io.vertx.sqlclient.Tuple;
+import org.flywaydb.core.Flyway;
+import org.junit.jupiter.api.*;
+import org.testcontainers.containers.PostgreSQLContainer;
+import org.testcontainers.junit.jupiter.Container;
+import org.testcontainers.junit.jupiter.Testcontainers;
+import org.werkpages.repository.ConfidenceRepository;
+import org.werkpages.repository.ManagerRepository;
+import org.werkpages.repository.ProofChallengeRepository;
+import org.werkpages.repository.UserRepository;
+import org.werkpages.service.NameValidator;
+import org.werkpages.service.SubmissionTier;
+
+import java.util.UUID;
+import java.util.concurrent.TimeUnit;
+
+import static org.junit.jupiter.api.Assertions.*;
+
+/**
+ * Holding a rating until we know its author actually worked there.
+ *
+ * The thing being protected is the contribution gate. It used to open on any review at all, so a
+ * junk rating written in ten seconds bought exactly the access an honest one bought — and the
+ * cheapest key anyone could cut was a famous name we printed in our own form placeholder.
+ *
+ * The most important test here is not any of the abuse cases. It is
+ * {@link #anOrdinaryRatingIsUntouched()}: this feature is only worth having if the overwhelming
+ * majority of people never notice it exists.
+ */
+@Testcontainers
+class ProofOfWorkIntegrationTest {
+
+    @Container
+    static PostgreSQLContainer<?> postgres = new PostgreSQLContainer<>("postgres:15-alpine")
+        .withDatabaseName("werkpages_test").withUsername("test").withPassword("test");
+
+    static Pool pool;
+    static ProofChallengeRepository challenges;
+    static ConfidenceRepository     confidence;
+    static UserRepository           users;
+    static ManagerRepository        managers;
+
+    @BeforeAll
+    static void setUpAll() {
+        Flyway.configure()
+            .dataSource(postgres.getJdbcUrl(), postgres.getUsername(), postgres.getPassword())
+            .locations("classpath:db/migrations").load().migrate();
+
+        pool = PgPool.pool(new PgConnectOptions()
+            .setHost(postgres.getHost()).setPort(postgres.getMappedPort(5432))
+            .setDatabase(postgres.getDatabaseName())
+            .setUser(postgres.getUsername()).setPassword(postgres.getPassword()),
+            new PoolOptions().setMaxSize(5));
+
+        challenges = new ProofChallengeRepository(pool);
+        confidence = new ConfidenceRepository(pool);
+        users      = new UserRepository(pool, null);
+        managers   = new ManagerRepository(pool);
+    }
+
+    @BeforeEach
+    void cleanDb() throws Exception {
+        await(pool.query(
+            "TRUNCATE manager_proof_challenges, high_profile_figures, user_confidence_events, "
+            + "reviews, managers, companies, users CASCADE").execute().mapEmpty());
+    }
+
+    @AfterAll
+    static void tearDownAll() { if (pool != null) pool.close(); }
+
+    // ── The invariant that matters most ───────────────────────────────────────
+
+    @Test
+    void anOrdinaryRatingIsUntouched() throws Exception {
+        UUID user = insertUser("auth0|pow-ordinary");
+        long mgr  = insertManager("Dana Whitfield", insertCompany("Bramworth Logistics"));
+
+        SubmissionTier tier = await(SubmissionTier.classify(
+            challenges, confidence, user, mgr, "Dana", "Whitfield", companyOf(mgr)));
+
+        assertEquals(SubmissionTier.LIVE, tier, "a real manager must feel exactly like before");
+        assertFalse(tier.isHeld());
+
+        insertReview(mgr, user);
+        assertTrue(await(users.hasContributed(user)), "the gate opens immediately");
+    }
+
+    @Test
+    void existingRatingsKeepCountingAfterTheMigration() throws Exception {
+        // The deploy must not re-lock anybody who already earned access. Every column added by
+        // V60 defaults to today's behaviour, and this is the test that says so out loud.
+        UUID user = insertUser("auth0|pow-existing");
+        long mgr  = insertManager("Priya Raghunathan", insertCompany("Ashgrove Health"));
+        insertReview(mgr, user);
+
+        Row r = await(pool.preparedQuery("SELECT disposition, gate_eligible, live_since FROM reviews WHERE user_id = $1")
+            .execute(Tuple.of(user)).map(rows -> rows.iterator().next()));
+
+        assertEquals("live", r.getString("disposition"));
+        assertTrue(r.getBoolean("gate_eligible"));
+        assertNotNull(r.getLocalDateTime("live_since"), "a live rating always carries live_since");
+        assertTrue(await(users.hasContributed(user)));
+    }
+
+    // ── Identity, not names ───────────────────────────────────────────────────
+
+    @Test
+    void anUnrelatedPersonSharingAFamousNameIsNeverChallenged() throws Exception {
+        // The whole reason the list is identity-keyed. A site manager genuinely called Tim Cook,
+        // at a construction firm with a team of eleven, must not be asked to prove he knows
+        // himself — that would break the one rule this feature is built around.
+        long apple  = insertCompany("Apple");
+        long trades = insertCompany("Redgate Construction");
+        long famous = insertManager("Tim Cook", apple);
+        long ordinary = insertManager("Tim Cook", trades);
+        await(challenges.addFigure(null, "Tim Cook", apple, "seeded"));
+
+        UUID user = insertUser("auth0|pow-namesake");
+
+        assertEquals(SubmissionTier.HIGH_PROFILE, await(SubmissionTier.classify(
+            challenges, confidence, user, famous, "Tim", "Cook", apple)));
+
+        assertEquals(SubmissionTier.LIVE_FLAGGED, await(SubmissionTier.classify(
+            challenges, confidence, user, ordinary, "Tim", "Cook", trades)),
+            "the builder publishes; the queue is told, and he is not");
+    }
+
+    @Test
+    void aListedFigureIsHeldAndDoesNotOpenTheGate() throws Exception {
+        long microsoft = insertCompany("Microsoft");
+        long satya = insertManager("Satya Nadella", microsoft);
+        await(challenges.addFigure(satya, null, null, "seeded: our own form placeholder"));
+
+        UUID user = insertUser("auth0|pow-satya");
+        UUID review = insertHeldReview(satya, user);
+        await(challenges.open(user, satya, review, "high_profile"));
+
+        assertFalse(await(users.hasContributed(user)),
+            "rating a CEO nobody reported to must not buy access to everyone else's data");
+    }
+
+    // ── The guard: held means invisible everywhere, not merely uncounted ──────
+
+    @Test
+    void aHeldRatingIsAbsentFromEverySurface() throws Exception {
+        // The one that would have caught the real bug. Changing hasContributed is a tenth of the
+        // work: a held rating must also stay out of the cached rating and count, which is a WRITE
+        // path — a leak there outlives the hold being lifted or the rating being rejected.
+        long mgr = insertManager("Corinne Aliyev", insertCompany("Northvale Media"));
+        UUID user = insertUser("auth0|pow-guard");
+        insertHeldReview(mgr, user);
+
+        await(managers.recalculate(mgr));
+
+        Row m = await(pool.preparedQuery("SELECT overall_rating, reviews_count FROM managers WHERE id = $1")
+            .execute(Tuple.of(mgr)).map(rows -> rows.iterator().next()));
+        assertEquals(0, m.getInteger("reviews_count"), "held ratings must not reach the cached count");
+        assertNull(m.getBigDecimal("overall_rating"), "nor the cached rating");
+
+        Long visible = await(pool.preparedQuery("SELECT COUNT(*) AS c FROM published_reviews WHERE manager_id = $1")
+            .execute(Tuple.of(mgr)).map(rows -> rows.iterator().next().getLong("c")));
+        assertEquals(0L, visible, "nor any public listing");
+
+        assertFalse(await(users.hasContributed(user)), "nor the gate");
+    }
+
+    @Test
+    void aHeldRatingIsAbsentFromTheMethodsThatServeThePublic() throws Exception {
+        /*
+         * The first version of the guard test asserted against the view, the cached stats and the
+         * gate — and missed the thing that actually mattered, because the endpoint people read
+         * does not go through any of them. GET /api/managers/{id}/reviews served a held rating to
+         * an anonymous caller while every one of those three assertions passed.
+         *
+         * So this asserts on the repository methods the handlers actually call. Asserting on a
+         * view proves the view is right; it proves nothing about who reads it.
+         */
+        long mgr = insertManager("Rashid Karimov", insertCompany("Stellan Works"));
+        UUID author = insertUser("auth0|pow-endpoints");
+        insertHeldReview(mgr, author);
+
+        org.werkpages.repository.ReviewRepository reviews =
+            new org.werkpages.repository.ReviewRepository(pool);
+
+        assertEquals(0, await(reviews.findByManager(mgr, 20, 0, "recent", null)).size(),
+            "the public review list");
+        assertEquals(0L, await(reviews.countByManager(mgr, null)),
+            "the public count, which has to agree with the list");
+        assertEquals(0, await(reviews.findCareerSegmentsByManager(mgr, 20, 0)).size(),
+            "the career segments on the public profile");
+        assertNull(await(reviews.findMostCurrentReviewForManager(mgr)),
+            "and the query that decides the manager's displayed company and title");
+
+        // The author still sees their own held rating. Withholding it from the person who wrote
+        // it would leave them with no way to know it exists, let alone act on the challenge.
+        assertEquals(1, await(reviews.findByManager(mgr, 20, 0, "recent", author)).size(),
+            "but its author can still see it");
+    }
+
+    @Test
+    void aSoftDeletedLiveRatingIsNotPublished() throws Exception {
+        // The view has to carry the whole publication predicate. Encoding half of it leaves every
+        // caller still holding the other half, which recreates the problem it exists to remove.
+        long mgr = insertManager("Ola Berglund", insertCompany("Kestrel Foods"));
+        UUID user = insertUser("auth0|pow-deleted");
+        insertReview(mgr, user);
+        await(pool.query("UPDATE reviews SET deleted_at = now()").execute().mapEmpty());
+
+        Long visible = await(pool.preparedQuery("SELECT COUNT(*) AS c FROM published_reviews WHERE manager_id = $1")
+            .execute(Tuple.of(mgr)).map(rows -> rows.iterator().next().getLong("c")));
+        assertEquals(0L, visible);
+    }
+
+    // ── Behaviour, not string-matching ────────────────────────────────────────
+
+    @Test
+    void repetitionIsHeldRatherThanRefused() throws Exception {
+        // "No No" passes every rule in NameValidator: two letters clears the minimum, it is
+        // letters-only, and it is on no list. Holding rather than rejecting is deliberate —
+        // Thomas Thomas is a real name, and telling someone their name is fake is worse than
+        // asking a person to look.
+        assertTrue(NameValidator.isSuspiciousName("No", "No"));
+        assertTrue(NameValidator.isSuspiciousName("Thomas", "Thomas"));
+        assertFalse(NameValidator.isSuspiciousName("Li", "Xu"), "short names are not suspicious");
+        assertFalse(NameValidator.isSuspiciousName("Anne-Marie", "Doucet"));
+
+        assertTrue(NameValidator.validateFullName("No", "No").valid(),
+            "still accepted — held is not rejected");
+    }
+
+    @Test
+    void anAuthorWithProofOutstandingIsHeldWhateverTheyType() throws Exception {
+        // The case that actually closes the loop: quit a challenge, type something plausible
+        // instead, and it is held because of who is asking rather than what they typed.
+        long microsoft = insertCompany("Microsoft");
+        long satya = insertManager("Satya Nadella", microsoft);
+        await(challenges.addFigure(satya, null, null, "seeded"));
+
+        UUID user = insertUser("auth0|pow-flagged");
+        await(challenges.open(user, satya, insertHeldReview(satya, user), "high_profile"));
+
+        long other = insertManager("Marcus Bell", insertCompany("Halden Rail"));
+        assertEquals(SubmissionTier.FLAGGED_USER, await(SubmissionTier.classify(
+            challenges, confidence, user, other, "Marcus", "Bell", companyOf(other))));
+    }
+
+    @Test
+    void deletingTheRatingLeavesTheAuthorFlagged() throws Exception {
+        // There is deliberately no self-clearing path. Letting somebody withdraw to lift their own
+        // flag is a laundering step: challenge a famous name, withdraw to come out clean, then
+        // submit the junk you actually wanted.
+        long satya = insertManager("Satya Nadella", insertCompany("Microsoft"));
+        UUID user = insertUser("auth0|pow-withdraw");
+        UUID review = insertHeldReview(satya, user);
+        await(challenges.open(user, satya, review, "high_profile"));
+
+        await(pool.preparedQuery("UPDATE reviews SET deleted_at = now() WHERE id = $1")
+            .execute(Tuple.of(review)).mapEmpty());
+
+        assertTrue(await(challenges.hasUnresolvedChallenge(user)), "the flag stands");
+    }
+
+    // ── Confidence ────────────────────────────────────────────────────────────
+
+    @Test
+    void applyingTheSameEventTwiceMovesTheScoreOnce() throws Exception {
+        // Every one of these can fire twice — a retry, a double-click, a rerun of the daily sweep.
+        // Debiting somebody 15 twice for one abandonment silently destroys an account's standing,
+        // so the guarantee is a constraint rather than a caller remembering to check a row count.
+        UUID user = insertUser("auth0|pow-idem");
+        String challengeId = UUID.randomUUID().toString();
+
+        await(confidence.apply(user, ConfidenceRepository.CHALLENGE_ABANDONED, -15, "challenge", challengeId));
+        await(confidence.apply(user, ConfidenceRepository.CHALLENGE_ABANDONED, -15, "challenge", challengeId));
+        await(confidence.apply(user, ConfidenceRepository.CHALLENGE_ABANDONED, -15, "challenge", challengeId));
+
+        assertEquals(55, await(confidence.current(user)), "70 - 15, once");
+    }
+
+    @Test
+    void confidenceCannotLeaveItsRange() throws Exception {
+        UUID user = insertUser("auth0|pow-clamp");
+        for (int i = 0; i < 8; i++) {
+            await(confidence.apply(user, ConfidenceRepository.CHALLENGE_REJECTED, -25,
+                                   "challenge", "c" + i));
+        }
+        assertEquals(0, await(confidence.current(user)), "clamped at the floor, never negative");
+
+        for (int i = 0; i < 12; i++) {
+            await(confidence.apply(user, ConfidenceRepository.CHALLENGE_APPROVED, 15,
+                                   "challenge", "a" + i));
+        }
+        assertEquals(100, await(confidence.current(user)), "and at the ceiling");
+    }
+
+    @Test
+    void passiveCreditStopsAtSeventyNine() throws Exception {
+        // Gating on the prior value leaks: from 70 the steps are 72, 74, 76, 78 — and at 78 a
+        // "confidence < 79" guard still passes, so the next credit lands on 80 and the account is
+        // trusted purely by waiting. The ceiling has to clamp the result.
+        UUID user = insertUser("auth0|pow-ceiling");
+        for (int i = 0; i < 20; i++) {
+            await(confidence.apply(user, ConfidenceRepository.REVIEW_STOOD_30D, 2, "review", "r" + i));
+        }
+        assertEquals(79, await(confidence.current(user)),
+            "trusted is granted by a person or a verified affiliation, never accumulated");
+    }
+
+    @Test
+    void aRatingHeldForTwentyNineDaysEarnsNothingTheDayAfterApproval() throws Exception {
+        // live_since, not created_at. Paying on age alone rewards exactly the behaviour this
+        // feature exists to slow down.
+        long mgr = insertManager("Yusuf Demirci", insertCompany("Alderline Group"));
+        UUID user = insertUser("auth0|pow-standing");
+        UUID review = insertReview(mgr, user);
+
+        await(pool.preparedQuery(
+                "UPDATE reviews SET created_at = now() - INTERVAL '29 days', live_since = now() "
+                + "WHERE id = $1").execute(Tuple.of(review)).mapEmpty());
+
+        assertEquals(0, await(confidence.findReviewsDueStandingCredit(10)).size(),
+            "old, but only just published");
+
+        await(pool.preparedQuery("UPDATE reviews SET live_since = now() - INTERVAL '31 days' WHERE id = $1")
+            .execute(Tuple.of(review)).mapEmpty());
+        assertEquals(1, await(confidence.findReviewsDueStandingCredit(10)).size());
+    }
+
+    @Test
+    void abandonmentIsChargedOnceHoweverOftenTheSweepRuns() throws Exception {
+        long satya = insertManager("Satya Nadella", insertCompany("Microsoft"));
+        UUID user  = insertUser("auth0|pow-sweep");
+        await(challenges.open(user, satya, insertHeldReview(satya, user), "high_profile"));
+        await(pool.query("UPDATE manager_proof_challenges SET created_at = now() - INTERVAL '8 days'")
+            .execute().mapEmpty());
+
+        for (int run = 0; run < 3; run++) {
+            for (Row r : await(challenges.markAbandoned())) {
+                await(confidence.apply(r.getUUID("user_id"), ConfidenceRepository.CHALLENGE_ABANDONED,
+                                       -15, "challenge", r.getUUID("id").toString()));
+            }
+        }
+        assertEquals(55, await(confidence.current(user)), "one debit, three sweeps");
+    }
+
+    @Test
+    void anAbandonedChallengeStillReachesTheQueue() throws Exception {
+        // Without this the flag is a lock with no key: the author stays held forever while nothing
+        // ever appears in front of anyone who could lift it.
+        long satya = insertManager("Satya Nadella", insertCompany("Microsoft"));
+        UUID user  = insertUser("auth0|pow-queue");
+        await(challenges.open(user, satya, insertHeldReview(satya, user), "high_profile"));
+        await(pool.query("UPDATE manager_proof_challenges SET created_at = now() - INTERVAL '8 days'")
+            .execute().mapEmpty());
+        await(challenges.markAbandoned());
+
+        assertEquals(1L, await(challenges.countForAdmin()));
+        assertTrue(await(challenges.hasUnresolvedChallenge(user)), "and still flags its author");
+    }
+
+    // ── State coherence ───────────────────────────────────────────────────────
+
+    @Test
+    void incoherentReviewStatesAreRefusedByTheDatabase() throws Exception {
+        long mgr = insertManager("Nadia Sorokina", insertCompany("Pellworth Ltd"));
+        UUID user = insertUser("auth0|pow-states");
+        UUID review = insertReview(mgr, user);
+
+        assertThrows(Exception.class, () -> await(pool.preparedQuery(
+                "UPDATE reviews SET disposition = 'held', gate_eligible = TRUE WHERE id = $1")
+            .execute(Tuple.of(review)).mapEmpty()),
+            "held must never credit a contribution nobody can read");
+
+        assertThrows(Exception.class, () -> await(pool.preparedQuery(
+                "UPDATE reviews SET live_since = NULL WHERE id = $1")
+            .execute(Tuple.of(review)).mapEmpty()),
+            "live since when?");
+    }
+
+    @Test
+    void theReviewPayloadSaysWhetherItIsPublished() throws Exception {
+        /*
+         * The contract the client now relies on. Before this, a client had to POST and then ask a
+         * second endpoint what the write it had just made had done - a race the write does not
+         * have, whose failure mode was silently telling somebody their rating was live.
+         */
+        // Two managers, because one rating per person per role is enforced by a unique index.
+        long companyId = insertCompany("Vantage Rail");
+        long mgrA = insertManager("Ines Fabre", companyId);
+        long mgrB = insertManager("Tomas Lindqvist", companyId);
+        UUID user = insertUser("auth0|pow-payload");
+
+        UUID live = insertReview(mgrA, user);
+        Row liveRow = await(pool.preparedQuery("SELECT * FROM reviews WHERE id = $1")
+            .execute(Tuple.of(live)).map(rows -> rows.iterator().next()));
+        assertEquals("live", org.werkpages.service.ManagerService.buildReviewJson(liveRow)
+            .getString("disposition"));
+
+        UUID held = insertHeldReview(mgrB, user);
+        Row heldRow = await(pool.preparedQuery("SELECT * FROM reviews WHERE id = $1")
+            .execute(Tuple.of(held)).map(rows -> rows.iterator().next()));
+        assertEquals("held", org.werkpages.service.ManagerService.buildReviewJson(heldRow)
+            .getString("disposition"),
+            "so the client can tell saved apart from published without a second request");
+    }
+
+    @Test
+    void aHeldRatingIsVisibleToItsAuthorAndToAdmins() throws Exception {
+        /*
+         * Withheld from the public, and from nobody else.
+         *
+         * Hiding it from its author leaves them staring at an empty page where the rating they
+         * just wrote should be, which reads as data loss. Hiding it from an admin means moderating
+         * by holding the queue and the profile side by side and matching them up by eye.
+         */
+        long mgr = insertManager("Halvard Nygaard", insertCompany("Brightmoor Care"));
+        UUID author = insertUser("auth0|pow-visibility-author");
+        UUID admin  = insertUser("auth0|pow-visibility-admin");
+        await(pool.preparedQuery("UPDATE users SET role = 'admin' WHERE id = $1")
+            .execute(Tuple.of(admin)).mapEmpty());
+        insertHeldReview(mgr, author);
+
+        org.werkpages.repository.ReviewRepository reviews =
+            new org.werkpages.repository.ReviewRepository(pool);
+
+        assertEquals(0, await(reviews.findByManager(mgr, 20, 0, "recent", null, null, false)).size(),
+            "the public sees nothing");
+        assertEquals(1, await(reviews.findByManager(mgr, 20, 0, "recent", null, author, false)).size(),
+            "its author sees their own");
+        assertEquals(1, await(reviews.findByManager(mgr, 20, 0, "recent", null, admin, true)).size(),
+            "an admin sees it without opening the queue");
+
+        UUID stranger = insertUser("auth0|pow-visibility-stranger");
+        assertEquals(0, await(reviews.findByManager(mgr, 20, 0, "recent", null, stranger, false)).size(),
+            "another signed-in person sees nothing");
+
+        // The count has to agree with the list, or the heading says "1 review" above none.
+        assertEquals(0L, await(reviews.countByManager(mgr, null, null, false)));
+        assertEquals(1L, await(reviews.countByManager(mgr, null, admin, true)));
+    }
+
+    @Test
+    void rejectingASubmissionAlsoRemovesTheGhostItLeftBehind() throws Exception {
+        /*
+         * Searching on /find creates a ghost manager as you type, so one attempt to add
+         * "Satya Nadella at Microsoft" can leave a public "Satya Nadella at Mi" behind it.
+         * Rejecting the submission used to touch only the row the admin clicked, so the person
+         * stayed in the directory under a half-typed company and the rejection looked broken.
+         */
+        long full    = insertCompany("Microsoft");
+        long partial = insertCompany("Mi");
+        long submitted = insertManager("Satya Nadella", full);
+        long ghost     = insertManager("Satya Nadella", partial);
+        await(pool.preparedQuery("UPDATE managers SET approval_status = 'pending_approval' WHERE id = $1")
+            .execute(Tuple.of(submitted)).mapEmpty());
+        await(pool.preparedQuery("UPDATE managers SET approval_status = 'ghost' WHERE id = $1")
+            .execute(Tuple.of(ghost)).mapEmpty());
+
+        await(managers.reject(submitted));
+
+        String ghostStatus = await(pool.preparedQuery("SELECT approval_status FROM managers WHERE id = $1")
+            .execute(Tuple.of(ghost)).map(rows -> rows.iterator().next().getString("approval_status")));
+        assertEquals("rejected", ghostStatus, "the half-typed twin goes too");
+    }
+
+    @Test
+    void aGhostSomebodyActuallyRatedIsNeverSweptUp() throws Exception {
+        // The limit on the rule above. A ghost carrying a review a real person wrote is somebody's
+        // contribution, and taking it on a name match would destroy real data. The capture path's
+        // placeholder reviews have no user_id, which is exactly what tells them apart.
+        long companyId = insertCompany("Contoso");
+        long submitted = insertManager("Jamie Okonkwo", companyId);
+        long ghost     = insertManager("Jamie Okonkwo", insertCompany("Cont"));
+        await(pool.preparedQuery("UPDATE managers SET approval_status = 'pending_approval' WHERE id = $1")
+            .execute(Tuple.of(submitted)).mapEmpty());
+        await(pool.preparedQuery("UPDATE managers SET approval_status = 'ghost' WHERE id = $1")
+            .execute(Tuple.of(ghost)).mapEmpty());
+        insertReview(ghost, insertUser("auth0|pow-real-contributor"));
+
+        await(managers.reject(submitted));
+
+        String ghostStatus = await(pool.preparedQuery("SELECT approval_status FROM managers WHERE id = $1")
+            .execute(Tuple.of(ghost)).map(rows -> rows.iterator().next().getString("approval_status")));
+        assertEquals("ghost", ghostStatus, "somebody rated this one, so it stays");
+    }
+
+    // ── What may reach the site without review ───────────────────────────────
+
+    @Test
+    void typingIntoTheAddFormNeverPublishesAManager() throws Exception {
+        /*
+         * The add-manager form posts a capture as soon as its first step is valid, so an abandoned
+         * attempt is not lost. That capture used to be created live, which meant typing put a
+         * manager on the public site - before any rating, any submit click, and any check - and
+         * captured whatever was in the company box at that moment, which is how the directory
+         * ended up with companies called "Mi" and "Ju".
+         *
+         * Capturing a drop-off and publishing it are different things. Only the first was ever the
+         * point, and this test is what stops them being confused again.
+         */
+        long companyId = insertCompany("Mi");
+        Row captured = await(managers.createCapturedDraft(
+            "Satya Nadella", "Mi", "CEO", "US", null, null, null, companyId));
+
+        assertEquals("pending_approval", captured.getString("approval_status"),
+            "a capture waits for a person; it does not go live");
+
+        assertEquals(0, await(managers.search(50, 0, "%Satya%", null, "recent")).size(),
+            "and it is absent from the public directory");
+    }
+
+    @Test
+    void theFindSearchPathIsStillAllowedToPublish() throws Exception {
+        /*
+         * The one exception, and it stays. A deliberate search on /find may create a live manager,
+         * once per user ever, tracked by users.has_auto_created_manager - that is the documented
+         * ghost behaviour and the whole reason the directory has anything in it for a new company.
+         *
+         * Pinned here because the fix above changes a neighbouring method, and quietly turning
+         * this one off would empty the product.
+         */
+        long companyId = insertCompany("Contoso Global");
+        UUID searcher = insertUser("auth0|pow-find-search");
+        Row auto = await(managers.createAutoApproved(
+            "Marguerite Vance", "Contoso Global", "Director", "US", null, null,
+            searcher, null, companyId));
+
+        assertEquals("ghost", auto.getString("approval_status"),
+            "a deliberate search still publishes, by design");
+    }
+
+    @Test
+    void theAuthorCanReadTheChallengeStandingAgainstTheirRating() throws Exception {
+        /*
+         * The page that asks somebody to verify a rating has to be able to find the thing it is
+         * asking about. This was never covered, and the banner offering the link was driven by a
+         * different source of truth to the page it opened - which is how a profile ended up saying
+         * "not published yet, help us verify" above a page saying there was nothing to verify.
+         */
+        long mgr = insertManager("Eddie Junior", insertCompany("Halloway Foods"));
+        UUID user = insertUser("auth0|pow-findmine");
+        UUID review = insertHeldReview(mgr, user);
+        await(challenges.open(user, mgr, review, "flagged_user"));
+
+        org.werkpages.service.ProofChallengeService service =
+            new org.werkpages.service.ProofChallengeService(challenges, users);
+
+        io.vertx.core.json.JsonObject result = await(service.findMine("auth0|pow-findmine", mgr));
+        io.vertx.core.json.JsonObject challenge = result.getJsonObject("challenge");
+
+        assertNotNull(challenge, "the author must be able to see their own challenge");
+        assertEquals("open", challenge.getString("status"));
+        assertEquals("flagged_user", challenge.getString("reason"));
+
+        // And somebody else's challenge is not theirs to read.
+        insertUser("auth0|pow-findmine-other");
+        assertNull(await(service.findMine("auth0|pow-findmine-other", mgr)).getJsonObject("challenge"));
+    }
+
+    // ── Merging managers ─────────────────────────────────────────────────────
+
+    @Test
+    void mergingCarriesEveryReviewAcrossIncludingSoftDeletedOnes() throws Exception {
+        /*
+         * A merge used to move what it could, discard the count of what it had moved, and then run
+         * DELETE FROM reviews over the remainder. Anything the move skipped was destroyed - no
+         * transaction, no manifest, no undo.
+         *
+         * Soft-deleted reviews were the worst of it: those are waiting out the three-day restore
+         * window, so merging quietly deleted reviews that were about to come back.
+         */
+        long companyId = insertCompany("Ardent Systems");
+        long keep  = insertManager("Eddie Junior", companyId);
+        long dup   = insertManager("Eddie Jr", companyId);
+
+        UUID a = insertUser("auth0|merge-a");
+        UUID b = insertUser("auth0|merge-b");
+        insertReview(dup, a);
+        UUID softDeleted = insertReview(dup, b);
+        await(pool.preparedQuery("UPDATE reviews SET deleted_at = now(), user_id = NULL WHERE id = $1")
+            .execute(Tuple.of(softDeleted)).mapEmpty());
+
+        assertEquals(2, await(managers.mergeInto(keep, dup)).getInteger("moved"), "both reviews move");
+
+        Long onKeep = await(pool.preparedQuery("SELECT COUNT(*) AS c FROM reviews WHERE manager_id = $1")
+            .execute(Tuple.of(keep)).map(rows -> rows.iterator().next().getLong("c")));
+        assertEquals(2L, onKeep, "including the one awaiting restore");
+
+        // The row is kept and marked, not deleted: reviews.manager_id cascades, so deleting it
+        // is what used to destroy anything that could not move.
+        Row merged = await(pool.preparedQuery(
+                "SELECT approval_status, merged_into FROM managers WHERE id = $1")
+            .execute(Tuple.of(dup)).map(rows -> rows.iterator().next()));
+        assertEquals("rejected", merged.getString("approval_status"));
+        assertEquals(keep, merged.getLong("merged_into"));
+    }
+
+    @Test
+    void aTrueDuplicateIsDedupedRatherThanDuplicated() throws Exception {
+        // The one case where dropping a review is right: the surviving manager already holds a
+        // review of the same role by the same person, so nothing is said twice and the unique
+        // role indexes forbid keeping both. Distinguished from "cannot move", which rolls back.
+        long companyId = insertCompany("Thorne Manufacturing");
+        long keep = insertManager("Nadia Petrov", companyId);
+        long dup  = insertManager("Nadia Petrova", companyId);
+
+        UUID author = insertUser("auth0|merge-collide");
+        insertReview(keep, author);   // same author, same company and title
+        insertReview(dup,  author);
+
+        // The count is reported, so an admin can be told a review was set aside rather than
+        // watching one disappear.
+        io.vertx.core.json.JsonObject counts = await(managers.mergeInto(keep, dup));
+        assertEquals(1, counts.getInteger("parked"), "the collision is reported, not silent");
+
+        Long onKeep = await(pool.preparedQuery(
+                "SELECT COUNT(*) AS c FROM reviews WHERE manager_id = $1 AND weight = FALSE")
+            .execute(Tuple.of(keep)).map(rows -> rows.iterator().next().getLong("c")));
+        assertEquals(1L, onKeep, "one opinion, stated once");
+
+        // And the losing copy is soft-deleted, not destroyed. A review somebody wrote is only
+        // ever marked deleted; the row survives, which is also why the merged-away manager is
+        // kept rather than deleted - deleting it would cascade and take this with it.
+        Long parked = await(pool.preparedQuery(
+                "SELECT COUNT(*) AS c FROM reviews WHERE manager_id = $1 AND deleted_at IS NOT NULL")
+            .execute(Tuple.of(dup)).map(rows -> rows.iterator().next().getLong("c")));
+        assertEquals(1L, parked, "the duplicate is soft-deleted, and still there");
+
+        Row merged = await(pool.preparedQuery(
+                "SELECT approval_status, merged_into FROM managers WHERE id = $1")
+            .execute(Tuple.of(dup)).map(rows -> rows.iterator().next()));
+        assertEquals("rejected", merged.getString("approval_status"), "hidden everywhere");
+        assertEquals(keep, merged.getLong("merged_into"), "and it records where it went");
+    }
+
+    @Test
+    void deletingAManagerKeepsTheReviewsPeopleWrote() throws Exception {
+        // The rule: a review written by a person is only ever soft-deleted. Seeded placeholders
+        // may go outright, because nobody wrote them.
+        long companyId = insertCompany("Larkfield Retail");
+        long mgr = insertManager("Imelda Barros", companyId);
+        UUID author = insertUser("auth0|delete-keeps");
+        UUID review = insertReview(mgr, author);
+
+        assertFalse(await(managers.deleteOrRetire(mgr)), "held reviews, so the row is retired");
+
+        Row r = await(pool.preparedQuery("SELECT deleted_at, manager_id FROM reviews WHERE id = $1")
+            .execute(Tuple.of(review)).map(rows -> rows.iterator().next()));
+        assertNotNull(r.getLocalDateTime("deleted_at"), "soft-deleted, not destroyed");
+        assertEquals(mgr, r.getLong("manager_id"), "and still attached to its manager");
+    }
+
+    @Test
+    void deletingAManagerNobodyReviewedRemovesItOutright() throws Exception {
+        // "Delete" still means delete for the empty rows this is mostly used on.
+        long mgr = insertManager("Unrated Person", insertCompany("Kestrel Freight"));
+        assertTrue(await(managers.deleteOrRetire(mgr)));
+        assertEquals(0, await(pool.preparedQuery("SELECT id FROM managers WHERE id = $1")
+            .execute(Tuple.of(mgr))).size());
+    }
+
+    @Test
+    void adminChangingTheCompanyMovesTheManagerToIt() throws Exception {
+        /*
+         * Changing the company from the admin edit has to move two things: the company text on the
+         * manager, and company_id, which is what every company surface actually joins on. Updating
+         * only the text leaves the manager listed under the old company - the same shape of bug
+         * that career-history edits had.
+         */
+        long oldCompany = insertCompany("Halden Rail");
+        long mgr = insertManager("Priya Raghunathan", oldCompany);
+
+        org.werkpages.repository.CompanyRepository companyRepo =
+            new org.werkpages.repository.CompanyRepository(pool);
+        org.werkpages.service.AdminService admin = new org.werkpages.service.AdminService(
+            users, managers, new org.werkpages.repository.ReviewRepository(pool), null,
+            new org.werkpages.repository.NotificationRepository(pool), companyRepo, null, pool);
+
+        UUID adminId = insertUser("auth0|admin-company-edit");
+        await(pool.preparedQuery("UPDATE users SET role = 'admin' WHERE id = $1")
+            .execute(Tuple.of(adminId)).mapEmpty());
+
+        // Typing a new name clears the selected id, so the service receives a null companyId and
+        // has to resolve the name. That is the path an admin actually takes.
+        await(admin.adminEditManager("auth0|admin-company-edit", mgr,
+            "Priya Raghunathan", "Manager", "Northwind Freight", null, null));
+
+        Row after = await(pool.preparedQuery(
+                "SELECT m.company, m.company_id, c.name AS joined FROM managers m "
+                + "LEFT JOIN companies c ON c.id = m.company_id WHERE m.id = $1")
+            .execute(Tuple.of(mgr)).map(rows -> rows.iterator().next()));
+
+        assertEquals("Northwind Freight", after.getString("company"), "the text moves");
+        assertNotEquals(oldCompany, after.getLong("company_id"), "and so does the link");
+        assertEquals("Northwind Freight", after.getString("joined"),
+            "so the manager is listed under the company an admin chose");
+    }
+
+    @Test
+    void submittingAdoptsTheCaptureLeftBehindInsteadOfFilingASecondPerson() throws Exception {
+        /*
+         * One attempt to add a manager produced two rows: the capture the form posts when step one
+         * is valid, under a prefix of the company ("Mi"), and the submission that followed under
+         * the finished name ("Microsoft"). Two managers, one person, differing only by how much had
+         * been typed when the capture fired.
+         */
+        long partial = insertCompany("Mi");
+        long full    = insertCompany("Microsoft");
+        Row capture = await(managers.createCapturedDraft(
+            "Eddie Junior", "Mi", "Engineer", "US", null, null, null, partial));
+        UUID submitter = insertUser("auth0|adopt-capture");
+
+        var adopted = await(managers.adoptCapture("Eddie Junior", "Microsoft", "Director", submitter, full));
+
+        assertTrue(adopted.isPresent(), "the capture is adopted, not left behind");
+        assertEquals(capture.getLong("id"), adopted.get().getLong("id"), "same row, updated");
+        assertEquals("Microsoft", adopted.get().getString("company"), "under the finished name");
+        assertEquals(submitter, adopted.get().getUUID("submitted_by"), "and now owned by its submitter");
+
+        Long rows = await(pool.preparedQuery(
+                "SELECT COUNT(*) AS c FROM managers WHERE LOWER(name) = 'eddie junior'")
+            .execute().map(r -> r.iterator().next().getLong("c")));
+        assertEquals(1L, rows, "one person, one row");
+    }
+
+    @Test
+    void adoptionWillNotSwallowADifferentPersonSharingAName() throws Exception {
+        // Tight on purpose: same name, captured company a prefix of the submitted one, still
+        // unsubmitted, and recent. A capture at an unrelated company is somebody else.
+        long other = insertCompany("Trellis Health");
+        await(managers.createCapturedDraft(
+            "Eddie Junior", "Trellis Health", "Nurse", "US", null, null, null, other));
+
+        var adopted = await(managers.adoptCapture("Eddie Junior", "Microsoft", "Director",
+            insertUser("auth0|adopt-nomatch"), insertCompany("Microsoft Corp")));
+        assertTrue(adopted.isEmpty(), "different company, different person");
+    }
+
+    // ── Helpers ───────────────────────────────────────────────────────────────
+
+    private static <T> T await(Future<T> f) throws Exception {
+        return f.toCompletionStage().toCompletableFuture().get(30, TimeUnit.SECONDS);
+    }
+
+    private UUID insertUser(String auth0Id) throws Exception {
+        return await(pool.preparedQuery(
+                "INSERT INTO users (auth0_id, username, email) VALUES ($1, $2, $3) RETURNING id")
+            .execute(Tuple.of(auth0Id, auth0Id, auth0Id + "@example.test"))
+            .map(rows -> rows.iterator().next().getUUID("id")));
+    }
+
+    private long insertCompany(String name) throws Exception {
+        return await(pool.preparedQuery(
+                "INSERT INTO companies (name, slug, status) VALUES ($1, $2, 'ghost') RETURNING id")
+            .execute(Tuple.of(name, name.toLowerCase().replace(' ', '-')))
+            .map(rows -> rows.iterator().next().getLong("id")));
+    }
+
+    private long insertManager(String name, long companyId) throws Exception {
+        return await(pool.preparedQuery("""
+                INSERT INTO managers (name, company, title, status, approval_status, company_id,
+                                      slug, overall_rating, reviews_count, category_averages)
+                SELECT $1, c.name, 'Manager', 'active', 'approved', $2, $3, 0, 0, '{}'::jsonb
+                FROM companies c WHERE c.id = $2
+                RETURNING id
+                """)
+            .execute(Tuple.of(name, companyId,
+                name.toLowerCase().replace(' ', '-') + "-" + companyId))
+            .map(rows -> rows.iterator().next().getLong("id")));
+    }
+
+    private Long companyOf(long managerId) throws Exception {
+        return await(pool.preparedQuery("SELECT company_id FROM managers WHERE id = $1")
+            .execute(Tuple.of(managerId)).map(rows -> rows.iterator().next().getLong("company_id")));
+    }
+
+    private UUID insertReview(long managerId, UUID userId) throws Exception {
+        return await(pool.preparedQuery("""
+                INSERT INTO reviews (manager_id, user_id, author, overall_rating,
+                    communication_style, perceived_approachability, perceived_clarity_of_expectations,
+                    feedback_style, perceived_supportiveness, decision_making_style,
+                    organization_and_planning_style, delegation_style, perceived_professional_demeanor,
+                    overall_working_experience, manager_company, manager_title)
+                VALUES ($1,$2,'Anon-' || substr($2::text, 1, 8),4.0,4,4,4,4,4,4,4,4,4,4,'Co','Manager')
+                RETURNING id
+                """)
+            .execute(Tuple.of(managerId, userId))
+            .map(rows -> rows.iterator().next().getUUID("id")));
+    }
+
+    private UUID insertHeldReview(long managerId, UUID userId) throws Exception {
+        UUID id = insertReview(managerId, userId);
+        await(pool.preparedQuery(
+                "UPDATE reviews SET disposition = 'held', gate_eligible = FALSE, live_since = NULL "
+                + "WHERE id = $1").execute(Tuple.of(id)).mapEmpty());
+        return id;
+    }
+}

@@ -794,6 +794,14 @@ public class CompanyRepository {
                     WHERE a.company_id = $2 AND b.company_id = $1
                       AND a.deleted_at IS NULL AND b.deleted_at IS NULL
                       AND a.user_id IS NOT NULL) AS interview_conflicts,
+                  -- The same collision for company ratings. One rating per person per company is
+                  -- a unique index, so merging two companies the same person rated separately
+                  -- would put two of their rows on one company and the insert would fail - after
+                  -- the managers had already moved.
+                  (SELECT COUNT(*) FROM company_reviews a
+                     JOIN company_reviews b ON a.user_id = b.user_id
+                    WHERE a.company_id = $2 AND b.company_id = $1
+                      AND a.deleted_at IS NULL AND b.deleted_at IS NULL) AS company_rating_conflicts,
                   -- Not blocking, but the admin should see it: the same person may now appear
                   -- twice under one company. Company identity and manager identity are separate
                   -- problems and this merge deliberately does not touch the second one.
@@ -827,8 +835,10 @@ public class CompanyRepository {
                     .put("aliases",            r.getLong("aliases"))
                     .put("pendingEdits",       r.getLong("pending_edits"))
                     .put("interviewConflicts", r.getLong("interview_conflicts"))
+                    .put("companyRatingConflicts", r.getLong("company_rating_conflicts"))
                     .put("duplicateManagers",  r.getLong("duplicate_managers"))
-                    .put("blocked",            r.getLong("interview_conflicts") > 0);
+                    .put("blocked",            r.getLong("interview_conflicts") > 0
+                                            || r.getLong("company_rating_conflicts") > 0);
             });
     }
 
@@ -854,6 +864,14 @@ public class CompanyRepository {
 
         return previewMerge(keepId, mergeId).compose(preview -> {
             if (preview.getBoolean("blocked")) {
+                long ratingConflicts = preview.getLong("companyRatingConflicts", 0L);
+                if (ratingConflicts > 0) {
+                    return Future.failedFuture(
+                        "Cannot merge: " + ratingConflicts + " person/people have rated both companies "
+                        + "as a workplace, and one person can hold only one rating per company. Both "
+                        + "are real contributions and neither should be discarded automatically. "
+                        + "Resolve them first, then merge.");
+                }
                 return Future.failedFuture(
                     "Cannot merge: " + preview.getLong("interviewConflicts") + " interview review(s) "
                     + "would collide, because the same person reviewed interviewing at both companies "
@@ -912,6 +930,18 @@ public class CompanyRepository {
                         .compose(v -> conn.preparedQuery("UPDATE interview_reviews SET company_id = $1 WHERE company_id = $2")
                             .execute(Tuple.of(keepId, mergeId)))
                         .compose(v -> conn.preparedQuery("UPDATE interview_review_deletions SET company_id = $1 WHERE company_id = $2")
+                            .execute(Tuple.of(keepId, mergeId)))
+
+                        // Company ratings move like everything else. Safe because previewMerge
+                        // has already refused the merge if anyone rated both, so no two of these
+                        // can land on the same company for the same person.
+                        .compose(v -> conn.preparedQuery("""
+                                INSERT INTO company_merge_records (merge_id, entity_type, record_id, old_company_id, new_company_id)
+                                SELECT $1, 'company_review', r.id::TEXT, $3, $2
+                                FROM company_reviews r WHERE r.company_id = $3
+                                """)
+                            .execute(Tuple.of(mergeUuid, keepId, mergeId)))
+                        .compose(v -> conn.preparedQuery("UPDATE company_reviews SET company_id = $1 WHERE company_id = $2")
                             .execute(Tuple.of(keepId, mergeId)))
 
                         // Pending edit requests that pointed at the source now point at the target,
@@ -1231,6 +1261,15 @@ public class CompanyRepository {
                                 FROM company_merge_records rec
                                 WHERE rec.merge_id = $1 AND rec.entity_type = 'company_relationship_parent'
                                   AND r.id = rec.record_id::BIGINT
+                                """)
+                            .execute(Tuple.of(mergeRecordId)))
+
+                        // Company ratings go back with everything else.
+                        .compose(v -> conn.preparedQuery("""
+                                UPDATE company_reviews r SET company_id = rec.old_company_id
+                                FROM company_merge_records rec
+                                WHERE rec.merge_id = $1 AND rec.entity_type = 'company_review'
+                                  AND r.id = rec.record_id::UUID
                                 """)
                             .execute(Tuple.of(mergeRecordId)))
 

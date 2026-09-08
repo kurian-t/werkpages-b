@@ -14,6 +14,8 @@ import org.werkpages.repository.ReportRepository;
 import org.werkpages.repository.InterviewRepository;
 import org.werkpages.repository.RoleAliasRepository;
 import org.werkpages.repository.ReviewRepository;
+import org.werkpages.repository.ProofChallengeRepository;
+import org.werkpages.repository.ConfidenceRepository;
 import org.werkpages.repository.UserRepository;
 import org.werkpages.rest.handlers.AdminHandler;
 import org.werkpages.rest.handlers.AuthHandler;
@@ -24,6 +26,8 @@ import org.werkpages.rest.handlers.ReportsHandler;
 import org.werkpages.rest.handlers.ResumesHandler;
 import org.werkpages.rest.handlers.IndustriesHandler;
 import org.werkpages.rest.handlers.InterviewsHandler;
+import org.werkpages.rest.handlers.CompanyRatingsHandler;
+import org.werkpages.rest.handlers.ProofChallengesHandler;
 import org.werkpages.service.AdminService;
 import org.werkpages.service.AnthropicClient;
 import org.werkpages.rest.handlers.CompanyLogoUtils;
@@ -35,6 +39,7 @@ import org.werkpages.service.ReportService;
 import org.werkpages.service.ResumeService;
 import org.werkpages.service.IndustryService;
 import org.werkpages.service.InterviewService;
+import org.werkpages.service.ProofChallengeService;
 import org.werkpages.service.RoleService;
 import org.werkpages.service.IndustryClassificationJob;
 import org.werkpages.service.SitemapService;
@@ -124,6 +129,8 @@ public class MainVerticle extends AbstractVerticle {
                         CompanyRepository      companyRepo = new CompanyRepository(Database.getClient());
                         ResumeRepository       resumeRepo  = new ResumeRepository(Database.getClient());
                         InterviewRepository    interviewRepo = new InterviewRepository(Database.getClient());
+                        ProofChallengeRepository proofChallengeRepo = new ProofChallengeRepository(Database.getClient());
+                        ConfidenceRepository   confidenceRepo = new ConfidenceRepository(Database.getClient());
                         RoleAliasRepository    roleAliasRepo = new RoleAliasRepository(Database.getClient());
 
                         // ── Services ──────────────────────────────────────────────────────────
@@ -135,6 +142,10 @@ public class MainVerticle extends AbstractVerticle {
                         ResumeService       resumeService  = new ResumeService(userRepo, resumeRepo, companyRepo);
                         IndustryService     industryService = new IndustryService(companyRepo, CompanyLogoUtils::resolveLogoUrl);
                         InterviewService    interviewService = new InterviewService(interviewRepo, companyRepo, userRepo);
+                        org.werkpages.repository.CompanyReviewRepository companyReviewRepo =
+                            new org.werkpages.repository.CompanyReviewRepository(Database.getClient());
+                        org.werkpages.service.CompanyReviewService companyReviewService =
+                            new org.werkpages.service.CompanyReviewService(companyReviewRepo, companyRepo, userRepo);
                         RoleService         roleService      = new RoleService(roleAliasRepo);
 
                         // ── Sitemap ───────────────────────────────────────────────────────────
@@ -149,6 +160,47 @@ public class MainVerticle extends AbstractVerticle {
                             interviewRepo.restoreExpiredDeletions()
                                 .onSuccess(n -> { if (n > 0) System.out.println("✓ Restored " + n + " anonymised interview review(s)"); })
                                 .onFailure(err -> System.err.println("⚠ Interview restore job failed: " + err.getMessage()));
+
+                            // ── Proof challenges nobody answered ──────────────────────────
+                            //
+                            // Abandoning is not a way out, so an untouched challenge ages into
+                            // 'abandoned' — which still flags its author and still sits in the
+                            // admin queue, because a flag nobody can lift is a lock with no key.
+                            //
+                            // Re-running this cannot double-charge anyone: the debit is keyed on
+                            // the challenge id in user_confidence_events, and that uniqueness is a
+                            // constraint rather than this loop being careful.
+                            proofChallengeRepo.markAbandoned()
+                                .onSuccess(rows -> {
+                                    for (io.vertx.sqlclient.Row r : rows) {
+                                        confidenceRepo.apply(r.getUUID("user_id"),
+                                                ConfidenceRepository.CHALLENGE_ABANDONED, -15,
+                                                "challenge", r.getUUID("id").toString())
+                                            .onFailure(err -> System.err.println(
+                                                "⚠ Abandonment debit failed: " + err.getMessage()));
+                                    }
+                                    if (rows.rowCount() > 0)
+                                        System.out.println("✓ Aged out " + rows.rowCount() + " unanswered challenge(s)");
+                                })
+                                .onFailure(err -> System.err.println("⚠ Challenge sweep failed: " + err.getMessage()));
+
+                            // ── Standing credit ───────────────────────────────────────────
+                            //
+                            // Thirty days continuously live, not thirty days since it was written:
+                            // a rating held for twenty-nine days and approved yesterday has stood
+                            // for a day. The query reads live_since, which resets whenever a
+                            // rating re-enters the live state.
+                            confidenceRepo.findReviewsDueStandingCredit(500)
+                                .onSuccess(rows -> {
+                                    for (io.vertx.sqlclient.Row r : rows) {
+                                        confidenceRepo.apply(r.getUUID("user_id"),
+                                                ConfidenceRepository.REVIEW_STOOD_30D, 2,
+                                                "review", r.getUUID("id").toString())
+                                            .onFailure(err -> System.err.println(
+                                                "⚠ Standing credit failed: " + err.getMessage()));
+                                    }
+                                })
+                                .onFailure(err -> System.err.println("⚠ Standing credit sweep failed: " + err.getMessage()));
 
                             // ── Expired placeholder weights ───────────────────────────────
                             //
@@ -215,6 +267,11 @@ public class MainVerticle extends AbstractVerticle {
                         ResumesHandler       resumesHandler       = new ResumesHandler(resumeService);
                         IndustriesHandler    industriesHandler    = new IndustriesHandler(industryService);
                         InterviewsHandler    interviewsHandler    = new InterviewsHandler(interviewService, jwtAuth);
+                        CompanyRatingsHandler companyRatingsHandler = new CompanyRatingsHandler(companyReviewService);
+                        ProofChallengeService proofChallengeService = new ProofChallengeService(proofChallengeRepo, userRepo);
+                        ProofChallengesHandler proofChallengesHandler = new ProofChallengesHandler(proofChallengeService, adminService);
+                        // The profile endpoint reports the workplace rating beside the manager one.
+                        managerService.setCompanyReviewRepo(companyReviewRepo);
 
                         routerFactory.addHandlerByOperationId("getManagers",           managersHandler::handleGetManagers);
                         routerFactory.addHandlerByOperationId("getManagerById",        managersHandler::handleGetManagerById);
@@ -242,6 +299,23 @@ public class MainVerticle extends AbstractVerticle {
                         routerFactory.addHandlerByOperationId("updateInterviewReview",  interviewsHandler::handleUpdateInterviewReview);
                         routerFactory.addHandlerByOperationId("hasInterviewContributed", interviewsHandler::handleHasInterviewContributed);
                         routerFactory.addHandlerByOperationId("getIndustryInterviewAverages", interviewsHandler::handleGetIndustryInterviewAverages);
+
+                        // Company ratings. Every operationId in the spec must be routed or the
+                        // router factory refuses to boot, which is why these three go in together.
+                        routerFactory.addHandlerByOperationId("submitCompanyRating", companyRatingsHandler::handleSubmit);
+                        routerFactory.addHandlerByOperationId("getMyCompanyRating",  companyRatingsHandler::handleGetMine);
+
+                        // Proof of work. Every operationId in the spec must be routed here or
+                        // OpenAPI3RouterFactory refuses to start, which is the behaviour that
+                        // keeps the spec and the server from drifting apart.
+                        routerFactory.addHandlerByOperationId("getMyProofChallenge",          proofChallengesHandler::handleGetMine);
+                        routerFactory.addHandlerByOperationId("submitProofEvidence",          proofChallengesHandler::handleSubmitEvidence);
+                        routerFactory.addHandlerByOperationId("adminGetProofChallenges",      proofChallengesHandler::handleAdminList);
+                        routerFactory.addHandlerByOperationId("adminResolveProofChallenge",   proofChallengesHandler::handleAdminResolve);
+                        routerFactory.addHandlerByOperationId("adminListHighProfileFigures",  proofChallengesHandler::handleListFigures);
+                        routerFactory.addHandlerByOperationId("adminAddHighProfileFigure",    proofChallengesHandler::handleAddFigure);
+                        routerFactory.addHandlerByOperationId("adminRemoveHighProfileFigure", proofChallengesHandler::handleRemoveFigure);
+                        routerFactory.addHandlerByOperationId("deleteCompanyRating", companyRatingsHandler::handleDelete);
                         routerFactory.addHandlerByOperationId("getManagerBySlug",       managersHandler::handleGetManagerBySlug);
                         routerFactory.addHandlerByOperationId("getCompanies",           managersHandler::handleGetCompanies);
                         routerFactory.addHandlerByOperationId("createCompany",           managersHandler::handleCreateCompany);
@@ -386,7 +460,7 @@ public class MainVerticle extends AbstractVerticle {
                         // Dev origin is 8081 — it must track the Vite dev server port in
                         // werkpages/vite.config.ts, which moved off 8080 so RateMyManagers'
                         // frontend can run alongside this one.
-                        String allowedOrigin = "true".equalsIgnoreCase(System.getenv("USE_AWS_SECRETS"))
+                        String allowedOrigin = org.werkpages.config.AppEnv.current().isProduction()
                         	    ? "https://werkpages\\.com|https://www\\.werkpages\\.com"
                         	    : "http://localhost:8081";
                         
@@ -422,7 +496,7 @@ public class MainVerticle extends AbstractVerticle {
                                 .putHeader("X-Frame-Options", "DENY")
                                 .putHeader("X-XSS-Protection", "0")
                                 .putHeader("Referrer-Policy", "strict-origin-when-cross-origin");
-                            boolean isProd = "true".equalsIgnoreCase(System.getenv("USE_AWS_SECRETS"));
+                            boolean isProd = org.werkpages.config.AppEnv.current().isProduction();
                             if (isProd) {
                                 secCtx.response().putHeader("Strict-Transport-Security", "max-age=31536000; includeSubDomains");
                             }
@@ -441,9 +515,58 @@ public class MainVerticle extends AbstractVerticle {
                             }
                         });
 
+                        /*
+                          Optional authentication.
+
+                          Most read endpoints declare `security: []` so anonymous visitors can read
+                          the site, which also means the bearerAuth handler never runs on them and
+                          nothing knows who is asking - even when a signed-in person is asking.
+                          That was fine while every rating was public. It stopped being fine once a
+                          rating could be withheld: the author of a held rating saw an empty page
+                          where their own contribution should be, and an admin had to moderate by
+                          reading the queue and the profile side by side.
+
+                          So: verify a token when one is offered, identify the caller, and never
+                          require it. The token is verified, not merely decoded - trusting an
+                          unverified subject here would let anyone claim to be an admin by editing
+                          a cookie.
+                         */
+                        router.route("/api/*").handler(routingContext -> {
+                            if (routingContext.get("auth0Id") != null) { routingContext.next(); return; }
+                            String token = null;
+                            String authHeader = routingContext.request().getHeader("Authorization");
+                            if (authHeader != null && authHeader.startsWith("Bearer ")) {
+                                token = authHeader.substring(7);
+                            } else {
+                                String cookieHeader = routingContext.request().getHeader("Cookie");
+                                if (cookieHeader != null) {
+                                    for (String part : cookieHeader.split(";")) {
+                                        String trimmed = part.trim();
+                                        if (trimmed.startsWith("auth_token=")) {
+                                            token = trimmed.substring("auth_token=".length());
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                            if (token == null) { routingContext.next(); return; }
+                            final String finalToken = token;
+                            jwtAuth.authenticate(new JsonObject().put("token", finalToken), res -> {
+                                if (res.succeeded()) {
+                                    try {
+                                        routingContext.put("auth0Id",
+                                            com.auth0.jwt.JWT.decode(finalToken).getSubject());
+                                    } catch (Exception ignored) {}
+                                }
+                                // A bad or expired token is not an error on a public route. It just
+                                // means we carry on not knowing who this is.
+                                routingContext.next();
+                            });
+                        });
+
                         router.mountSubRouter("/", apiRouter);
 
-                        boolean isProdEnv = "true".equalsIgnoreCase(System.getenv("USE_AWS_SECRETS"));
+                        boolean isProdEnv = org.werkpages.config.AppEnv.current().isProduction();
                         if (!isProdEnv) {
                             router.route("/swagger/*")
                                 .handler(StaticHandler.create().setCachingEnabled(false).setWebRoot("swagger"));

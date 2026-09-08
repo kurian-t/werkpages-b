@@ -501,7 +501,9 @@ class ManagerServiceCoverageIntegrationTest {
     // ── createGhostManager ────────────────────────────────────────────────────
 
     @Test
-    void createGhostManager_createsGhostWithCorrectApprovalStatus() throws Exception {
+    void createGhostManager_capturesForReviewRatherThanPublishing() throws Exception {
+        // Changed deliberately: this asserted 'ghost', which is live. The add-manager form posts
+        // here the moment its first step is valid, so that made typing publish a manager.
         JsonObject body = new JsonObject()
             .put("firstName", "Ghost")
             .put("lastName", "Manager")
@@ -520,7 +522,7 @@ class ManagerServiceCoverageIntegrationTest {
             .execute(Tuple.of(id))
             .toCompletionStage().toCompletableFuture().get(5, TimeUnit.SECONDS);
         assertTrue(rows.iterator().hasNext());
-        assertEquals("ghost", rows.iterator().next().getString("approval_status"));
+        assertEquals("pending_approval", rows.iterator().next().getString("approval_status"));
     }
 
     @Test

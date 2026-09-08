@@ -459,7 +459,9 @@ public class ManagersHandler {
             try { userId = UUID.fromString(userIdParam); }
             catch (IllegalArgumentException e) { respond(ctx, 400, new JsonObject().put("error", "Invalid userId format")); return; }
         }
-        service.getManagerReviews(managerId, limit, offset, sortBy, userId)
+        // The caller's own identity comes from the token; the userId parameter above is only a
+        // display filter and carries no authority.
+        service.getManagerReviews(managerId, limit, offset, sortBy, userId, ctx.get("auth0Id"))
             .onSuccess(json -> ctx.response().putHeader("Content-Type", "application/json").end(json.encode()))
             .onFailure(err -> handleError(ctx, err));
     }
@@ -475,7 +477,7 @@ public class ManagersHandler {
         }
         int limit  = parseIntParam(ctx.queryParam("limit").stream().findFirst().orElse("20"),  20, 1, 50);
         int offset = parseIntParam(ctx.queryParam("offset").stream().findFirst().orElse("0"),   0, 0, Integer.MAX_VALUE);
-        service.getManagerCareerSegments(managerId, limit, offset)
+        service.getManagerCareerSegments(managerId, limit, offset, ctx.get("auth0Id"))
             .onSuccess(json -> ctx.response().putHeader("Content-Type", "application/json").end(json.encode()))
             .onFailure(err -> handleError(ctx, err));
     }

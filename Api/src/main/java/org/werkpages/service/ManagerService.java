@@ -58,6 +58,7 @@ public class ManagerService {
     private final CompanyRepository          companyRepo;
     private final SqlClient                  db; // needed for transactions
     private final Function<String, String>   logoResolver;
+    private final ProofOfWorkService         proofOfWork;
 
     public ManagerService(ManagerRepository managerRepo, ReviewRepository reviewRepo,
                           UserRepository userRepo, EditRepository editRepo,
@@ -84,6 +85,11 @@ public class ManagerService {
         this.companyRepo  = companyRepo;
         this.db           = db;
         this.logoResolver = logoResolver;
+        // Built here rather than injected because every constructor overload would otherwise have
+        // to thread it through, and it holds no state of its own.
+        this.proofOfWork  = new ProofOfWorkService(
+            new org.werkpages.repository.ProofChallengeRepository(db),
+            new org.werkpages.repository.ConfidenceRepository(db));
     }
 
     // ── GET managers list ─────────────────────────────────────────────────────
@@ -331,7 +337,8 @@ public class ManagerService {
                     // Corporate structure, attached last so a failure to load it cannot cost the
                     // reader the company page itself. "Part of Loblaw" is useful context; it is
                     // not worth a 500 if the relationship tables are unavailable.
-                    .compose(result -> withCorporateStructure(result, companyId));
+                    .compose(result -> withCorporateStructure(result, companyId))
+                    .compose(result -> withCompanyRating(result, companyId));
             });
     }
 
@@ -380,6 +387,55 @@ public class ManagerService {
         String resolved = logoResolver.apply(name);
         if (resolved != null && !resolved.isBlank()) return resolved;
         return stored != null && !stored.isBlank() ? stored : stats;
+    }
+
+    /**
+     * Company ratings, when the app has wired them.
+     *
+     * Optional so the many constructors - and the tests behind them - do not all have to learn
+     * about a dataset most of them do not exercise. Null simply means the profile carries no
+     * company rating block, which is also what an unrated company looks like.
+     */
+    private org.werkpages.repository.CompanyReviewRepository companyReviewRepo;
+
+    public void setCompanyReviewRepo(org.werkpages.repository.CompanyReviewRepository repo) {
+        this.companyReviewRepo = repo;
+    }
+
+    /**
+     * Attaches the company's workplace rating alongside its manager ratings.
+     *
+     * Two numbers, never merged. A company page shows both precisely so they can disagree: a good
+     * employer with uneven managers is a real thing, and averaging them into one score would hide
+     * exactly the signal people come for.
+     *
+     * Absent rather than zero when nobody has rated it - the same rule the tiles follow.
+     */
+    private Future<JsonObject> withCompanyRating(JsonObject profile, long companyId) {
+        if (companyReviewRepo == null) return Future.succeededFuture(profile);
+        return companyReviewRepo.findCompanyAggregate(companyId)
+            .map(opt -> {
+                opt.ifPresent(row -> {
+                    JsonObject categories = new JsonObject();
+                    for (String c : org.werkpages.repository.CompanyReviewRepository.CATEGORIES) {
+                        java.math.BigDecimal v = row.getBigDecimal(c);
+                        categories.put(c, v == null ? null : v.doubleValue());
+                    }
+                    java.math.BigDecimal overall = row.getBigDecimal("overall_rating");
+                    profile.put("companyRating", new JsonObject()
+                        .put("ratingCount",   row.getLong("rating_count"))
+                        .put("overallRating", overall == null ? null : overall.doubleValue())
+                        .put("categories",    categories));
+                });
+                return profile;
+            })
+            // A company page must not 500 because its rating aggregate failed - the manager data
+            // is the older and more important half of the page.
+            .recover(err -> {
+                System.err.println("company rating aggregate failed for company " + companyId
+                    + ": " + err.getMessage());
+                return Future.succeededFuture(profile);
+            });
     }
 
     private Future<JsonObject> withCorporateStructure(JsonObject profile, long companyId) {
@@ -478,7 +534,8 @@ public class ManagerService {
                                                              companyIndustry, logoUrl, rows))
                     // The slug route is the one people actually reach from a link, so it needs the
                     // corporate structure just as much as the by-name route.
-                    .compose(result -> withCorporateStructure(result, companyId));
+                    .compose(result -> withCorporateStructure(result, companyId))
+                    .compose(result -> withCompanyRating(result, companyId));
             });
     }
 
@@ -856,7 +913,21 @@ public class ManagerService {
                         // Check for an existing manager with the same company and a fuzzy-matching name
                         // (Levenshtein distance ≤ 1). If found, attach the review there instead of
                         // creating a duplicate pending_approval entry.
-                        return managerRepo.findByCompanyExact(company)
+                        /*
+                          First, adopt the capture this same attempt left behind.
+
+                          The add form posts a capture as soon as step one is valid, which is
+                          before the company box is finished - so adding "Eddie Junior at
+                          Microsoft" left a row at "Eddie Junior at Mi", and the submission then
+                          filed a second row for the same person.
+
+                          Adopting rewrites that capture's company to the one actually submitted,
+                          which is what lets the ordinary duplicate detection below find it. No
+                          special case downstream: by the time it runs, there is simply an existing
+                          manager at this company with this name.
+                        */
+                        return managerRepo.adoptCapture(name, company, title, userId, null)
+                            .compose(adopted -> managerRepo.findByCompanyExact(company))
                             .compose(candidates -> {
                                 Row fuzzyMatch = findFuzzyNameMatch(candidates, name);
                                 if (fuzzyMatch != null) {
@@ -865,6 +936,7 @@ public class ManagerService {
                                         fStartDate, fEndDate, fOverallRating, fRatings,
                                         fMgrCompany, fMgrTitle, fReviewText, fWorkedFrom, fWorkedUntil, fDraftToken);
                                 }
+
                                 // No match — create a new pending_approval manager with its first review.
                                 // Resolve (or create) the company row first so we can link company_id.
                                 OffsetDateTime startDt = fStartDate.atStartOfDay(ZoneOffset.UTC).toOffsetDateTime();
@@ -915,6 +987,18 @@ public class ManagerService {
                                                         getRating(fRatings, 9), fMgrCompany, fMgrTitle, fReviewText,
                                                         fWorkedFrom, fWorkedUntil
                                                     ))
+                                                    .compose(reviewIns -> {
+                                                        // The manager row is new, so the figures
+                                                        // list can only match on name + company —
+                                                        // which is exactly why that form exists.
+                                                        UUID newReviewId = reviewIns.iterator().next().getUUID("id");
+                                                        String[] parts = splitName(name);
+                                                        // The response for this path is the
+                                                        // manager, not the review, so the
+                                                        // post-decision row is not needed here.
+                                                        return proofOfWork.applyTo(conn, userId, managerId,
+                                                            newReviewId, parts[0], parts[1], companyId);
+                                                    })
                                                     .map(ignored -> managerRow)
                                             );
                                         })
@@ -1395,10 +1479,16 @@ public class ManagerService {
                 .compose(reviewResult -> {
                     Row reviewRow = reviewResult.iterator().next();
                     UUID newId = reviewRow.getUUID("id");
-                    return conn.preparedQuery("""
+                    // Saved first, questioned second. If this rating is held, the hold lands
+                    // inside this transaction, so it is never briefly visible and never opens the
+                    // gate for an instant.
+                    return applyProofOfWork(conn, managerId, userId, newId)
+                        .compose(afterDecision -> conn.preparedQuery("""
                             SELECT id, manager_company, manager_title, worked_from, worked_until
-                            FROM reviews
-                            WHERE manager_id = $1 AND weight = FALSE AND deleted_at IS NULL
+                            -- Same reason as ReviewRepository.findMostCurrentReviewForManager:
+                            -- this decides the manager's public company and title.
+                            FROM published_reviews
+                            WHERE manager_id = $1 AND weight = FALSE
                             ORDER BY
                                 CASE WHEN worked_until IS NULL THEN 0 ELSE 1 END,
                                 worked_from DESC
@@ -1452,8 +1542,11 @@ public class ManagerService {
                                             "UPDATE managers SET updated_at = now(), company = $1, title = $2, company_logo_url = $3, company_id = $4 WHERE id = $5")
                                         .execute(Tuple.of(currentCompany, currentTitle, currentLogo, cmpId, managerId));
                                 })
-                                .map(ignored -> reviewRow);
-                        });
+                                // The post-decision row when the rating was held, so the response
+                                // says what the server actually did rather than what the INSERT
+                                // returned a moment earlier.
+                                .map(ignored -> afterDecision != null ? afterDecision : reviewRow);
+                        }));
                 });
         }).compose(row -> {
             managerRepo.recalculateInBackground(managerId);
@@ -1467,8 +1560,39 @@ public class ManagerService {
 
     public Future<JsonObject> getManagerReviews(long managerId, int limit, int offset,
                                                   String sortBy, UUID userIdFilter) {
-        Future<Long>        totalFuture = reviewRepo.countByManager(managerId, userIdFilter);
-        Future<RowSet<Row>> dataFuture  = reviewRepo.findByManager(managerId, limit, offset, sortBy, userIdFilter);
+        return getManagerReviews(managerId, limit, offset, sortBy, userIdFilter, null);
+    }
+
+    /**
+     * The manager's ratings as this caller may see them.
+     *
+     * <p>Resolving the caller from their token rather than trusting the {@code userId} query
+     * parameter is the whole point: that parameter is a display filter anybody can set, so
+     * granting visibility on it would hand every withheld rating to anyone willing to guess an id.
+     *
+     * <p>An unauthenticated or unknown caller degrades to the public view rather than failing.
+     * Reading a manager profile has never required an account and must not start to.
+     */
+    public Future<JsonObject> getManagerReviews(long managerId, int limit, int offset,
+                                                  String sortBy, UUID userIdFilter,
+                                                  String callerAuth0Id) {
+        Future<Row> viewer = callerAuth0Id == null
+            ? Future.succeededFuture((Row) null)
+            : userRepo.findByAuth0IdWithBan(callerAuth0Id).map(opt -> opt.orElse(null))
+                .otherwise((Row) null);
+
+        return viewer.compose(v -> {
+            UUID    viewerId = v == null ? null : v.getUUID("id");
+            boolean isAdmin  = v != null && "admin".equals(v.getString("role"));
+            return buildReviewsPage(managerId, limit, offset, sortBy, userIdFilter, viewerId, isAdmin);
+        });
+    }
+
+    private Future<JsonObject> buildReviewsPage(long managerId, int limit, int offset,
+                                                String sortBy, UUID userIdFilter,
+                                                UUID viewerId, boolean isAdmin) {
+        Future<Long>        totalFuture = reviewRepo.countByManager(managerId, userIdFilter, viewerId, isAdmin);
+        Future<RowSet<Row>> dataFuture  = reviewRepo.findByManager(managerId, limit, offset, sortBy, userIdFilter, viewerId, isAdmin);
 
         return Future.all(totalFuture, dataFuture)
             .map(cf -> {
@@ -1487,11 +1611,31 @@ public class ManagerService {
     // ── GET manager career segments ───────────────────────────────────────────
 
     public Future<JsonObject> getManagerCareerSegments(long managerId, int limit, int offset) {
+        return getManagerCareerSegments(managerId, limit, offset, null);
+    }
+
+    /** Same visibility rule as the review list: the public sees live, an author and an admin see theirs. */
+    public Future<JsonObject> getManagerCareerSegments(long managerId, int limit, int offset,
+                                                        String callerAuth0Id) {
+        Future<Row> viewer = callerAuth0Id == null
+            ? Future.succeededFuture((Row) null)
+            : userRepo.findByAuth0IdWithBan(callerAuth0Id).map(o -> o.orElse(null)).otherwise((Row) null);
+        return viewer.compose(v -> buildCareerSegments(managerId, limit, offset,
+            v == null ? null : v.getUUID("id"),
+            v != null && "admin".equals(v.getString("role"))));
+    }
+
+    private Future<JsonObject> buildCareerSegments(long managerId, int limit, int offset,
+                                                    UUID viewerId, boolean isAdmin) {
         int effectiveLimit  = Math.min(Math.max(limit, 1), 50);
         int effectiveOffset = Math.max(offset, 0);
         return Future.all(
             reviewRepo.countCareerSegmentsByManager(managerId),
-            reviewRepo.findCareerSegmentsByManager(managerId, effectiveLimit, effectiveOffset)
+            // An anonymous caller goes through the public overload unchanged; only a signed-in
+            // author or an admin needs the wider one.
+            (viewerId == null && !isAdmin)
+                ? reviewRepo.findCareerSegmentsByManager(managerId, effectiveLimit, effectiveOffset)
+                : reviewRepo.findCareerSegmentsByManager(managerId, effectiveLimit, effectiveOffset, viewerId, isAdmin)
         ).map(cf -> {
             long total = cf.resultAt(0);
             RowSet<Row> rows = cf.resultAt(1);
@@ -1930,7 +2074,30 @@ public class ManagerService {
             .put("createdAt",     row.getOffsetDateTime("created_at").toString())
             .put("updatedAt",     row.getOffsetDateTime("updated_at").toString())
             .put("workedFrom",    row.getLocalDate("worked_from")  != null ? row.getLocalDate("worked_from").toString()  : null)
-            .put("workedUntil",   row.getLocalDate("worked_until") != null ? row.getLocalDate("worked_until").toString() : null);
+            .put("workedUntil",   row.getLocalDate("worked_until") != null ? row.getLocalDate("worked_until").toString() : null)
+            /*
+              Whether this rating is on the site.
+
+              Additive, and always "live" on any public surface - those read published_reviews, so
+              a held rating cannot appear there at all. It is only ever anything else on a caller's
+              view of their own rating, which is exactly where a client needs to tell "saved" apart
+              from "published".
+
+              The alternative was for the client to POST and then ask a second endpoint what had
+              just happened, which is a race the write itself does not have: the server knows the
+              disposition at the moment it writes it.
+            */
+            .put("disposition",   dispositionOf(row));
+    }
+
+    /** Tolerates rows selected before V60, and rows from projections that omit the column. */
+    private static String dispositionOf(Row row) {
+        try {
+            String value = row.getString("disposition");
+            return value == null ? "live" : value;
+        } catch (Exception e) {
+            return "live";
+        }
     }
 
     private JsonObject buildMyReviewJson(Row row) {
@@ -2031,6 +2198,40 @@ public class ManagerService {
 
     private static String toNullIfBlank(String s) {
         return (s != null && !s.isBlank()) ? s.trim() : null;
+    }
+
+    /**
+     * Runs the tier decision for a rating attached to an existing manager row.
+     *
+     * <p>Reads the manager's own name and company rather than trusting anything the client sent:
+     * the figures list identifies people, and the identity that matters is the row being rated,
+     * not the text somebody typed on the way in.
+     */
+    private Future<Row> applyProofOfWork(io.vertx.sqlclient.SqlConnection conn,
+                                         long managerId, UUID userId, UUID reviewId) {
+        if (userId == null) return Future.succeededFuture(null);
+        return conn.preparedQuery("SELECT name, company_id FROM managers WHERE id = $1")
+            .execute(Tuple.of(managerId))
+            .compose(rows -> {
+                if (!rows.iterator().hasNext()) return Future.succeededFuture((Row) null);
+                Row m = rows.iterator().next();
+                String[] parts = splitName(m.getString("name"));
+                return proofOfWork.applyTo(conn, userId, managerId, reviewId,
+                                           parts[0], parts[1], m.getLong("company_id"));
+            });
+    }
+
+    /** "Satya Nadella" → {"Satya", "Nadella"}. A single-word name has no surname to compare. */
+    static String[] splitName(String fullName) {
+        if (fullName == null || fullName.isBlank()) return new String[] { "", "" };
+        String[] words = fullName.trim().split("\\s+");
+        if (words.length == 1) return new String[] { words[0], "" };
+        // Everything after the first word is the surname, so "Mary Lou Retton" compares as
+        // "Mary" / "Lou Retton" rather than silently dropping a name part.
+        return new String[] {
+            words[0],
+            String.join(" ", java.util.Arrays.copyOfRange(words, 1, words.length))
+        };
     }
 
     // Converts any casing variant to proper name case: "TIM COOK" / "tIM cOOk" → "Tim Cook".
@@ -2312,7 +2513,7 @@ public class ManagerService {
         final String fState = state;
         final String fCity  = city;
 
-        return managerRepo.findByNameAndCompany(name, company)
+        return managerRepo.findCapturedByNameAndCompany(name, company)
             .compose(rows -> {
                 if (rows.iterator().hasNext()) {
                     Row row = rows.iterator().next();
@@ -2324,7 +2525,7 @@ public class ManagerService {
                     );
                 }
                 return companyRepo.resolve(body.getLong("companyId"), company, null, resolvedLogoUrl)
-                    .compose(companyRow -> managerRepo.createGhost(name, company, title, country, fState, fCity, resolvedLogoUrl, companyRow.getLong("id")))
+                    .compose(companyRow -> managerRepo.createCapturedDraft(name, company, title, country, fState, fCity, resolvedLogoUrl, companyRow.getLong("id")))
                     .compose(row -> {
                         long newId = row.getLong("id");
                         return reviewRepo.createSeedReview(newId, company, title)
@@ -2397,7 +2598,7 @@ public class ManagerService {
 
         // If an approved/ghost manager already exists, skip — it's already visible.
         // If it's already pending (from a prior anonymous capture), skip — don't duplicate.
-        return managerRepo.findByNameAndCompany(name, fCompany)
+        return managerRepo.findCapturedByNameAndCompany(name, fCompany)
             .compose(rows -> {
                 if (rows.iterator().hasNext()) return Future.<Void>succeededFuture(); // already exists
                 return companyRepo.resolve(body.getLong("companyId"), fCompany, null, resolvedLogoUrl)
@@ -2471,7 +2672,7 @@ public class ManagerService {
         if (review.getJsonObject("ratings") == null && review.getDouble("overallRating") == null)
             return Future.failedFuture(ServiceException.badRequest("Nothing to capture"));
 
-        return managerRepo.findByNameAndCompany(name, company)
+        return managerRepo.findCapturedByNameAndCompany(name, company)
             .compose(rows -> {
                 if (rows.iterator().hasNext()) {
                     Row existing = rows.iterator().next();

@@ -26,8 +26,30 @@ public class ReviewRepository {
 
     // ── Read ──────────────────────────────────────────────────────────────────
 
+    /** Public view: live ratings only. */
     public Future<RowSet<Row>> findByManager(long managerId, int limit, int offset,
                                               String sortBy, UUID userIdFilter) {
+        return findByManager(managerId, limit, offset, sortBy, userIdFilter, null, false);
+    }
+
+    /**
+     * The manager's ratings, as this particular caller is entitled to see them.
+     *
+     * <p>A held rating is withheld from the public, and from nobody else. Its author has to see it
+     * or the page they just contributed to looks empty, and an admin has to see it or moderating
+     * means reading a queue and a profile side by side and matching them up by eye.
+     *
+     * <p>{@code viewerId} is resolved from the caller's token, never from the {@code userId} query
+     * parameter, which is client-supplied: keying visibility off that would let anyone read
+     * anyone's withheld ratings by guessing an id.
+     *
+     * @param userIdFilter narrow to one author's ratings; a display filter, not a permission
+     * @param viewerId     who is asking, from their token
+     * @param isAdmin      whether they moderate
+     */
+    public Future<RowSet<Row>> findByManager(long managerId, int limit, int offset,
+                                              String sortBy, UUID userIdFilter,
+                                              UUID viewerId, boolean isAdmin) {
         String orderBy = switch (sortBy) {
             case "helpful" -> "helpful_count DESC";
             case "highest" -> "overall_rating DESC";
@@ -42,13 +64,23 @@ public class ReviewRepository {
             String sql = String.format("SELECT * FROM reviews WHERE manager_id = $1 AND user_id = $4 AND deleted_at IS NULL ORDER BY %s LIMIT $2 OFFSET $3", orderBy);
             return db.preparedQuery(sql).execute(Tuple.of(managerId, limit, offset, userIdFilter));
         } else {
+            // Not the view here, because the view answers only "is it published" and this query
+            // also has to answer "is it yours" and "do you moderate".
             String sql = String.format(
-                "SELECT * FROM reviews WHERE manager_id = $1 AND deleted_at IS NULL AND (weight = FALSE OR weight_expires_on IS NULL OR weight_expires_on > CURRENT_DATE) ORDER BY %s LIMIT $2 OFFSET $3", orderBy);
-            return db.preparedQuery(sql).execute(Tuple.of(managerId, limit, offset));
+                "SELECT * FROM reviews WHERE manager_id = $1 AND deleted_at IS NULL "
+                + "AND (weight = FALSE OR weight_expires_on IS NULL OR weight_expires_on > CURRENT_DATE) "
+                + "AND (disposition = 'live' OR $4 = TRUE OR ($5::uuid IS NOT NULL AND user_id = $5)) "
+                + "ORDER BY %s LIMIT $2 OFFSET $3", orderBy);
+            return db.preparedQuery(sql).execute(Tuple.of(managerId, limit, offset, isAdmin, viewerId));
         }
     }
 
     public Future<RowSet<Row>> findCareerSegmentsByManager(long managerId, int limit, int offset) {
+        return findCareerSegmentsByManager(managerId, limit, offset, null, false);
+    }
+
+    public Future<RowSet<Row>> findCareerSegmentsByManager(long managerId, int limit, int offset,
+                                                           UUID viewerId, boolean isAdmin) {
         return db.preparedQuery("""
                 SELECT
                   MIN(manager_company)                        AS company,
@@ -71,12 +103,19 @@ public class ReviewRepository {
                   MIN(manager_role_start)                     AS manager_role_start,
                   MAX(manager_role_end)                       AS manager_role_end
                 FROM reviews
-                WHERE manager_id = $1 AND deleted_at IS NULL
+                WHERE manager_id = $1
+                  AND deleted_at IS NULL
+                  -- Same rule as the review list: withheld from the public, shown to its author
+                  -- and to an admin. Filtering this to published only had a second effect nobody
+                  -- would guess - the admin controls for editing career history hang off these
+                  -- rows, so a manager whose ratings were all held lost its timeline and its edit
+                  -- buttons at the same time.
+                  AND (disposition = 'live' OR $4 = TRUE OR ($5::uuid IS NOT NULL AND user_id = $5))
                 GROUP BY LOWER(TRIM(manager_company)), LOWER(TRIM(manager_title))
                 ORDER BY MIN(worked_from) ASC NULLS LAST
                 LIMIT $2 OFFSET $3
                 """)
-            .execute(Tuple.of(managerId, limit, offset));
+            .execute(Tuple.of(managerId, limit, offset, isAdmin, viewerId));
     }
 
     public Future<Long> countCareerSegmentsByManager(long managerId) {
@@ -92,14 +131,22 @@ public class ReviewRepository {
     }
 
     public Future<Long> countByManager(long managerId, UUID userIdFilter) {
+        return countByManager(managerId, userIdFilter, null, false);
+    }
+
+    /** Counts what this caller can see, so the number above the list matches the list. */
+    public Future<Long> countByManager(long managerId, UUID userIdFilter,
+                                       UUID viewerId, boolean isAdmin) {
         if (userIdFilter != null) {
             return db.preparedQuery("SELECT COUNT(*) FROM reviews WHERE manager_id = $1 AND user_id = $2 AND deleted_at IS NULL")
                 .execute(Tuple.of(managerId, userIdFilter))
                 .map(rows -> rows.iterator().next().getLong(0));
         }
         return db.preparedQuery(
-                "SELECT COUNT(*) FROM reviews WHERE manager_id = $1 AND deleted_at IS NULL AND (weight = FALSE OR weight_expires_on IS NULL OR weight_expires_on > CURRENT_DATE)")
-            .execute(Tuple.of(managerId))
+                "SELECT COUNT(*) FROM reviews WHERE manager_id = $1 AND deleted_at IS NULL "
+                + "AND (weight = FALSE OR weight_expires_on IS NULL OR weight_expires_on > CURRENT_DATE) "
+                + "AND (disposition = 'live' OR $2 = TRUE OR ($3::uuid IS NOT NULL AND user_id = $3))")
+            .execute(Tuple.of(managerId, isAdmin, viewerId))
             .map(rows -> rows.iterator().next().getLong(0));
     }
 
@@ -427,8 +474,11 @@ public class ReviewRepository {
     public Future<Row> findMostCurrentReviewForManager(long managerId) {
         return db.preparedQuery("""
                 SELECT id, manager_company, manager_title, worked_from, worked_until
-                FROM reviews
-                WHERE manager_id = $1 AND deleted_at IS NULL
+                -- The view, because this drives the manager's displayed company, title and logo.
+                -- A rating being withheld pending proof must not rewrite what the public profile
+                -- says somebody's current role is.
+                FROM published_reviews
+                WHERE manager_id = $1
                 ORDER BY
                     CASE WHEN worked_until IS NULL THEN 0 ELSE 1 END,
                     worked_from DESC

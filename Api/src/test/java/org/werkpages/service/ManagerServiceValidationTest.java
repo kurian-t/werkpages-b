@@ -577,6 +577,22 @@ class ManagerServiceValidationTest {
         when(pq.execute(any(Tuple.class))).thenReturn(Future.succeededFuture(rs));
         when(conn.preparedQuery(argThat(s -> s != null && s.contains("INSERT INTO reviews"))))
             .thenReturn(pq);
+
+        // Every insert is now followed by the tier decision, which reads the manager's own name
+        // and company — the figures list identifies people, so the identity that matters is the
+        // row being rated rather than whatever text arrived with the request.
+        //
+        // Empty on purpose. These tests are about review validation, not about proof of work, and
+        // an empty result makes the tier resolve to LIVE immediately without reaching any of the
+        // proof repositories. Their behaviour is covered properly in ProofOfWorkIntegrationTest,
+        // against a real database rather than a mock.
+        // Built before the stubbing starts: rowSetOf() mocks internally, and calling it inside
+        // thenReturn() leaves Mockito mid-stub.
+        RowSet<Row> noIdentity = rowSetOf();
+        PreparedQuery<RowSet<Row>> identityPq = mock(PreparedQuery.class);
+        when(identityPq.execute(any(Tuple.class))).thenReturn(Future.succeededFuture(noIdentity));
+        when(conn.preparedQuery(argThat(s -> s != null && s.contains("SELECT name, company_id FROM managers"))))
+            .thenReturn(identityPq);
     }
 
     private void stubConnCompany(SqlConnection conn) {

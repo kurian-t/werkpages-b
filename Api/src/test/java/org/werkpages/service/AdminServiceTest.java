@@ -8,6 +8,7 @@ import io.vertx.sqlclient.RowIterator;
 import io.vertx.sqlclient.RowSet;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.mockito.InOrder;
 import org.werkpages.repository.CompanyRepository;
 import org.werkpages.repository.EditRepository;
 import org.werkpages.repository.ManagerRepository;
@@ -598,9 +599,8 @@ class AdminServiceTest {
     @Test
     void mergeManagers_success_returnsKeepId() throws Exception {
         when(managerRepo.countExistingById(any())).thenReturn(Future.succeededFuture(2));
-        when(reviewRepo.moveToManager(2L, 1L)).thenReturn(Future.succeededFuture(3));
-        when(reviewRepo.deleteByManager(2L)).thenReturn(Future.succeededFuture());
-        when(managerRepo.delete(2L)).thenReturn(Future.succeededFuture());
+        when(managerRepo.mergeInto(1L, 2L)).thenReturn(Future.succeededFuture(
+            new JsonObject().put("moved", 3).put("parked", 0)));
         when(managerRepo.mergeInlineRecalculate(1L)).thenReturn(Future.succeededFuture());
 
         JsonObject result = await(service.mergeManagers(ADMIN_AUTH0_ID, 1L, 2L));
@@ -610,17 +610,25 @@ class AdminServiceTest {
 
     @Test
     void mergeManagers_checksDependencyOrder() throws Exception {
+        /*
+         * Changed deliberately. This used to verify move -> deleteByManager -> delete, which is
+         * the sequence that lost data: the move skipped reviews it could not carry and the delete
+         * then destroyed them. The moving and the removal are now one transactional repository
+         * call that refuses rather than deletes, so there is no ordering left to get wrong -
+         * what remains to check is that the merge happens before the surviving manager's cached
+         * figures are recomputed.
+         */
         when(managerRepo.countExistingById(any())).thenReturn(Future.succeededFuture(2));
-        when(reviewRepo.moveToManager(3L, 1L)).thenReturn(Future.succeededFuture(0));
-        when(reviewRepo.deleteByManager(3L)).thenReturn(Future.succeededFuture());
-        when(managerRepo.delete(3L)).thenReturn(Future.succeededFuture());
+        when(managerRepo.mergeInto(1L, 3L)).thenReturn(Future.succeededFuture(
+            new JsonObject().put("moved", 0).put("parked", 0)));
         when(managerRepo.mergeInlineRecalculate(1L)).thenReturn(Future.succeededFuture());
 
         await(service.mergeManagers(ADMIN_AUTH0_ID, 1L, 3L));
-        verify(reviewRepo).moveToManager(3L, 1L);
-        verify(reviewRepo).deleteByManager(3L);
-        verify(managerRepo).delete(3L);
-        verify(managerRepo).mergeInlineRecalculate(1L);
+
+        InOrder order = inOrder(managerRepo);
+        order.verify(managerRepo).mergeInto(1L, 3L);
+        order.verify(managerRepo).mergeInlineRecalculate(1L);
+        verify(reviewRepo, never()).deleteByManager(anyLong());
     }
 
     // ══════════════════════════════════════════════════════════════════════════

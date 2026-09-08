@@ -11,7 +11,18 @@ import org.werkpages.config.SecretsConfig;
 public class Database {
 
     private static Pool client;
-    private static boolean useSSL = "true".equalsIgnoreCase(System.getenv("USE_AWS_SECRETS"));
+    /**
+     * TLS to the database, decided by the environment rather than by where secrets came from.
+     * Those were the same variable, so a deployment that sourced secrets any other way silently
+     * connected in plaintext.
+     *
+     * Read on use rather than in a static initialiser: APP_ENV is required and throws when
+     * absent, and an initialiser that throws makes the whole class unloadable - which broke
+     * tests that only wanted to read the migrations flag beside it.
+     */
+    private static boolean useSSL() {
+        return org.werkpages.config.AppEnv.current().isProduction();
+    }
     
     public static void init(Vertx vertx, SecretsConfig secrets, Runnable onReady) {
     	
@@ -24,7 +35,7 @@ public class Database {
             .setConnectTimeout(5000); // 5 s to establish a connection; fail fast rather than hang
            
 
-		if (useSSL) {
+		if (useSSL()) {
 			connectOptions.setSslMode(io.vertx.pgclient.SslMode.REQUIRE);
 			connectOptions.setTrustAll(true);
 		}
@@ -58,7 +69,7 @@ public class Database {
     }
 
     private static void runMigrations(PgConnectOptions connectOptions) {
-    	String sslSuffix = useSSL ? "?sslmode=require" : "";
+    	String sslSuffix = useSSL() ? "?sslmode=require" : "";
     	String jdbcUrl = String.format(
     		    "jdbc:postgresql://%s:%d/%s%s",
     		    connectOptions.getHost(),

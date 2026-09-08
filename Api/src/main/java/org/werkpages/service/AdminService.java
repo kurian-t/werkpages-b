@@ -4,12 +4,16 @@ import io.vertx.core.Future;
 import io.vertx.core.json.JsonArray;
 import io.vertx.core.json.JsonObject;
 import io.vertx.sqlclient.Row;
+import io.vertx.sqlclient.RowSet;
 import io.vertx.sqlclient.SqlClient;
+import io.vertx.sqlclient.Tuple;
 import org.werkpages.repository.CompanyRepository;
+import org.werkpages.repository.ConfidenceRepository;
 import org.werkpages.repository.EditRepository;
 import org.werkpages.repository.ManagerRepository;
 import org.werkpages.repository.MergeSuggestionsRepository;
 import org.werkpages.repository.NotificationRepository;
+import org.werkpages.repository.ProofChallengeRepository;
 import org.werkpages.repository.ReviewRepository;
 import org.werkpages.repository.UserRepository;
 
@@ -34,6 +38,8 @@ public class AdminService {
     private final CompanyRepository           companyRepo;
     private final MergeSuggestionsRepository  mergeSuggestionsRepo;
     private final SqlClient                   db;
+    private final ProofChallengeRepository    challengeRepo;
+    private final ConfidenceRepository        confidenceRepo;
 
     public AdminService(UserRepository userRepo, ManagerRepository managerRepo,
                         ReviewRepository reviewRepo, EditRepository editRepo,
@@ -66,6 +72,8 @@ public class AdminService {
         this.companyRepo          = companyRepo;
         this.mergeSuggestionsRepo = mergeSuggestionsRepo;
         this.db                   = db;
+        this.challengeRepo  = db == null ? null : new ProofChallengeRepository(db);
+        this.confidenceRepo = db == null ? null : new ConfidenceRepository(db);
     }
 
     // ── Guard: verify admin ───────────────────────────────────────────────────
@@ -183,6 +191,9 @@ public class AdminService {
 
     public Future<JsonObject> rejectPendingManager(String auth0Id, long managerId, String reason) {
         return requireAdmin(auth0Id)
+            // reject() also sweeps up the ghost twins the submission left behind, in the same
+            // statement, so a person cannot be rejected here and still appear under a half-typed
+            // company name somewhere else.
             .compose(adminId -> managerRepo.reject(managerId))
             .compose(opt -> {
                 if (opt.isEmpty()) return Future.failedFuture(ServiceException.notFound("Pending manager not found"));
@@ -195,6 +206,17 @@ public class AdminService {
                 // Only notify users who explicitly submitted — search-created managers must not
                 // send rejection emails the user would find confusing (they just searched).
                 if (submittedBy != null && !isSearchCreated) {
+                    // Same test, same reason, now also gating confidence. A ghost manager created
+                    // by somebody's search on /find is not a submission: they typed a name into a
+                    // search box. Rejecting it must cost them nothing, because a score they cannot
+                    // see, appeal, or even know exists must never move on something we chose to
+                    // keep silent. If we would not tell you about it, it cannot count against you.
+                    if (confidenceRepo != null) {
+                        confidenceRepo.apply(submittedBy, ConfidenceRepository.MANAGER_REJECTED_JUNK,
+                                -20, "manager", String.valueOf(managerId))
+                            .onFailure(err -> System.err.println(
+                                "Confidence debit failed for manager " + managerId + ": " + err.getMessage()));
+                    }
                     String msg = "Your submitted manager profile for " + managerName + " at " + managerCompany + " was not approved.";
                     if (reason != null && !reason.isBlank()) msg += " Reason: " + reason.trim();
                     notifRepo.sendAsync(submittedBy, "manager_rejected", "Manager Not Approved", msg);
@@ -204,6 +226,153 @@ public class AdminService {
     }
 
     // ── Pending edits ─────────────────────────────────────────────────────────
+
+    // ── Proof challenges ──────────────────────────────────────────────────────
+
+    /**
+     * The proof queue: ratings held until somebody vouches for the person who wrote them.
+     *
+     * <p>Deliberately separate from {@link #getPendingManagers}, because "is this a real person who
+     * belongs in the directory?" and "did <em>this author</em> work with them?" are different
+     * questions decided on different evidence — and often only one of them exists. When the figure
+     * is already in the directory there is no manager decision to make at all, only the held
+     * rating.
+     */
+    public Future<JsonObject> getProofChallenges(String auth0Id, int limit, int offset) {
+        return requireAdmin(auth0Id)
+            .compose(adminId -> Future.all(
+                    challengeRepo.findForAdmin(limit, offset),
+                    challengeRepo.countForAdmin())
+                .map(cf -> {
+                    RowSet<Row> rows = cf.resultAt(0);
+                    JsonArray data = new JsonArray();
+                    for (Row r : rows) {
+                        data.add(new JsonObject()
+                            .put("id",              r.getUUID("id").toString())
+                            .put("managerId",       r.getLong("manager_id"))
+                            .put("managerName",     r.getString("manager_name"))
+                            .put("managerCompany",  r.getString("manager_company"))
+                            .put("reason",          r.getString("reason"))
+                            .put("status",          r.getString("status"))
+                            // What we thought of them when they wrote it, not what we think now.
+                            .put("authorConfidence", r.getInteger("author_confidence"))
+                            .put("workedFrom",      r.getLocalDate("worked_from") == null ? null
+                                                    : r.getLocalDate("worked_from").toString())
+                            .put("workedUntil",     r.getLocalDate("worked_until") == null ? null
+                                                    : r.getLocalDate("worked_until").toString())
+                            .put("claimedTitle",    r.getString("claimed_title"))
+                            .put("claimedOrg",      r.getString("claimed_org"))
+                            .put("relationship",    r.getString("relationship"))
+                            .put("evidenceNote",    r.getString("evidence_note"))
+                            // False on a submitted claim is the signal worth reading: the dates do
+                            // not line up with the career history we already hold for this manager.
+                            .put("claimCorroborated", r.getBoolean("claim_corroborated"))
+                            .put("createdAt",       r.getOffsetDateTime("created_at").toString()));
+                    }
+                    return new JsonObject()
+                        .put("data",  data)
+                        .put("total", cf.<Long>resultAt(1))
+                        .put("limit", limit)
+                        .put("offset", offset);
+                }));
+    }
+
+    /**
+     * Decides one held rating.
+     *
+     * <p>Approving publishes it, credits the author and notifies. Rejecting keeps it hidden,
+     * debits and notifies. Neither touches the manager row — that is
+     * {@link #approvePendingManager}'s decision, and a rating becomes publicly visible only when
+     * both have gone its way, which is a conjunction of two independent facts rather than a third
+     * state anybody has to maintain.
+     */
+    public Future<JsonObject> resolveProofChallenge(String auth0Id, UUID challengeId,
+                                                    boolean approve, String reason) {
+        return requireAdmin(auth0Id)
+            .compose(adminId -> challengeRepo.resolve(challengeId, adminId,
+                                                      approve ? "approved" : "rejected")
+                .compose(opt -> {
+                    if (opt.isEmpty()) {
+                        return Future.failedFuture(ServiceException.notFound("Challenge not found"));
+                    }
+                    Row c = opt.get();
+                    UUID userId   = c.getUUID("user_id");
+                    UUID reviewId = c.getUUID("review_id");
+
+                    Future<Void> disposition = reviewId == null
+                        ? Future.succeededFuture()
+                        : db.preparedQuery(approve
+                            // live_since starts now, not when it was written: thirty days of
+                            // standing has to mean thirty days actually live.
+                            ? "UPDATE reviews SET disposition = 'live', gate_eligible = TRUE, "
+                              + "live_since = now() WHERE id = $1"
+                            : "UPDATE reviews SET disposition = 'rejected', gate_eligible = FALSE, "
+                              + "live_since = NULL WHERE id = $1")
+                            .execute(Tuple.of(reviewId)).mapEmpty();
+
+                    Future<Void> score = confidenceRepo.apply(userId,
+                        approve ? ConfidenceRepository.CHALLENGE_APPROVED
+                                : ConfidenceRepository.CHALLENGE_REJECTED,
+                        approve ? 15 : -25,
+                        "challenge", challengeId.toString());
+
+                    return disposition.compose(v -> score).compose(v -> {
+                        notifRepo.sendAsync(userId,
+                            approve ? "proof_approved" : "proof_rejected",
+                            approve ? "Rating published" : "Rating not published",
+                            approve
+                                ? "Thanks — we've confirmed your rating and it's now live."
+                                : "We weren't able to confirm your rating, so it hasn't been published."
+                                  + (reason != null && !reason.isBlank() ? " Reason: " + reason.trim() : ""),
+                            c.getLong("manager_id"));
+                        // Recalculate only on approval: a rejected rating never entered the cache.
+                        if (approve) managerRepo.recalculateInBackground(c.getLong("manager_id"));
+                        return Future.succeededFuture(new JsonObject()
+                            .put("success", true)
+                            .put("status", approve ? "approved" : "rejected"));
+                    });
+                }));
+    }
+
+    /** The figures list, editable without a deploy because an anti-abuse list churns. */
+    public Future<JsonArray> listHighProfileFigures(String auth0Id) {
+        return requireAdmin(auth0Id)
+            .compose(adminId -> challengeRepo.listFigures())
+            .map(rows -> {
+                JsonArray out = new JsonArray();
+                for (Row r : rows) {
+                    out.add(new JsonObject()
+                        .put("id",          r.getLong("id"))
+                        .put("managerId",   r.getLong("manager_id"))
+                        .put("fullName",    r.getString("full_name"))
+                        .put("companyId",   r.getLong("company_id"))
+                        .put("companyName", r.getString("company_name"))
+                        .put("note",        r.getString("note")));
+                }
+                return out;
+            });
+    }
+
+    public Future<JsonObject> addHighProfileFigure(String auth0Id, Long managerId,
+                                                   String fullName, Long companyId, String note) {
+        // A name with no company identifies nobody: it would challenge every unrelated person who
+        // happens to share it. The database enforces this too; failing here gives a usable message.
+        if (managerId == null && (fullName == null || fullName.isBlank() || companyId == null)) {
+            return Future.failedFuture(ServiceException.badRequest(
+                "A figure needs either a manager, or both a name and a company"));
+        }
+        return requireAdmin(auth0Id)
+            .compose(adminId -> challengeRepo.addFigure(managerId, fullName, companyId, note))
+            .map(r -> new JsonObject().put("success", true).put("id", r.getLong("id")));
+    }
+
+    public Future<JsonObject> removeHighProfileFigure(String auth0Id, long id) {
+        return requireAdmin(auth0Id)
+            .compose(adminId -> challengeRepo.removeFigure(id))
+            .compose(removed -> removed
+                ? Future.succeededFuture(new JsonObject().put("success", true))
+                : Future.failedFuture(ServiceException.notFound("Figure not found")));
+    }
 
     public Future<JsonObject> getPendingEdits(String auth0Id, int limit, int offset) {
         return requireAdmin(auth0Id)
@@ -519,8 +688,10 @@ public class AdminService {
             .compose(opt -> {
                 if (opt.isEmpty()) return Future.failedFuture(ServiceException.notFound("Manager not found"));
                 Long companyId = opt.get().getLong("company_id");
-                return reviewRepo.deleteByManager(managerId)
-                    .compose(v -> managerRepo.delete(managerId))
+                // Keeps anything a person wrote: seeded placeholders are removed, real reviews
+                // are soft-deleted, and the manager row is retired rather than deleted when it
+                // holds any - because the cascade on reviews.manager_id would destroy them.
+                return managerRepo.deleteOrRetire(managerId)
                     .compose(v -> {
                         if (companyId != null && companyRepo != null) {
                             return companyRepo.updateCompanyStatsForCompany(companyId);
@@ -536,13 +707,20 @@ public class AdminService {
             .compose(adminId -> managerRepo.countExistingById(new Long[]{keepId, mergeId}))
             .compose(count -> {
                 if (count < 2) return Future.failedFuture(ServiceException.notFound("One or both managers not found"));
-                return reviewRepo.moveToManager(mergeId, keepId);
+                // Moves the reviews and removes the duplicate in one transaction, or refuses and
+                // leaves both untouched. It will not delete a review somebody wrote.
+                return managerRepo.mergeInto(keepId, mergeId)
+                    .recover(err -> Future.failedFuture(err instanceof IllegalStateException
+                        ? ServiceException.conflict(err.getMessage())
+                        : err));
             })
-            .compose(moved -> reviewRepo.deleteByManager(mergeId))
-            .compose(v -> managerRepo.delete(mergeId))
-            .compose(v -> managerRepo.mergeInlineRecalculate(keepId))
-            .compose(v -> {
-                JsonObject ok = new JsonObject().put("success", true).put("keepId", keepId);
+            .compose(counts -> managerRepo.mergeInlineRecalculate(keepId).map(v -> counts))
+            .compose(counts -> {
+                JsonObject ok = new JsonObject().put("success", true).put("keepId", keepId)
+                    // Said out loud. A review that could not come across was set aside, not
+                    // deleted, and an admin has to be told which happened.
+                    .put("movedReviews",  counts.getInteger("moved"))
+                    .put("parkedReviews", counts.getInteger("parked"));
                 if (companyRepo == null) return Future.succeededFuture(ok);
                 return companyRepo.syncStatsForManager(keepId).map(statsDone -> ok);
             });

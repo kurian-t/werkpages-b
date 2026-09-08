@@ -21,5 +21,30 @@
         <vertx.version>4.5.10</vertx.version>
         <swagger.version>4.18.2</swagger.version>
         <openapi.generator.version>7.0.0</openapi.generator.version>
+        <jackson.version>2.19.1</jackson.version>
     </properties>
+
+    <!--
+      Jackson is version-managed here for every module, because managing it per-module is what
+      broke: Api pinned jackson-core to match its databind, RestApi pinned databind and jsr310
+      but not core, and RestApi is the module that gets shaded. Vert.x's transitive jackson-core
+      2.16.1 therefore won inside the only artifact we actually run, next to databind 2.19.1 -
+      and databind calls a ParserMinimalBase constructor that core only gained in 2.17. The
+      backend died on boot with NoSuchMethodError while every test passed, because the tests run
+      against the module classpath rather than the shaded jar.
+
+      The BOM keeps core, databind, annotations and every datatype module on one version by
+      construction, so a future module cannot inherit half a pin.
+    -->
+    <dependencyManagement>
+        <dependencies>
+            <dependency>
+                <groupId>com.fasterxml.jackson</groupId>
+                <artifactId>jackson-bom</artifactId>
+                <version>${jackson.version}</version>
+                <type>pom</type>
+                <scope>import</scope>
+            </dependency>
+        </dependencies>
+    </dependencyManagement>
 </project>

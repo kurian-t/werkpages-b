@@ -275,8 +275,25 @@ public class AuthHandler {
 
     // ── TURNSTILE ─────────────────────────────────────────────────────────────
 
+    /**
+     * Cloudflare Turnstile, enforced.
+     *
+     * A missing secret used to mean "skip the check and let the request through", so an unset or
+     * blank TURNSTILE_SECRET_KEY silently removed bot protection from signup while everything
+     * still appeared to work. In production that now refuses the request instead: a control that
+     * disappears when its configuration is absent is not a control.
+     *
+     * Development keeps the pass-through, because requiring every developer to hold a Turnstile
+     * secret to sign up locally buys nothing.
+     */
     private void verifyTurnstile(String token, RoutingContext ctx, Runnable onVerified) {
-        if (turnstileSecretKey == null || turnstileSecretKey.isBlank()) { onVerified.run(); return; }
+        if (turnstileSecretKey == null || turnstileSecretKey.isBlank()) {
+            if (!org.werkpages.config.AppEnv.current().isProduction()) { onVerified.run(); return; }
+            System.err.println("TURNSTILE_SECRET_KEY is not configured but APP_ENV=production - "
+                + "refusing the request rather than accepting it unverified.");
+            internalError(ctx);
+            return;
+        }
         if (token == null || token.isBlank()) {
             ctx.response().setStatusCode(400).putHeader("Content-Type", "application/json")
                 .end(new JsonObject().put("error", "captcha_required")
@@ -376,11 +393,12 @@ public class AuthHandler {
                             }
                             io.vertx.sqlclient.Row row = opt.get();
                             java.util.UUID userId = row.getUUID("id");
-                            boolean isProd = "true".equalsIgnoreCase(System.getenv("USE_AWS_SECRETS"));
+                            boolean isProd = org.werkpages.config.AppEnv.current().isProduction();
                             String setCookie = "auth_token=" + accessToken
                                 + "; HttpOnly; Path=/; Max-Age=86400; SameSite=Lax" + (isProd ? "; Secure" : "");
-                            userRepo.hasContributed(userId)
-                                .onSuccess(contributed -> ctx.response()
+                            io.vertx.core.Future.all(userRepo.hasContributed(userId), userRepo.hasRatedCompany(userId))
+                                .onSuccess(flags -> { boolean contributed = flags.resultAt(0); boolean ratedCompany = flags.resultAt(1);
+                                  ctx.response()
                                     .putHeader("Set-Cookie", setCookie)
                                     .putHeader("Content-Type", "application/json")
                                     .end(new JsonObject().put("user", new JsonObject()
@@ -392,7 +410,8 @@ public class AuthHandler {
                                         .put("role",          row.getString("role"))
                                         .put("isBanned",      row.getBoolean("is_banned"))
                                         .put("hasContributed", contributed)
-                                    ).encode()))
+                                        .put("hasRatedCompany", ratedCompany)
+                                    ).encode()); })
                                 .onFailure(ctx::fail);
                         })
                         .onFailure(ctx::fail);
@@ -419,8 +438,9 @@ public class AuthHandler {
                 }
                 io.vertx.sqlclient.Row row = opt.get();
                 java.util.UUID userId = row.getUUID("id");
-                userRepo.hasContributed(userId)
-                    .onSuccess(contributed -> ctx.response().setStatusCode(200)
+                io.vertx.core.Future.all(userRepo.hasContributed(userId), userRepo.hasRatedCompany(userId))
+                    .onSuccess(flags -> { boolean contributed = flags.resultAt(0); boolean ratedCompany = flags.resultAt(1);
+                      ctx.response().setStatusCode(200)
                         .putHeader("Content-Type", "application/json")
                         .end(new JsonObject()
                             .put("id",             userId.toString())
@@ -432,8 +452,11 @@ public class AuthHandler {
                             .put("role",           row.getString("role"))
                             .put("isBanned",       row.getBoolean("is_banned"))
                             .put("hasContributed", contributed)
+                            // One gate per dataset. Rating a manager buys the manager numbers and
+                            // nothing else; the workplace numbers are bought by rating a workplace.
+                            .put("hasRatedCompany", ratedCompany)
                             .put("createdAt",      row.getLocalDateTime("created_at").toString())
-                            .encode()))
+                            .encode()); })
                     .onFailure(ctx::fail);
             })
             .onFailure(ctx::fail);
@@ -538,12 +561,13 @@ public class AuthHandler {
                                     ctx.response().setStatusCode(403).putHeader("Content-Type", "application/json")
                                         .end(new JsonObject().put("error", "account_suspended").encode()); return;
                                 }
-                                boolean isProd = "true".equalsIgnoreCase(System.getenv("USE_AWS_SECRETS"));
+                                boolean isProd = org.werkpages.config.AppEnv.current().isProduction();
                                 String setCookie = "auth_token=" + fTokenForCookie
                                     + "; HttpOnly; Path=/; Max-Age=86400; SameSite=Lax" + (isProd ? "; Secure" : "");
                                 java.util.UUID socialUserId = row.getUUID("id");
-                                userRepo.hasContributed(socialUserId)
-                                    .onSuccess(contributed -> ctx.response()
+                                io.vertx.core.Future.all(userRepo.hasContributed(socialUserId), userRepo.hasRatedCompany(socialUserId))
+                                    .onSuccess(flags -> { boolean contributed = flags.resultAt(0); boolean ratedCompany = flags.resultAt(1);
+                                      ctx.response()
                                         .putHeader("Set-Cookie", setCookie)
                                         .putHeader("Content-Type", "application/json")
                                         .end(new JsonObject().put("user", new JsonObject()
@@ -555,7 +579,8 @@ public class AuthHandler {
                                             .put("role",          row.getString("role"))
                                             .put("isBanned",      row.getBoolean("is_banned"))
                                             .put("hasContributed", contributed)
-                                        ).put("isNewUser", isNewUserHolder[0]).encode()))
+                                            .put("hasRatedCompany", ratedCompany)
+                                        ).put("isNewUser", isNewUserHolder[0]).encode()); })
                                     .onFailure(ctx::fail);
                             })
                             .onFailure(err -> {

@@ -416,30 +416,33 @@ class ManagerRepositoryCoverageIntegrationTest {
     // ══════════════════════════════════════════════════════════════════════════
 
     @Test
-    void createGhost_createsManagerWithGhostStatus() throws Exception {
+    void createCapturedDraft_isHeldForAnAdminRatherThanPublished() throws Exception {
+        // Changed deliberately. This used to assert 'ghost', which is live: the add-manager form
+        // posts here the moment its first step is valid, so typing put a manager on the site
+        // before any rating, any submit, and any check.
         Row company = await(companyRepo.findOrCreate("GhostCreateCorp", null, null));
         long companyId = company.getLong("id");
 
-        Row manager = await(managerRepo.createGhost(
+        Row manager = await(managerRepo.createCapturedDraft(
             "Ghost Created", "GhostCreateCorp", "Director",
             "US", "NY", "New York", null, companyId));
 
-        assertEquals("ghost", manager.getString("approval_status"));
+        assertEquals("pending_approval", manager.getString("approval_status"));
         assertEquals("Ghost Created", manager.getString("name"));
         assertNotNull(manager.getString("slug"));
     }
 
     @Test
-    void createGhost_withNullState_doesNotThrow() throws Exception {
+    void createCapturedDraft_withNullState_doesNotThrow() throws Exception {
         Row company = await(companyRepo.findOrCreate("GhostNullStateCorp", null, null));
         long companyId = company.getLong("id");
 
-        Row manager = await(managerRepo.createGhost(
+        Row manager = await(managerRepo.createCapturedDraft(
             "Ghost No State", "GhostNullStateCorp", "Engineer",
             "CA", null, null, null, companyId));
 
         assertNotNull(manager);
-        assertEquals("ghost", manager.getString("approval_status"));
+        assertEquals("pending_approval", manager.getString("approval_status"));
     }
 
     // ══════════════════════════════════════════════════════════════════════════

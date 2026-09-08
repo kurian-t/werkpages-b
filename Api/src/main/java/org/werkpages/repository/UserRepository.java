@@ -253,10 +253,43 @@ public class UserRepository {
             .mapEmpty();
     }
 
+    /**
+     * Has this person rated a manager? The gate on manager data.
+     *
+     * <p>Reads through {@code published_reviews} and asks for {@code gate_eligible} explicitly —
+     * both facts, rather than the absence of the worst one. An earlier form of this query was the
+     * whole vulnerability: a bare {@code EXISTS} over {@code reviews} meant any review, on any
+     * manager, in any state opened the gate, so a junk rating written in ten seconds bought
+     * exactly the access an honest one did.
+     *
+     * <p>Asking for {@code disposition <> 'rejected'} instead would be correct only while the two
+     * columns stay synchronised, and the reason they are two columns is that one day they will
+     * not. Reading the view inherits the publication rule instead of approximating it.
+     */
     public Future<Boolean> hasContributed(UUID userId) {
         return db.preparedQuery(
-                "SELECT EXISTS(SELECT 1 FROM reviews WHERE user_id = $1) AS contributed")
+                "SELECT EXISTS(SELECT 1 FROM published_reviews "
+                + "WHERE user_id = $1 AND gate_eligible = TRUE) AS contributed")
             .execute(Tuple.of(userId))
             .map(rows -> rows.iterator().next().getBoolean("contributed"));
+    }
+
+    /**
+     * Has this person rated a company? The gate on workplace data.
+     *
+     * One gate per dataset, each opened by contributing to that dataset. Rating a manager tells us
+     * nothing about a workplace, so it should not buy the workplace numbers - and the reverse is
+     * equally true. Interview data already worked this way; this is the same rule for the third.
+     *
+     * Any company, not this company. The manager gate is global for the same reason: the point is
+     * that somebody has contributed to the corpus they are reading, not that they have contributed
+     * to the exact page they happen to be on.
+     */
+    public Future<Boolean> hasRatedCompany(UUID userId) {
+        return db.preparedQuery(
+                "SELECT EXISTS(SELECT 1 FROM company_reviews "
+                + "WHERE user_id = $1 AND deleted_at IS NULL) AS rated")
+            .execute(Tuple.of(userId))
+            .map(rows -> rows.iterator().next().getBoolean("rated"));
     }
 }

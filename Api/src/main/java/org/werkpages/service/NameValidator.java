@@ -97,6 +97,29 @@ public class NameValidator {
         return validateNameContent(firstName, lastName);
     }
 
+    /**
+     * Not junk enough to reject, odd enough that a person should look.
+     *
+     * The distinction carries weight. Rejection tells somebody their name is not real, and this
+     * rule fires on names that sometimes are - "Thomas Thomas" and "Martin Martin" are surnames as
+     * well as given names. So a hit holds the submission for review rather than refusing it.
+     *
+     * It exists because the blocklists above cannot be finished. "No No" passes every rule in this
+     * class: two letters clears the minimum, it is letters-only, and it is on no list. Enumerating
+     * the next variant, and the one after, is a game we lose. Repetition is the cheap tell, and
+     * unlike a word list it needs no updating when somebody thinks of "Ab Ab".
+     *
+     * Deliberately narrow. A "both parts are short" rule would catch this too, and would also hold
+     * every "Li Xu" and "Kim Ho" on the site - a real cost paid by real people with short names,
+     * and paid unevenly across languages. One rule, one tell.
+     */
+    public static boolean isSuspiciousName(String firstName, String lastName) {
+        if (firstName == null || lastName == null) return false;
+        String first = firstName.trim().toLowerCase();
+        String last  = lastName.trim().toLowerCase();
+        return !first.isEmpty() && first.equals(last);
+    }
+
     private static ValidationResult validateNameContent(String firstName, String lastName) {
         String firstLower = firstName.trim().toLowerCase();
         String lastLower  = lastName.trim().toLowerCase();

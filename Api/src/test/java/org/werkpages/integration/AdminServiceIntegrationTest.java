@@ -738,7 +738,7 @@ class AdminServiceIntegrationTest {
     }
 
     @Test
-    void mergeManagers_success_deletesSourceManager() throws Exception {
+    void mergeManagers_success_retiresSourceManagerWithoutDestroyingIt() throws Exception {
         String adminAuth0 = insertUser("auth0|admin30", "Admin30", "admin");
         String userAuth   = insertUser("auth0|merge-user", "MergeUser01", "user");
         UUID   userId     = findUserId(userAuth);
@@ -751,12 +751,19 @@ class AdminServiceIntegrationTest {
         assertTrue(result.getBoolean("success"));
         assertEquals(keepId, result.getLong("keepId"));
 
-        // Merge manager deleted
-        long mergeExists = await(pool
-            .preparedQuery("SELECT COUNT(*) FROM managers WHERE id = $1")
+        /*
+         * Changed deliberately. This asserted the row was deleted, and deleting it is what lost
+         * data: reviews.manager_id is ON DELETE CASCADE, so any review that could not move - a
+         * true role duplicate, which the unique indexes forbid holding twice - was destroyed with
+         * it. The row is kept, hidden, and marked with where it went. Every public surface filters
+         * approval_status to approved and ghost, so 'rejected' is already invisible.
+         */
+        var merged = await(pool
+            .preparedQuery("SELECT approval_status, merged_into FROM managers WHERE id = $1")
             .execute(Tuple.of(mergeId))
-            .map(rs -> rs.iterator().next().getLong(0)));
-        assertEquals(0L, mergeExists);
+            .map(rs -> rs.iterator().next()));
+        assertEquals("rejected", merged.getString("approval_status"), "hidden everywhere");
+        assertEquals(keepId, merged.getLong("merged_into"), "and it records where it went");
 
         // Keep manager exists
         long keepExists = await(pool
@@ -888,7 +895,7 @@ class AdminServiceIntegrationTest {
     }
 
     @Test
-    void deleteManager_removesManagerAndReviews() throws Exception {
+    void deleteManager_retiresTheManagerAndKeepsTheReviews() throws Exception {
         String adminAuth = insertUser("auth0|del-admin02", "DelAdmin02", "admin");
         String userAuth  = insertUser("auth0|del-user02", "DelUser02", "user");
         UUID   userId    = findUserId(userAuth);
@@ -897,17 +904,30 @@ class AdminServiceIntegrationTest {
 
         await(service.deleteManager(adminAuth, managerId));
 
-        long managerExists = await(pool
-            .preparedQuery("SELECT COUNT(*) FROM managers WHERE id = $1")
+        /*
+         * Changed deliberately. A review written by a person is only ever soft-deleted, and this
+         * asserted both the manager and its reviews were destroyed outright. reviews.manager_id
+         * cascades, so removing the row is what destroyed them - the row is retired instead, which
+         * hides it everywhere (every public surface filters to approved and ghost) while the
+         * reviews survive.
+         */
+        var manager = await(pool
+            .preparedQuery("SELECT approval_status FROM managers WHERE id = $1")
+            .execute(Tuple.of(managerId))
+            .map(rs -> rs.iterator().next()));
+        assertEquals("rejected", manager.getString("approval_status"), "hidden, not destroyed");
+
+        long liveReviews = await(pool
+            .preparedQuery("SELECT COUNT(*) FROM reviews WHERE manager_id = $1 AND deleted_at IS NULL")
             .execute(Tuple.of(managerId))
             .map(rs -> rs.iterator().next().getLong(0)));
-        assertEquals(0L, managerExists);
+        assertEquals(0L, liveReviews, "nothing is readable");
 
-        long reviewsExist = await(pool
+        long kept = await(pool
             .preparedQuery("SELECT COUNT(*) FROM reviews WHERE manager_id = $1")
             .execute(Tuple.of(managerId))
             .map(rs -> rs.iterator().next().getLong(0)));
-        assertEquals(0L, reviewsExist);
+        assertEquals(1L, kept, "but the review somebody wrote still exists");
     }
 
     // adminEditManager

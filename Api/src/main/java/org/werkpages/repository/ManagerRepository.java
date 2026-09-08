@@ -346,16 +346,201 @@ public class ManagerRepository {
             .map(rows -> rows.rowCount() > 0);
     }
 
+    /**
+     * Rejects a submitted manager, and the ghost twins that submission left behind.
+     *
+     * <p>Searching on /find creates a ghost manager as you type, so one attempt to add
+     * "Satya Nadella at Microsoft" can leave a publicly visible "Satya Nadella at Mi" behind it.
+     * Rejecting only the row an admin clicked left the person in the directory under a half-typed
+     * company, which makes the rejection look broken - the manager is still there.
+     *
+     * <p>One statement, so the two updates cannot come apart: a rejection that removed the
+     * submission but failed to remove its twin would be worse than either outcome alone.
+     *
+     * <p>The twin sweep is deliberately narrow. Only ghosts, only the same name, and only ones
+     * nobody has genuinely rated - a ghost carrying a review a real person wrote is somebody's
+     * contribution, and taking it on a name match would destroy real data. The capture path's
+     * placeholder reviews carry no user_id, which is exactly what tells the two apart.
+     */
     public Future<Optional<Row>> reject(long managerId) {
         return db.preparedQuery("""
-                UPDATE managers SET approval_status = 'rejected', updated_at = now()
-                WHERE id = $1 AND approval_status = 'pending_approval'
-                RETURNING id, name, company, submitted_by, search_created_by_user_id
+                WITH target AS (
+                    UPDATE managers SET approval_status = 'rejected', updated_at = now()
+                    WHERE id = $1 AND approval_status = 'pending_approval'
+                    RETURNING id, name, company, submitted_by, search_created_by_user_id
+                ),
+                twins AS (
+                    UPDATE managers m SET approval_status = 'rejected', updated_at = now()
+                    WHERE m.approval_status = 'ghost'
+                      AND m.id <> $1
+                      AND LOWER(TRIM(m.name)) = (SELECT LOWER(TRIM(name)) FROM target)
+                      AND NOT EXISTS (
+                          SELECT 1 FROM reviews r
+                          WHERE r.manager_id = m.id
+                            AND r.user_id IS NOT NULL
+                            AND r.deleted_at IS NULL
+                      )
+                    RETURNING m.id
+                )
+                SELECT id, name, company, submitted_by, search_created_by_user_id FROM target
                 """)
             .execute(Tuple.of(managerId))
             .map(rows -> rows.iterator().hasNext()
                 ? Optional.of(rows.iterator().next())
                 : Optional.empty());
+    }
+
+    /**
+     * Merges one manager into another, or refuses. Never destroys a review.
+     *
+     * <p>What this replaces did three things wrong at once. It moved whatever it could, threw away
+     * the count of what it had moved, then ran {@code DELETE FROM reviews WHERE manager_id = ...}
+     * over the remainder - so every review the move had skipped was destroyed, silently, with no
+     * transaction and no undo. Soft-deleted reviews were the sharpest case: those are waiting out
+     * the three-day restore window, so a merge quietly deleted reviews that were coming back.
+     *
+     * <p>Now a review can only disappear if it is a synthetic placeholder, or a provable duplicate
+     * of one already on the surviving manager - same person, same role - which the unique role
+     * indexes forbid keeping twice and which says nothing the survivor does not already say.
+     * Anything else this code cannot account for rolls the whole merge back, because a refusal an
+     * admin can act on beats a deletion nobody can undo.
+     *
+     * <p>One transaction, so a half-merged manager is not a state this can end in.
+     *
+     * @return {@code {moved, parked}} - what came across, and what could not and was set aside.
+     *         The caller has to be able to say so: a merge that silently picks a winner between
+     *         two reviews looks exactly like a merge that lost one.
+     */
+    public Future<io.vertx.core.json.JsonObject> mergeInto(long keepId, long mergeId) {
+        return ((io.vertx.sqlclient.Pool) db).withTransaction(conn ->
+            // Soft-deleted reviews move too. They belong to the surviving manager, and the restore
+            // job will bring them back there.
+            conn.preparedQuery("""
+                    UPDATE reviews SET manager_id = $1
+                    WHERE manager_id = $2
+                      -- Two unique indexes guard a role, not one: the same role on the same
+                      -- manager is unique per user_id AND per author name. Checking only the
+                      -- first is what let a merge die on a raw constraint violation instead of
+                      -- refusing cleanly - and a soft-deleted review has its user_id cleared, so
+                      -- the author name is the only thing left that identifies it at all.
+                      AND NOT EXISTS (
+                          SELECT 1 FROM reviews t
+                          WHERE t.manager_id = $1
+                            AND t.weight = FALSE AND reviews.weight = FALSE
+                            AND LOWER(TRIM(COALESCE(t.manager_company, ''))) = LOWER(TRIM(COALESCE(reviews.manager_company, '')))
+                            AND LOWER(TRIM(COALESCE(t.manager_title, '')))   = LOWER(TRIM(COALESCE(reviews.manager_title, '')))
+                            AND (
+                                (t.user_id IS NOT NULL AND t.user_id = reviews.user_id)
+                                OR LOWER(TRIM(t.author)) = LOWER(TRIM(reviews.author))
+                            )
+                      )
+                      AND (weight = FALSE OR NOT EXISTS (
+                          SELECT 1 FROM reviews WHERE manager_id = $1 AND weight = TRUE
+                      ))
+                    """)
+                .execute(Tuple.of(keepId, mergeId))
+                .compose(moved -> conn.preparedQuery("""
+                        -- Seeded placeholders are removed outright: weight = TRUE with no author,
+                        -- written to fill an empty profile, nobody's contribution.
+                        DELETE FROM reviews r
+                        WHERE r.manager_id = $1 AND r.weight = TRUE AND r.user_id IS NULL
+                        """)
+                    .execute(Tuple.of(mergeId))
+                    .compose(ignored -> conn.preparedQuery("""
+                        -- Everything a person wrote is soft-deleted, never removed.
+                        --
+                        -- These are the true duplicates: the surviving manager already holds a
+                        -- review of the same role by the same person, and the unique role indexes
+                        -- forbid holding two, so this one cannot follow it across. It stays here,
+                        -- on the merged-away row, marked deleted - which is why that row is now
+                        -- kept rather than deleted. Deleting it would cascade and destroy this.
+                        UPDATE reviews r
+                        SET deleted_at = now()
+                        WHERE r.manager_id = $2
+                          AND r.deleted_at IS NULL
+                          AND EXISTS (
+                                  SELECT 1 FROM reviews t
+                                  WHERE t.manager_id = $1
+                                    AND t.weight = FALSE AND r.weight = FALSE
+                                    AND LOWER(TRIM(COALESCE(t.manager_company, ''))) = LOWER(TRIM(COALESCE(r.manager_company, '')))
+                                    AND LOWER(TRIM(COALESCE(t.manager_title, '')))   = LOWER(TRIM(COALESCE(r.manager_title, '')))
+                                    AND (
+                                        (t.user_id IS NOT NULL AND t.user_id = r.user_id)
+                                        OR LOWER(TRIM(t.author)) = LOWER(TRIM(r.author))
+                                    )
+                          )
+                        """)
+                    .execute(Tuple.of(keepId, mergeId)))
+                    .compose(parked -> conn.preparedQuery(
+                            "SELECT COUNT(*) AS remaining FROM reviews "
+                            + "WHERE manager_id = $1 AND deleted_at IS NULL")
+                        .execute(Tuple.of(mergeId))
+                        .map(rows -> new Object[]{ rows, parked.rowCount() }))
+                    .compose(pair -> {
+                        @SuppressWarnings("unchecked")
+                        RowSet<Row> rows = (RowSet<Row>) pair[0];
+                        int parkedCount  = (int) pair[1];
+                        long remaining = rows.iterator().next().getLong("remaining");
+                        if (remaining > 0) {
+                            // Rolls the whole thing back. The duplicate keeps its reviews and the
+                            // admin gets a sentence explaining why, instead of a silent loss.
+                            // Nothing should reach here: everything either moved or was a
+                            // placeholder or a provable duplicate. If something does, it is a
+                            // review this code cannot account for, and the honest response is to
+                            // roll the merge back rather than delete data it does not understand.
+                            return Future.failedFuture(new IllegalStateException(
+                                remaining + " review(s) on the duplicate could not be moved and are"
+                                + " not duplicates of anything on the manager you are keeping."
+                                + " The merge was cancelled so nothing is lost."));
+                        }
+                        // Kept, not deleted. The cascade on reviews.manager_id is exactly what
+                        // used to destroy the reviews that could not move, and 'rejected' is
+                        // already filtered out of every public surface.
+                        return conn.preparedQuery("""
+                                UPDATE managers
+                                SET approval_status = 'rejected', merged_into = $2, updated_at = now()
+                                WHERE id = $1
+                                """)
+                            .execute(Tuple.of(mergeId, keepId))
+                            .map(ignored -> new io.vertx.core.json.JsonObject()
+                                .put("moved", moved.rowCount())
+                                .put("parked", parkedCount));
+                    })));
+    }
+
+    /**
+     * Removes a manager, keeping every review a person wrote.
+     *
+     * <p>Seeded placeholders go; anything with an author is soft-deleted and the manager row is
+     * retired rather than removed, because {@code reviews.manager_id} cascades and deleting the
+     * row would destroy them. A manager nobody has reviewed is deleted outright, which is what
+     * "delete" means for the empty rows this is mostly used on.
+     *
+     * @return true when the row was deleted, false when it was retired because it held reviews
+     */
+    public Future<Boolean> deleteOrRetire(long managerId) {
+        return ((io.vertx.sqlclient.Pool) db).withTransaction(conn ->
+            conn.preparedQuery(
+                    "DELETE FROM reviews WHERE manager_id = $1 AND weight = TRUE AND user_id IS NULL")
+                .execute(Tuple.of(managerId))
+                .compose(ignored -> conn.preparedQuery(
+                        "SELECT COUNT(*) AS c FROM reviews WHERE manager_id = $1")
+                    .execute(Tuple.of(managerId)))
+                .compose(rows -> {
+                    if (rows.iterator().next().getLong("c") == 0) {
+                        return conn.preparedQuery("DELETE FROM managers WHERE id = $1")
+                            .execute(Tuple.of(managerId)).map(true);
+                    }
+                    return conn.preparedQuery(
+                            "UPDATE reviews SET deleted_at = now() "
+                            + "WHERE manager_id = $1 AND deleted_at IS NULL")
+                        .execute(Tuple.of(managerId))
+                        .compose(v -> conn.preparedQuery(
+                                "UPDATE managers SET approval_status = 'rejected', updated_at = now() "
+                                + "WHERE id = $1")
+                            .execute(Tuple.of(managerId)))
+                        .map(false);
+                }));
     }
 
     public Future<Void> delete(long managerId) {
@@ -526,9 +711,12 @@ public class ManagerRepository {
                 ROUND(AVG(delegation_style)::NUMERIC, 1) AS delegation_style,
                 ROUND(AVG(perceived_professional_demeanor)::NUMERIC, 1) AS perceived_professional_demeanor,
                 ROUND(AVG(overall_working_experience)::NUMERIC, 1) AS overall_working_experience
-            FROM reviews
+            -- The view, not the table. A held rating must not reach the cached rating or count:
+            -- this is a write path, so a leak here outlives the hold being lifted or the rating
+            -- being rejected. The comment below records the same class of bug happening once
+            -- already, which is why the predicate now lives in one place instead of at each site.
+            FROM published_reviews
             WHERE manager_id = $1
-              AND deleted_at IS NULL
               -- Same filter the review list and count use. Without it the cached reviews_count and
               -- overall_rating kept counting placeholder reviews whose 14-day weight had expired,
               -- while the list below them had already stopped showing those reviews. The number on
@@ -685,6 +873,68 @@ public class ManagerRepository {
 
     // ── Find-or-create ────────────────────────────────────────────────────────
 
+    /**
+     * The same lookup as {@link #findByNameAndCompany}, but able to see captures too.
+     *
+     * <p>Used only by the capture path. That path now writes {@code pending_approval}, and the
+     * public lookup admits only {@code approved} and {@code ghost} - which is correct for the
+     * public lookup and pinned by the filter table in CLAUDE.md, so it is left alone. Reusing it
+     * here would make every capture invisible to the check meant to stop duplicates, and each
+     * visit to the add form would file another copy of the same person in the admin queue.
+     *
+     * <p>Rejected rows stay excluded: a person an admin has already turned down should not come
+     * back as an existing match.
+     */
+    /**
+     * Adopts the capture a submission left behind, instead of filing a second person.
+     *
+     * <p>The add-manager form posts a capture as soon as its first step is valid, which is before
+     * the company box is finished. So one attempt to add "Eddie Junior at Microsoft" left a
+     * capture at "Mi", and the submission that followed created a second row - two managers for
+     * one person, differing only by how much of the company name had been typed.
+     *
+     * <p>Matching is deliberately tight: the same name, the captured company a prefix of the
+     * submitted one, still unsubmitted, and captured within the hour. That is the shape this
+     * specific race produces. Anything looser starts merging people who happen to share a name.
+     *
+     * @return the adopted row, or empty when there is nothing to adopt
+     */
+    public Future<Optional<Row>> adoptCapture(String fullName, String company, String title,
+                                              UUID submittedBy, Long companyId) {
+        return db.preparedQuery("""
+                UPDATE managers m
+                SET company = $2, title = COALESCE($3, m.title), company_id = COALESCE($5, m.company_id),
+                    submitted_by = $4, updated_at = now()
+                WHERE m.id = (
+                    SELECT c.id FROM managers c
+                    WHERE LOWER(TRIM(c.name)) = LOWER(TRIM($1))
+                      AND c.approval_status = 'pending_approval'
+                      AND c.submitted_by IS NULL
+                      AND c.created_at > now() - INTERVAL '1 hour'
+                      AND LOWER(TRIM($2)) LIKE LOWER(TRIM(c.company)) || '%'
+                    ORDER BY c.created_at DESC
+                    LIMIT 1
+                )
+                RETURNING *
+                """)
+            .execute(Tuple.of(fullName, company, title, submittedBy, companyId))
+            .map(rows -> rows.iterator().hasNext()
+                ? Optional.of(rows.iterator().next())
+                : Optional.empty());
+    }
+
+    public Future<RowSet<Row>> findCapturedByNameAndCompany(String fullName, String company) {
+        return db.preparedQuery(SELECT_BODY + """
+                WHERE m.name ILIKE $1
+                  AND m.company ILIKE $2
+                  AND m.approval_status IN ('approved', 'ghost', 'pending_approval')
+                GROUP BY m.id, c.slug, c.industry
+                ORDER BY m.reviews_count DESC, m.id ASC
+                LIMIT 5
+                """)
+            .execute(Tuple.of(fullName, "%" + company.trim() + "%"));
+    }
+
     public Future<RowSet<Row>> findByNameAndCompany(String fullName, String company) {
         return db.preparedQuery(SELECT_BODY + """
                 WHERE m.name ILIKE $1
@@ -737,7 +987,23 @@ public class ManagerRepository {
                 .map(rows -> rows.iterator().next()));
     }
 
-    public Future<Row> createGhost(String name, String company, String title,
+    /**
+     * Records a manager somebody began adding, for an admin to look at. Never published.
+     *
+     * <p>The add-manager form posts here as soon as its first step is valid, so the work is not
+     * lost if the person abandons the flow. That capture used to insert {@code 'ghost'}, which is
+     * live and publicly visible: typing into a form put a manager on the site, before any rating,
+     * any submit click, and any check. It also captured whatever was in the company box at that
+     * instant, which is why the directory grew entries at companies called "Mi" and "Ju".
+     *
+     * <p>It now lands in the admin queue as {@code pending_approval}. Capturing a drop-off and
+     * publishing it are different things, and only the first was ever the point.
+     *
+     * <p>Not to be confused with {@link #createAutoApproved}, which is the {@code /find} path and
+     * is <em>meant</em> to be live: that one fires on a deliberate search, once per user ever,
+     * tracked by {@code users.has_auto_created_manager}.
+     */
+    public Future<Row> createCapturedDraft(String name, String company, String title,
                                    String country, String state, String city, String logoUrl, Long companyId) {
         return generateUniqueSlug(name, company).compose(slug ->
             db.preparedQuery("""
@@ -745,7 +1011,7 @@ public class ManagerRepository {
                     (name, company, title, status, approval_status, country, state, city,
                      overall_rating, reviews_count, category_averages,
                      company_logo_url, company_id, slug, created_at, updated_at)
-                    VALUES ($1,$2,$3,'active','ghost',$4,$5,$6,
+                    VALUES ($1,$2,$3,'active','pending_approval',$4,$5,$6,
                             0,0,'{}'::jsonb,
                             $7,$8,$9,now(),now())
                     RETURNING *

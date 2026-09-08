@@ -110,8 +110,10 @@ class DropOffDraftIntegrationTest {
     }
 
     @Test
-    void createDropOffDraft_ghostManagerExists_staysGhostAndAddsReview() throws Exception {
-        // First create a ghost manager via the ghost endpoint
+    void createDropOffDraft_capturedManagerKeepsItsStatusAndGainsTheReview() throws Exception {
+        // What this protects is unchanged: attaching a drop-off draft must not move a manager's
+        // approval status. The expected value moved because a capture is no longer created live.
+        // First create a captured manager via the capture endpoint
         JsonObject ghostBody = new JsonObject()
             .put("name",    "Alice Smith")
             .put("company", "Acme Corp")
@@ -121,10 +123,10 @@ class DropOffDraftIntegrationTest {
         assertTrue(ghostResult.getBoolean("created"));
         long managerId = ghostResult.getLong("id");
 
-        // Verify it's ghost
+        // Captured, waiting for a person - not on the site.
         var before = await(pool.preparedQuery("SELECT approval_status FROM managers WHERE id = $1")
             .execute(Tuple.of(managerId)));
-        assertEquals("ghost", before.iterator().next().getString("approval_status"));
+        assertEquals("pending_approval", before.iterator().next().getString("approval_status"));
 
         // Now create drop-off draft for the same manager
         JsonObject dropOffBody = dropOffBody("Alice Smith", "Acme Corp", "Engineering Manager", "United States");
@@ -133,10 +135,10 @@ class DropOffDraftIntegrationTest {
         assertFalse(result.getBoolean("created"));
         assertEquals(managerId, result.getLong("id"));
 
-        // Ghost stays ghost — it is already live and should not enter the admin queue
+        // The status is unchanged by attaching a draft, which is the actual invariant here.
         var after = await(pool.preparedQuery("SELECT approval_status FROM managers WHERE id = $1")
             .execute(Tuple.of(managerId)));
-        assertEquals("ghost", after.iterator().next().getString("approval_status"));
+        assertEquals("pending_approval", after.iterator().next().getString("approval_status"));
 
         // Verify drop-off review was attached (seed review is weight=true; drop-off is weight=false)
         var reviewRows = await(pool.preparedQuery("SELECT COUNT(*) FROM reviews WHERE manager_id = $1 AND weight = FALSE")
