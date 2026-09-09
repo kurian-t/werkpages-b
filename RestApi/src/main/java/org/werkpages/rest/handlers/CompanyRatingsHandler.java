@@ -42,6 +42,23 @@ public class CompanyRatingsHandler {
             .onFailure(err -> ManagersHandler.handleError(ctx, err));
     }
 
+    // ── GET /api/companies/{companySlug}/ratings ──────────────────────────────
+
+    /** Public: the individual ratings behind the average. The caller's own is marked, if signed in. */
+    public void handleList(RoutingContext ctx) {
+        int limit  = intParam(ctx, "limit", 20);
+        int offset = intParam(ctx, "offset", 0);
+        service.listFor(ctx.get("auth0Id"), ctx.pathParam("companySlug"), limit, offset)
+            .onSuccess(json -> respond(ctx, 200, json))
+            .onFailure(err -> ManagersHandler.handleError(ctx, err));
+    }
+
+    private static int intParam(RoutingContext ctx, String name, int fallback) {
+        String raw = ctx.request().getParam(name);
+        if (raw == null || raw.isBlank()) return fallback;
+        try { return Integer.parseInt(raw); } catch (NumberFormatException e) { return fallback; }
+    }
+
     // ── DELETE /api/company-ratings/{ratingId} ────────────────────────────────
 
     public void handleDelete(RoutingContext ctx) {

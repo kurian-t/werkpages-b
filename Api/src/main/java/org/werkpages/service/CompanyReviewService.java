@@ -145,6 +145,50 @@ public class CompanyReviewService {
         });
     }
 
+    /**
+     * The individual ratings behind a company's average.
+     *
+     * <p>Anonymous, with one exception: the caller's own rating is marked so the page can show it
+     * back to them expanded. That mark is derived from the token, never from anything the client
+     * sends, so nobody can ask which rating belongs to somebody else.
+     */
+    public Future<JsonObject> listFor(String auth0Id, String companySlug, int limit, int offset) {
+        int cappedLimit  = Math.min(Math.max(limit, 1), 50);
+        int safeOffset   = Math.max(offset, 0);
+
+        Future<UUID> viewer = auth0Id == null
+            ? Future.succeededFuture((UUID) null)
+            : resolveUser(auth0Id).otherwise((UUID) null);
+
+        return resolveCompany(companySlug).compose(company -> {
+            long companyId = company.getLong("id");
+            return viewer.compose(viewerId ->
+                reviewRepo.findByCompany(companyId, cappedLimit, safeOffset).map(rows -> {
+                    JsonArray data = new JsonArray();
+                    for (Row row : rows) {
+                        JsonObject categories = new JsonObject();
+                        for (String c : CompanyReviewRepository.CATEGORIES) {
+                            categories.put(c, numberOrNull(row, c));
+                        }
+                        UUID author = row.getUUID("user_id");
+                        data.add(new JsonObject()
+                            .put("id",            row.getUUID("id").toString())
+                            .put("overallRating", numberOrNull(row, "overall_rating"))
+                            .put("categories",    categories)
+                            .put("workedFrom",    row.getLocalDate("worked_from") == null
+                                                  ? null : row.getLocalDate("worked_from").toString())
+                            .put("workedUntil",   row.getLocalDate("worked_until") == null
+                                                  ? null : row.getLocalDate("worked_until").toString())
+                            // Still employed there, said as a fact rather than a missing field.
+                            .put("current",       row.getLocalDate("worked_until") == null)
+                            .put("createdAt",     row.getOffsetDateTime("created_at").toString())
+                            .put("mine",          viewerId != null && viewerId.equals(author)));
+                    }
+                    return new JsonObject().put("data", data).put("limit", cappedLimit).put("offset", safeOffset);
+                }));
+        });
+    }
+
     // ── helpers ───────────────────────────────────────────────────────────────
 
     private Future<UUID> resolveUser(String auth0Id) {

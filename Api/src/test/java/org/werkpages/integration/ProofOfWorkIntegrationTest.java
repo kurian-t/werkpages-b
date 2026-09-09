@@ -744,6 +744,96 @@ class ProofOfWorkIntegrationTest {
         assertTrue(adopted.isEmpty(), "different company, different person");
     }
 
+    @Test
+    void rejectingASubmissionLeavesAnUnrelatedNamesakeAlone() throws Exception {
+        /*
+         * The test that was missing, and the bug it would have caught.
+         *
+         * The twin sweep matched on name alone, so rejecting "John Smith at Acme" rejected every
+         * ghost John Smith on the site - including a live, unrelated one at another company, whose
+         * profile then 404'd. A shared name is not evidence of anything; the company being a prefix
+         * of the submitted one is what makes a row the capture this attempt left behind.
+         */
+        long acme  = insertCompany("Acme Corp");
+        long other = insertCompany("Zenith Logistics");
+        long submitted = insertManager("John Smith", acme);
+        long namesake  = insertManager("John Smith", other);
+        await(pool.preparedQuery("UPDATE managers SET approval_status = 'pending_approval' WHERE id = $1")
+            .execute(Tuple.of(submitted)).mapEmpty());
+        await(pool.preparedQuery("UPDATE managers SET approval_status = 'ghost' WHERE id = $1")
+            .execute(Tuple.of(namesake)).mapEmpty());
+
+        await(managers.reject(submitted));
+
+        String status = await(pool.preparedQuery("SELECT approval_status FROM managers WHERE id = $1")
+            .execute(Tuple.of(namesake)).map(rows -> rows.iterator().next().getString("approval_status")));
+        assertEquals("ghost", status, "a different person who happens to share a name stays live");
+    }
+
+    @Test
+    void adminEditPersistsACaseOnlyCompanyChange() throws Exception {
+        /*
+         * "Central rock gym" -> "Central Rock Gym". Company names are unique case-insensitively,
+         * so the companies row is found rather than created and its own name never changes - but
+         * the manager's company text must still take the casing an admin typed, or the save looks
+         * like it did nothing.
+         */
+        long companyId = insertCompany("Central rock gym");
+        long mgr = insertManager("Kat Kaufman", companyId);
+
+        org.werkpages.repository.CompanyRepository companyRepo =
+            new org.werkpages.repository.CompanyRepository(pool);
+        org.werkpages.service.AdminService admin = new org.werkpages.service.AdminService(
+            users, managers, new org.werkpages.repository.ReviewRepository(pool), null,
+            new org.werkpages.repository.NotificationRepository(pool), companyRepo, null, pool);
+
+        UUID adminId = insertUser("auth0|admin-case-edit");
+        await(pool.preparedQuery("UPDATE users SET role = 'admin' WHERE id = $1")
+            .execute(Tuple.of(adminId)).mapEmpty());
+
+        await(admin.adminEditManager("auth0|admin-case-edit", mgr,
+            "Kat Kaufman", "VP", "Central Rock Gym", null, null));
+
+        Row after = await(pool.preparedQuery(
+                "SELECT m.company, m.company_id, c.name AS entity FROM managers m "
+                + "LEFT JOIN companies c ON c.id = m.company_id WHERE m.id = $1")
+            .execute(Tuple.of(mgr)).map(rows -> rows.iterator().next()));
+
+        assertEquals("Central Rock Gym", after.getString("company"),
+            "the manager takes the casing an admin typed");
+        assertEquals(companyId, after.getLong("company_id"),
+            "and stays linked to the same company, which is matched case-insensitively");
+    }
+
+    @Test
+    void adminEditCascadesTheCompanyOntoThatManagersReviews() throws Exception {
+        // The reviews carry their own copy of the company, and a rename that updates only the
+        // manager leaves the page disagreeing with itself.
+        long companyId = insertCompany("Central rock gym");
+        long mgr = insertManager("Kat Kaufman", companyId);
+        UUID author = insertUser("auth0|admin-cascade-edit");
+        UUID review = insertReview(mgr, author);
+        await(pool.preparedQuery("UPDATE reviews SET manager_company = 'Central rock gym' WHERE id = $1")
+            .execute(Tuple.of(review)).mapEmpty());
+        await(pool.preparedQuery("UPDATE managers SET company = 'Central rock gym' WHERE id = $1")
+            .execute(Tuple.of(mgr)).mapEmpty());
+
+        org.werkpages.service.AdminService admin = new org.werkpages.service.AdminService(
+            users, managers, new org.werkpages.repository.ReviewRepository(pool), null,
+            new org.werkpages.repository.NotificationRepository(pool),
+            new org.werkpages.repository.CompanyRepository(pool), null, pool);
+        UUID adminId = insertUser("auth0|admin-cascade-2");
+        await(pool.preparedQuery("UPDATE users SET role = 'admin' WHERE id = $1")
+            .execute(Tuple.of(adminId)).mapEmpty());
+
+        await(admin.adminEditManager("auth0|admin-cascade-2", mgr,
+            "Kat Kaufman", "Manager", "Central Rock Gym", null, null));
+
+        String onReview = await(pool.preparedQuery("SELECT manager_company FROM reviews WHERE id = $1")
+            .execute(Tuple.of(review)).map(rows -> rows.iterator().next().getString("manager_company")));
+        assertEquals("Central Rock Gym", onReview, "the review's copy moves with it");
+    }
+
     // ── Helpers ───────────────────────────────────────────────────────────────
 
     private static <T> T await(Future<T> f) throws Exception {

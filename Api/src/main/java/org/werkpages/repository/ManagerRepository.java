@@ -374,6 +374,18 @@ public class ManagerRepository {
                     WHERE m.approval_status = 'ghost'
                       AND m.id <> $1
                       AND LOWER(TRIM(m.name)) = (SELECT LOWER(TRIM(name)) FROM target)
+                      -- The company is what makes this a twin rather than a namesake.
+                      --
+                      -- Matching on the name alone rejected every ghost with that name anywhere on
+                      -- the site: rejecting "John Smith at Acme" took out an unrelated, live John
+                      -- Smith at some other company, and his profile started 404ing. A shared name
+                      -- is not evidence of anything.
+                      --
+                      -- The case this exists for is narrow and specific: the capture written while
+                      -- somebody was still typing the company, so the captured name is a prefix of
+                      -- the one finally submitted ("Mi" for "Microsoft"). Nothing else qualifies.
+                      AND (SELECT LOWER(TRIM(company)) FROM target)
+                          LIKE LOWER(TRIM(m.company)) || '%'
                       AND NOT EXISTS (
                           SELECT 1 FROM reviews r
                           WHERE r.manager_id = m.id

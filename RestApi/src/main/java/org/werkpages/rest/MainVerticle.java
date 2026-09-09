@@ -304,6 +304,7 @@ public class MainVerticle extends AbstractVerticle {
                         // router factory refuses to boot, which is why these three go in together.
                         routerFactory.addHandlerByOperationId("submitCompanyRating", companyRatingsHandler::handleSubmit);
                         routerFactory.addHandlerByOperationId("getMyCompanyRating",  companyRatingsHandler::handleGetMine);
+                        routerFactory.addHandlerByOperationId("listCompanyRatings",   companyRatingsHandler::handleList);
 
                         // Proof of work. Every operationId in the spec must be routed here or
                         // OpenAPI3RouterFactory refuses to start, which is the behaviour that

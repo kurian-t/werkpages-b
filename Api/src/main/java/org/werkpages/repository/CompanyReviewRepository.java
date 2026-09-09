@@ -91,6 +91,26 @@ public class CompanyReviewRepository {
     }
 
     /**
+     * The individual ratings behind the average.
+     *
+     * <p>An average alone asks to be taken on trust. Showing the ratings it is made of lets a
+     * reader see the spread - whether a 4.2 is everybody saying 4.2 or half saying 5 and half
+     * saying 3 - which is the thing an average is worst at conveying.
+     *
+     * <p>No author name is selected. A company rating is anonymous by construction; the only
+     * identity that ever appears beside one is the reader's own, and the caller matches that on
+     * user_id rather than reading a name from here.
+     */
+    public Future<RowSet<Row>> findByCompany(long companyId, int limit, int offset) {
+        return db.preparedQuery(
+                "SELECT " + COLUMNS + ", worked_from, worked_until, created_at "
+                + "FROM company_reviews "
+                + "WHERE company_id = $1 AND deleted_at IS NULL "
+                + "ORDER BY created_at DESC LIMIT $2 OFFSET $3")
+            .execute(Tuple.of(companyId, limit, offset));
+    }
+
+    /**
      * The company's aggregate, or empty when nobody has rated it.
      *
      * <p>Returns a single row of averages plus the count. Every category is NOT NULL so all ten
