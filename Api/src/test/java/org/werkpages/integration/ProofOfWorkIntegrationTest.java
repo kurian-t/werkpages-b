@@ -448,27 +448,38 @@ class ProofOfWorkIntegrationTest {
     }
 
     @Test
-    void rejectingASubmissionAlsoRemovesTheGhostItLeftBehind() throws Exception {
+    void rejectingASubmissionLeavesTheLiveRecordItResemblesAlone() throws Exception {
         /*
-         * Searching on /find creates a ghost manager as you type, so one attempt to add
-         * "Satya Nadella at Microsoft" can leave a public "Satya Nadella at Mi" behind it.
-         * Rejecting the submission used to touch only the row the admin clicked, so the person
-         * stayed in the directory under a half-typed company and the rejection looked broken.
+         * Pending and live are separate states, and a rejection does not cross between them.
+         *
+         * This test used to assert the opposite: that rejecting "Satya Nadella at Microsoft" also
+         * took out a live "Satya Nadella at Mi" left behind by the search box creating a record as
+         * somebody typed. Scoping that sweep was never made safe - by name alone it destroyed
+         * unrelated namesakes, and the company-prefix rule that replaced it was defeated by a blank
+         * company. The premise was wrong: rejecting something that was never public must not change
+         * something that is.
+         *
+         * The half-typed capture it was aimed at no longer goes live at all - createCapturedDraft
+         * writes pending_approval - so it arrives in the admin queue and is rejected on its own row.
          */
         long full    = insertCompany("Microsoft");
         long partial = insertCompany("Mi");
         long submitted = insertManager("Satya Nadella", full);
-        long ghost     = insertManager("Satya Nadella", partial);
+        long live      = insertManager("Satya Nadella", partial);
         await(pool.preparedQuery("UPDATE managers SET approval_status = 'pending_approval' WHERE id = $1")
             .execute(Tuple.of(submitted)).mapEmpty());
         await(pool.preparedQuery("UPDATE managers SET approval_status = 'ghost' WHERE id = $1")
-            .execute(Tuple.of(ghost)).mapEmpty());
+            .execute(Tuple.of(live)).mapEmpty());
 
         await(managers.reject(submitted));
 
-        String ghostStatus = await(pool.preparedQuery("SELECT approval_status FROM managers WHERE id = $1")
-            .execute(Tuple.of(ghost)).map(rows -> rows.iterator().next().getString("approval_status")));
-        assertEquals("rejected", ghostStatus, "the half-typed twin goes too");
+        String liveStatus = await(pool.preparedQuery("SELECT approval_status FROM managers WHERE id = $1")
+            .execute(Tuple.of(live)).map(rows -> rows.iterator().next().getString("approval_status")));
+        assertEquals("ghost", liveStatus, "a live record is untouched by a decision about a pending one");
+
+        String rejectedStatus = await(pool.preparedQuery("SELECT approval_status FROM managers WHERE id = $1")
+            .execute(Tuple.of(submitted)).map(rows -> rows.iterator().next().getString("approval_status")));
+        assertEquals("rejected", rejectedStatus, "and the row the admin actually clicked is rejected");
     }
 
     @Test
@@ -832,6 +843,33 @@ class ProofOfWorkIntegrationTest {
         String onReview = await(pool.preparedQuery("SELECT manager_company FROM reviews WHERE id = $1")
             .execute(Tuple.of(review)).map(rows -> rows.iterator().next().getString("manager_company")));
         assertEquals("Central Rock Gym", onReview, "the review's copy moves with it");
+    }
+
+    @Test
+    void rejectingASubmissionLeavesANamesakeWithABlankCompanyAlone() throws Exception {
+        /*
+         * The prefix match's dangerous edge. `company` is NOT NULL but not non-empty, and
+         * "anything" LIKE '' || '%' is true - so a ghost carrying a blank company would be swept up
+         * by a rejection of any namesake at any company at all.
+         */
+        long acme = insertCompany("Acme Blank Co");
+        long bystander = insertManager("Blank Namesake", acme);
+        await(pool.preparedQuery("UPDATE managers SET company = '', approval_status = 'ghost' WHERE id = $1")
+            .execute(Tuple.of(bystander)).mapEmpty());
+
+        long other = insertCompany("Unrelated Corp");
+        long submitted = insertManager("Blank Namesake", other);
+        await(pool.preparedQuery(
+                "UPDATE managers SET company = 'Unrelated Corp', approval_status = 'pending_approval' WHERE id = $1")
+            .execute(Tuple.of(submitted)).mapEmpty());
+
+        await(managers.reject(submitted));
+
+        String status = await(pool.preparedQuery("SELECT approval_status FROM managers WHERE id = $1")
+            .execute(Tuple.of(bystander))
+            .map(rows -> rows.iterator().next().getString("approval_status")));
+        assertEquals("ghost", status,
+            "a blank company is not evidence that two managers are the same person");
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────

@@ -347,54 +347,25 @@ public class ManagerRepository {
     }
 
     /**
-     * Rejects a submitted manager, and the ghost twins that submission left behind.
+     * Rejects a submitted manager. Touches nothing else.
      *
-     * <p>Searching on /find creates a ghost manager as you type, so one attempt to add
-     * "Satya Nadella at Microsoft" can leave a publicly visible "Satya Nadella at Mi" behind it.
-     * Rejecting only the row an admin clicked left the person in the directory under a half-typed
-     * company, which makes the rejection look broken - the manager is still there.
+     * <p>This used to also sweep up "twins" - ghost managers with the same name whose company was a
+     * prefix of the submitted one, left behind by the search box creating a record as somebody
+     * typed. It was the wrong place to solve that. Pending and live are separate states: a pending
+     * row is awaiting a decision and is not public, a live row has already been decided. An admin
+     * rejecting something that was never public should not be able to change something that is,
+     * and every attempt to scope that sweep narrowly still got it wrong - first by name alone,
+     * which took out unrelated namesakes, then by a prefix rule a blank company defeated.
      *
-     * <p>One statement, so the two updates cannot come apart: a rejection that removed the
-     * submission but failed to remove its twin would be worse than either outcome alone.
-     *
-     * <p>The twin sweep is deliberately narrow. Only ghosts, only the same name, and only ones
-     * nobody has genuinely rated - a ghost carrying a review a real person wrote is somebody's
-     * contribution, and taking it on a name match would destroy real data. The capture path's
-     * placeholder reviews carry no user_id, which is exactly what tells the two apart.
+     * <p>The problem it was compensating for is gone at the source: {@code createCapturedDraft}
+     * writes {@code pending_approval}, so typing no longer publishes anything. A half-typed capture
+     * now lands in the same admin queue as everything else and is rejected on its own row.
      */
     public Future<Optional<Row>> reject(long managerId) {
         return db.preparedQuery("""
-                WITH target AS (
-                    UPDATE managers SET approval_status = 'rejected', updated_at = now()
-                    WHERE id = $1 AND approval_status = 'pending_approval'
-                    RETURNING id, name, company, submitted_by, search_created_by_user_id
-                ),
-                twins AS (
-                    UPDATE managers m SET approval_status = 'rejected', updated_at = now()
-                    WHERE m.approval_status = 'ghost'
-                      AND m.id <> $1
-                      AND LOWER(TRIM(m.name)) = (SELECT LOWER(TRIM(name)) FROM target)
-                      -- The company is what makes this a twin rather than a namesake.
-                      --
-                      -- Matching on the name alone rejected every ghost with that name anywhere on
-                      -- the site: rejecting "John Smith at Acme" took out an unrelated, live John
-                      -- Smith at some other company, and his profile started 404ing. A shared name
-                      -- is not evidence of anything.
-                      --
-                      -- The case this exists for is narrow and specific: the capture written while
-                      -- somebody was still typing the company, so the captured name is a prefix of
-                      -- the one finally submitted ("Mi" for "Microsoft"). Nothing else qualifies.
-                      AND (SELECT LOWER(TRIM(company)) FROM target)
-                          LIKE LOWER(TRIM(m.company)) || '%'
-                      AND NOT EXISTS (
-                          SELECT 1 FROM reviews r
-                          WHERE r.manager_id = m.id
-                            AND r.user_id IS NOT NULL
-                            AND r.deleted_at IS NULL
-                      )
-                    RETURNING m.id
-                )
-                SELECT id, name, company, submitted_by, search_created_by_user_id FROM target
+                UPDATE managers SET approval_status = 'rejected', updated_at = now()
+                WHERE id = $1 AND approval_status = 'pending_approval'
+                RETURNING id, name, company, submitted_by, search_created_by_user_id
                 """)
             .execute(Tuple.of(managerId))
             .map(rows -> rows.iterator().hasNext()
