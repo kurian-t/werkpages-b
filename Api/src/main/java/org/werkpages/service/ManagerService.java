@@ -141,7 +141,8 @@ public class ManagerService {
     // ── GET manager by ID ─────────────────────────────────────────────────────
 
     public Future<Row> getManagerById(long managerId, String auth0Id) {
-        return managerRepo.findById(managerId)
+        // Follows merges: an id that was merged away lands on the manager it was merged into.
+        return managerRepo.findByIdFollowingMerges(managerId)
             .compose(opt -> {
                 if (opt.isEmpty()) return Future.failedFuture(ServiceException.notFound("Manager not found"));
                 Row row = opt.get();
@@ -182,7 +183,7 @@ public class ManagerService {
 
     /** Looks up a manager by slug. Same access rules as getManagerById. */
     public Future<Row> getManagerBySlug(String slug, String auth0Id) {
-        return managerRepo.findBySlug(slug)
+        return managerRepo.findBySlugFollowingMerges(slug)
             .compose(opt -> {
                 if (opt.isEmpty()) return Future.failedFuture(ServiceException.notFound("Manager not found"));
                 Row row = opt.get();

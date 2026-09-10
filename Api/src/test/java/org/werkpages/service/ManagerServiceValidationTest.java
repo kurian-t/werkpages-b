@@ -1203,6 +1203,7 @@ class ManagerServiceValidationTest {
     void createEditRequest_managerNotFound_returns404() {
         when(editRepo.countSubmittedTodayByUser(USER_ID)).thenReturn(Future.succeededFuture(0L));
         when(managerRepo.findById(MANAGER_ID)).thenReturn(Future.succeededFuture(Optional.empty()));
+        when(managerRepo.findByIdFollowingMerges(MANAGER_ID)).thenReturn(Future.succeededFuture(Optional.empty()));
         JsonObject body = new JsonObject().put("company", "NewCo");
         ServiceException ex = assertServiceFails(service.createEditRequest(AUTH0_ID, MANAGER_ID, body));
         assertEquals(404, ex.getStatusCode());
@@ -1216,6 +1217,7 @@ class ManagerServiceValidationTest {
         when(editRepo.countSubmittedTodayByUser(USER_ID)).thenReturn(Future.succeededFuture(0L));
         Row managerRow = mock(Row.class);
         when(managerRepo.findById(MANAGER_ID)).thenReturn(Future.succeededFuture(Optional.of(managerRow)));
+        when(managerRepo.findByIdFollowingMerges(MANAGER_ID)).thenReturn(Future.succeededFuture(Optional.of(managerRow)));
         Row editRow = mock(Row.class);
         when(editRow.getUUID("id")).thenReturn(editId);
         when(editRow.getOffsetDateTime("created_at")).thenReturn(createdAt);
@@ -1341,6 +1343,7 @@ class ManagerServiceValidationTest {
     @Test
     void getManagerById_notFound_returns404() {
         when(managerRepo.findById(MANAGER_ID)).thenReturn(Future.succeededFuture(Optional.empty()));
+        when(managerRepo.findByIdFollowingMerges(MANAGER_ID)).thenReturn(Future.succeededFuture(Optional.empty()));
         ServiceException ex = assertServiceFails(service.getManagerById(MANAGER_ID, null));
         assertEquals(404, ex.getStatusCode());
     }
@@ -1350,6 +1353,7 @@ class ManagerServiceValidationTest {
         Row managerRow = mock(Row.class);
         when(managerRow.getString("approval_status")).thenReturn("approved");
         when(managerRepo.findById(MANAGER_ID)).thenReturn(Future.succeededFuture(Optional.of(managerRow)));
+        when(managerRepo.findByIdFollowingMerges(MANAGER_ID)).thenReturn(Future.succeededFuture(Optional.of(managerRow)));
 
         Row result = await(service.getManagerById(MANAGER_ID, null));
         assertNotNull(result);
@@ -1361,6 +1365,7 @@ class ManagerServiceValidationTest {
         when(managerRow.getString("approval_status")).thenReturn("pending_approval");
         when(managerRow.getUUID("submitted_by")).thenReturn(USER_ID);
         when(managerRepo.findById(MANAGER_ID)).thenReturn(Future.succeededFuture(Optional.of(managerRow)));
+        when(managerRepo.findByIdFollowingMerges(MANAGER_ID)).thenReturn(Future.succeededFuture(Optional.of(managerRow)));
         when(userRepo.findIdByAuth0Id(AUTH0_ID)).thenReturn(Future.succeededFuture(Optional.of(USER_ID)));
 
         Row result = await(service.getManagerById(MANAGER_ID, AUTH0_ID));
@@ -1373,6 +1378,7 @@ class ManagerServiceValidationTest {
         when(managerRow.getString("approval_status")).thenReturn("pending_approval");
         when(managerRow.getUUID("submitted_by")).thenReturn(UUID.randomUUID());
         when(managerRepo.findById(MANAGER_ID)).thenReturn(Future.succeededFuture(Optional.of(managerRow)));
+        when(managerRepo.findByIdFollowingMerges(MANAGER_ID)).thenReturn(Future.succeededFuture(Optional.of(managerRow)));
         when(userRepo.findIdByAuth0Id(AUTH0_ID)).thenReturn(Future.succeededFuture(Optional.of(USER_ID)));
 
         ServiceException ex = assertServiceFails(service.getManagerById(MANAGER_ID, AUTH0_ID));
@@ -1385,6 +1391,7 @@ class ManagerServiceValidationTest {
         when(managerRow.getString("approval_status")).thenReturn("pending_approval");
         when(managerRow.getUUID("submitted_by")).thenReturn(USER_ID);
         when(managerRepo.findById(MANAGER_ID)).thenReturn(Future.succeededFuture(Optional.of(managerRow)));
+        when(managerRepo.findByIdFollowingMerges(MANAGER_ID)).thenReturn(Future.succeededFuture(Optional.of(managerRow)));
 
         ServiceException ex = assertServiceFails(service.getManagerById(MANAGER_ID, null));
         assertEquals(404, ex.getStatusCode());
@@ -1396,6 +1403,7 @@ class ManagerServiceValidationTest {
         when(managerRow.getString("approval_status")).thenReturn("rejected");
         when(managerRow.getUUID("submitted_by")).thenReturn(USER_ID);
         when(managerRepo.findById(MANAGER_ID)).thenReturn(Future.succeededFuture(Optional.of(managerRow)));
+        when(managerRepo.findByIdFollowingMerges(MANAGER_ID)).thenReturn(Future.succeededFuture(Optional.of(managerRow)));
 
         ServiceException ex = assertServiceFails(service.getManagerById(MANAGER_ID, AUTH0_ID));
         assertEquals(404, ex.getStatusCode());
@@ -1406,6 +1414,7 @@ class ManagerServiceValidationTest {
         Row managerRow = mock(Row.class);
         when(managerRow.getString("approval_status")).thenReturn("rejected");
         when(managerRepo.findById(MANAGER_ID)).thenReturn(Future.succeededFuture(Optional.of(managerRow)));
+        when(managerRepo.findByIdFollowingMerges(MANAGER_ID)).thenReturn(Future.succeededFuture(Optional.of(managerRow)));
 
         ServiceException ex = assertServiceFails(service.getManagerById(MANAGER_ID, null));
         assertEquals(404, ex.getStatusCode());

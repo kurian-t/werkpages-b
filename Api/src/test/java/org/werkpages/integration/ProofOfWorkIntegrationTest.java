@@ -872,6 +872,72 @@ class ProofOfWorkIntegrationTest {
             "a blank company is not evidence that two managers are the same person");
     }
 
+    @Test
+    void aMergedManagersProfileLandsOnTheSurvivor() throws Exception {
+        /*
+         * The merge keeps the merged-away row and marks it rejected, pointing at the survivor.
+         * Nothing followed that pointer, so merging made the profile 404 - to the admin who had
+         * just merged them, the manager had vanished.
+         */
+        long companyId = insertCompany("Merge Follow Co wer");
+        long keep = insertManager("Dana Keep", companyId);
+        long gone = insertManager("Dana Dupe", companyId);
+        await(pool.preparedQuery("UPDATE managers SET approval_status = 'approved' WHERE id IN ($1, $2)")
+            .execute(Tuple.of(keep, gone)).mapEmpty());
+
+        await(managers.mergeInto(keep, gone));
+
+        assertEquals(keep, await(managers.findByIdFollowingMerges(gone)).orElseThrow().getLong("id"),
+            "the old id lands on the surviving manager");
+    }
+
+    @Test
+    void aMergedManagersOldSlugStillLoadsAPage() throws Exception {
+        long companyId = insertCompany("Merge Slug Co wer");
+        long keep = insertManager("Robin Keep", companyId);
+        long gone = insertManager("Robin Dupe", companyId);
+        await(pool.preparedQuery("UPDATE managers SET approval_status = 'approved' WHERE id IN ($1, $2)")
+            .execute(Tuple.of(keep, gone)).mapEmpty());
+        String oldSlug = await(pool.preparedQuery("SELECT slug FROM managers WHERE id = $1")
+            .execute(Tuple.of(gone)).map(r -> r.iterator().next().getString("slug")));
+
+        await(managers.mergeInto(keep, gone));
+
+        assertEquals(keep, await(managers.findBySlugFollowingMerges(oldSlug)).orElseThrow().getLong("id"),
+            "a bookmarked URL still reaches the person");
+    }
+
+    @Test
+    void aChainOfManagerMergesLandsOnTheLastSurvivor() throws Exception {
+        // A row merged twice points at a row that was itself merged.
+        long companyId = insertCompany("Merge Chain Co wer");
+        long finalKeep = insertManager("Sam Final", companyId);
+        long middle    = insertManager("Sam Middle", companyId);
+        long first     = insertManager("Sam First", companyId);
+        await(pool.preparedQuery("UPDATE managers SET approval_status = 'approved' WHERE id IN ($1,$2,$3)")
+            .execute(Tuple.of(finalKeep, middle, first)).mapEmpty());
+
+        await(managers.mergeInto(middle, first));
+        await(managers.mergeInto(finalKeep, middle));
+
+        assertEquals(finalKeep, await(managers.findByIdFollowingMerges(first)).orElseThrow().getLong("id"),
+            "two merges deep still resolves");
+    }
+
+    @Test
+    void aRejectedManagerThatWasNeverMergedResolvesToItself() throws Exception {
+        // The limit of the rule above. Following merges must not resurrect a rejected submission:
+        // it resolves to itself, and the service's rejected-is-not-found rule still applies.
+        long companyId = insertCompany("Merge Limit Co wer");
+        long rejected = insertManager("Nope Nobody", companyId);
+        await(pool.preparedQuery("UPDATE managers SET approval_status = 'rejected' WHERE id = $1")
+            .execute(Tuple.of(rejected)).mapEmpty());
+
+        Row row = await(managers.findByIdFollowingMerges(rejected)).orElseThrow();
+        assertEquals(rejected, row.getLong("id"), "no merge to follow");
+        assertEquals("rejected", row.getString("approval_status"), "and it is still rejected");
+    }
+
     // ── Helpers ───────────────────────────────────────────────────────────────
 
     private static <T> T await(Future<T> f) throws Exception {

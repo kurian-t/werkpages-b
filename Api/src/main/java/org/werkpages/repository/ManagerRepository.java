@@ -106,6 +106,46 @@ public class ManagerRepository {
             });
     }
 
+    /**
+     * Resolves a manager id through any merges it has been through.
+     *
+     * <p>Merging keeps the merged-away row and marks it {@code rejected}, pointing at the survivor
+     * via {@code merged_into} (V62). Nothing followed that pointer, so merging A into B made A's
+     * profile 404 - to an admin who had just merged two records, the manager had simply vanished.
+     * A merge is a statement that two rows are the same person, so the old URL has to lead to them.
+     *
+     * <p>Walks the chain, because a row merged twice points at a row that was itself merged. The
+     * depth cap is there so a cycle - which the schema does not forbid - cannot spin forever.
+     */
+    private static final String RESOLVE_MERGE_SQL = """
+            WITH RECURSIVE chain AS (
+                SELECT id, merged_into, 0 AS depth FROM managers WHERE %s
+                UNION ALL
+                SELECT m.id, m.merged_into, c.depth + 1
+                FROM managers m JOIN chain c ON m.id = c.merged_into
+                WHERE c.depth < 10
+            )
+            SELECT id FROM chain ORDER BY depth DESC LIMIT 1
+            """;
+
+    /** {@link #findById}, but an id that was merged away resolves to the manager it was merged into. */
+    public Future<Optional<Row>> findByIdFollowingMerges(long id) {
+        return db.preparedQuery(RESOLVE_MERGE_SQL.formatted("id = $1"))
+            .execute(Tuple.of(id))
+            .compose(rows -> rows.iterator().hasNext()
+                ? findById(rows.iterator().next().getLong("id"))
+                : Future.succeededFuture(Optional.empty()));
+    }
+
+    /** {@link #findBySlug}, but a slug that was merged away resolves to the surviving manager. */
+    public Future<Optional<Row>> findBySlugFollowingMerges(String slug) {
+        return db.preparedQuery(RESOLVE_MERGE_SQL.formatted("slug = $1"))
+            .execute(Tuple.of(slug))
+            .compose(rows -> rows.iterator().hasNext()
+                ? findById(rows.iterator().next().getLong("id"))
+                : Future.succeededFuture(Optional.empty()));
+    }
+
     public Future<RowSet<Row>> search(int limit, int offset, String searchPattern, String companyPattern, String sortBy) {
         return search(limit, offset, searchPattern, companyPattern, sortBy, null);
     }
