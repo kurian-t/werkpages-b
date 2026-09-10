@@ -1297,4 +1297,29 @@ public class CompanyRepository {
                             .put("targetCompanyId", targetId)));
             });
     }
+
+    /**
+     * Corrects a company's stored capitalisation, and only that.
+     *
+     * <p>Company names are unique case-insensitively, so resolving "Central Rock Gym" when
+     * "Central rock gym" is stored returns the existing row and leaves its name alone. The manager
+     * then displayed the corrected text while the company page - which reads the company row -
+     * still showed the old one, so a fix looked half-applied.
+     *
+     * <p>The {@code LOWER(TRIM(...))} guard is what makes this safe to call: it can only ever
+     * re-case the name it already has. A materially different name does not match, nothing is
+     * written, and one manager's edit can never rename a company out from under everyone else on
+     * it.
+     */
+    public Future<Boolean> recaseName(long companyId, String name) {
+        if (name == null || name.isBlank()) return Future.succeededFuture(false);
+        return db.preparedQuery("""
+                UPDATE companies SET name = $2, updated_at = now()
+                WHERE id = $1
+                  AND LOWER(TRIM(name)) = LOWER(TRIM($2))
+                  AND name <> $2
+                """)
+            .execute(Tuple.of(companyId, name.trim()))
+            .map(rows -> rows.rowCount() > 0);
+    }
 }

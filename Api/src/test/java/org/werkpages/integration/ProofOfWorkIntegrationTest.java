@@ -938,6 +938,71 @@ class ProofOfWorkIntegrationTest {
         assertEquals("rejected", row.getString("approval_status"), "and it is still rejected");
     }
 
+    @Test
+    void aGhostManagerFromFindAppearsUnderItsCompany() throws Exception {
+        /*
+         * The /find flow: a signed-in user searches for a manager nobody has added, so one is
+         * created as a ghost - live, no review required. Going to that company's page must then
+         * show them. Ghost is a live status, not a draft.
+         */
+        long companyId = insertCompany("Ghost Appears Co");
+        UUID searcher = insertUser("auth0|ghost-appears");
+        Row ghost = await(managers.createAutoApproved(
+            "Priya Ramanathan", "Ghost Appears Co", "Director",
+            "Canada", null, null, searcher, null, companyId));
+
+        boolean found = false;
+        for (Row r : await(new org.werkpages.repository.CompanyRepository(pool)
+                .findManagersByCompanyId(companyId))) {
+            if (r.getLong("id").equals(ghost.getLong("id"))) found = true;
+        }
+        assertTrue(found, "a ghost manager is live and belongs on its company page");
+    }
+
+    @Test
+    void aGhostCompanyWithOnlyAGhostManagerStillListsInTheCompaniesTab() throws Exception {
+        // The Companies tab reads company_stats_live, which is maintained by trigger. A company
+        // whose only manager is a ghost still has a manager, so it has to be listed.
+        long companyId = insertCompany("Ghost Listing Co");
+        UUID searcher = insertUser("auth0|ghost-listing");
+        await(managers.createAutoApproved("Omar Haddad", "Ghost Listing Co", "Lead",
+            "Canada", null, null, searcher, null, companyId));
+
+        Long count = await(pool.preparedQuery(
+                "SELECT manager_count FROM company_stats_live WHERE company_id = $1")
+            .execute(Tuple.of(companyId))
+            .map(rows -> rows.iterator().hasNext() ? rows.iterator().next().getLong("manager_count") : null));
+        assertEquals(Long.valueOf(1L), count, "the ghost counts toward the company's manager count");
+    }
+
+    @Test
+    void anAdminEditCorrectsTheCompanysOwnCapitalisation() throws Exception {
+        /*
+         * The manager page read managers.company and showed the correction; the company page reads
+         * companies.name and did not, because resolving a name that already exists matches
+         * case-insensitively and never rewrites it. One fix, two different answers on one site.
+         */
+        long companyId = insertCompany("central rock gym");
+
+        boolean changed = await(new org.werkpages.repository.CompanyRepository(pool).recaseName(companyId, "Central Rock Gym"));
+
+        assertTrue(changed, "the company row takes the corrected casing");
+        assertEquals("Central Rock Gym", await(pool.preparedQuery("SELECT name FROM companies WHERE id = $1")
+            .execute(Tuple.of(companyId)).map(r -> r.iterator().next().getString("name"))));
+    }
+
+    @Test
+    void recasingCannotRenameACompanyToADifferentOne() throws Exception {
+        // The guard that makes this safe to call from an edit form: it re-cases, it never renames.
+        long companyId = insertCompany("Acme Recase Co");
+
+        boolean changed = await(new org.werkpages.repository.CompanyRepository(pool).recaseName(companyId, "Totally Different Company"));
+
+        assertFalse(changed, "a materially different name is refused");
+        assertEquals("Acme Recase Co", await(pool.preparedQuery("SELECT name FROM companies WHERE id = $1")
+            .execute(Tuple.of(companyId)).map(r -> r.iterator().next().getString("name"))));
+    }
+
     // ── Helpers ───────────────────────────────────────────────────────────────
 
     private static <T> T await(Future<T> f) throws Exception {

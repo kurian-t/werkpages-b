@@ -670,7 +670,11 @@ public class AdminService {
         final String effLinkedinUrl = linkedinUrl != null ? linkedinUrl.trim() : null;
         // When company changes, ensure a companies row exists and link company_id
         Future<Long> companyIdFuture = (effCompany != null && companyRepo != null)
-            ? companyRepo.resolve(companyId, effCompany, null, null).map(row -> row.getLong("id"))
+            ? companyRepo.resolve(companyId, effCompany, null, null)
+                // An admin correcting the capitalisation is correcting it for the company
+                // too, not just this manager's copy of the text.
+                .compose(row -> companyRepo.recaseName(row.getLong("id"), effCompany)
+                    .map(ignored -> row.getLong("id")))
             : Future.succeededFuture(null);
         return requireAdmin(auth0Id)
             .compose(adminId -> companyIdFuture)
