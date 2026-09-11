@@ -578,6 +578,24 @@ public class ManagerRepository {
             .map(RowSet::rowCount);
     }
 
+    /**
+     * Whether a manager is a legitimate party to a merge: it exists and has not already been
+     * merged away.
+     *
+     * <p>The plain existence check this sits beside counts any row at all, retired ones included.
+     * A merge retires the row it absorbs rather than deleting it - so a manager that had already
+     * been merged remained a valid target, and merging into one retired the survivor too, taking
+     * both out of the directory. Repeating one suggestion, or acting on a reciprocal pair
+     * (A into B, then B into A), was enough to do it, and the manager count fell with every click.
+     */
+    public Future<Boolean> isMergeable(long id) {
+        return db.preparedQuery(
+                "SELECT 1 FROM managers WHERE id = $1 AND merged_into IS NULL "
+                + "AND approval_status <> 'rejected'")
+            .execute(Tuple.of(id))
+            .map(rows -> rows.rowCount() > 0);
+    }
+
     // ── Career history ────────────────────────────────────────────────────────
 
     public Future<RowSet<Row>> getCareerHistory(long managerId) {

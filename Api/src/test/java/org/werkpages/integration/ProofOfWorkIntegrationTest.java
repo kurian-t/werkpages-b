@@ -1003,6 +1003,133 @@ class ProofOfWorkIntegrationTest {
             .execute(Tuple.of(companyId)).map(r -> r.iterator().next().getString("name"))));
     }
 
+    @Test
+    void mergingResolvesTheSuggestionSoItDoesNotComeBack() throws Exception {
+        /*
+         * Merging left the suggestion pending, so it returned on the next refresh and invited the
+         * admin to run it again. Only "dismiss" ever wrote a status.
+         */
+        long companyId = insertCompany("Suggest Merge Co wer");
+        long keep  = insertManager("Dana Dup Keep", companyId);
+        long gone  = insertManager("Dana Dup Gone", companyId);
+        await(pool.preparedQuery("UPDATE managers SET approval_status = 'approved' WHERE id IN ($1,$2)")
+            .execute(Tuple.of(keep, gone)).mapEmpty());
+        await(new org.werkpages.repository.MergeSuggestionsRepository(pool).upsert(keep, gone, "HIGH", "same name and company", 0, 0));
+
+        UUID adminId = insertUser("auth0|wer-merge-suggestion-admin");
+        await(pool.preparedQuery("UPDATE users SET role = 'admin' WHERE id = $1")
+            .execute(Tuple.of(adminId)).mapEmpty());
+        await(newAdmin().mergeManagers("auth0|wer-merge-suggestion-admin", keep, gone));
+
+        String status = await(pool.preparedQuery(
+                "SELECT status FROM merge_suggestions WHERE manager_id_a = $1 AND manager_id_b = $2")
+            .execute(Tuple.of(keep, gone))
+            .map(rows -> rows.iterator().next().getString("status")));
+        assertEquals("merged", status, "an acted-on suggestion does not return to the queue");
+    }
+
+    @Test
+    void aManagerAlreadyMergedAwayCannotBeMergedAgain() throws Exception {
+        /*
+         * The dangerous one. A merge retires the row it absorbs rather than deleting it, and the
+         * only guard was "does a row with this id exist" - which a retired row satisfies. So a
+         * repeated suggestion, or a reciprocal pair, retired a second live manager each time and
+         * the directory count fell with every click.
+         */
+        long companyId = insertCompany("Double Merge Co wer");
+        long keep  = insertManager("Eli Twice Keep", companyId);
+        long gone  = insertManager("Eli Twice Gone", companyId);
+        await(pool.preparedQuery("UPDATE managers SET approval_status = 'approved' WHERE id IN ($1,$2)")
+            .execute(Tuple.of(keep, gone)).mapEmpty());
+        UUID adminId = insertUser("auth0|wer-double-merge-admin");
+        await(pool.preparedQuery("UPDATE users SET role = 'admin' WHERE id = $1")
+            .execute(Tuple.of(adminId)).mapEmpty());
+
+        await(newAdmin().mergeManagers("auth0|wer-double-merge-admin", keep, gone));
+
+        try {
+            await(newAdmin().mergeManagers("auth0|wer-double-merge-admin", keep, gone));
+            org.junit.jupiter.api.Assertions.fail("a second merge of the same pair must be refused");
+        } catch (Exception expected) {
+            // refused, as it should be
+        }
+
+        String keepStatus = await(pool.preparedQuery("SELECT approval_status FROM managers WHERE id = $1")
+            .execute(Tuple.of(keep)).map(r -> r.iterator().next().getString("approval_status")));
+        assertEquals("approved", keepStatus, "the survivor is still live");
+    }
+
+    @Test
+    void aReciprocalSuggestionCannotRetireTheSurvivor() throws Exception {
+        // A into B, then B into A. Without the guard this took both out of the directory.
+        long companyId = insertCompany("Reciprocal Co wer");
+        long a = insertManager("Fay Mirror One", companyId);
+        long b = insertManager("Fay Mirror Two", companyId);
+        await(pool.preparedQuery("UPDATE managers SET approval_status = 'approved' WHERE id IN ($1,$2)")
+            .execute(Tuple.of(a, b)).mapEmpty());
+        UUID adminId = insertUser("auth0|wer-reciprocal-admin");
+        await(pool.preparedQuery("UPDATE users SET role = 'admin' WHERE id = $1")
+            .execute(Tuple.of(adminId)).mapEmpty());
+
+        await(newAdmin().mergeManagers("auth0|wer-reciprocal-admin", a, b));
+        try {
+            await(newAdmin().mergeManagers("auth0|wer-reciprocal-admin", b, a));
+            org.junit.jupiter.api.Assertions.fail("the reciprocal merge must be refused");
+        } catch (Exception expected) {
+            // refused
+        }
+
+        String aStatus = await(pool.preparedQuery("SELECT approval_status FROM managers WHERE id = $1")
+            .execute(Tuple.of(a)).map(r -> r.iterator().next().getString("approval_status")));
+        assertEquals("approved", aStatus, "the survivor never leaves the directory");
+    }
+
+    @Test
+    void aRepeatedMergeDoesNotRemoveAnotherManagerFromTheDirectory() throws Exception {
+        /*
+         * The question this answers: clicking merge, refreshing, and clicking merge again on the
+         * same pair - does the directory lose a second manager?
+         *
+         * It must not. The first merge retires the duplicate; the second has nothing left to retire
+         * and is refused outright. The count is asserted before and after, because "the number went
+         * down again" is the only symptom an admin can actually see.
+         */
+        long companyId = insertCompany("Repeat Count Co wer");
+        long keep = insertManager("Gwen Repeat Keep", companyId);
+        long gone = insertManager("Gwen Repeat Gone", companyId);
+        await(pool.preparedQuery("UPDATE managers SET approval_status = 'approved' WHERE id IN ($1,$2)")
+            .execute(Tuple.of(keep, gone)).mapEmpty());
+        UUID adminId = insertUser("auth0|wer-repeat-count-admin");
+        await(pool.preparedQuery("UPDATE users SET role = 'admin' WHERE id = $1")
+            .execute(Tuple.of(adminId)).mapEmpty());
+
+        await(newAdmin().mergeManagers("auth0|wer-repeat-count-admin", keep, gone));
+        long afterFirst = directoryCount();
+
+        try {
+            await(newAdmin().mergeManagers("auth0|wer-repeat-count-admin", keep, gone));
+        } catch (Exception refused) {
+            // expected
+        }
+        assertEquals(afterFirst, directoryCount(),
+            "a repeated merge must not cost the directory another manager");
+    }
+
+    private long directoryCount() throws Exception {
+        return await(pool.preparedQuery(
+                "SELECT COUNT(*) AS n FROM managers WHERE approval_status IN ('approved','ghost')")
+            .execute().map(rows -> rows.iterator().next().getLong("n")));
+    }
+
+    /** Admin service wired with the merge-suggestions repo, which the merge path now resolves. */
+    private org.werkpages.service.AdminService newAdmin() {
+        return new org.werkpages.service.AdminService(
+            users, managers, new org.werkpages.repository.ReviewRepository(pool), null,
+            new org.werkpages.repository.NotificationRepository(pool),
+            new org.werkpages.repository.CompanyRepository(pool),
+            new org.werkpages.repository.MergeSuggestionsRepository(pool));
+    }
+
     // ── Helpers ───────────────────────────────────────────────────────────────
 
     private static <T> T await(Future<T> f) throws Exception {

@@ -138,6 +138,25 @@ public class MergeSuggestionsRepository {
             .map(rows -> rows.iterator().next().getInteger(0));
     }
 
+    /**
+     * Marks the suggestion for a pair as acted on, in whichever order it was stored.
+     *
+     * <p>Merging left the suggestion {@code pending}, so it came straight back on the next refresh
+     * and invited the admin to run it again. That was not merely noise: repeating a merge, or
+     * acting on the reciprocal pair, retired a second live manager each time, and the directory
+     * count fell with every click.
+     */
+    public Future<Void> markPairMerged(long managerIdA, long managerIdB) {
+        return db.preparedQuery("""
+                UPDATE merge_suggestions SET status = 'merged'
+                WHERE status = 'pending'
+                  AND ((manager_id_a = $1 AND manager_id_b = $2)
+                    OR (manager_id_a = $2 AND manager_id_b = $1))
+                """)
+            .execute(Tuple.of(managerIdA, managerIdB))
+            .mapEmpty();
+    }
+
     public Future<Void> updateStatus(long suggestionId, String status) {
         return db.preparedQuery(
                 "UPDATE merge_suggestions SET status = $1 WHERE id = $2")

@@ -711,12 +711,20 @@ public class AdminService {
             .compose(adminId -> managerRepo.countExistingById(new Long[]{keepId, mergeId}))
             .compose(count -> {
                 if (count < 2) return Future.failedFuture(ServiceException.notFound("One or both managers not found"));
-                // Moves the reviews and removes the duplicate in one transaction, or refuses and
-                // leaves both untouched. It will not delete a review somebody wrote.
-                return managerRepo.mergeInto(keepId, mergeId)
-                    .recover(err -> Future.failedFuture(err instanceof IllegalStateException
-                        ? ServiceException.conflict(err.getMessage())
-                        : err));
+                // Neither side may already have been merged away. A merge retires the row it
+                // absorbs rather than deleting it, so without this a retired manager stayed a
+                // valid target - and merging into one took the survivor out of the directory too.
+                return Future.all(managerRepo.isMergeable(keepId), managerRepo.isMergeable(mergeId))
+                    .compose(ok -> {
+                        if (!Boolean.TRUE.equals(ok.resultAt(0)))
+                            return Future.failedFuture(ServiceException.conflict(
+                                "The manager you are keeping has already been merged into another profile."));
+                        if (!Boolean.TRUE.equals(ok.resultAt(1)))
+                            return Future.failedFuture(ServiceException.conflict(
+                                "That duplicate has already been merged."));
+                        return Future.succeededFuture();
+                    })
+                    .compose(v -> doMerge(keepId, mergeId));
             })
             .compose(counts -> managerRepo.mergeInlineRecalculate(keepId).map(v -> counts))
             .compose(counts -> {
@@ -725,9 +733,24 @@ public class AdminService {
                     // deleted, and an admin has to be told which happened.
                     .put("movedReviews",  counts.getInteger("moved"))
                     .put("parkedReviews", counts.getInteger("parked"));
-                if (companyRepo == null) return Future.succeededFuture(ok);
-                return companyRepo.syncStatsForManager(keepId).map(statsDone -> ok);
+                // Only now, with the merge committed. Marking it earlier would hide a suggestion
+                // whose merge then refused, and the duplicate would never be offered again.
+                Future<Void> resolved = mergeSuggestionsRepo == null
+                    ? Future.succeededFuture()
+                    : mergeSuggestionsRepo.markPairMerged(keepId, mergeId);
+                return resolved.compose(v -> companyRepo == null
+                    ? Future.succeededFuture(ok)
+                    : companyRepo.syncStatsForManager(keepId).map(statsDone -> ok));
             });
+    }
+
+    /** Moves the reviews and retires the duplicate in one transaction, or refuses and leaves both
+     *  untouched. It will not delete a review somebody wrote. */
+    private Future<JsonObject> doMerge(long keepId, long mergeId) {
+        return managerRepo.mergeInto(keepId, mergeId)
+            .recover(err -> Future.failedFuture(err instanceof IllegalStateException
+                ? ServiceException.conflict(err.getMessage())
+                : err));
     }
 
     // ── Company admin operations ──────────────────────────────────────────────

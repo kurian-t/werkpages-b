@@ -585,6 +585,7 @@ class AdminServiceTest {
     @Test
     void mergeManagers_oneNotFound_returns404() {
         when(managerRepo.countExistingById(any())).thenReturn(Future.succeededFuture(1));
+        when(managerRepo.isMergeable(anyLong())).thenReturn(Future.succeededFuture(true));
         ServiceException ex = assertServiceFails(service.mergeManagers(ADMIN_AUTH0_ID, 1L, 2L));
         assertEquals(404, ex.getStatusCode());
     }
@@ -592,6 +593,7 @@ class AdminServiceTest {
     @Test
     void mergeManagers_neitherFound_returns404() {
         when(managerRepo.countExistingById(any())).thenReturn(Future.succeededFuture(0));
+        when(managerRepo.isMergeable(anyLong())).thenReturn(Future.succeededFuture(true));
         ServiceException ex = assertServiceFails(service.mergeManagers(ADMIN_AUTH0_ID, 1L, 2L));
         assertEquals(404, ex.getStatusCode());
     }
@@ -599,6 +601,7 @@ class AdminServiceTest {
     @Test
     void mergeManagers_success_returnsKeepId() throws Exception {
         when(managerRepo.countExistingById(any())).thenReturn(Future.succeededFuture(2));
+        when(managerRepo.isMergeable(anyLong())).thenReturn(Future.succeededFuture(true));
         when(managerRepo.mergeInto(1L, 2L)).thenReturn(Future.succeededFuture(
             new JsonObject().put("moved", 3).put("parked", 0)));
         when(managerRepo.mergeInlineRecalculate(1L)).thenReturn(Future.succeededFuture());
@@ -619,6 +622,7 @@ class AdminServiceTest {
          * figures are recomputed.
          */
         when(managerRepo.countExistingById(any())).thenReturn(Future.succeededFuture(2));
+        when(managerRepo.isMergeable(anyLong())).thenReturn(Future.succeededFuture(true));
         when(managerRepo.mergeInto(1L, 3L)).thenReturn(Future.succeededFuture(
             new JsonObject().put("moved", 0).put("parked", 0)));
         when(managerRepo.mergeInlineRecalculate(1L)).thenReturn(Future.succeededFuture());
