@@ -1,6 +1,7 @@
 package org.werkpages.integration;
 
 import io.vertx.core.Future;
+import io.vertx.core.json.JsonObject;
 import io.vertx.pgclient.PgConnectOptions;
 import io.vertx.pgclient.PgPool;
 import io.vertx.sqlclient.Pool;
@@ -113,7 +114,7 @@ class ProofOfWorkIntegrationTest {
     // ── Identity, not names ───────────────────────────────────────────────────
 
     @Test
-    void anUnrelatedPersonSharingAFamousNameIsNeverChallenged() throws Exception {
+    void anUnrelatedPersonSharingAFamousNameIsHeldForReview() throws Exception {
         // The whole reason the list is identity-keyed. A site manager genuinely called Tim Cook,
         // at a construction firm with a team of eleven, must not be asked to prove he knows
         // himself — that would break the one rule this feature is built around.
@@ -128,9 +129,16 @@ class ProofOfWorkIntegrationTest {
         assertEquals(SubmissionTier.HIGH_PROFILE, await(SubmissionTier.classify(
             challenges, confidence, user, famous, "Tim", "Cook", apple)));
 
-        assertEquals(SubmissionTier.LIVE_FLAGGED, await(SubmissionTier.classify(
+        /*
+          The rule changed deliberately: a listed name at any company is now held for an admin
+          rather than published. "Steve Jobs at Puma SE" was getting through because naming a
+          different employer walked past a name-and-company match, and one word is too small a
+          dodge. The builder still costs his author nothing - see the confidence test below - he
+          simply waits for a person to confirm he is a different Tim Cook.
+        */
+        assertEquals(SubmissionTier.HIGH_PROFILE, await(SubmissionTier.classify(
             challenges, confidence, user, ordinary, "Tim", "Cook", trades)),
-            "the builder publishes; the queue is told, and he is not");
+            "a listed name is held wherever it is claimed to work");
     }
 
     @Test
@@ -1115,6 +1123,548 @@ class ProofOfWorkIntegrationTest {
             "a repeated merge must not cost the directory another manager");
     }
 
+    // ── Answering a challenge ────────────────────────────────────────────────
+
+    /*
+     * Everything above tests that a rating gets held. This is the other half: what the person who
+     * wrote it can actually do about it. It was the least-covered path in the feature, which is an
+     * odd place to leave a gap - it is the only screen a real person ever sees of this system, and
+     * the one where a wrong answer means their rating sits held forever.
+     */
+
+    @Test
+    void answeringAChallengeSendsItToAPersonAndNeverPublishes() throws Exception {
+        /*
+         * The invariant the whole design rests on: nothing an author does alone lifts their own
+         * flag. If submitting evidence resolved the challenge, the laundering route is one step -
+         * challenge a famous name, clear it yourself, come out clean.
+         */
+        long mgr = insertManager("Grace Submitter", insertCompany("Submit Foods"));
+        UUID user = insertUser("auth0|pow-sub-1");
+        UUID review = insertHeldReview(mgr, user);
+        UUID challengeId = await(challenges.open(user, mgr, review, "flagged_user"))
+            .orElseThrow().getUUID("id");
+
+        JsonObject result = await(newProofService().submitEvidence(
+            "auth0|pow-sub-1", challengeId, evidence()));
+
+        assertEquals("admin_review", result.getJsonObject("challenge").getString("status"),
+            "it waits on a person - it does not clear itself");
+        assertNotNull(result.getString("message"), "and the author is told that plainly");
+        assertEquals("held", await(dispositionOf(review)),
+            "the rating stays held while the claim is being read");
+    }
+
+    @Test
+    void aRelationshipWeDidNotAskAboutIsRefused() throws Exception {
+        // Free text here would be a claim nobody can compare against anything.
+        long mgr = insertManager("Hank Freeform", insertCompany("Freeform Ltd"));
+        UUID user = insertUser("auth0|pow-sub-2");
+        UUID challengeId = openFor(user, mgr);
+
+        assertThrows(Exception.class, () -> await(newProofService().submitEvidence(
+            "auth0|pow-sub-2", challengeId, evidence().put("relationship", "his barber"))));
+    }
+
+    @Test
+    void everyRelationshipTheFormOffersIsAccepted() throws Exception {
+        /*
+         * "other" is on this list on purpose: contractors, secondees and people on a joint project
+         * genuinely worked with somebody without appearing on their org chart. Dropping it would
+         * make them pick the nearest wrong answer and hide the thing that explains the overlap.
+         */
+        for (String relationship : new String[]{"direct_report", "skip_level", "other_team", "other"}) {
+            long mgr = insertManager("Ivy " + relationship, insertCompany("Rel " + relationship));
+            UUID user = insertUser("auth0|pow-rel-" + relationship);
+            UUID challengeId = openFor(user, mgr);
+
+            JsonObject result = await(newProofService().submitEvidence(
+                "auth0|pow-rel-" + relationship, challengeId,
+                evidence().put("relationship", relationship)));
+
+            assertEquals("admin_review", result.getJsonObject("challenge").getString("status"),
+                relationship + " is a relationship the form offers, so the service must take it");
+        }
+    }
+
+    @Test
+    void aClaimWithNoStartDateIsRefused() throws Exception {
+        // The dates are the load-bearing field: they are what the career-history cross-check reads.
+        long mgr = insertManager("Jane Undated", insertCompany("Undated Inc"));
+        UUID user = insertUser("auth0|pow-sub-3");
+        UUID challengeId = openFor(user, mgr);
+
+        assertThrows(Exception.class, () -> await(newProofService().submitEvidence(
+            "auth0|pow-sub-3", challengeId, evidence().putNull("workedFrom"))));
+    }
+
+    @Test
+    void aClaimToHaveWorkedWithSomebodyInTheFutureIsRefused() throws Exception {
+        long mgr = insertManager("Kim Future", insertCompany("Future Inc"));
+        UUID user = insertUser("auth0|pow-sub-4");
+        UUID challengeId = openFor(user, mgr);
+
+        assertThrows(Exception.class, () -> await(newProofService().submitEvidence(
+            "auth0|pow-sub-4", challengeId, evidence().put("workedFrom", "2999-01"))));
+    }
+
+    @Test
+    void aClaimThatEndsBeforeItStartsIsRefused() throws Exception {
+        long mgr = insertManager("Lee Backwards", insertCompany("Backwards Inc"));
+        UUID user = insertUser("auth0|pow-sub-5");
+        UUID challengeId = openFor(user, mgr);
+
+        assertThrows(Exception.class, () -> await(newProofService().submitEvidence(
+            "auth0|pow-sub-5", challengeId,
+            evidence().put("workedFrom", "2022-06").put("workedUntil", "2021-01"))));
+    }
+
+    @Test
+    void aDateTheFormCouldNotHaveSentIsRefusedRatherThanThrowing() throws Exception {
+        // parseMonth throws on junk. Caught and turned into a message, not a 500.
+        long mgr = insertManager("Mia Junkdate", insertCompany("Junkdate Inc"));
+        UUID user = insertUser("auth0|pow-sub-6");
+        UUID challengeId = openFor(user, mgr);
+
+        assertThrows(Exception.class, () -> await(newProofService().submitEvidence(
+            "auth0|pow-sub-6", challengeId, evidence().put("workedFrom", "sometime in 2019"))));
+    }
+
+    @Test
+    void aClaimWithNoTitleIsRefused() throws Exception {
+        long mgr = insertManager("Ned Titleless", insertCompany("Titleless Inc"));
+        UUID user = insertUser("auth0|pow-sub-7");
+        UUID challengeId = openFor(user, mgr);
+
+        assertThrows(Exception.class, () -> await(newProofService().submitEvidence(
+            "auth0|pow-sub-7", challengeId, evidence().put("claimedTitle", "   "))));
+    }
+
+    @Test
+    void anOverlongNoteIsCutRatherThanRefused() throws Exception {
+        /*
+         * The opposite call to the title. Somebody who has written 3,000 characters explaining
+         * their working relationship has done the thing we asked; throwing it back at them over
+         * length would be the wrong lesson. The claim is what matters, and it survives the cut.
+         */
+        long mgr = insertManager("Omar Verbose", insertCompany("Verbose Inc"));
+        UUID user = insertUser("auth0|pow-sub-8");
+        UUID challengeId = openFor(user, mgr);
+
+        await(newProofService().submitEvidence("auth0|pow-sub-8", challengeId,
+            evidence().put("evidenceNote", "n".repeat(3000))));
+
+        Integer stored = await(pool.preparedQuery(
+                "SELECT LENGTH(evidence_note) AS n FROM manager_proof_challenges WHERE id = $1")
+            .execute(Tuple.of(challengeId)).map(rs -> rs.iterator().next().getInteger("n")));
+        assertEquals(2000, stored, "kept, trimmed to what the column and the admin screen hold");
+    }
+
+    @Test
+    void somebodyElsesChallengeCannotBeAnsweredForThem() throws Exception {
+        /*
+         * Ownership and existence give the same answer on purpose. Telling a stranger their id was
+         * real but not theirs confirms which challenge ids exist.
+         */
+        long mgr = insertManager("Pia Guarded", insertCompany("Guarded Inc"));
+        UUID owner = insertUser("auth0|pow-sub-9");
+        insertUser("auth0|pow-sub-9-other");
+        UUID challengeId = openFor(owner, mgr);
+
+        assertThrows(Exception.class, () -> await(newProofService().submitEvidence(
+            "auth0|pow-sub-9-other", challengeId, evidence())));
+    }
+
+    @Test
+    void aChallengeAlreadyDecidedCannotBeAnsweredAgain() throws Exception {
+        // Otherwise a rejected claim could be quietly resubmitted until it landed on a kinder read.
+        long mgr = insertManager("Quinn Decided", insertCompany("Decided Inc"));
+        UUID user = insertUser("auth0|pow-sub-10");
+        UUID challengeId = openFor(user, mgr);
+        await(challenges.resolve(challengeId, insertUser("auth0|pow-sub-10-admin"), "rejected"));
+
+        assertThrows(Exception.class, () -> await(newProofService().submitEvidence(
+            "auth0|pow-sub-10", challengeId, evidence())));
+    }
+
+    @Test
+    void aChallengeNobodyAnsweredCanStillBeAnsweredAfterItAgesOut() throws Exception {
+        /*
+         * Abandoned is not a dead end. It exists so an unanswered challenge reaches the admin queue
+         * rather than flagging its author forever - and somebody who comes back a month later to
+         * answer it should be able to.
+         */
+        long mgr = insertManager("Rosa Late", insertCompany("Late Inc"));
+        UUID user = insertUser("auth0|pow-sub-11");
+        UUID challengeId = openFor(user, mgr);
+        await(pool.preparedQuery(
+                "UPDATE manager_proof_challenges SET status = 'abandoned' WHERE id = $1")
+            .execute(Tuple.of(challengeId)).mapEmpty());
+
+        JsonObject result = await(newProofService().submitEvidence(
+            "auth0|pow-sub-11", challengeId, evidence()));
+
+        assertEquals("admin_review", result.getJsonObject("challenge").getString("status"));
+    }
+
+    @Test
+    void answeringWithNoBodyIsRefused() throws Exception {
+        long mgr = insertManager("Sam Bodiless", insertCompany("Bodiless Inc"));
+        UUID user = insertUser("auth0|pow-sub-12");
+        UUID challengeId = openFor(user, mgr);
+
+        assertThrows(Exception.class,
+            () -> await(newProofService().submitEvidence("auth0|pow-sub-12", challengeId, null)));
+    }
+
+    @Test
+    void anAnonymousCallerCannotReadOrAnswerAnything() throws Exception {
+        long mgr = insertManager("Tess Anon", insertCompany("Anon Inc"));
+        UUID user = insertUser("auth0|pow-sub-13");
+        UUID challengeId = openFor(user, mgr);
+
+        assertThrows(Exception.class, () -> await(newProofService().findMine(null, mgr)));
+        assertThrows(Exception.class,
+            () -> await(newProofService().submitEvidence(null, challengeId, evidence())));
+    }
+
+    @Test
+    void aTokenForSomebodyWhoIsNotAUserIsRefused() throws Exception {
+        // A valid-looking token for a deleted account. Unauthorized, not a 500 halfway down.
+        long mgr = insertManager("Uma Ghosted", insertCompany("Ghosted Inc"));
+
+        assertThrows(Exception.class,
+            () -> await(newProofService().findMine("auth0|never-existed", mgr)));
+    }
+
+    @Test
+    void aChallengeThatWasAnsweredIsNoLongerOfferedAsOpen() throws Exception {
+        // findMine drives the banner. Once answered, it must stop asking for the same thing.
+        long mgr = insertManager("Vic Answered", insertCompany("Answered Inc"));
+        UUID user = insertUser("auth0|pow-sub-14");
+        UUID challengeId = openFor(user, mgr);
+        await(newProofService().submitEvidence("auth0|pow-sub-14", challengeId, evidence()));
+
+        JsonObject live = await(newProofService().findMine("auth0|pow-sub-14", mgr))
+            .getJsonObject("challenge");
+
+        assertNotNull(live, "the author can still see where their claim got to");
+        assertEquals("admin_review", live.getString("status"));
+        assertNotNull(live.getString("submittedAt"), "and when they sent it");
+    }
+
+    // ── The admin side of a challenge ────────────────────────────────────────
+
+    /*
+     * The other end of the same feature, and the part with no coverage at all: the queue an admin
+     * reads and the decision they make on it. Every method here was at 0% for one structural
+     * reason - they need the SqlClient constructor, and the existing fixture built AdminService
+     * without one, so challengeRepo was null and nothing could reach them.
+     */
+
+    @Test
+    void theQueueCarriesTheClaimAndTheCrossCheckAgainstIt() throws Exception {
+        /*
+         * The claim alone is just an assertion. What makes the queue decidable is the
+         * corroboration flag beside it - whether the dates line up with career history we already
+         * hold - so an admin reads a contradiction rather than having to know one.
+         */
+        long mgr = insertManager("Wade Queued", insertCompany("Queued Inc"));
+        UUID user = insertUser("auth0|pow-adm-1");
+        UUID challengeId = openFor(user, mgr);
+        await(newProofService().submitEvidence("auth0|pow-adm-1", challengeId, evidence()));
+
+        JsonObject queue = await(newFullAdmin().getProofChallenges(admin(), 20, 0));
+        JsonObject row = queue.getJsonArray("data").getJsonObject(0);
+
+        assertEquals(1, queue.getInteger("total"));
+        assertEquals("Wade Queued",      row.getString("managerName"));
+        assertEquals("admin_review",     row.getString("status"));
+        assertEquals("direct_report",    row.getString("relationship"));
+        assertEquals("Senior Engineer",  row.getString("claimedTitle"));
+        assertEquals("2019-03-01",       row.getString("workedFrom"));
+        assertNotNull(row.getValue("claimCorroborated"), "the cross-check is part of the row");
+        assertNotNull(row.getValue("authorConfidence"),
+            "what we thought of them when they wrote it, not what we think now");
+    }
+
+    @Test
+    void aChallengeNobodyAnsweredIsStillInTheQueue() throws Exception {
+        /*
+         * Otherwise an unanswered challenge flags its author forever while never appearing in
+         * front of anybody who could lift it - a lock with no key.
+         */
+        long mgr = insertManager("Xena Silent", insertCompany("Silent Inc"));
+        UUID user = insertUser("auth0|pow-adm-2");
+        openFor(user, mgr);
+
+        JsonObject queue = await(newFullAdmin().getProofChallenges(admin(), 20, 0));
+
+        assertEquals(1, queue.getInteger("total"));
+        assertEquals("open", queue.getJsonArray("data").getJsonObject(0).getString("status"));
+    }
+
+    @Test
+    void approvingPublishesTheRatingAndCreditsItsAuthor() throws Exception {
+        long mgr = insertManager("Yuri Approved", insertCompany("Approved Inc"));
+        UUID user = insertUser("auth0|pow-adm-3");
+        UUID review = insertHeldReview(mgr, user);
+        UUID challengeId = await(challenges.open(user, mgr, review, "flagged_user"))
+            .orElseThrow().getUUID("id");
+        int before = confidenceOf(user);
+
+        JsonObject result = await(newFullAdmin().resolveProofChallenge(admin(), challengeId, true, null));
+
+        assertEquals("approved", result.getString("status"));
+        assertEquals("live", await(dispositionOf(review)));
+        assertTrue(gateEligible(review), "an approved rating counts toward the gate");
+        assertTrue(confidenceOf(user) > before, "and its author is credited for it");
+    }
+
+    @Test
+    void anApprovedRatingsClockStartsWhenItGoesLiveNotWhenItWasWritten() throws Exception {
+        // Thirty days of standing has to mean thirty days actually visible to people.
+        long mgr = insertManager("Zane Clock", insertCompany("Clock Inc"));
+        UUID user = insertUser("auth0|pow-adm-4");
+        UUID review = insertHeldReview(mgr, user);
+        UUID challengeId = await(challenges.open(user, mgr, review, "flagged_user"))
+            .orElseThrow().getUUID("id");
+
+        await(newFullAdmin().resolveProofChallenge(admin(), challengeId, true, null));
+
+        Boolean fresh = await(pool.preparedQuery(
+                "SELECT live_since > now() - interval '1 minute' AS fresh FROM reviews WHERE id = $1")
+            .execute(Tuple.of(review)).map(rs -> rs.iterator().next().getBoolean("fresh")));
+        assertTrue(fresh, "live_since is set at the moment of approval");
+    }
+
+    @Test
+    void rejectingKeepsTheRatingHiddenAndDebitsItsAuthor() throws Exception {
+        long mgr = insertManager("Abe Rejected", insertCompany("Rejected Inc"));
+        UUID user = insertUser("auth0|pow-adm-5");
+        UUID review = insertHeldReview(mgr, user);
+        UUID challengeId = await(challenges.open(user, mgr, review, "flagged_user"))
+            .orElseThrow().getUUID("id");
+        int before = confidenceOf(user);
+
+        JsonObject result = await(newFullAdmin().resolveProofChallenge(
+            admin(), challengeId, false, "The dates do not match their career history."));
+
+        assertEquals("rejected", result.getString("status"));
+        assertEquals("rejected", await(dispositionOf(review)));
+        assertFalse(gateEligible(review), "a rejected rating buys nothing");
+        assertTrue(confidenceOf(user) < before, "and costs its author");
+    }
+
+    @Test
+    void decidingAChallengeTwiceIsRefused() throws Exception {
+        // The debit would otherwise be charged again on every click of a stale queue.
+        long mgr = insertManager("Bea Twice", insertCompany("Twice Inc"));
+        UUID user = insertUser("auth0|pow-adm-6");
+        UUID challengeId = openFor(user, mgr);
+        await(newFullAdmin().resolveProofChallenge(admin(), challengeId, true, null));
+
+        assertThrows(Exception.class, () -> await(
+            newFullAdmin().resolveProofChallenge(admin(), challengeId, false, null)));
+    }
+
+    @Test
+    void decidingAChallengeThatDoesNotExistIsNotFound() throws Exception {
+        assertThrows(Exception.class, () -> await(
+            newFullAdmin().resolveProofChallenge(admin(), UUID.randomUUID(), true, null)));
+    }
+
+    @Test
+    void nobodyButAnAdminCanReadTheQueueOrDecideOnIt() throws Exception {
+        /*
+         * The queue carries other people's names, employers and written accounts of who they
+         * worked for. It is the most identifying surface in the product.
+         */
+        long mgr = insertManager("Cal Guarded", insertCompany("Adm Guarded Inc"));
+        UUID user = insertUser("auth0|pow-adm-7");
+        UUID challengeId = openFor(user, mgr);
+
+        assertThrows(Exception.class, () -> await(
+            newFullAdmin().getProofChallenges("auth0|pow-adm-7", 20, 0)));
+        assertThrows(Exception.class, () -> await(
+            newFullAdmin().resolveProofChallenge("auth0|pow-adm-7", challengeId, true, null)));
+        assertThrows(Exception.class, () -> await(newFullAdmin().getProofChallenges(null, 20, 0)));
+    }
+
+    // ── The figures list itself ──────────────────────────────────────────────
+
+    @Test
+    void aFigureCanBeAddedListedAndRemovedWithoutADeploy() throws Exception {
+        // An anti-abuse list churns. Needing a release to add a name to it means the list is
+        // always behind whoever is currently being impersonated.
+        long companyId = insertCompany("Figure Co");
+        String admin = admin();
+
+        long id = await(newFullAdmin().addHighProfileFigure(
+            admin, null, "wade wilson", companyId, "Added during the test")).getLong("id");
+
+        var listed = await(newFullAdmin().listHighProfileFigures(admin));
+        assertTrue(listed.stream().map(o -> (JsonObject) o)
+                .anyMatch(o -> "wade wilson".equals(o.getString("fullName"))),
+            "what was added comes back with its company named");
+
+        await(newFullAdmin().removeHighProfileFigure(admin, id));
+        assertTrue(await(newFullAdmin().listHighProfileFigures(admin)).stream()
+                .map(o -> (JsonObject) o)
+                .noneMatch(o -> "wade wilson".equals(o.getString("fullName"))));
+    }
+
+    @Test
+    void aNameWithNoCompanyIsRefused() throws Exception {
+        /*
+         * A bare name identifies nobody: it would challenge every unrelated person who happens to
+         * share it. Refused here rather than left to the database so the admin gets a sentence
+         * instead of a constraint violation.
+         */
+        assertThrows(Exception.class, () -> await(
+            newFullAdmin().addHighProfileFigure(admin(), null, "just a name", null, null)));
+        assertThrows(Exception.class, () -> await(
+            newFullAdmin().addHighProfileFigure(admin(), null, "   ", 1L, null)));
+    }
+
+    @Test
+    void removingAFigureThatIsNotThereIsNotFound() throws Exception {
+        assertThrows(Exception.class,
+            () -> await(newFullAdmin().removeHighProfileFigure(admin(), 999_999L)));
+    }
+
+    @Test
+    void theFiguresListIsAdminOnly() throws Exception {
+        // It is the map of exactly which names walk past the checks, and who is watched.
+        UUID plain = insertUser("auth0|pow-fig-plain");
+        assertNotNull(plain);
+
+        assertThrows(Exception.class,
+            () -> await(newFullAdmin().listHighProfileFigures("auth0|pow-fig-plain")));
+        assertThrows(Exception.class, () -> await(
+            newFullAdmin().addHighProfileFigure("auth0|pow-fig-plain", null, "x y", 1L, null)));
+        assertThrows(Exception.class,
+            () -> await(newFullAdmin().removeHighProfileFigure("auth0|pow-fig-plain", 1L)));
+    }
+
+    // ── The repository's own edges ───────────────────────────────────────────
+
+    @Test
+    void aListedNameClaimedAtADifferentCompanyIsANameOnlyMatch() throws Exception {
+        /*
+         * The signal behind "publish it, but tell the queue". A listed figure named at the company
+         * we hold for them is an ordinary match; the same name at some other employer is the shape
+         * a dodge takes, and it is worth surfacing without holding the rating - holding it would
+         * reinstate the problem the name-only rule was written to fix.
+         */
+        long listedAt = insertCompany("Listed Employer");
+        long elsewhere = insertCompany("Some Other Employer");
+        await(pool.preparedQuery(
+                "INSERT INTO high_profile_figures (full_name, company_id) VALUES ($1, $2)")
+            .execute(Tuple.of("dana famous", listedAt)).mapEmpty());
+
+        assertTrue(await(challenges.isNameOnlyMatch("Dana Famous", elsewhere)),
+            "the name is listed, the company is not the one we hold - that is the signal");
+        assertFalse(await(challenges.isNameOnlyMatch("Dana Famous", listedAt)),
+            "named at the company we already hold for them, it is an ordinary match");
+        assertFalse(await(challenges.isNameOnlyMatch("Nobody Inparticular", elsewhere)));
+        // Normalised on the way in, because the seed rows are lowercase and people type anything.
+        assertTrue(await(challenges.isNameOnlyMatch("  DANA FAMOUS  ", elsewhere)));
+        assertFalse(await(challenges.isNameOnlyMatch(null, elsewhere)),
+            "a missing name matches nobody rather than throwing");
+    }
+
+    @Test
+    void aChallengeCanBeLookedUpByIdAndAMissingOneIsEmpty() throws Exception {
+        long mgr = insertManager("Erin Byid", insertCompany("Byid Inc"));
+        UUID user = insertUser("auth0|pow-byid");
+        UUID challengeId = openFor(user, mgr);
+
+        assertTrue(await(challenges.findById(challengeId)).isPresent());
+        assertTrue(await(challenges.findById(UUID.randomUUID())).isEmpty(),
+            "an id nobody issued is absent, not an error");
+    }
+
+    @Test
+    void openingASecondChallengeOnAPairLeavesTheFirstAlone() throws Exception {
+        /*
+         * ON CONFLICT DO NOTHING returns no row, and the caller has to cope with that. If a second
+         * open replaced the first, the evidence somebody had already submitted against it would be
+         * thrown away by a later sweep touching the same pair.
+         */
+        long mgr = insertManager("Finn Twice", insertCompany("Opentwice Inc"));
+        UUID user = insertUser("auth0|pow-opentwice");
+        UUID review = insertHeldReview(mgr, user);
+        UUID first = await(challenges.open(user, mgr, review, "flagged_user"))
+            .orElseThrow().getUUID("id");
+
+        assertTrue(await(challenges.open(user, mgr, review, "flagged_user")).isEmpty(),
+            "the second open writes nothing and says so");
+        long opened = await(pool.preparedQuery(
+                "SELECT COUNT(*) AS n FROM manager_proof_challenges WHERE user_id = $1")
+            .execute(Tuple.of(user)).map(rs -> rs.iterator().next().getLong("n")));
+        assertEquals(1L, opened);
+        assertTrue(await(challenges.findById(first)).isPresent(), "and the original is untouched");
+    }
+
+    // ── proof fixtures ───────────────────────────────────────────────────────
+
+    /** Admin wired with the pool, which is what the proof-challenge and figures methods need. */
+    private org.werkpages.service.AdminService newFullAdmin() {
+        return new org.werkpages.service.AdminService(
+            users, managers, new org.werkpages.repository.ReviewRepository(pool), null,
+            new org.werkpages.repository.NotificationRepository(pool),
+            new org.werkpages.repository.CompanyRepository(pool),
+            new org.werkpages.repository.MergeSuggestionsRepository(pool), pool);
+    }
+
+    /** A fresh admin account, since every test truncates. */
+    private String admin() throws Exception {
+        String auth0Id = "auth0|pow-admin-" + UUID.randomUUID();
+        await(pool.preparedQuery(
+                "INSERT INTO users (auth0_id, username, email, role) "
+                + "VALUES ($1, $1, $1 || '@example.test', 'admin')")
+            .execute(Tuple.of(auth0Id)).mapEmpty());
+        return auth0Id;
+    }
+
+    private int confidenceOf(UUID userId) throws Exception {
+        return await(pool.preparedQuery("SELECT confidence FROM users WHERE id = $1")
+            .execute(Tuple.of(userId)).map(rs -> rs.iterator().next().getInteger("confidence")));
+    }
+
+    private boolean gateEligible(UUID reviewId) throws Exception {
+        return await(pool.preparedQuery("SELECT gate_eligible FROM reviews WHERE id = $1")
+            .execute(Tuple.of(reviewId)).map(rs -> rs.iterator().next().getBoolean("gate_eligible")));
+    }
+
+    private org.werkpages.service.ProofChallengeService newProofService() {
+        return new org.werkpages.service.ProofChallengeService(challenges, users);
+    }
+
+    /** A complete, valid claim. Each test spoils exactly the one field it is about. */
+    private static JsonObject evidence() {
+        return new JsonObject()
+            .put("relationship",  "direct_report")
+            .put("workedFrom",    "2019-03")
+            .put("workedUntil",   "2020-06")
+            .put("claimedTitle",  "Senior Engineer")
+            .put("claimedOrg",    "Platform")
+            .put("evidenceNote",  "Reported to them for a year on the platform team.");
+    }
+
+    private UUID openFor(UUID userId, long managerId) throws Exception {
+        UUID review = insertHeldReview(managerId, userId);
+        return await(challenges.open(userId, managerId, review, "flagged_user"))
+            .orElseThrow().getUUID("id");
+    }
+
+    private Future<String> dispositionOf(UUID reviewId) {
+        return pool.preparedQuery("SELECT disposition FROM reviews WHERE id = $1")
+            .execute(Tuple.of(reviewId))
+            .map(rs -> rs.iterator().next().getString("disposition"));
+    }
+
     private long directoryCount() throws Exception {
         return await(pool.preparedQuery(
                 "SELECT COUNT(*) AS n FROM managers WHERE approval_status IN ('approved','ghost')")
@@ -1128,6 +1678,71 @@ class ProofOfWorkIntegrationTest {
             new org.werkpages.repository.NotificationRepository(pool),
             new org.werkpages.repository.CompanyRepository(pool),
             new org.werkpages.repository.MergeSuggestionsRepository(pool));
+    }
+
+    @Test
+    void aListedNameIsHeldWhateverCompanyItIsClaimedAt() throws Exception {
+        /*
+         * "Steve Jobs, Manager at Puma SE" got through: the list was matched on name AND company,
+         * so naming any other employer walked straight past it. The name alone decides now.
+         */
+        long apple = insertCompany("Apple Held Co wer");
+        long puma  = insertCompany("Puma Held Co wer");
+        await(pool.preparedQuery(
+                "INSERT INTO high_profile_figures (full_name, company_id, note) VALUES ($1, $2, 'test')")
+            .execute(Tuple.of("steve jobs", apple)).mapEmpty());
+
+        UUID user = insertUser("auth0|wer-listed-name-any-company");
+        org.werkpages.repository.ProofChallengeRepository challenges =
+            new org.werkpages.repository.ProofChallengeRepository(pool);
+
+        assertTrue(await(challenges.isHighProfile(null, "steve jobs")),
+            "listed at his own company");
+        assertTrue(await(challenges.isHighProfile(null, "steve jobs")),
+            "and listed wherever else he is claimed to work");
+
+        org.werkpages.service.SubmissionTier atPuma = await(
+            org.werkpages.service.SubmissionTier.classify(
+                challenges, confidence, user, null, "Steve", "Jobs", puma));
+        assertEquals(org.werkpages.service.SubmissionTier.HIGH_PROFILE, atPuma,
+            "held for an admin rather than published");
+    }
+
+    @Test
+    void holdingAListedNameCostsTheAuthorNoConfidence() throws Exception {
+        /*
+         * Somebody genuinely called Steve Jobs may well work at Puma. The submission waits for a
+         * person to look at it; it does not make its author less trusted for having sent it.
+         */
+        long companyId = insertCompany("Confidence Intact Co wer");
+        await(pool.preparedQuery(
+                "INSERT INTO high_profile_figures (full_name, company_id, note) VALUES ($1, $2, 'test')")
+            .execute(Tuple.of("tim cook", companyId)).mapEmpty());
+
+        UUID user = insertUser("auth0|wer-listed-no-penalty");
+        int before = await(confidence.current(user));
+
+        await(org.werkpages.service.SubmissionTier.classify(
+            new org.werkpages.repository.ProofChallengeRepository(pool), confidence,
+            user, null, "Tim", "Cook", companyId));
+
+        assertEquals(before, await(confidence.current(user)),
+            "classifying a listed name writes no confidence event");
+    }
+
+    @Test
+    void anUnlistedNameStillPublishes() throws Exception {
+        // The limit of the rule: holding everything would make the list pointless.
+        long companyId = insertCompany("Ordinary Co wer");
+        UUID user = insertUser("auth0|wer-ordinary-name");
+
+        org.werkpages.service.SubmissionTier tier = await(
+            org.werkpages.service.SubmissionTier.classify(
+                new org.werkpages.repository.ProofChallengeRepository(pool), confidence,
+                user, null, "Dana", "Whitfield", companyId));
+
+        assertEquals(org.werkpages.service.SubmissionTier.LIVE, tier,
+            "an ordinary manager is not held");
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────

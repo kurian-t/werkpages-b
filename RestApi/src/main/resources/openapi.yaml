@@ -345,6 +345,45 @@ paths:
   # Attached to a company, not a manager. Structured only: no free text, because an interview
   # review naming an interviewer is a defamation surface with no employment relationship behind it.
 
+  /api/companies/{companySlug}/interviews/list:
+    get:
+      operationId: listCompanyInterviews
+      summary: The individual interview experiences behind the averages
+      description: >-
+        Gated exactly as the category data is - sharing an experience is what buys the detail.
+        A reader who has not contributed gets {"data": [], "gated": true}.
+      tags:
+        - Interviews
+      # Signed out is a valid state: it resolves to no contributor, and the gated empty list is
+      # the right answer rather than a 401. Same as getCompanyInterviews beside it.
+      security: []
+      parameters:
+        - in: path
+          name: companySlug
+          required: true
+          schema:
+            type: string
+        - in: query
+          name: limit
+          schema: { type: integer, default: 20, minimum: 1, maximum: 50 }
+        - in: query
+          name: offset
+          schema: { type: integer, default: 0, minimum: 0 }
+      responses:
+        '200':
+          description: Interview experiences
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:   { type: array, items: { type: object } }
+                  gated:  { type: boolean }
+                  limit:  { type: integer }
+                  offset: { type: integer }
+        '404':
+          description: Company not found
+
   /api/companies/{companySlug}/interviews:
     get:
       operationId: getCompanyInterviews
@@ -2311,6 +2350,53 @@ paths:
         '403':
           description: Forbidden
 
+  /api/admin/companies/pending:
+    get:
+      operationId: adminPendingCompanies
+      summary: Companies created by a workplace rating and awaiting review (admin only)
+      tags:
+        - Admin
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          schema: { type: integer, default: 50 }
+        - name: offset
+          in: query
+          required: false
+          schema: { type: integer, default: 0 }
+      responses:
+        '200':
+          description: Companies waiting to be let into the directory
+        '403':
+          description: Not an admin
+
+  /api/admin/companies/{companyId}/decision:
+    post:
+      operationId: adminDecidePendingCompany
+      summary: Let a pending company into the directory, or refuse it (admin only)
+      tags:
+        - Admin
+      parameters:
+        - name: companyId
+          in: path
+          required: true
+          schema: { type: integer, format: int64 }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                approve: { type: boolean }
+              required: [approve]
+      responses:
+        '200':
+          description: Decision recorded
+        '404':
+          description: No pending company with that id
+
   /api/admin/companies/{companyId}:
     put:
       operationId: adminRenameCompany
@@ -3304,6 +3390,14 @@ components:
           type: string
           nullable: true
           description: YYYY-MM, or null while still there.
+        author:
+          type: string
+          nullable: true
+          maxLength: 60
+          description: >-
+            The randomly generated handle the author picked, the way a manager review is signed.
+            Anonymous but consistent, so a page of several ratings reads as several people rather
+            than one voice repeated. Null leaves the rating unsigned.
 
     CompanyRating:
       type: object
@@ -3314,6 +3408,7 @@ components:
         ratings:       { type: object }
         workedFrom:    { type: string, nullable: true }
         workedUntil:   { type: string, nullable: true }
+        author:        { type: string, nullable: true }
 
     InterviewReviewRequest:
       type: object
@@ -3322,6 +3417,14 @@ components:
         - outcome
         - interviewYear
       properties:
+        author:
+          type: string
+          nullable: true
+          maxLength: 60
+          description: >-
+            The randomly generated handle the author picked, as a manager review and a workplace
+            rating both carry. Anonymous but consistent, so several accounts of one company read as
+            several people. Null leaves the experience unsigned.
         overallRating:
           type: number
           format: double

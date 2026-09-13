@@ -2414,6 +2414,29 @@ public class ManagerService {
                                 .put("hasContributed", contributed));
                     }
 
+                    /*
+                      A listed name never spends the slot.
+
+                      Everybody gets one automatic ghost, ever. Searching "Steve Jobs" used to
+                      consume it - so a first-time visitor could burn their one creation on a name
+                      that was never going to publish, and the manager they actually came to add
+                      would land in the admin queue instead. The search still records a pending row
+                      for an admin to look at; it just does not cost the searcher anything.
+                    */
+                    return proofOfWork.isListedName(fullName).compose(listedName -> {
+                    if (listedName) {
+                        final String fStateL = trimmedState;
+                        final String fCityL  = trimmedCity;
+                        return companyRepo.resolve(companyId, company, null, resolvedLogoUrl)
+                            .compose(cRow -> managerRepo.createSearchPending(
+                                fullName, company, title, country,
+                                fStateL, fCityL, resolvedLogoUrl, cRow.getLong("id"), userId))
+                            .map(row -> new JsonObject()
+                                .put("data", new JsonArray())
+                                .put("created", false)
+                                .put("hasContributed", contributed));
+                    }
+
                     // Atomically claim the one-time ghost slot. Only one concurrent request wins;
                     // the loser gets empty results — no silent pending that could trigger a
                     // confusing rejection notification.
@@ -2468,6 +2491,7 @@ public class ManagerService {
                                     .put("hasContributed", contributed);
                             });
                     });
+                    }); // isListedName guard
                     }); // findByCompanyExact fuzzy-guard
                 });
             });

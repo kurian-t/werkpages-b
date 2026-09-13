@@ -771,17 +771,84 @@ class InterviewReviewIntegrationTest {
     }
 
     @Test
-    void categoryAverages_areWithheldBelowThreshold_butNotReportedAsGated() throws Exception {
+    void aThinSampleIsShownAndFlagged_notWithheld() throws Exception {
+        /*
+          CHANGED DELIBERATELY. This used to assert the breakdown was withheld below the threshold,
+          so a company with two interviews answered "not enough reports to break down yet".
+
+          That is a worse answer than the figures plus a caveat, and it is not what the rest of the
+          product does: the manager profile and the workplace tab both print their numbers and tell
+          the reader how much is behind them. Two reports genuinely are two people's experience,
+          and a reader told so can weigh it.
+
+          belowThreshold still travels - it is what drives the caveat.
+        */
         insertCompany("Thin Co", "thin-co");
         String contributor = submit("t1", "thin-co", 4.0, "offer", YEAR);
         submit("t2", "thin-co", 4.0, "offer", YEAR);
 
         JsonObject json = await(service.getCompanyInterviews("thin-co", null, null, contributor));
 
-        assertNull(json.getValue("categoryAverages"));
-        assertFalse(json.getBoolean("gated"), "the viewer contributed — this is a data problem, not a gate");
-        assertTrue(json.getBoolean("belowThreshold"));
-        assertNull(json.getValue("categoryComparison"), "withheld on the same gate as the averages");
+        assertNotNull(json.getValue("categoryAverages"), "shown, not withheld");
+        assertFalse(json.getBoolean("gated"), "the viewer contributed — this was never a gate");
+        assertTrue(json.getBoolean("belowThreshold"), "and the page is told to say so");
+    }
+
+    @Test
+    void theSixthCategoryIsStoredAndAveragedLikeTheRest() throws Exception {
+        /*
+          "Relevance to the job" - whether the process actually assessed the work. The other five
+          categories all ask how a company behaved toward a candidate; this is the only one about
+          what was tested, which is both the most common substantive complaint about hiring and the
+          most actionable thing on the list.
+        */
+        insertCompany("Relevant Co", "relevant-co");
+        String viewer = insertUser("jr1");
+        await(service.createReview(viewer, "relevant-co", new JsonObject()
+            .put("overallRating", 4.0).put("outcome", "offer").put("interviewYear", YEAR)
+            .put("jobRelevance", 2.0)));
+
+        JsonObject mine = await(service.getCompanyInterviews("relevant-co", null, null, viewer))
+            .getJsonObject("myInterview");
+
+        assertEquals(2.0, mine.getDouble("jobRelevance"), 0.01, "stored with the experience");
+    }
+
+    @Test
+    void anExperienceWrittenBeforeTheQuestionExistedStillReads() throws Exception {
+        /*
+          The column is nullable with no backfill: every interview already on record was written
+          without being asked this, and inventing a score would fabricate an opinion nobody gave.
+          Those rows simply do not contribute to that one average.
+        */
+        insertCompany("Legacy Co", "legacy-co");
+        String viewer = insertUser("jr2");
+        await(service.createReview(viewer, "legacy-co", new JsonObject()
+            .put("overallRating", 4.0).put("outcome", "offer").put("interviewYear", YEAR)));
+
+        JsonObject mine = await(service.getCompanyInterviews("legacy-co", null, null, viewer))
+            .getJsonObject("myInterview");
+
+        assertTrue(mine.containsKey("jobRelevance"), "the key is present");
+        assertNull(mine.getValue("jobRelevance"), "and null rather than invented");
+    }
+
+    @Test
+    void theTypicalProcessLengthIsTheMiddleAnswer() throws Exception {
+        /*
+          The four answers are ordered, so a median is meaningful - and it returns one somebody
+          actually gave rather than interpolating between two buckets, which for a categorical
+          scale is the only sensible reading. Median rather than mean so one candidate stuck in a
+          six-month process does not make the company look slow to everyone else.
+        */
+        insertCompany("Paced Co", "paced-co");
+        String viewer = submitWithLength("p1", "paced-co", "under_1_week");
+        submitWithLength("p2", "paced-co", "2_4_weeks");
+        submitWithLength("p3", "paced-co", "over_1_month");
+
+        JsonObject json = await(service.getCompanyInterviews("paced-co", null, null, viewer));
+
+        assertEquals("2_4_weeks", json.getString("medianProcessLength"));
     }
 
     @Test
@@ -1046,6 +1113,18 @@ class InterviewReviewIntegrationTest {
             .put("interviewYear", year);
         if (roleCategory != null) body.put("roleCategory", roleCategory);
         await(service.createReview(auth0Id, companySlug, body));
+        return auth0Id;
+    }
+
+    /** One experience, with the process length set - the field the typical-process metric reads. */
+    private static String submitWithLength(String username, String companySlug, String length)
+            throws Exception {
+        String auth0Id = insertUser(username);
+        await(service.createReview(auth0Id, companySlug, new JsonObject()
+            .put("overallRating", 4.0)
+            .put("outcome", "offer")
+            .put("interviewYear", YEAR)
+            .put("processLength", length)));
         return auth0Id;
     }
 

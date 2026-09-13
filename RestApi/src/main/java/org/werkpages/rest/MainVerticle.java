@@ -294,6 +294,7 @@ public class MainVerticle extends AbstractVerticle {
                         routerFactory.addHandlerByOperationId("getIndustryListing",     industriesHandler::handleGetIndustryListing);
                         routerFactory.addHandlerByOperationId("getIndustryProfile",     industriesHandler::handleGetIndustryProfile);
                         routerFactory.addHandlerByOperationId("getCompanyInterviews",   interviewsHandler::handleGetCompanyInterviews);
+                        routerFactory.addHandlerByOperationId("listCompanyInterviews",  interviewsHandler::handleListCompanyInterviews);
                         routerFactory.addHandlerByOperationId("createInterviewReview",  interviewsHandler::handleCreateInterviewReview);
                         routerFactory.addHandlerByOperationId("deleteInterviewReview",  interviewsHandler::handleDeleteInterviewReview);
                         routerFactory.addHandlerByOperationId("updateInterviewReview",  interviewsHandler::handleUpdateInterviewReview);
@@ -346,6 +347,8 @@ public class MainVerticle extends AbstractVerticle {
                         routerFactory.addHandlerByOperationId("adminDeleteManager",       adminHandler::handleDeleteManager);
                         routerFactory.addHandlerByOperationId("mergeManagers",            adminHandler::handleMergeManagers);
                         routerFactory.addHandlerByOperationId("adminListCompanies",       adminHandler::handleListCompanies);
+                        routerFactory.addHandlerByOperationId("adminPendingCompanies",   adminHandler::handlePendingCompanies);
+                        routerFactory.addHandlerByOperationId("adminDecidePendingCompany", adminHandler::handleDecidePendingCompany);
                         routerFactory.addHandlerByOperationId("adminRenameCompany",       adminHandler::handleRenameCompany);
                         routerFactory.addHandlerByOperationId("adminMergeCompanies",      adminHandler::handleMergeCompanies);
                         routerFactory.addHandlerByOperationId("previewCompanyMerge",      adminHandler::handlePreviewCompanyMerge);

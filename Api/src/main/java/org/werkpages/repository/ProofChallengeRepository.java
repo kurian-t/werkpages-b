@@ -39,16 +39,19 @@ public class ProofChallengeRepository {
      *
      * @param managerId the row being rated, when it already exists; may be null
      */
-    public Future<Boolean> isHighProfile(Long managerId, String fullName, Long companyId) {
+    public Future<Boolean> isHighProfile(Long managerId, String fullName) {
         String normalised = fullName == null ? "" : fullName.trim().toLowerCase();
         return db.preparedQuery("""
                 SELECT EXISTS(
                     SELECT 1 FROM high_profile_figures
                     WHERE (manager_id IS NOT NULL AND manager_id = $1)
-                       OR (full_name = $2 AND company_id IS NOT NULL AND company_id = $3)
+                       -- The name alone. Somebody adding "Steve Jobs at Puma SE" is making the
+                       -- same claim as somebody adding him at Apple, and requiring the company to
+                       -- match let a one-word change walk straight past the list.
+                       OR full_name = $2
                 ) AS hit
                 """)
-            .execute(Tuple.of(managerId, normalised, companyId))
+            .execute(Tuple.of(managerId, normalised))
             .map(rows -> rows.iterator().next().getBoolean("hit"));
     }
 

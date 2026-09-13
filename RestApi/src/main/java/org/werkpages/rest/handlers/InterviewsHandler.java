@@ -36,6 +36,24 @@ public class InterviewsHandler {
 
     // ── GET /api/companies/{companySlug}/interviews ───────────────────────────
 
+    /** The individual experiences behind the averages. Gated with the rest of the detail. */
+    public void handleListCompanyInterviews(RoutingContext ctx) {
+        String companySlug = ctx.pathParam("companySlug");
+        int limit  = parseIntOr(ctx.queryParams().get("limit"), 20);
+        int offset = parseIntOr(ctx.queryParams().get("offset"), 0);
+        // Signed out is valid: it resolves to no contributor, and the gated empty list is the
+        // correct answer rather than a 401.
+        verifiedAuth0Id(ctx)
+            .compose(auth0Id -> service.listForCompany(auth0Id, companySlug, limit, offset))
+            .onSuccess(json -> respond(ctx, 200, json))
+            .onFailure(err -> ManagersHandler.handleError(ctx, err));
+    }
+
+    private static int parseIntOr(String raw, int fallback) {
+        if (raw == null || raw.isBlank()) return fallback;
+        try { return Integer.parseInt(raw.trim()); } catch (NumberFormatException e) { return fallback; }
+    }
+
     public void handleGetCompanyInterviews(RoutingContext ctx) {
         String companySlug = ctx.pathParam("companySlug");
         // Role is the only filter. Outcome is no longer one: the comparison chart shows every

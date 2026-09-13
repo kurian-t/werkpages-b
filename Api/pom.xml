@@ -125,8 +125,15 @@
 					<excludes>
 						<exclude>**/*IntegrationTest.java</exclude>
 					</excludes>
-					<!-- Picks up JaCoCo agent set by pre-unit-test execution -->
-					<argLine>${jacoco.agent.argLine}</argLine>
+					<!--
+						@{...}, not ${...}. ${} is interpolated when the POM is read, which is
+						before prepare-agent runs, so it resolved to the empty default below and the
+						unit-test JVM started with no agent attached. No jacoco.exec was ever
+						written, the merge had only the IT data to work with, and every class covered
+						solely by a unit test - EncryptionService, AppEnv - reported 0%. Failsafe
+						below already gets this right.
+					-->
+					<argLine>@{jacoco.agent.argLine}</argLine>
 				</configuration>
 			</plugin>
 			<!-- Integration tests run during the verify phase (mvn verify / mvn install) -->

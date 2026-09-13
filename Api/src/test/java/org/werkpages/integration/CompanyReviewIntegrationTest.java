@@ -228,6 +228,481 @@ class CompanyReviewIntegrationTest {
             () -> await(service.delete(bystander, UUID.fromString(review.getString("id")))));
     }
 
+    // ── The period worked ─────────────────────────────────────────────────────
+
+    /*
+      When somebody worked there is what makes a rating readable - an employer in 2014 says little
+      about the employer today - so the dates carry real validation, and none of it was covered.
+    */
+
+    @Test
+    void aRatingWithNoStartDateIsRefused() throws Exception {
+        insertCompany("Red Hat", "red-hat");
+        String auth = insertUser("auth0|cr-20", "CrUser20");
+        JsonObject body = validBody(4.0).putNull("workedFrom");
+
+        assertThrows(Exception.class, () -> await(service.submit(auth, "red-hat", body)));
+    }
+
+    @Test
+    void aStartDateInTheFutureIsRefused() throws Exception {
+        insertCompany("Red Hat", "red-hat");
+        String auth = insertUser("auth0|cr-21", "CrUser21");
+        JsonObject body = validBody(4.0).put("workedFrom", "2999-01");
+
+        assertThrows(Exception.class, () -> await(service.submit(auth, "red-hat", body)));
+    }
+
+    @Test
+    void anEndDateBeforeTheStartIsRefused() throws Exception {
+        insertCompany("Red Hat", "red-hat");
+        String auth = insertUser("auth0|cr-22", "CrUser22");
+        JsonObject body = validBody(4.0).put("workedFrom", "2022-06").put("workedUntil", "2021-01");
+
+        assertThrows(Exception.class, () -> await(service.submit(auth, "red-hat", body)));
+    }
+
+    @Test
+    void anEndDateInTheFutureIsRefused() throws Exception {
+        insertCompany("Red Hat", "red-hat");
+        String auth = insertUser("auth0|cr-23", "CrUser23");
+        JsonObject body = validBody(4.0).put("workedUntil", "2999-01");
+
+        assertThrows(Exception.class, () -> await(service.submit(auth, "red-hat", body)));
+    }
+
+    @Test
+    void aMonthPickerValueAndAFullDateBothParse() throws Exception {
+        // The form sends "2021-04"; an API client may send "2021-04-01". Both mean the same month.
+        insertCompany("Red Hat", "red-hat");
+        String monthly = insertUser("auth0|cr-24", "CrUser24");
+        String dated   = insertUser("auth0|cr-25", "CrUser25");
+
+        JsonObject a = await(service.submit(monthly, "red-hat", validBody(4.0)));
+        JsonObject b = await(service.submit(dated, "red-hat",
+            validBody(4.0).put("workedFrom", "2021-04-01")));
+
+        assertEquals("2021-04-01", a.getString("workedFrom"));
+        assertEquals(a.getString("workedFrom"), b.getString("workedFrom"));
+    }
+
+    @Test
+    void anUnparseableStartDateIsRefusedRatherThanStoredAsNothing() throws Exception {
+        /*
+          parseDate returns null on a value it cannot read, which lands on the same branch as a
+          missing date. That is the safe direction - the alternative is a rating silently stored
+          with no period at all - and this is the test that says the branch is deliberate.
+        */
+        insertCompany("Red Hat", "red-hat");
+        String auth = insertUser("auth0|cr-26", "CrUser26");
+        JsonObject body = validBody(4.0).put("workedFrom", "last April");
+
+        assertThrows(Exception.class, () -> await(service.submit(auth, "red-hat", body)));
+    }
+
+    // ── The author handle ─────────────────────────────────────────────────────
+
+    @Test
+    void theAuthorHandleIsStoredWithTheRating() throws Exception {
+        insertCompany("Red Hat", "red-hat");
+        String auth = insertUser("auth0|cr-30", "CrUser30");
+
+        JsonObject saved = await(service.submit(auth, "red-hat",
+            validBody(4.0).put("author", "CoolLynx30")));
+
+        assertEquals("CoolLynx30", saved.getString("author"));
+    }
+
+    @Test
+    void editingWithoutSendingAHandleKeepsTheOneAReaderAlreadySaw() throws Exception {
+        /*
+          The COALESCE in the upsert. Without it, revisiting the form to change a star would blank
+          the byline, and the same person's rating would read as a different account than the one
+          somebody replied to yesterday.
+        */
+        insertCompany("Red Hat", "red-hat");
+        String auth = insertUser("auth0|cr-31", "CrUser31");
+        await(service.submit(auth, "red-hat", validBody(2.0).put("author", "FirstName11")));
+
+        JsonObject edited = await(service.submit(auth, "red-hat", validBody(5.0)));
+
+        assertEquals("FirstName11", edited.getString("author"), "the handle survived the edit");
+        assertEquals(5.0, edited.getDouble("overallRating"), 0.01, "and the new answer took");
+    }
+
+    @Test
+    void aBlankHandleIsStoredAsNoneRatherThanAnEmptyByline() throws Exception {
+        // An empty string would print a nameless byline, which is a different thing from anonymous.
+        insertCompany("Red Hat", "red-hat");
+        String auth = insertUser("auth0|cr-32", "CrUser32");
+
+        JsonObject saved = await(service.submit(auth, "red-hat",
+            validBody(4.0).put("author", "   ")));
+
+        assertNull(saved.getString("author"));
+    }
+
+    @Test
+    void aHandleTooLongToRenderIsRefused() throws Exception {
+        insertCompany("Red Hat", "red-hat");
+        String auth = insertUser("auth0|cr-33", "CrUser33");
+        JsonObject body = validBody(4.0).put("author", "x".repeat(61));
+
+        assertThrows(Exception.class, () -> await(service.submit(auth, "red-hat", body)));
+    }
+
+    // ── Reading back your own rating ──────────────────────────────────────────
+
+    @Test
+    void findMineReturnsTheRatingForPreFillingTheForm() throws Exception {
+        insertCompany("Red Hat", "red-hat");
+        String auth = insertUser("auth0|cr-40", "CrUser40");
+        await(service.submit(auth, "red-hat", validBody(3.5).put("author", "MineHandle40")));
+
+        JsonObject mine = await(service.findMine(auth, "red-hat")).getJsonObject("review");
+
+        assertEquals(3.5, mine.getDouble("overallRating"), 0.01);
+        assertEquals("MineHandle40", mine.getString("author"));
+        assertNotNull(mine.getJsonObject("ratings"), "the form pre-fills every category too");
+    }
+
+    @Test
+    void findMineIsEmptyForSomebodyWhoHasNotRated() throws Exception {
+        insertCompany("Red Hat", "red-hat");
+        String auth = insertUser("auth0|cr-41", "CrUser41");
+
+        assertNull(await(service.findMine(auth, "red-hat")).getValue("review"),
+            "not having rated is a null review, not an error");
+    }
+
+    @Test
+    void findMineIsEmptyForSomebodySignedOut() throws Exception {
+        // The page asks this before it knows who is reading. It must answer, not throw.
+        insertCompany("Red Hat", "red-hat");
+
+        assertNull(await(service.findMine(null, "red-hat")).getValue("review"));
+    }
+
+    @Test
+    void findMineIsEmptyAfterWithdrawing() throws Exception {
+        insertCompany("Red Hat", "red-hat");
+        String auth = insertUser("auth0|cr-42", "CrUser42");
+        JsonObject saved = await(service.submit(auth, "red-hat", validBody(4.0)));
+
+        await(service.delete(auth, UUID.fromString(saved.getString("id"))));
+
+        assertNull(await(service.findMine(auth, "red-hat")).getValue("review"),
+            "the form offers to rate again rather than showing a withdrawn rating back");
+    }
+
+    // ── The list behind the average ───────────────────────────────────────────
+
+    @Test
+    void theListMarksTheReadersOwnRatingAndNobodyElses() throws Exception {
+        /*
+          "mine" is derived from the token, never from anything the client sends. If it were not,
+          anyone could ask which of a company's ratings belonged to a named person - which is the
+          whole promise the anonymity is making.
+        */
+        insertCompany("Red Hat", "red-hat");
+        String reader  = insertUser("auth0|cr-50", "CrUser50");
+        String bystander  = insertUser("auth0|cr-51", "CrUser51");
+        await(service.submit(reader, "red-hat", validBody(5.0).put("author", "MineHandle50")));
+        await(service.submit(bystander, "red-hat", validBody(2.0).put("author", "TheirHandle51")));
+
+        var rows = await(service.listFor(reader, "red-hat", 20, 0)).getJsonArray("data");
+
+        assertEquals(2, rows.size());
+        long mine = rows.stream().map(o -> (JsonObject) o)
+            .filter(o -> Boolean.TRUE.equals(o.getBoolean("mine"))).count();
+        assertEquals(1L, mine, "exactly one row is the reader's own");
+    }
+
+    @Test
+    void theListMarksNothingAsMineForSomebodySignedOut() throws Exception {
+        insertCompany("Red Hat", "red-hat");
+        String someone = insertUser("auth0|cr-52", "CrUser52");
+        await(service.submit(someone, "red-hat", validBody(4.0)));
+
+        var rows = await(service.listFor(null, "red-hat", 20, 0)).getJsonArray("data");
+
+        assertEquals(1, rows.size());
+        assertFalse(rows.getJsonObject(0).getBoolean("mine"),
+            "a signed-out reader owns none of them");
+    }
+
+    @Test
+    void aRatingWithNoEndDateReadsAsStillWorkingThere() throws Exception {
+        // Said as a fact the card can print, rather than left as a missing field to interpret.
+        insertCompany("Red Hat", "red-hat");
+        String auth = insertUser("auth0|cr-53", "CrUser53");
+        await(service.submit(auth, "red-hat", validBody(4.0)));
+
+        var row = await(service.listFor(auth, "red-hat", 20, 0)).getJsonArray("data")
+            .getJsonObject(0);
+
+        assertTrue(row.getBoolean("current"));
+        assertNull(row.getString("workedUntil"));
+    }
+
+    @Test
+    void aRatingWrittenBeforeAuthorsExistedStillLists() throws Exception {
+        // V63 added the column nullable with no backfill, so these rows are real. They render
+        // without a byline rather than breaking the list they appear in.
+        insertCompany("Red Hat", "red-hat");
+        String auth = insertUser("auth0|cr-54", "CrUser54");
+        await(service.submit(auth, "red-hat", validBody(4.0)));
+
+        var row = await(service.listFor(auth, "red-hat", 20, 0)).getJsonArray("data")
+            .getJsonObject(0);
+
+        assertNull(row.getString("author"));
+    }
+
+    @Test
+    void theListIsCappedSoNobodyCanAskForTheWholeTable() throws Exception {
+        insertCompany("Red Hat", "red-hat");
+        String auth = insertUser("auth0|cr-55", "CrUser55");
+        await(service.submit(auth, "red-hat", validBody(4.0)));
+
+        JsonObject page = await(service.listFor(auth, "red-hat", 5000, -10));
+
+        assertEquals(50, page.getInteger("limit"), "an oversized page size is capped");
+        assertEquals(0,  page.getInteger("offset"), "a negative offset is floored, not passed to SQL");
+    }
+
+    @Test
+    void listingACompanyThatDoesNotExistIsRefused() throws Exception {
+        String auth = insertUser("auth0|cr-56", "CrUser56");
+
+        assertThrows(Exception.class, () -> await(service.listFor(auth, "no-such-company", 20, 0)));
+    }
+
+    // ── Rating an employer we do not have yet ────────────────────────────────
+
+    @Test
+    void ratingACompanyWeDoNotHaveCreatesIt() throws Exception {
+        /*
+          CHANGED DELIBERATELY. This used to be refused outright, on the reasoning that a company
+          existing only because somebody claims to have worked there has no anchor. The refusal was
+          the wrong end of that trade: the one moment a person is willing to write something is the
+          worst moment to answer "we don't have a page for that".
+
+          Created as ghost - the same status a search-created company gets - so it is publicly
+          visible and reviewable rather than hidden.
+        */
+        String auth = insertUser("auth0|cr-new-1", "CrNew1");
+        JsonObject body = validBody(4.0).put("companyName", "Brand New Employer Inc");
+
+        JsonObject saved = await(service.submit(auth, "brand-new-employer-inc", body));
+
+        assertNotNull(saved.getLong("companyId"), "the rating is attached to a real company row");
+        String status = await(pool.preparedQuery(
+                "SELECT status FROM companies WHERE LOWER(TRIM(name)) = LOWER(TRIM($1))")
+            .execute(Tuple.of("Brand New Employer Inc"))
+            .map(rs -> rs.iterator().next().getString("status")));
+        assertEquals("pending_approval", status,
+            "held for an admin, not live - a company nobody has vouched for is not the directory's");
+    }
+
+    @Test
+    void ratingAnExistingCompanyStillUsesIt() throws Exception {
+        // The new path must not create a duplicate alongside a company we already hold.
+        insertCompany("Red Hat", "red-hat");
+        String auth = insertUser("auth0|cr-new-2", "CrNew2");
+
+        await(service.submit(auth, "red-hat", validBody(4.0).put("companyName", "Red Hat")));
+
+        Long rows = await(pool.preparedQuery(
+                "SELECT COUNT(*) AS n FROM companies WHERE LOWER(TRIM(name)) = 'red hat'")
+            .execute().map(rs -> rs.iterator().next().getLong("n")));
+        assertEquals(1L, rows);
+    }
+
+    @Test
+    void ratingWithNeitherASlugNorANameIsStillRefused() throws Exception {
+        // Creating on demand is not the same as creating from nothing.
+        String auth = insertUser("auth0|cr-new-3", "CrNew3");
+
+        assertThrows(Exception.class, () -> await(service.submit(auth, null, validBody(4.0))));
+    }
+
+    @Test
+    void readingACompanyWeDoNotHaveIsStillNotFound() throws Exception {
+        /*
+          Only the write path creates. A page view for a company nobody has rated must stay a 404 -
+          otherwise every mistyped URL would mint a directory entry.
+        */
+        String auth = insertUser("auth0|cr-new-4", "CrNew4");
+
+        assertThrows(Exception.class, () -> await(service.listFor(auth, "no-such-company", 20, 0)));
+        assertThrows(Exception.class, () -> await(service.findMine(auth, "no-such-company")));
+    }
+
+    @Test
+    void aCompanyBornFromARatingIsNotPubliclyVisible() throws Exception {
+        /*
+          The whole point of holding it. Every public surface filters on an allowlist of
+          ('approved','ghost'), so pending is excluded by construction rather than by each query
+          remembering to exclude it - which is the difference between a rule and a habit.
+        */
+        String auth = insertUser("auth0|cr-new-5", "CrNew5");
+        await(service.submit(auth, "invented-co", validBody(4.0).put("companyName", "Invented Co")));
+
+        Long listed = await(pool.preparedQuery(
+                "SELECT COUNT(*) AS n FROM companies "
+                + "WHERE LOWER(TRIM(name)) = 'invented co' AND status IN ('approved','ghost')")
+            .execute().map(rs -> rs.iterator().next().getLong("n")));
+        assertEquals(0L, listed, "it is not on any surface that lists companies");
+    }
+
+    @Test
+    void anAdminSeesItWaitingAndCanLetItIn() throws Exception {
+        String auth = insertUser("auth0|cr-new-6", "CrNew6");
+        await(service.submit(auth, "waiting-co", validBody(4.0).put("companyName", "Waiting Co")));
+        String admin = insertAdmin("auth0|cr-new-admin-1");
+
+        JsonObject queue = await(newAdminService().getPendingCompanies(admin, 20, 0));
+        assertEquals(1, queue.getInteger("total"));
+        JsonObject row = queue.getJsonArray("data").getJsonObject(0);
+        assertEquals("Waiting Co", row.getString("name"));
+        assertEquals(1L, row.getLong("ratingCount"), "how much is actually behind it");
+
+        await(newAdminService().decidePendingCompany(admin, row.getLong("id"), true));
+        assertEquals("ghost", statusOf("Waiting Co"), "approved companies join the directory");
+    }
+
+    @Test
+    void arefusedCompanyStaysOutButKeepsTheRatingSomebodyWrote() throws Exception {
+        // The person did write it. Refusing the company hides it; it does not delete their work.
+        String auth = insertUser("auth0|cr-new-7", "CrNew7");
+        await(service.submit(auth, "bogus-co", validBody(4.0).put("companyName", "Bogus Co")));
+        String admin = insertAdmin("auth0|cr-new-admin-2");
+        long id = await(newAdminService().getPendingCompanies(admin, 20, 0))
+            .getJsonArray("data").getJsonObject(0).getLong("id");
+
+        await(newAdminService().decidePendingCompany(admin, id, false));
+
+        assertEquals("rejected", statusOf("Bogus Co"));
+        Long ratings = await(pool.preparedQuery(
+                "SELECT COUNT(*) AS n FROM company_reviews WHERE company_id = $1 AND deleted_at IS NULL")
+            .execute(Tuple.of(id)).map(rs -> rs.iterator().next().getLong("n")));
+        assertEquals(1L, ratings, "the rating is kept, it simply has nowhere public to appear");
+    }
+
+    @Test
+    void decidingTheSameCompanyTwiceIsRefused() throws Exception {
+        String auth = insertUser("auth0|cr-new-8", "CrNew8");
+        await(service.submit(auth, "twice-co", validBody(4.0).put("companyName", "Twice Co")));
+        String admin = insertAdmin("auth0|cr-new-admin-3");
+        long id = await(newAdminService().getPendingCompanies(admin, 20, 0))
+            .getJsonArray("data").getJsonObject(0).getLong("id");
+        await(newAdminService().decidePendingCompany(admin, id, true));
+
+        assertThrows(Exception.class,
+            () -> await(newAdminService().decidePendingCompany(admin, id, false)));
+    }
+
+    @Test
+    void theQueueIsAdminOnly() throws Exception {
+        String plain = insertUser("auth0|cr-new-9", "CrNew9");
+
+        assertThrows(Exception.class, () -> await(newAdminService().getPendingCompanies(plain, 20, 0)));
+        assertThrows(Exception.class, () -> await(newAdminService().decidePendingCompany(plain, 1L, true)));
+    }
+
+    @Test
+    void theQueueCountsEverythingAttachedToAPendingCompany() throws Exception {
+        /*
+          A pending company is reachable, so the person who created it can also add a manager at it
+          and file an interview experience for it. Counting only company_reviews reported "1
+          rating" for a company carrying three different kinds of content - understating exactly
+          what the admin is being asked to decide on.
+        */
+        String auth = insertUser("auth0|cr-foot-1", "CrFoot1");
+        await(service.submit(auth, "footprint-co", validBody(4.0).put("companyName", "Footprint Co")));
+        long companyId = await(pool.preparedQuery(
+                "SELECT id FROM companies WHERE LOWER(TRIM(name)) = 'footprint co'")
+            .execute().map(rs -> rs.iterator().next().getLong("id")));
+        await(pool.preparedQuery(
+                "INSERT INTO managers(name,company,company_id,title,status,approval_status,"
+                + "overall_rating,reviews_count,category_averages) "
+                + "VALUES ('Pat Pending','Footprint Co',$1,'Manager','active','pending_approval',"
+                + "0,0,'{}'::jsonb)")
+            .execute(Tuple.of(companyId)).mapEmpty());
+
+        JsonObject row = await(newAdminService().getPendingCompanies(insertAdmin("auth0|cr-foot-admin"), 20, 0))
+            .getJsonArray("data").getJsonObject(0);
+
+        assertEquals(1L, row.getLong("ratingCount"));
+        assertEquals(1L, row.getLong("managerCount"), "the manager attached to it is counted too");
+        assertNotNull(row.getLong("interviewCount"), "and interview experiences are reported");
+    }
+
+    @Test
+    void aRejectedCompanyIsNeverOfferedByThePickerAgain() throws Exception {
+        /*
+          The rejection has to stick. The picker had no status filter beyond 'merged', so a company
+          an admin had just refused came straight back as a suggestion - the next person to type
+          the name picked it out of the list and attached fresh content to the same row. There was
+          no way to make a rejection hold short of deciding it again.
+        */
+        String auth = insertUser("auth0|cr-rej-1", "CrRej1");
+        await(service.submit(auth, "refused-co", validBody(4.0).put("companyName", "Refused Co")));
+        String admin = insertAdmin("auth0|cr-rej-admin");
+        long id = await(newAdminService().getPendingCompanies(admin, 20, 0))
+            .getJsonArray("data").getJsonObject(0).getLong("id");
+
+        // While pending it is still offered, on purpose: a second person naming the same employer
+        // should land on the existing row rather than minting a duplicate.
+        assertTrue(pickerOffers("Refused Co"), "a pending company is suggestible");
+
+        await(newAdminService().decidePendingCompany(admin, id, false));
+
+        assertFalse(pickerOffers("Refused Co"), "once refused it is gone from the picker");
+    }
+
+    @Test
+    void anApprovedCompanyIsStillOfferedByThePicker() throws Exception {
+        // The other half of the same rule - approving must not remove it.
+        String auth = insertUser("auth0|cr-app-1", "CrApp1");
+        await(service.submit(auth, "allowed-co", validBody(4.0).put("companyName", "Allowed Co")));
+        String admin = insertAdmin("auth0|cr-app-admin");
+        long id = await(newAdminService().getPendingCompanies(admin, 20, 0))
+            .getJsonArray("data").getJsonObject(0).getLong("id");
+
+        await(newAdminService().decidePendingCompany(admin, id, true));
+
+        assertTrue(pickerOffers("Allowed Co"));
+    }
+
+    private boolean pickerOffers(String name) throws Exception {
+        var rows = await(companyRepo.searchForPicker(name));
+        for (var r : rows) {
+            if (name.equalsIgnoreCase(r.getString("name"))) return true;
+        }
+        return false;
+    }
+
+    private org.werkpages.service.AdminService newAdminService() {
+        return new org.werkpages.service.AdminService(
+            new UserRepository(pool), new ManagerRepository(pool), new ReviewRepository(pool), null,
+            new NotificationRepository(pool), companyRepo, new MergeSuggestionsRepository(pool), pool);
+    }
+
+    private String insertAdmin(String auth0Id) throws Exception {
+        await(pool.preparedQuery(
+                "INSERT INTO users(auth0_id,email,username,role) VALUES ($1,$1||'@t.com',$1,'admin')")
+            .execute(Tuple.of(auth0Id)).mapEmpty());
+        return auth0Id;
+    }
+
+    private String statusOf(String name) throws Exception {
+        return await(pool.preparedQuery(
+                "SELECT status FROM companies WHERE LOWER(TRIM(name)) = LOWER(TRIM($1))")
+            .execute(Tuple.of(name)).map(rs -> rs.iterator().next().getString("status")));
+    }
+
     // ── fixtures ──────────────────────────────────────────────────────────────
 
     private static JsonObject validBody(double overall) {

@@ -334,6 +334,62 @@ public class AdminService {
                 }));
     }
 
+    // ── Companies awaiting review ─────────────────────────────────────────────
+
+    /**
+     * Companies that exist only because somebody rated them.
+     *
+     * <p>A workplace rating creates its employer when we do not already hold it, so that the one
+     * moment a person is willing to contribute is not met with "we have no page for that". Those
+     * rows are held at {@code pending_approval} rather than going live, and this is where they
+     * wait.
+     */
+    public Future<JsonObject> getPendingCompanies(String auth0Id, int limit, int offset) {
+        return requireAdmin(auth0Id)
+            .compose(adminId -> Future.all(
+                    companyRepo.findPendingCompaniesForAdmin(limit, offset),
+                    companyRepo.countPendingCompanies())
+                .map(cf -> {
+                    RowSet<Row> rows = cf.resultAt(0);
+                    JsonArray data = new JsonArray();
+                    for (Row r : rows) {
+                        data.add(new JsonObject()
+                            .put("id",          r.getLong("id"))
+                            .put("name",        r.getString("name"))
+                            .put("slug",        r.getString("slug"))
+                            .put("domain",      r.getString("domain"))
+                            .put("logoUrl",     r.getString("logo_url"))
+                            // How much is actually behind it: one rating is a name somebody typed,
+                            // several is a company.
+                            .put("ratingCount",    r.getLong("rating_count"))
+                            .put("managerCount",   r.getLong("manager_count"))
+                            .put("interviewCount", r.getLong("interview_count"))
+                            .put("createdAt",   r.getOffsetDateTime("created_at").toString()));
+                    }
+                    return new JsonObject()
+                        .put("data", data).put("total", cf.<Long>resultAt(1))
+                        .put("limit", limit).put("offset", offset);
+                }));
+    }
+
+    /**
+     * Lets a pending company into the directory, or refuses it.
+     *
+     * <p>Never touches the ratings themselves. A refused company keeps the rating attached to it -
+     * the person did write it - it simply does not surface anywhere, which is the same shape the
+     * rest of the product uses for held content.
+     */
+    public Future<JsonObject> decidePendingCompany(String auth0Id, long companyId, boolean approve) {
+        return requireAdmin(auth0Id)
+            .compose(adminId -> companyRepo.decidePendingCompany(companyId, approve))
+            .compose(changed -> changed
+                ? Future.succeededFuture(new JsonObject()
+                    .put("success", true).put("status", approve ? "ghost" : "rejected"))
+                // Already decided, or never pending. Saying so beats reporting a success that
+                // changed nothing.
+                : Future.failedFuture(ServiceException.notFound("No pending company with that id")));
+    }
+
     /** The figures list, editable without a deploy because an anti-abuse list churns. */
     public Future<JsonArray> listHighProfileFigures(String auth0Id) {
         return requireAdmin(auth0Id)

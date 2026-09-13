@@ -92,9 +92,9 @@ public class InterviewService {
                         }
                         return interviewRepo.create(companyId, userId, draft.overall, draft.communication,
                             draft.respectForTime, draft.roleClarity, draft.processFairness,
-                            draft.nextStepTransparency, draft.difficulty, draft.outcome,
+                            draft.nextStepTransparency, draft.jobRelevance, draft.difficulty, draft.outcome,
                             draft.roundCount(), draft.processLength, draft.roleCategory,
-                            draft.country, draft.city, draft.interviewYear);
+                            draft.country, draft.city, draft.interviewYear, draft.author);
                     })
                     .compose(row -> interviewRepo
                         .insertRounds(row.getUUID("id"), draft.rounds)
@@ -123,7 +123,7 @@ public class InterviewService {
             Draft draft = parseDraft(body);
             return interviewRepo.update(id, userId, draft.overall, draft.communication,
                     draft.respectForTime, draft.roleClarity, draft.processFairness,
-                    draft.nextStepTransparency, draft.difficulty, draft.outcome,
+                    draft.nextStepTransparency, draft.jobRelevance, draft.difficulty, draft.outcome,
                     draft.roundCount(), draft.processLength, draft.roleCategory,
                     draft.country, draft.city, draft.interviewYear)
                 .compose(updated -> {
@@ -142,9 +142,9 @@ public class InterviewService {
     /** Everything a create or an edit needs, parsed and validated once. */
     private record Draft(BigDecimal overall, BigDecimal communication, BigDecimal respectForTime,
                          BigDecimal roleClarity, BigDecimal processFairness,
-                         BigDecimal nextStepTransparency, Integer difficulty, String outcome,
+                         BigDecimal nextStepTransparency, BigDecimal jobRelevance, Integer difficulty, String outcome,
                          String processLength, String roleCategory, String country, String city,
-                         int interviewYear, List<String> rounds) {
+                         int interviewYear, List<String> rounds, String author) {
         /** The count follows the list, so the two cannot contradict each other. */
         Integer roundCount() {
             return rounds.isEmpty() ? null : rounds.size();
@@ -159,6 +159,7 @@ public class InterviewService {
             optionalRating(body, "roleClarity"),
             optionalRating(body, "processFairness"),
             optionalRating(body, "nextStepTransparency"),
+            optionalRating(body, "jobRelevance"),
             optionalInt(body, "difficulty", 1, 5),
             requiredEnum(body, "outcome", OUTCOMES),
             optionalEnum(body, "processLength", PROCESS_LENGTHS),
@@ -168,7 +169,10 @@ public class InterviewService {
             optionalText(body, "country", 100),
             optionalText(body, "city", 100),
             requiredYear(body),
-            parseRounds(body));
+            parseRounds(body),
+            // The handle the author picked, the way a manager review is signed. Blank means none:
+            // an empty string would put a nameless byline on the card rather than leaving it bare.
+            optionalText(body, "author", 60));
     }
 
     // ── Delete ────────────────────────────────────────────────────────────────
@@ -247,6 +251,14 @@ public class InterviewService {
                     .put("avgRating",     stats.map(r -> numberOrNull(r, "avg_rating")).orElse(null))
                     .put("avgDifficulty", stats.map(r -> numberOrNull(r, "avg_difficulty")).orElse(null))
                     .put("medianRounds",  stats.map(r -> r.getValue("median_rounds")).orElse(null))
+                    /*
+                      How long it usually took, as one of the four answers the form offers.
+
+                      Read from the breakdown, not the stats row: company_interview_stats is a
+                      trigger-maintained table and adding a column to it would mean a migration for
+                      a figure the unfiltered breakdown already has to hand.
+                    */
+                    .put("medianProcessLength", breakdown == null ? null : breakdown.getString("median_process_length"))
                     .put("outcomeSplit",  outcomeSplitJson(split))
                     .put("roleCategories", roleCategoriesJson(roles))
                     .put("countries", countriesJson(countries))
@@ -265,8 +277,21 @@ public class InterviewService {
                     out.put("categoryComparison", (Object) null);
                     out.put("gated", true);
                 } else if (reviewCount < MIN_REVIEWS_TO_SHOW_AVERAGES) {
-                    out.put("categoryAverages", (Object) null);
-                    out.put("categoryComparison", (Object) null);
+                    /*
+                      A thin sample is shown, and said to be thin.
+
+                      This used to withhold the breakdown entirely below the threshold, so a
+                      company with two interviews answered "not enough to break down yet" - which
+                      is a worse answer than the data plus a caveat. Nowhere else in the product
+                      refuses to show a figure for being early: the manager profile and the
+                      workplace tab both print theirs and tell the reader how much is behind it.
+                      Two reports genuinely are two people's experience; the reader is capable of
+                      weighing that once told.
+
+                      belowThreshold still travels, because the caveat is driven by it.
+                    */
+                    out.put("categoryAverages", categoryAveragesJson(breakdown));
+                    out.put("categoryComparison", categoryComparisonJson(comparison));
                     out.put("gated", false);
                     out.put("belowThreshold", true);
                 } else {
@@ -337,6 +362,63 @@ public class InterviewService {
      * company that exists only because someone claims to have interviewed there has no verifiable
      * anchor at all, and the directory would fill with them.
      */
+    /**
+     * The individual interview experiences behind the averages.
+     *
+     * <p>Gated exactly as the category data is: sharing an experience is what buys the detail, and
+     * a reader who has not is shown the count but not the accounts. One gate for the whole tab
+     * rather than a second rule to keep in step with the first.
+     *
+     * <p>Each row carries what identifies an experience - the year, the role, the outcome, the
+     * rounds - and no author, because an interview review has never had one.
+     */
+    public Future<JsonObject> listForCompany(String auth0Id, String companySlug, int limit, int offset) {
+        final int cappedLimit = Math.max(1, Math.min(limit, 50));
+        final int safeOffset  = Math.max(0, offset);
+        return resolveCompanyId(companySlug).compose(companyId ->
+            isInterviewContributor(auth0Id).compose(contributor -> {
+                if (!contributor) {
+                    return Future.succeededFuture(new JsonObject()
+                        .put("data", new JsonArray()).put("gated", true));
+                }
+                return interviewRepo.findByCompany(companyId, cappedLimit, safeOffset).map(rows -> {
+                    JsonArray data = new JsonArray();
+                    for (Row row : rows) {
+                        data.add(new JsonObject()
+                            .put("id",            row.getUUID("id").toString())
+                            .put("overallRating", numberOrNull(row, "overall_rating"))
+                            .put("difficulty",    numberOrNull(row, "difficulty"))
+                            // The per-part scores, so a card can open the way a workplace rating
+                            // does. Already selected by the query; withholding them here just made
+                            // the reader take the average on trust.
+                            .put("categories",    new JsonObject()
+                                .put("communication",        numberOrNull(row, "communication"))
+                                .put("respectForTime",       numberOrNull(row, "respect_for_time"))
+                                .put("roleClarity",          numberOrNull(row, "role_clarity"))
+                                .put("processFairness",      numberOrNull(row, "process_fairness"))
+                                .put("nextStepTransparency", numberOrNull(row, "next_step_transparency"))
+            .put("jobRelevance", numberOrNull(row, "job_relevance"))
+                                .put("jobRelevance", numberOrNull(row, "job_relevance")))
+                            .put("outcome",       row.getString("outcome"))
+                            .put("rounds",        row.getInteger("rounds"))
+                            .put("processLength", row.getString("process_length"))
+                            .put("roleCategory",  row.getString("role_category"))
+                            .put("interviewYear", row.getInteger("interview_year"))
+                            .put("country",       row.getString("country"))
+                            // Null on experiences written before authors existed; those render
+                            // without a byline, exactly as they always did.
+                            .put("author",        row.getString("author"))
+                            .put("createdAt",     row.getOffsetDateTime("created_at").toString())
+                            .put("updatedAt",     row.getOffsetDateTime("updated_at") == null
+                                                  ? null : row.getOffsetDateTime("updated_at").toString()));
+                    }
+                    return new JsonObject()
+                        .put("data", data).put("gated", false)
+                        .put("limit", cappedLimit).put("offset", safeOffset);
+                });
+            }));
+    }
+
     private Future<Long> resolveCompanyId(String companySlug) {
         if (companySlug == null || companySlug.isBlank()) {
             return Future.failedFuture(ServiceException.badRequest("Company is required"));
@@ -357,6 +439,7 @@ public class InterviewService {
             .put("roleClarity",          numberOrNull(row, "role_clarity"))
             .put("processFairness",      numberOrNull(row, "process_fairness"))
             .put("nextStepTransparency", numberOrNull(row, "next_step_transparency"))
+            .put("jobRelevance", numberOrNull(row, "job_relevance"))
             .put("difficulty",           row.getValue("difficulty"))
             .put("outcome",              row.getString("outcome"))
             .put("rounds",               row.getValue("rounds"))

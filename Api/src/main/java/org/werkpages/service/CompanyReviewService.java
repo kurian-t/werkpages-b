@@ -51,8 +51,13 @@ public class CompanyReviewService {
     public Future<JsonObject> submit(String auth0Id, String companySlug, JsonObject body) {
         if (body == null) return Future.failedFuture(ServiceException.badRequest("Missing request body"));
 
+        /*
+          Only the write path may create. Reading a company that does not exist stays a 404 - a
+          rating creates its employer, a page view must not.
+        */
+        String newCompanyName = body.getString("companyName");
         return resolveUser(auth0Id).compose(userId ->
-            resolveCompany(companySlug).compose(company -> {
+            resolveCompany(companySlug, newCompanyName).compose(company -> {
                 long companyId = company.getLong("id");
 
                 Double overall = body.getDouble("overallRating");
@@ -99,7 +104,21 @@ public class CompanyReviewService {
                         "Your end date cannot be before your start date."));
                 }
 
-                return reviewRepo.upsert(companyId, userId, overall, values, from, until)
+                /*
+                  The handle the author picked. Trimmed and capped, and blank means none - an
+                  empty string would put a nameless byline on the rating rather than leaving it
+                  anonymous, which is a different thing.
+                */
+                String author = body.getString("author");
+                if (author != null) {
+                    author = author.trim();
+                    if (author.isEmpty()) author = null;
+                    else if (author.length() > 60) {
+                        return Future.failedFuture(ServiceException.badRequest("That name is too long."));
+                    }
+                }
+
+                return reviewRepo.upsert(companyId, userId, overall, values, from, until, author)
                     .map(CompanyReviewService::reviewToJson);
             }));
     }
@@ -182,6 +201,13 @@ public class CompanyReviewService {
                             // Still employed there, said as a fact rather than a missing field.
                             .put("current",       row.getLocalDate("worked_until") == null)
                             .put("createdAt",     row.getOffsetDateTime("created_at").toString())
+                            // So the card can say "edited 3 days ago" rather than implying the
+                            // rating has said the same thing since the day it was written.
+                            .put("updatedAt",     row.getOffsetDateTime("updated_at") == null
+                                                  ? null : row.getOffsetDateTime("updated_at").toString())
+                            // Null for ratings written before authors existed; the page renders
+                            // those as "Anonymous employee", exactly as it always did.
+                            .put("author",        row.getString("author"))
                             .put("mine",          viewerId != null && viewerId.equals(author)));
                     }
                     return new JsonObject().put("data", data).put("limit", cappedLimit).put("offset", safeOffset);
@@ -203,17 +229,41 @@ public class CompanyReviewService {
     }
 
     /**
-     * A company rating never creates a company, for the same reason an interview review does not:
-     * a company that exists only because somebody claims to have worked there has no anchor at
-     * all, and the directory would fill with them.
+     * The company being rated, created if we do not have it yet.
+     *
+     * <p>This used to refuse: a company that exists only because somebody claims to have worked
+     * there has no anchor, and the directory could fill with them. The refusal was the wrong end
+     * of that trade. Somebody sitting in front of the form has an employer to tell us about, and
+     * answering "we don't have a page for that" turns a contribution into a dead end - the one
+     * moment the person is willing to write something is the worst moment to say no.
+     *
+     * <p>Created as {@code pending_approval}, not {@code ghost}. Ghost means auto-created and
+     * publicly live; a company that exists only because somebody typed its name into a rating form
+     * has not earned the directory yet. It is held for an admin, and every public surface filters
+     * on an allowlist that does not include it, so it stays out of them by construction.
+     *
+     * <p>Lookup is by slug first because that is what the URL carries; a name only appears when
+     * the form sends one for a company the directory does not have.
      */
     private Future<Row> resolveCompany(String slug) {
-        if (slug == null || slug.isBlank()) {
+        return resolveCompany(slug, null);
+    }
+
+    private Future<Row> resolveCompany(String slug, String fallbackName) {
+        boolean haveSlug = slug != null && !slug.isBlank();
+        if (!haveSlug && (fallbackName == null || fallbackName.isBlank())) {
             return Future.failedFuture(ServiceException.badRequest("Company is required"));
         }
-        return companyRepo.findBySlug(slug.trim()).compose(opt -> opt.isEmpty()
-            ? Future.failedFuture(ServiceException.notFound("Company not found"))
-            : Future.succeededFuture(opt.get()));
+        if (!haveSlug) {
+            return companyRepo.findOrCreatePending(fallbackName.trim(), null, null);
+        }
+        return companyRepo.findBySlug(slug.trim()).compose(opt -> {
+            if (opt.isPresent()) return Future.succeededFuture(opt.get());
+            if (fallbackName != null && !fallbackName.isBlank()) {
+                return companyRepo.findOrCreatePending(fallbackName.trim(), null, null);
+            }
+            return Future.failedFuture(ServiceException.notFound("Company not found"));
+        });
     }
 
     private static LocalDate parseDate(String raw) {
@@ -238,6 +288,7 @@ public class CompanyReviewService {
                                     ? null : row.getLocalDate("worked_from").toString());
         LocalDate until = row.getLocalDate("worked_until");
         json.put("workedUntil", until == null ? null : until.toString());
+        json.put("author", row.getString("author"));
         return json;
     }
 

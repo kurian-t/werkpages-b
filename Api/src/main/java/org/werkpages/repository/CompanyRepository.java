@@ -92,11 +92,21 @@ public class CompanyRepository {
                 SELECT c.id, c.name, c.slug, c.logo_url, c.industry,
                        (best.tier <= 4) AS starts_with
                 FROM best
-                -- Never offer a retired company. Selecting one would attach a new manager to a
-                -- company that has been absorbed, which is the one thing a merge is supposed to
-                -- have ended. Its name still finds the survivor, because the merge left that name
-                -- behind as an alias on the target.
-                JOIN companies c ON c.id = best.id AND c.status <> 'merged'
+                -- Never offer a retired or refused company.
+                --
+                -- 'merged': selecting one would attach a new manager to a company that has been
+                -- absorbed, which is the one thing a merge is supposed to have ended. Its name
+                -- still finds the survivor, because the merge left that name behind as an alias.
+                --
+                -- 'rejected': an admin has decided this company does not belong in the directory.
+                -- It stayed suggestible, so the next person to type the name picked it straight
+                -- back out of the list and attached fresh content to it - the rejection could not
+                -- stick, and re-deciding it was the admin's only recourse.
+                --
+                -- 'pending_approval' is deliberately still offered. A second person naming the
+                -- same employer should land on the row that already exists rather than minting a
+                -- duplicate, and their rating is what tells an admin the company is real.
+                JOIN companies c ON c.id = best.id AND c.status NOT IN ('merged', 'rejected')
                 -- LEFT, never INNER: stats decide ordering, never whether a company exists. An
                 -- INNER JOIN here would quietly reinstate "only companies with managers are
                 -- findable", which is the bug this whole change exists to remove.
@@ -160,7 +170,80 @@ public class CompanyRepository {
      * a ghost entry. The logo_url and domain are only written on INSERT; an existing
      * row is touched only to update updated_at so the RETURNING clause is always valid.
      */
+    /**
+     * Creates the company already reviewed, awaiting a person.
+     *
+     * <p>Same lookup-or-insert as {@link #findOrCreate}, but a row this path invents is
+     * {@code pending_approval} rather than {@code ghost}. Ghost means auto-created and publicly
+     * live; a company that exists only because somebody typed its name into a rating form has not
+     * earned that yet, so it is held until an admin looks at it.
+     *
+     * <p>No schema change is needed for the new value - companies.status carries no CHECK
+     * constraint, the same reason V57 could introduce 'merged' - and every public surface filters
+     * on an allowlist of ('approved','ghost'), so a pending company is excluded from all of them
+     * by construction rather than by remembering to exclude it.
+     */
+    /**
+     * Companies invented by a workplace rating and not yet decided on.
+     *
+     * <p>Carries the rating count so an admin can tell a company somebody genuinely worked at from
+     * a typo with one rating behind it.
+     */
+    public Future<RowSet<Row>> findPendingCompaniesForAdmin(int limit, int offset) {
+        return db.preparedQuery("""
+                /*
+                  Everything attached, not just the workplace ratings.
+
+                  A pending company is reachable, so the person who created it can also add a
+                  manager at it and an interview experience for it. Counting only company_reviews
+                  showed "1 rating" for a company that had three different kinds of content behind
+                  it - understating exactly the thing the admin is deciding on.
+                */
+                SELECT c.id, c.name, c.slug, c.domain, c.logo_url, c.created_at,
+                       (SELECT COUNT(*) FROM company_reviews r
+                         WHERE r.company_id = c.id AND r.deleted_at IS NULL) AS rating_count,
+                       (SELECT COUNT(*) FROM managers m
+                         WHERE m.company_id = c.id) AS manager_count,
+                       (SELECT COUNT(*) FROM interview_reviews i
+                         WHERE i.company_id = c.id AND i.deleted_at IS NULL) AS interview_count
+                FROM companies c
+                WHERE c.status = 'pending_approval'
+                ORDER BY c.created_at ASC
+                LIMIT $1 OFFSET $2
+                """)
+            .execute(Tuple.of(limit, offset));
+    }
+
+    public Future<Long> countPendingCompanies() {
+        return db.preparedQuery("SELECT COUNT(*) AS n FROM companies WHERE status = 'pending_approval'")
+            .execute().map(rs -> rs.iterator().next().getLong("n"));
+    }
+
+    /**
+     * Lets a pending company into the directory, or refuses it.
+     *
+     * <p>Approving makes it {@code ghost} - auto-created and live, which is what it now is. There
+     * is deliberately no path back to pending: a decision made is a decision made, and an admin
+     * who changes their mind rejects it instead.
+     */
+    public Future<Boolean> decidePendingCompany(long companyId, boolean approve) {
+        return db.preparedQuery("""
+                UPDATE companies SET status = $2, updated_at = now()
+                WHERE id = $1 AND status = 'pending_approval'
+                """)
+            .execute(Tuple.of(companyId, approve ? "ghost" : "rejected"))
+            .map(rs -> rs.rowCount() > 0);
+    }
+
+    public Future<Row> findOrCreatePending(String name, String domain, String logoUrl) {
+        return findOrCreate(name, domain, logoUrl, "pending_approval");
+    }
+
     public Future<Row> findOrCreate(String name, String domain, String logoUrl) {
+        return findOrCreate(name, domain, logoUrl, "ghost");
+    }
+
+    public Future<Row> findOrCreate(String name, String domain, String logoUrl, String status) {
         // Primary conflict target is the slug index. Two names that produce the same slug
         // (e.g. "Acme Corp" and "Acme Corp.") are treated as the same company.
         //
@@ -172,14 +255,14 @@ public class CompanyRepository {
         // Both cases are resolved by a SELECT that tries name then slug.
         return db.preparedQuery("""
                 INSERT INTO companies (name, domain, logo_url, status, slug, created_at, updated_at)
-                VALUES ($1, $2, $3, 'ghost',
+                VALUES ($1, $2, $3, $4,
                     lower(regexp_replace(regexp_replace(lower(trim($1)), '[^a-z0-9\\s-]', '', 'g'), '\\s+', '-', 'g')),
                     now(), now())
                 ON CONFLICT (slug) DO UPDATE
                     SET updated_at = now()
                 RETURNING *
                 """)
-            .execute(Tuple.of(name.trim(), domain, logoUrl))
+            .execute(Tuple.of(name.trim(), domain, logoUrl, status))
             .map(rows -> rows.iterator().next())
             .recover(err -> {
                 if (err.getMessage() != null && err.getMessage().contains("23505")) {

@@ -79,18 +79,22 @@ public enum SubmissionTier {
                     if (score < ConfidenceRepository.RESTRICTED_BELOW) {
                         return Future.succeededFuture(FLAGGED_USER);
                     }
-                    return challenges.isHighProfile(managerId, fullName, companyId)
+                    /*
+                      The name alone decides it. A listed name at any company is held for an admin
+                      rather than published, because "Steve Jobs at Puma SE" and "Steve Jobs at
+                      Apple" are the same claim and the company was a one-word dodge around it.
+
+                      Held, not penalised: somebody genuinely called Steve Jobs may well work at
+                      Puma, and an admin approving that submission should cost its author nothing.
+                      No confidence event is written here for that reason.
+                    */
+                    return challenges.isHighProfile(managerId, fullName)
                         .compose(listed -> {
                             if (listed) return Future.succeededFuture(HIGH_PROFILE);
                             if (NameValidator.isSuspiciousName(firstName, lastName)) {
                                 return Future.succeededFuture(SUSPICIOUS_NAME);
                             }
-                            // Last: a listed name at a company that is not theirs. Publishes,
-                            // because holding it would challenge every unrelated Tim Cook — but
-                            // the queue is told, because misspelling the company is otherwise a
-                            // one-line dodge.
-                            return challenges.isNameOnlyMatch(fullName, companyId)
-                                .map(nearMiss -> nearMiss ? LIVE_FLAGGED : LIVE);
+                            return Future.succeededFuture(LIVE);
                         });
                 });
             });

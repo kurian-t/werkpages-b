@@ -24,7 +24,7 @@ public class InterviewRepository {
     /** Rating columns, in display order. Overall is separate; difficulty is not a rating. */
     public static final List<String> CATEGORIES = List.of(
         "communication", "respect_for_time", "role_clarity",
-        "process_fairness", "next_step_transparency"
+        "process_fairness", "next_step_transparency", "job_relevance"
     );
 
     private final SqlClient db;
@@ -38,20 +38,24 @@ public class InterviewRepository {
     public Future<Row> create(long companyId, UUID userId, BigDecimal overall,
                               BigDecimal communication, BigDecimal respectForTime,
                               BigDecimal roleClarity, BigDecimal processFairness,
-                              BigDecimal nextStepTransparency, Integer difficulty,
+                              BigDecimal nextStepTransparency, BigDecimal jobRelevance,
+                              Integer difficulty,
                               String outcome, Integer rounds, String processLength,
-                              String roleCategory, String country, String city, int interviewYear) {
+                              String roleCategory, String country, String city, int interviewYear,
+                              String author) {
         return db.preparedQuery("""
                 INSERT INTO interview_reviews
                     (company_id, user_id, overall_rating, communication, respect_for_time,
-                     role_clarity, process_fairness, next_step_transparency, difficulty,
-                     outcome, rounds, process_length, role_category, country, city, interview_year)
-                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
+                     role_clarity, process_fairness, next_step_transparency, job_relevance,
+                     difficulty, outcome, rounds, process_length, role_category, country, city,
+                     interview_year, author)
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
                 RETURNING *
                 """)
             .execute(Tuple.of(companyId, userId, overall, communication, respectForTime,
-                              roleClarity, processFairness, nextStepTransparency, difficulty,
-                              outcome, rounds, processLength, roleCategory, country, city, interviewYear))
+                              roleClarity, processFairness, nextStepTransparency, jobRelevance,
+                              difficulty, outcome, rounds, processLength, roleCategory, country, city, interviewYear,
+                              author))
             .map(rs -> rs.iterator().next());
     }
 
@@ -61,6 +65,31 @@ public class InterviewRepository {
      * <p>The count on {@code interview_reviews.rounds} is maintained by V50's trigger, so it is
      * never written here — the detail is the source of truth and the count follows it.
      */
+    /**
+     * The individual experiences behind the averages, newest first.
+     *
+     * <p>An average alone asks to be taken on trust. The workplace tab already shows the ratings
+     * its average is made of, for exactly that reason; this is the same thing for interviews, where
+     * the spread matters even more - two candidates can meet the same company and come away with
+     * completely different accounts of it.
+     *
+     * <p>Soft-deleted rows are excluded. No author name is selected because interview reviews have
+     * never carried one: the outcome, the year and the role are what identify an experience.
+     */
+    public Future<RowSet<Row>> findByCompany(long companyId, int limit, int offset) {
+        return db.preparedQuery("""
+                SELECT id, user_id, overall_rating, communication, respect_for_time, role_clarity,
+                       process_fairness, next_step_transparency, difficulty, outcome, rounds,
+                       process_length, role_category, interview_year, country, author,
+                       created_at, updated_at
+                FROM interview_reviews
+                WHERE company_id = $1 AND deleted_at IS NULL
+                ORDER BY created_at DESC
+                LIMIT $2 OFFSET $3
+                """)
+            .execute(Tuple.of(companyId, limit, offset));
+    }
+
     public Future<Void> insertRounds(UUID reviewId, List<String> roundTypes) {
         if (roundTypes == null || roundTypes.isEmpty()) return Future.succeededFuture();
 
@@ -193,8 +222,34 @@ public class InterviewRepository {
                        ROUND(AVG(role_clarity)::NUMERIC, 1)            AS role_clarity,
                        ROUND(AVG(process_fairness)::NUMERIC, 1)        AS process_fairness,
                        ROUND(AVG(next_step_transparency)::NUMERIC, 1)  AS next_step_transparency,
+                       ROUND(AVG(job_relevance)::NUMERIC, 1)           AS job_relevance,
                        ROUND(AVG(difficulty)::NUMERIC, 1)              AS difficulty,
-                       PERCENTILE_DISC(0.5) WITHIN GROUP (ORDER BY rounds) AS median_rounds
+                       PERCENTILE_DISC(0.5) WITHIN GROUP (ORDER BY rounds) AS median_rounds,
+                       /*
+                         How long the process usually took.
+
+                         The four answers are ordered - under a week, 1-2 weeks, 2-4 weeks, over a
+                         month - so a median is meaningful: mapped to their rank, the middle answer
+                         taken, then mapped back to the value the form uses. PERCENTILE_DISC returns
+                         an answer somebody actually gave rather than interpolating between two
+                         buckets, which for a categorical scale is the only sensible reading.
+
+                         Median rather than mean for the usual reason: one candidate stuck in a
+                         six-month process should not make the company look slow to everyone else.
+
+                         FILTER excludes rows that left it blank - it is optional on the form, and
+                         counting a blank as the shortest answer would flatter every company.
+                       */
+                       (ARRAY['under_1_week','1_2_weeks','2_4_weeks','over_1_month'])[
+                         PERCENTILE_DISC(0.5) WITHIN GROUP (ORDER BY
+                           CASE process_length
+                             WHEN 'under_1_week' THEN 1
+                             WHEN '1_2_weeks'    THEN 2
+                             WHEN '2_4_weeks'    THEN 3
+                             WHEN 'over_1_month' THEN 4
+                           END)
+                         FILTER (WHERE process_length IS NOT NULL)
+                       ] AS median_process_length
                 FROM interview_reviews
                 WHERE company_id = $1 AND deleted_at IS NULL
                 """)
@@ -304,21 +359,24 @@ public class InterviewRepository {
     public Future<Optional<Row>> update(UUID reviewId, UUID userId, BigDecimal overall,
                                         BigDecimal communication, BigDecimal respectForTime,
                                         BigDecimal roleClarity, BigDecimal processFairness,
-                                        BigDecimal nextStepTransparency, Integer difficulty,
+                                        BigDecimal nextStepTransparency, BigDecimal jobRelevance,
+                                        Integer difficulty,
                                         String outcome, Integer rounds, String processLength,
                                         String roleCategory, String country, String city, int interviewYear) {
         return db.preparedQuery("""
                 UPDATE interview_reviews SET
                     overall_rating = $3, communication = $4, respect_for_time = $5,
                     role_clarity = $6, process_fairness = $7, next_step_transparency = $8,
-                    difficulty = $9, outcome = $10, rounds = $11, process_length = $12,
-                    role_category = $13, country = $14, city = $15, interview_year = $16, updated_at = now()
+                    job_relevance = $9,
+                    difficulty = $10, outcome = $11, rounds = $12, process_length = $13,
+                    role_category = $14, country = $15, city = $16, interview_year = $17, updated_at = now()
                 WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL
                 RETURNING *
                 """)
             .execute(Tuple.of(reviewId, userId, overall, communication, respectForTime,
-                              roleClarity, processFairness, nextStepTransparency, difficulty,
-                              outcome, rounds, processLength, roleCategory, country, city, interviewYear))
+                              roleClarity, processFairness, nextStepTransparency, jobRelevance,
+                              difficulty, outcome, rounds, processLength, roleCategory, country,
+                              city, interviewYear))
             .map(rs -> rs.iterator().hasNext() ? Optional.of(rs.iterator().next()) : Optional.empty());
     }
 

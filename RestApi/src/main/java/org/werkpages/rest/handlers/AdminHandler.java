@@ -283,6 +283,34 @@ public class AdminHandler {
             .onFailure(err -> ManagersHandler.handleError(ctx, err));
     }
 
+    // ── GET /api/admin/companies/pending ─────────────────────────────────────
+
+    /** Companies a workplace rating created, waiting to be let into the directory. */
+    public void handlePendingCompanies(RoutingContext ctx) {
+        String auth0Id = ctx.get("auth0Id");
+        int limit  = parseIntOr(ctx.queryParams().get("limit"), 50);
+        int offset = parseIntOr(ctx.queryParams().get("offset"), 0);
+        service.getPendingCompanies(auth0Id, limit, offset)
+            .onSuccess(json -> ok(ctx, json))
+            .onFailure(err -> ManagersHandler.handleError(ctx, err));
+    }
+
+    // ── POST /api/admin/companies/:companyId/decision ────────────────────────
+
+    public void handleDecidePendingCompany(RoutingContext ctx) {
+        String auth0Id = ctx.get("auth0Id");
+        long companyId;
+        try { companyId = Long.parseLong(ctx.pathParam("companyId")); }
+        catch (NumberFormatException e) { bad(ctx, "Invalid company ID"); return; }
+        JsonObject body = ctx.body().asJsonObject();
+        if (body == null || body.getBoolean("approve") == null) {
+            bad(ctx, "approve is required"); return;
+        }
+        service.decidePendingCompany(auth0Id, companyId, body.getBoolean("approve"))
+            .onSuccess(json -> ok(ctx, json))
+            .onFailure(err -> ManagersHandler.handleError(ctx, err));
+    }
+
     // ── PUT /api/admin/companies/:companyId ──────────────────────────────────
 
     public void handleRenameCompany(RoutingContext ctx) {

@@ -2,6 +2,7 @@ package org.werkpages.integration;
 
 import io.vertx.core.Future;
 import io.vertx.core.json.JsonArray;
+import io.vertx.core.json.JsonObject;
 import io.vertx.pgclient.PgConnectOptions;
 import io.vertx.pgclient.PgPool;
 import io.vertx.sqlclient.Pool;
@@ -22,6 +23,7 @@ import org.testcontainers.containers.PostgreSQLContainer;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
 
+import java.util.List;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.StreamSupport;
 
@@ -309,9 +311,21 @@ class CompanySuggestIntegrationTest {
         insertCompany("Cobalt Systems", "approved"); // starts with "co"
 
         JsonArray results = await(service.suggestCompanies("co"));
+        List<String> names = results.stream()
+            .map(o -> ((JsonObject) o).getString("name")).toList();
 
-        assertEquals(1, results.size());
-        assertEquals("Cobalt Systems", results.getJsonObject(0).getString("name"));
+        /*
+          Both directions, named. This asserted `size() == 1`, which was never a statement about
+          the tiers at all: this class truncates managers and users but not companies, so the count
+          was really a claim about everything else in the table. V64 seeded Coca-Cola - a perfectly
+          good prefix match that the rule says to return - and the assertion broke while the
+          behaviour it was guarding stayed correct.
+
+          What the tiers actually promise is the pair below, and it holds whatever else is seeded.
+        */
+        assertTrue(names.contains("Cobalt Systems"), "a prefix match is exactly what 'co' should find");
+        assertFalse(names.contains("Zeta Cortex"),
+            "containing 'co' mid-name is the tier a two-character query skips");
     }
 
     @Test

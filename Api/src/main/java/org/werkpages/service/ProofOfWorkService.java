@@ -44,6 +44,17 @@ public class ProofOfWorkService {
      *         answers the request with this rather than with the row the INSERT returned, which
      *         predates the hold and would tell the client its rating is live when it is not.
      */
+    /**
+     * Whether this name is on the high-profile list, at any company.
+     *
+     * <p>Used before the one-time ghost slot is spent: a search for a listed name records a pending
+     * row for an admin and costs the searcher nothing, so somebody's single automatic creation is
+     * not burnt on a name that was never going to publish.
+     */
+    public Future<Boolean> isListedName(String fullName) {
+        return challenges.isHighProfile(null, fullName);
+    }
+
     public Future<Row> applyTo(SqlConnection conn, UUID userId, long managerId,
                                UUID reviewId, String firstName, String lastName,
                                Long companyId) {

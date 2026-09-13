@@ -39,7 +39,7 @@ public class CompanyReviewRepository {
 
     private static final String COLUMNS =
         "id, company_id, user_id, overall_rating, " + String.join(", ", CATEGORIES)
-        + ", worked_from, worked_until, created_at, updated_at";
+        + ", worked_from, worked_until, author, created_at, updated_at";
 
     /**
      * Inserts, or replaces this person's existing rating of this company.
@@ -49,7 +49,7 @@ public class CompanyReviewRepository {
      * The unique index is partial on {@code deleted_at}, so this targets it explicitly.
      */
     public Future<Row> upsert(long companyId, UUID userId, double overall, List<Double> categories,
-                              LocalDate workedFrom, LocalDate workedUntil) {
+                              LocalDate workedFrom, LocalDate workedUntil, String author) {
         if (categories.size() != CATEGORIES.size()) {
             return Future.failedFuture(
                 "Expected " + CATEGORIES.size() + " category ratings, got " + categories.size());
@@ -65,18 +65,23 @@ public class CompanyReviewRepository {
         Tuple tuple = Tuple.of(companyId, userId, overall, workedFrom);
         for (Double c : categories) tuple.addDouble(c);
         tuple.addValue(workedUntil);
+        tuple.addValue(author);
 
         return db.preparedQuery("""
-                INSERT INTO company_reviews (company_id, user_id, overall_rating, worked_from, %s, worked_until)
-                VALUES ($1, $2, $3, $4%s, $%d)
+                INSERT INTO company_reviews (company_id, user_id, overall_rating, worked_from, %s, worked_until, author)
+                VALUES ($1, $2, $3, $4%s, $%d, $%d)
                 ON CONFLICT (user_id, company_id) WHERE deleted_at IS NULL
                 DO UPDATE SET overall_rating = EXCLUDED.overall_rating,
                               %s
                               worked_from  = EXCLUDED.worked_from,
                               worked_until = EXCLUDED.worked_until,
+                              -- Kept, not overwritten, when an edit omits it: the handle is the
+                              -- identity a reader already saw on this rating, and silently
+                              -- replacing it on an edit would make one person look like two.
+                              author       = COALESCE(EXCLUDED.author, company_reviews.author),
                               updated_at   = now()
                 RETURNING %s
-                """.formatted(cols, placeholders, 5 + CATEGORIES.size(), updates, COLUMNS))
+                """.formatted(cols, placeholders, 5 + CATEGORIES.size(), 6 + CATEGORIES.size(), updates, COLUMNS))
             .execute(tuple)
             .map(rs -> rs.iterator().next());
     }
