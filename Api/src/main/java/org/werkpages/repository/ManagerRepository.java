@@ -752,12 +752,14 @@ public class ManagerRepository {
                 ROUND(AVG(delegation_style)::NUMERIC, 1) AS delegation_style,
                 ROUND(AVG(perceived_professional_demeanor)::NUMERIC, 1) AS perceived_professional_demeanor,
                 ROUND(AVG(overall_working_experience)::NUMERIC, 1) AS overall_working_experience
-            -- The view, not the table. A held rating must not reach the cached rating or count:
-            -- this is a write path, so a leak here outlives the hold being lifted or the rating
-            -- being rejected. The comment below records the same class of bug happening once
-            -- already, which is why the predicate now lives in one place instead of at each site.
-            FROM published_reviews
-            WHERE manager_id = $1
+            -- Live only. A held rating must not reach the cached rating or count: this is a write
+            -- path, so a leak here outlives the hold being lifted or the rating being rejected. The
+            -- comment below records the same class of bug happening once already, which is why the
+            -- predicate comes from ReviewSql rather than being retyped at each site.
+            FROM reviews r
+            WHERE
+            """ + ReviewSql.live("r") + """
+              AND manager_id = $1
               -- Same filter the review list and count use. Without it the cached reviews_count and
               -- overall_rating kept counting placeholder reviews whose 14-day weight had expired,
               -- while the list below them had already stopped showing those reviews. The number on

@@ -474,11 +474,13 @@ public class ReviewRepository {
     public Future<Row> findMostCurrentReviewForManager(long managerId) {
         return db.preparedQuery("""
                 SELECT id, manager_company, manager_title, worked_from, worked_until
-                -- The view, because this drives the manager's displayed company, title and logo.
+                -- Live only, because this drives the manager's displayed company, title and logo.
                 -- A rating being withheld pending proof must not rewrite what the public profile
                 -- says somebody's current role is.
-                FROM published_reviews
-                WHERE manager_id = $1
+                FROM reviews r
+                WHERE
+                """ + ReviewSql.live("r") + """
+                  AND manager_id = $1
                 ORDER BY
                     CASE WHEN worked_until IS NULL THEN 0 ELSE 1 END,
                     worked_from DESC

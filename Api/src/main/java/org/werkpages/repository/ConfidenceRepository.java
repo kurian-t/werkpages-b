@@ -126,9 +126,11 @@ public class ConfidenceRepository {
     public Future<RowSet<Row>> findReviewsDueStandingCredit(int limit) {
         return db.preparedQuery("""
                 SELECT r.id, r.user_id
-                FROM published_reviews r
+                FROM reviews r
                 JOIN users u ON u.id = r.user_id
-                WHERE r.user_id IS NOT NULL
+                WHERE
+                """ + ReviewSql.live("r") + """
+                  AND r.user_id IS NOT NULL
                   AND r.live_since <= now() - INTERVAL '30 days'
                   AND u.confidence < 79
                   AND NOT EXISTS (

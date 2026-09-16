@@ -10,9 +10,12 @@ import io.vertx.sqlclient.SqlClient;
 import io.vertx.sqlclient.Tuple;
 import org.werkpages.repository.CompanyRepository;
 import org.werkpages.repository.EditRepository;
+import org.werkpages.repository.GeoObservation;
+import org.werkpages.repository.GeoObservationRepository;
 import org.werkpages.repository.ManagerRepository;
 import org.werkpages.repository.ReportRepository;
 import org.werkpages.repository.ReviewRepository;
+import org.werkpages.repository.ReviewSql;
 import org.werkpages.repository.UserRepository;
 
 import java.math.BigDecimal;
@@ -59,6 +62,9 @@ public class ManagerService {
     private final SqlClient                  db; // needed for transactions
     private final Function<String, String>   logoResolver;
     private final ProofOfWorkService         proofOfWork;
+    private final GeoObservationRepository   geoObservations;
+    private final DeclaredLocationResolver   declaredLocations;
+    private final LocationStatsProjector     locationStats;
 
     public ManagerService(ManagerRepository managerRepo, ReviewRepository reviewRepo,
                           UserRepository userRepo, EditRepository editRepo,
@@ -90,6 +96,12 @@ public class ManagerService {
         this.proofOfWork  = new ProofOfWorkService(
             new org.werkpages.repository.ProofChallengeRepository(db),
             new org.werkpages.repository.ConfidenceRepository(db));
+        // Same reasoning as proofOfWork above: stateless, and injecting it would mean threading it
+        // through every overload.
+        this.geoObservations = new GeoObservationRepository(db);
+        this.declaredLocations = new DeclaredLocationResolver(
+            new org.werkpages.repository.CompanyLocationRepository(db));
+        this.locationStats = new LocationStatsProjector();
     }
 
     // ── GET managers list ─────────────────────────────────────────────────────
@@ -768,9 +780,21 @@ public class ManagerService {
 
     // ── CREATE manager ────────────────────────────────────────────────────────
 
-    /** All validation and business logic for POST /api/managers. Returns the created manager row. */
+    /**
+     * For callers with no request behind them — tests, and anything invoking this outside an HTTP
+     * context. Records an empty observation rather than none at all, so the "one row per write"
+     * rule holds regardless of who called.
+     */
     public Future<Row> createManager(String auth0Id, JsonObject body, String resolvedLogoUrl) {
+        return createManager(auth0Id, body, resolvedLogoUrl, SubmissionContext.NONE);
+    }
+
+    /** All validation and business logic for POST /api/managers. Returns the created manager row. */
+    public Future<Row> createManager(String auth0Id, JsonObject body, String resolvedLogoUrl,
+                                     SubmissionContext submission) {
         if (body == null) return Future.failedFuture(ServiceException.badRequest("Missing request body"));
+        final GeoObservation observed = submission.observed();
+        final DeclaredLocation declared = submission.declared();
 
         String name    = toProperNameCase(body.getString("name"));
         String company = body.getString("company") != null ? body.getString("company").trim() : null;
@@ -949,14 +973,22 @@ public class ManagerService {
                                 return managerRepo.generateUniqueSlug(name, company)
                                     .compose(slug ->
                                 ((Pool) db).withTransaction(conn ->
+                                    // Resolved inside the transaction: at exact precision this reads
+                                    // the chosen location row, and it must be the same row the
+                                    // insert below points at.
+                                    declaredLocations.resolve(conn, declared, companyId)
+                                    .compose(loc ->
                                     conn.preparedQuery("""
                                         INSERT INTO managers
                                         (name, company, title, image, bio, status, approval_status, country, state, city, linkedin_url,
-                                         company_logo_url, company_id, slug, overall_rating, reviews_count, category_averages, created_at, submitted_by)
-                                        VALUES ($1,$2,$3,$4,$5,$6,'pending_approval',$7,$8,$9,$10,$11,$12,$13,0,0,'{}'::jsonb,now(),$14)
+                                         company_logo_url, company_id, slug, overall_rating, reviews_count, category_averages, created_at, submitted_by,
+                                         declared_country, declared_state, declared_city, declared_precision, company_location_id)
+                                        VALUES ($1,$2,$3,$4,$5,$6,'pending_approval',$7,$8,$9,$10,$11,$12,$13,0,0,'{}'::jsonb,now(),$14,
+                                                $15,$16,$17,$18,$19)
                                         RETURNING *
                                         """)
-                                        .execute(Tuple.of(name, fCompany, title, image, fBio, fStatus, fCountry, fState, fCity, fLinkedinUrl, resolvedLogoUrl, companyId, slug, userId))
+                                        .execute(Tuple.of(name, fCompany, title, image, fBio, fStatus, fCountry, fState, fCity, fLinkedinUrl, resolvedLogoUrl, companyId, slug, userId,
+                                                          loc.country(), loc.state(), loc.city(), loc.precision(), loc.companyLocationId()))
                                         .compose(managerResult -> {
                                             Row managerRow = managerResult.iterator().next();
                                             long managerId = managerRow.getLong("id");
@@ -1000,9 +1032,16 @@ public class ManagerService {
                                                         return proofOfWork.applyTo(conn, userId, managerId,
                                                             newReviewId, parts[0], parts[1], companyId);
                                                     })
+                                                    // Inside the transaction on purpose: if the
+                                                    // manager does not survive, neither does the
+                                                    // claim that we saw somebody create one.
+                                                    .compose(ignored -> geoObservations.record(
+                                                        conn, GeoObservationRepository.SUBJECT_MANAGER, managerId,
+                                                        GeoObservationRepository.ACTION_CREATE, observed))
                                                     .map(ignored -> managerRow)
                                             );
                                         })
+                                ) // compose(loc ->
                                 ).onSuccess(managerRow -> {
                                     // Pending managers must NOT have a cached rating — recalculate
                                     // runs on admin approval instead (AdminService.approvePendingManager).
@@ -1222,7 +1261,13 @@ public class ManagerService {
 
     // ── CREATE review ─────────────────────────────────────────────────────────
 
+    /** For callers with no request behind them — see the createManager overload above. */
     public Future<Row> createReview(String auth0Id, long managerId, JsonObject body, String resolvedLogoUrl) {
+        return createReview(auth0Id, managerId, body, resolvedLogoUrl, SubmissionContext.NONE);
+    }
+
+    public Future<Row> createReview(String auth0Id, long managerId, JsonObject body, String resolvedLogoUrl,
+                                    SubmissionContext submission) {
         if (body == null) return Future.failedFuture(ServiceException.badRequest("Missing request body"));
 
         return userRepo.findByAuth0IdWithBan(auth0Id)
@@ -1255,7 +1300,7 @@ public class ManagerService {
                         if (draftTokenStr != null && !draftTokenStr.isBlank()) {
                             try { draftToken = UUID.fromString(draftTokenStr); } catch (IllegalArgumentException ignored) {}
                         }
-                        return validateAndInsertReview(body, managerId, userId, author, resolvedLogoUrl, draftToken);
+                        return validateAndInsertReview(body, managerId, userId, author, resolvedLogoUrl, draftToken, submission);
                     });
             });
     }
@@ -1292,7 +1337,15 @@ public class ManagerService {
     }
 
     private Future<Row> validateAndInsertReview(JsonObject body, long managerId, UUID userId, String author, String resolvedLogoUrl, UUID draftToken) {
-        return validateAndInsertReview(body, managerId, userId, author, resolvedLogoUrl, draftToken, false);
+        return validateAndInsertReview(body, managerId, userId, author, resolvedLogoUrl, draftToken, false, SubmissionContext.NONE);
+    }
+
+    private Future<Row> validateAndInsertReview(JsonObject body, long managerId, UUID userId, String author, String resolvedLogoUrl, UUID draftToken, SubmissionContext submission) {
+        return validateAndInsertReview(body, managerId, userId, author, resolvedLogoUrl, draftToken, false, submission);
+    }
+
+    private Future<Row> validateAndInsertReview(JsonObject body, long managerId, UUID userId, String author, String resolvedLogoUrl, UUID draftToken, boolean allowIncomplete) {
+        return validateAndInsertReview(body, managerId, userId, author, resolvedLogoUrl, draftToken, allowIncomplete, SubmissionContext.NONE);
     }
 
     /**
@@ -1302,7 +1355,7 @@ public class ManagerService {
      *                        person never reached that field. Requiring it there threw away exactly
      *                        the submissions the capture exists to save.
      */
-    private Future<Row> validateAndInsertReview(JsonObject body, long managerId, UUID userId, String author, String resolvedLogoUrl, UUID draftToken, boolean allowIncomplete) {
+    private Future<Row> validateAndInsertReview(JsonObject body, long managerId, UUID userId, String author, String resolvedLogoUrl, UUID draftToken, boolean allowIncomplete, SubmissionContext submission) {
         Double overallRating      = body.getDouble("overallRating");
         JsonObject ratings        = body.getJsonObject("ratings");
         String managerCompany     = body.getString("managerCompany") != null ? body.getString("managerCompany").trim() : null;
@@ -1404,7 +1457,7 @@ public class ManagerService {
                 if (managerRoleStart == null) {
                     return insertReviewTransactionally(managerId, userId, author, overallRating,
                             ratings, managerCompany, managerTitle, text,
-                            workedFrom, workedUntil, null, null, resolvedLogoUrl, draftToken);
+                            workedFrom, workedUntil, null, null, resolvedLogoUrl, draftToken, submission);
                 }
                 return reviewRepo.findRolePeriodsForManager(managerId)
                     .compose(allRoleRows -> {
@@ -1425,7 +1478,7 @@ public class ManagerService {
 
                         return insertReviewTransactionally(managerId, userId, author, overallRating,
                                 ratings, managerCompany, managerTitle, text,
-                                workedFrom, workedUntil, managerRoleStart, managerRoleEnd, resolvedLogoUrl, draftToken);
+                                workedFrom, workedUntil, managerRoleStart, managerRoleEnd, resolvedLogoUrl, draftToken, submission);
                     });  // closes allRoleRows compose
             })  // closes existingRows compose
         );  // closes deleteDraftFirst compose
@@ -1436,12 +1489,55 @@ public class ManagerService {
      * company/title/logo if this review is the most current one for that manager.
      * Either both succeed or both roll back — the caller gets a failed Future on error.
      */
+
+    /**
+     * Resolves a declared location for a contribution about a manager.
+     *
+     * <p>A review's company is the manager's company, so the ownership check needs a lookup. Only
+     * performed at exact precision - the coarse rungs have nothing to own.
+     */
+
+    /**
+     * Adds a freshly written opinion to the location read model.
+     *
+     * <p>Reads the company off the manager rather than trusting the request: the projection is
+     * keyed by company, and a contribution filed under the wrong one is invisible to the page that
+     * should show it and inflates a page that should not.
+     */
+    private Future<Void> projectNewReview(SqlClient conn, long managerId, Row reviewRow) {
+        return conn.preparedQuery("SELECT company_id FROM managers WHERE id = $1")
+            .execute(Tuple.of(managerId))
+            .compose(rs -> {
+                var it = rs.iterator();
+                Long companyId = it.hasNext() ? it.next().getLong("company_id") : null;
+                // A manager with no company yet - a pending submission whose company never
+                // resolved - has nothing to project onto. The rebuild will pick it up if one
+                // is attached later.
+                if (companyId == null) return Future.succeededFuture();
+                return locationStats.applyManagerReview(conn,
+                    LocationStatsProjector.ManagerReviewFacts.from(reviewRow, companyId));
+            });
+    }
+
+    private Future<DeclaredLocation> resolveDeclaredForManager(SqlClient conn, DeclaredLocation declared, long managerId) {
+        if (declared == null || declared.isEmpty() || !DeclaredLocation.EXACT.equals(declared.precision())) {
+            return declaredLocations.resolve(conn, declared, null);
+        }
+        return conn.preparedQuery("SELECT company_id FROM managers WHERE id = $1")
+            .execute(Tuple.of(managerId))
+            .compose(rs -> {
+                var it = rs.iterator();
+                Long companyId = it.hasNext() ? it.next().getLong("company_id") : null;
+                return declaredLocations.resolve(conn, declared, companyId);
+            });
+    }
+
     private Future<Row> insertReviewTransactionally(
             long managerId, UUID userId, String author, double overallRating,
             JsonObject ratings, String managerCompany, String managerTitle, String text,
             LocalDate workedFrom, LocalDate workedUntil,
             LocalDate managerRoleStart, LocalDate managerRoleEnd,
-            String resolvedLogoUrl, UUID draftToken) {
+            String resolvedLogoUrl, UUID draftToken, SubmissionContext submission) {
 
         return ((Pool) db).withTransaction(conn -> {
             // Authenticated submit with a token: delete the matching anonymous drop-off draft first.
@@ -1454,7 +1550,9 @@ public class ManagerService {
             // draft_token is stored only on anonymous drop-off inserts; authenticated reviews get null.
             UUID tokenToStore = (userId == null) ? draftToken : null;
 
-            return deleteDraft.compose(v ->
+            return deleteDraft
+                .compose(v -> resolveDeclaredForManager(conn, submission.declared(), managerId))
+                .compose(resolvedDeclared ->
                 conn.preparedQuery("""
                         INSERT INTO reviews (
                             manager_id, user_id, author, overall_rating,
@@ -1463,9 +1561,11 @@ public class ManagerService {
                             organization_and_planning_style, delegation_style, perceived_professional_demeanor,
                             overall_working_experience, manager_company, manager_title, text,
                             worked_from, worked_until, manager_role_start, manager_role_end,
-                            draft_token, verified, helpful_count, created_at, updated_at
+                            draft_token, verified, helpful_count, created_at, updated_at,
+                            declared_country, declared_state, declared_city, declared_precision, company_location_id
                         )
-                        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,true,0,now(),now())
+                        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,true,0,now(),now(),
+                                $23,$24,$25,$26,$27)
                         RETURNING *
                         """)
                     .execute(Tuple.of(
@@ -1474,22 +1574,36 @@ public class ManagerService {
                         getRating(ratings, 3), getRating(ratings, 4), getRating(ratings, 5),
                         getRating(ratings, 6), getRating(ratings, 7), getRating(ratings, 8),
                         getRating(ratings, 9), managerCompany, managerTitle, text,
-                        workedFrom, workedUntil, managerRoleStart, managerRoleEnd, tokenToStore
+                        workedFrom, workedUntil, managerRoleStart, managerRoleEnd, tokenToStore,
+                        resolvedDeclared.country(), resolvedDeclared.state(), resolvedDeclared.city(),
+                        resolvedDeclared.precision(), resolvedDeclared.companyLocationId()
                     ))
-            )
                 .compose(reviewResult -> {
                     Row reviewRow = reviewResult.iterator().next();
                     UUID newId = reviewRow.getUUID("id");
                     // Saved first, questioned second. If this rating is held, the hold lands
                     // inside this transaction, so it is never briefly visible and never opens the
                     // gate for an instant.
-                    return applyProofOfWork(conn, managerId, userId, newId)
+                    //
+                    // The observation rides the same transaction: an opinion that exists without a
+                    // record of where it came from is the gap this table was added to close.
+                    return geoObservations.record(conn, GeoObservationRepository.SUBJECT_REVIEW,
+                                                  newId.toString(), GeoObservationRepository.ACTION_REVIEW, submission.observed())
+                        // The location projection rides the same transaction as the opinion that
+                        // caused it. A count that can drift from its source is worse than no count:
+                        // nobody checks a number that has always been roughly right.
+                        .compose(ignoredObs -> projectNewReview(conn, managerId, reviewRow))
+                        .compose(ignoredProj -> applyProofOfWork(conn, managerId, userId, newId))
                         .compose(afterDecision -> conn.preparedQuery("""
-                            SELECT id, manager_company, manager_title, worked_from, worked_until
+                            SELECT id, manager_company, manager_title, worked_from, worked_until,
+                                   declared_country, declared_state, declared_city,
+                                   declared_precision, company_location_id
                             -- Same reason as ReviewRepository.findMostCurrentReviewForManager:
-                            -- this decides the manager's public company and title.
-                            FROM published_reviews
-                            WHERE manager_id = $1 AND weight = FALSE
+                            -- this decides the manager's public company, title and location.
+                            FROM reviews r
+                            WHERE
+                            """ + ReviewSql.live("r") + """
+                              AND manager_id = $1 AND weight = FALSE
                             ORDER BY
                                 CASE WHEN worked_until IS NULL THEN 0 ELSE 1 END,
                                 worked_from DESC
@@ -1512,6 +1626,25 @@ public class ManagerService {
                             String currentLogo = newId.equals(mostCurrent.getUUID("id"))
                                 ? resolvedLogoUrl
                                 : logoResolver.apply(currentCompany);
+                            /*
+                              Where the manager works now, decided the same way as their company and
+                              title: by whichever opinion is the most current one, not by whichever
+                              arrived last. A rating about a role somebody left in 2019 must not
+                              relocate a manager who is working somewhere else today - which the
+                              ORDER BY above already guarantees, since a role with no end date sorts
+                              ahead of every finished one.
+
+                              An opinion that declared nothing leaves the manager's location alone
+                              rather than clearing it: silence is not a claim that they work nowhere.
+                            */
+                            final DeclaredLocation currentLocation = newId.equals(mostCurrent.getUUID("id"))
+                                ? resolvedDeclared
+                                : new DeclaredLocation(
+                                    mostCurrent.getString("declared_country"),
+                                    mostCurrent.getString("declared_state"),
+                                    mostCurrent.getString("declared_city"),
+                                    mostCurrent.getString("declared_precision"),
+                                    mostCurrent.getLong("company_location_id"));
                             // SELECT first to avoid aborting the transaction with a constraint
                             // violation. ON CONFLICT inside withTransaction leaves the
                             // connection in an aborted state; SAVEPOINT or pre-check avoids it.
@@ -1539,16 +1672,31 @@ public class ManagerService {
                                 })
                                 .compose(cmpResult -> {
                                     long cmpId = cmpResult.iterator().next().getLong("id");
-                                    return conn.preparedQuery(
-                                            "UPDATE managers SET updated_at = now(), company = $1, title = $2, company_logo_url = $3, company_id = $4 WHERE id = $5")
-                                        .execute(Tuple.of(currentCompany, currentTitle, currentLogo, cmpId, managerId));
+                                    if (currentLocation.isEmpty()) {
+                                        return conn.preparedQuery(
+                                                "UPDATE managers SET updated_at = now(), company = $1, title = $2, company_logo_url = $3, company_id = $4 WHERE id = $5")
+                                            .execute(Tuple.of(currentCompany, currentTitle, currentLogo, cmpId, managerId));
+                                    }
+                                    return conn.preparedQuery("""
+                                            UPDATE managers
+                                               SET updated_at = now(), company = $1, title = $2,
+                                                   company_logo_url = $3, company_id = $4,
+                                                   declared_country = $6, declared_state = $7,
+                                                   declared_city = $8, declared_precision = $9,
+                                                   company_location_id = $10
+                                             WHERE id = $5
+                                            """)
+                                        .execute(Tuple.of(currentCompany, currentTitle, currentLogo, cmpId, managerId,
+                                                          currentLocation.country(), currentLocation.state(),
+                                                          currentLocation.city(), currentLocation.precision(),
+                                                          currentLocation.companyLocationId()));
                                 })
                                 // The post-decision row when the rating was held, so the response
                                 // says what the server actually did rather than what the INSERT
                                 // returned a moment earlier.
                                 .map(ignored -> afterDecision != null ? afterDecision : reviewRow);
                         }));
-                });
+                }));
         }).compose(row -> {
             managerRepo.recalculateInBackground(managerId);
             // .compose rather than .onSuccess: a void success handler cannot await, which is how
@@ -2079,7 +2227,7 @@ public class ManagerService {
             /*
               Whether this rating is on the site.
 
-              Additive, and always "live" on any public surface - those read published_reviews, so
+              Additive, and always "live" on any public surface - those filter on ReviewSql.live, so
               a held rating cannot appear there at all. It is only ever anything else on a caller's
               view of their own rating, which is exactly where a client needs to tell "saved" apart
               from "published".
@@ -2300,7 +2448,16 @@ public class ManagerService {
                                            String state, String city,
                                            String resolvedLogoUrl) {
         return findOrCreate(auth0Id, firstName, lastName, title, company, country,
-                            state, city, resolvedLogoUrl, null);
+                            state, city, resolvedLogoUrl, null, SubmissionContext.NONE);
+    }
+
+    public Future<JsonObject> findOrCreate(String auth0Id,
+                                           String firstName, String lastName,
+                                           String title, String company, String country,
+                                           String state, String city,
+                                           String resolvedLogoUrl, Long companyId) {
+        return findOrCreate(auth0Id, firstName, lastName, title, company, country,
+                            state, city, resolvedLogoUrl, companyId, SubmissionContext.NONE);
     }
 
     /**
@@ -2312,7 +2469,9 @@ public class ManagerService {
                                            String firstName, String lastName,
                                            String title, String company, String country,
                                            String state, String city,
-                                           String resolvedLogoUrl, Long companyId) {
+                                           String resolvedLogoUrl, Long companyId,
+                                           SubmissionContext submission) {
+        final GeoObservation observed = submission.observed();
         NameValidator.ValidationResult validation =
             NameValidator.validate(firstName, lastName, title, company, country);
         if (!validation.valid())
@@ -2465,7 +2624,16 @@ public class ManagerService {
                                 trimmedState, trimmedCity, userId, resolvedLogoUrl, companyRow.getLong("id")))
                             .compose(row -> {
                                 long newId = row.getLong("id");
-                                return reviewRepo.createSeedReview(newId, company, title)
+                                // Composed, not transactional — unlike every other path here.
+                                // The ghost flow is a chain of separate writes with a deliberate
+                                // ordering invariant (createAutoApproved before the user's slot is
+                                // marked), and wrapping it in a transaction would restructure that.
+                                // So a failure here surfaces as an error and the recover() below
+                                // releases the slot; it cannot silently vanish.
+                                return geoObservations.record(
+                                        GeoObservationRepository.SUBJECT_MANAGER, String.valueOf(newId),
+                                        GeoObservationRepository.ACTION_SEARCH, observed)
+                                    .compose(obsDone -> reviewRepo.createSeedReview(newId, company, title))
                                     .compose(ignored -> {
                                         managerRepo.recalculateInBackground(newId);
                                         return companyRepo.syncStatsForManager(newId)
@@ -2504,6 +2672,12 @@ public class ManagerService {
      * Returns the existing record if a matching approved/ghost manager already exists.
      */
     public Future<JsonObject> createGhostManager(JsonObject body, String resolvedLogoUrl) {
+        return createGhostManager(body, resolvedLogoUrl, SubmissionContext.NONE);
+    }
+
+    public Future<JsonObject> createGhostManager(JsonObject body, String resolvedLogoUrl,
+                                                 SubmissionContext submission) {
+        final GeoObservation observed = submission.observed();
         if (body == null) return Future.failedFuture(ServiceException.badRequest("Missing request body"));
         String name    = toProperNameCase(body.getString("name"));
         String company = body.getString("company") != null ? body.getString("company").trim() : null;
@@ -2553,7 +2727,13 @@ public class ManagerService {
                     .compose(companyRow -> managerRepo.createCapturedDraft(name, company, title, country, fState, fCity, resolvedLogoUrl, companyRow.getLong("id")))
                     .compose(row -> {
                         long newId = row.getLong("id");
-                        return reviewRepo.createSeedReview(newId, company, title)
+                        // Composed rather than transactional, for the same reason as the /find
+                        // path: this is a chain of separate writes and wrapping it would change
+                        // the capture flow's ordering.
+                        return geoObservations.record(
+                                GeoObservationRepository.SUBJECT_MANAGER, String.valueOf(newId),
+                                GeoObservationRepository.ACTION_CREATE, observed)
+                            .compose(obsDone -> reviewRepo.createSeedReview(newId, company, title))
                             .compose(ignored -> {
                                 managerRepo.recalculateInBackground(newId);
                                 return companyRepo.syncStatsForManager(newId)
@@ -2578,6 +2758,12 @@ public class ManagerService {
      * Returns nothing useful to the caller — the record goes straight to the admin queue.
      */
     public Future<Void> captureAnonymousSearch(JsonObject body, String resolvedLogoUrl) {
+        return captureAnonymousSearch(body, resolvedLogoUrl, SubmissionContext.NONE);
+    }
+
+    public Future<Void> captureAnonymousSearch(JsonObject body, String resolvedLogoUrl,
+                                               SubmissionContext submission) {
+        final GeoObservation observed = submission.observed();
         if (body == null) return Future.failedFuture(ServiceException.badRequest("Missing request body"));
         String name    = toProperNameCase(body.getString("name"));
         String company = body.getString("company") != null ? body.getString("company").trim() : null;
@@ -2621,9 +2807,15 @@ public class ManagerService {
         final String fCompany = company != null ? company : "";
         final String fTitle   = title   != null ? title   : "";
 
-        // If an approved/ghost manager already exists, skip — it's already visible.
-        // If it's already pending (from a prior anonymous capture), skip — don't duplicate.
-        return managerRepo.findCapturedByNameAndCompany(name, fCompany)
+        // Recorded before the branch, and with a null subject: what happened here is that somebody
+        // searched, which is true whether or not it produced a row. Hanging the observation off the
+        // created manager would silently drop every repeat search for a name we already hold —
+        // exactly the searches worth counting.
+        return geoObservations.record(GeoObservationRepository.SUBJECT_SEARCH, null,
+                                      GeoObservationRepository.ACTION_SEARCH, observed)
+            .compose(obsDone -> managerRepo.findCapturedByNameAndCompany(name, fCompany))
+            // If an approved/ghost manager already exists, skip — it's already visible.
+            // If it's already pending (from a prior anonymous capture), skip — don't duplicate.
             .compose(rows -> {
                 if (rows.iterator().hasNext()) return Future.<Void>succeededFuture(); // already exists
                 return companyRepo.resolve(body.getLong("companyId"), fCompany, null, resolvedLogoUrl)
@@ -2639,6 +2831,16 @@ public class ManagerService {
      * Creates a pending_approval manager with an anonymous review — goes to the admin queue.
      */
     public Future<JsonObject> createDropOffDraft(JsonObject body, String resolvedLogoUrl) {
+        return createDropOffDraft(body, resolvedLogoUrl, SubmissionContext.NONE);
+    }
+
+    /**
+     * Records one {@code review} observation, not a {@code manager} one: a drop-off is a captured
+     * rating that happens to need a manager row to hang off. One submission, one observation, keyed
+     * to the thing the person was actually writing.
+     */
+    public Future<JsonObject> createDropOffDraft(JsonObject body, String resolvedLogoUrl,
+                                                 SubmissionContext submission) {
         if (body == null) return Future.failedFuture(ServiceException.badRequest("Missing request body"));
 
         String name    = toProperNameCase(body.getString("name"));
@@ -2710,11 +2912,11 @@ public class ManagerService {
                     // This path was calling the strict overload, so every abandoned review for a
                     // new manager was validated as though it were a finished one, and rejected.
                     if ("ghost".equals(approvalStatus)) {
-                        return validateAndInsertReview(review, existingId, null, fAuthor, resolvedLogoUrl, fDropOffToken, true)
+                        return validateAndInsertReview(review, existingId, null, fAuthor, resolvedLogoUrl, fDropOffToken, true, submission)
                             .compose(ignored -> reviewRepo.scheduleSeedExpiry(existingId))
                             .map(ignored -> new JsonObject().put("id", existingId).put("created", false));
                     } else {
-                        return validateAndInsertReview(review, existingId, null, fAuthor, resolvedLogoUrl, fDropOffToken, true)
+                        return validateAndInsertReview(review, existingId, null, fAuthor, resolvedLogoUrl, fDropOffToken, true, submission)
                             .map(ignored -> new JsonObject().put("id", existingId).put("created", false));
                     }
                 } else {
@@ -2722,7 +2924,7 @@ public class ManagerService {
                         .compose(companyRow -> managerRepo.createPending(name, company, title, fStatus, country, fState, resolvedLogoUrl, companyRow.getLong("id")))
                         .compose(managerRow -> {
                             long managerId = managerRow.getLong("id");
-                            return validateAndInsertReview(review, managerId, null, fAuthor, resolvedLogoUrl, fDropOffToken, true)
+                            return validateAndInsertReview(review, managerId, null, fAuthor, resolvedLogoUrl, fDropOffToken, true, submission)
                                 .map(ignored -> new JsonObject().put("id", managerId).put("created", true))
                                 // The manager row is already committed by the time the review can
                                 // fail, and there is no transaction spanning the two. Rather than

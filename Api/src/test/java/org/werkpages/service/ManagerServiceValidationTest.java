@@ -593,6 +593,28 @@ class ManagerServiceValidationTest {
         when(identityPq.execute(any(Tuple.class))).thenReturn(Future.succeededFuture(noIdentity));
         when(conn.preparedQuery(argThat(s -> s != null && s.contains("SELECT name, company_id FROM managers"))))
             .thenReturn(identityPq);
+
+        // And by the geo observation, which rides the same transaction deliberately: an opinion
+        // that exists with no record of where it came from is the gap that table was added to
+        // close. Stubbed rather than asserted here for the same reason as the tier decision above —
+        // these tests are about review validation, and the observation's own behaviour is covered
+        // in GeoObservationIntegrationTest against a real database.
+        RowSet<Row> noObservation = rowSetOf();
+        PreparedQuery<RowSet<Row>> geoPq = mock(PreparedQuery.class);
+        when(geoPq.execute(any(Tuple.class))).thenReturn(Future.succeededFuture(noObservation));
+        when(conn.preparedQuery(argThat(s -> s != null && s.contains("INSERT INTO geo_observations"))))
+            .thenReturn(geoPq);
+
+        // And by the location projection, which looks up the manager's company before counting the
+        // opinion into each scope of its hierarchy. Empty on purpose: a manager with no company has
+        // nothing to project onto, so the projector returns without touching the stats tables.
+        // Kept out of these tests deliberately - they are about review validation, and the read
+        // model has its own suite in LocationStatsIntegrationTest against a real database.
+        RowSet<Row> noCompany = rowSetOf();
+        PreparedQuery<RowSet<Row>> companyLookupPq = mock(PreparedQuery.class);
+        when(companyLookupPq.execute(any(Tuple.class))).thenReturn(Future.succeededFuture(noCompany));
+        when(conn.preparedQuery(argThat(s -> s != null && s.contains("SELECT company_id FROM managers"))))
+            .thenReturn(companyLookupPq);
     }
 
     private void stubConnCompany(SqlConnection conn) {

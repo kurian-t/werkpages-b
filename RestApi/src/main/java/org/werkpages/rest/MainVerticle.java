@@ -231,15 +231,20 @@ public class MainVerticle extends AbstractVerticle {
                                 .onFailure(err -> System.err.println("⚠ Expired-weight recalculation failed: " + err.getMessage()));
                         });
 
-                        // ── company_stats matview refresh (safety net — primary updates go through
-                        //    updateCompanyStatsForManager/Company on each mutation) ──────────────
+                        // ── company_stats_live reconciliation (safety net — primary updates go
+                        //    through updateCompanyStatsForManager/Company on each mutation) ──────
+                        //
+                        // Not a materialized view. The matview this replaced was dropped in V40;
+                        // company_stats_live is an ordinary table recomputed from source here, and
+                        // calling it a matview in the logs sent more than one person looking for a
+                        // database object that has not existed for thirty migrations.
                         final CompanyRepository companyRepoForScheduler = companyRepo;
                         final AtomicBoolean statsRefreshRunning = new AtomicBoolean(false);
                         vertx.setPeriodic(6 * 3_600_000L, timerId -> {
                             if (statsRefreshRunning.compareAndSet(false, true)) {
                                 companyRepoForScheduler.refreshCompanyStats()
-                                    .onSuccess(v -> System.out.println("✓ company_stats matview refreshed"))
-                                    .onFailure(err -> System.err.println("⚠ company_stats matview refresh failed: " + err.getMessage()))
+                                    .onSuccess(v -> System.out.println("✓ company_stats_live reconciled from source"))
+                                    .onFailure(err -> System.err.println("⚠ company_stats_live reconciliation failed: " + err.getMessage()))
                                     .onComplete(ignored -> statsRefreshRunning.set(false));
                             }
                         });

@@ -10,6 +10,7 @@ import io.vertx.ext.web.client.WebClient;
 import io.vertx.sqlclient.Row;
 import io.vertx.sqlclient.RowSet;
 import org.werkpages.service.ManagerService;
+import org.werkpages.service.SubmissionContext;
 import org.werkpages.service.ServiceException;
 
 import java.util.UUID;
@@ -346,7 +347,7 @@ public class ManagersHandler {
         String company = body != null ? body.getString("company") : null;
         String logoUrl = CompanyLogoUtils.resolveLogoUrl(company);
 
-        service.createManager(auth0Id, body, logoUrl)
+        service.createManager(auth0Id, body, logoUrl, SubmissionContext.of(GeoUtils.observed(ctx), body))
             .onSuccess(row -> {
                 JsonObject response = new JsonObject()
                     .put("id", row.getLong("id"))
@@ -409,7 +410,7 @@ public class ManagersHandler {
         }
         JsonObject body = ctx.getBodyAsJson();
         String resolvedLogoUrl = CompanyLogoUtils.resolveLogoUrl(body != null ? body.getString("managerCompany") : null);
-        service.createReview(auth0Id, managerId, body, resolvedLogoUrl)
+        service.createReview(auth0Id, managerId, body, resolvedLogoUrl, SubmissionContext.of(GeoUtils.observed(ctx), body))
             .onSuccess(row -> {
                 JsonObject ratings = new JsonObject()
                     .put("Communication Style",               row.getBigDecimal("communication_style"))
@@ -601,7 +602,7 @@ public class ManagersHandler {
         GeoUtils.stampGeo(ctx, body);
         String company = body != null ? body.getString("company") : null;
         String logoUrl = CompanyLogoUtils.resolveLogoUrl(company);
-        service.createGhostManager(body, logoUrl)
+        service.createGhostManager(body, logoUrl, SubmissionContext.of(GeoUtils.observed(ctx), body))
             .onSuccess(json -> {
                 int status = Boolean.TRUE.equals(json.getBoolean("created")) ? 201 : 200;
                 ctx.response().setStatusCode(status).putHeader("Content-Type", "application/json").end(json.encode());
@@ -632,7 +633,7 @@ public class ManagersHandler {
         GeoUtils.stampGeo(ctx, body);
         String company = body != null ? body.getString("company") : null;
         String logoUrl = CompanyLogoUtils.resolveLogoUrl(company);
-        service.createDropOffDraft(body, logoUrl)
+        service.createDropOffDraft(body, logoUrl, SubmissionContext.of(GeoUtils.observed(ctx), body))
             .onSuccess(json -> {
                 int status = Boolean.TRUE.equals(json.getBoolean("created")) ? 201 : 200;
                 ctx.response().setStatusCode(status).putHeader("Content-Type", "application/json").end(json.encode());
@@ -648,7 +649,8 @@ public class ManagersHandler {
         GeoUtils.stampGeo(ctx, body);
         String company = body.getString("company");
         String logoUrl = CompanyLogoUtils.resolveLogoUrl(company);
-        service.captureAnonymousSearch(body, logoUrl)
+        service.captureAnonymousSearch(body, logoUrl,
+            SubmissionContext.of(GeoUtils.observed(ctx), body).withoutDeclared())
             .onSuccess(v -> ctx.response().setStatusCode(202).end())
             .onFailure(err -> handleError(ctx, err));
     }
@@ -690,7 +692,9 @@ public class ManagersHandler {
         // Present when the user picked a company from the typeahead rather than typing a name
         // nobody has stored yet. Identity comes from here; `company` is what gets displayed.
         Long companyId = body.getLong("companyId");
-        service.findOrCreate(auth0Id, firstName, lastName, title, company, country, state, city, logoUrl, companyId)
+        service.findOrCreate(auth0Id, firstName, lastName, title, company, country, state, city, logoUrl, companyId,
+                             // A search never declares a location, whatever the body claims.
+                             SubmissionContext.of(GeoUtils.observed(ctx), body).withoutDeclared())
             .onSuccess(json -> {
                 // Back-fill logo on any rows that don't already have one (existing managers)
                 io.vertx.core.json.JsonArray data = json.getJsonArray("data");

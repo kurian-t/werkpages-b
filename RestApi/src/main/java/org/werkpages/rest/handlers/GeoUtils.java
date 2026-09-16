@@ -2,6 +2,7 @@ package org.werkpages.rest.handlers;
 
 import io.vertx.core.json.JsonObject;
 import io.vertx.ext.web.RoutingContext;
+import org.werkpages.repository.GeoObservation;
 
 import java.util.Locale;
 import java.util.Set;
@@ -47,12 +48,25 @@ public final class GeoUtils {
     static String state(RoutingContext ctx)   { return header(ctx, H_REGION); }
     static String city(RoutingContext ctx)    { return header(ctx, H_CITY); }
 
+    /**
+     * What this request appeared to come from, for the private audit trail.
+     *
+     * <p>The one way observed location leaves this class. It is deliberately a distinct type from
+     * anything on a request body: a value that reaches {@code geo_observations} must never also be
+     * able to reach a {@code declared_*} column, and the only thing standing between those two is
+     * that nothing converts between them.
+     */
+    static GeoObservation observed(RoutingContext ctx) {
+        return new GeoObservation(country(ctx), state(ctx), city(ctx));
+    }
+
     /** A {country, state, city} object built purely from the request's Cloudflare headers. */
     static JsonObject geoJson(RoutingContext ctx) {
+        GeoObservation geo = observed(ctx);
         return new JsonObject()
-            .put("country", country(ctx))
-            .put("state",   state(ctx))
-            .put("city",    city(ctx));
+            .put("country", geo.country())
+            .put("state",   geo.region())
+            .put("city",    geo.city());
     }
 
     /**

@@ -256,7 +256,7 @@ public class UserRepository {
     /**
      * Has this person rated a manager? The gate on manager data.
      *
-     * <p>Reads through {@code published_reviews} and asks for {@code gate_eligible} explicitly —
+     * <p>Counts only live, undeleted ratings, and asks for {@code gate_eligible} explicitly —
      * both facts, rather than the absence of the worst one. An earlier form of this query was the
      * whole vulnerability: a bare {@code EXISTS} over {@code reviews} meant any review, on any
      * manager, in any state opened the gate, so a junk rating written in ten seconds bought
@@ -268,8 +268,9 @@ public class UserRepository {
      */
     public Future<Boolean> hasContributed(UUID userId) {
         return db.preparedQuery(
-                "SELECT EXISTS(SELECT 1 FROM published_reviews "
-                + "WHERE user_id = $1 AND gate_eligible = TRUE) AS contributed")
+                "SELECT EXISTS(SELECT 1 FROM reviews r "
+                + "WHERE " + ReviewSql.live("r")
+                + " AND r.user_id = $1 AND r.gate_eligible = TRUE) AS contributed")
             .execute(Tuple.of(userId))
             .map(rows -> rows.iterator().next().getBoolean("contributed"));
     }
