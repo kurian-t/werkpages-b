@@ -1175,6 +1175,92 @@ class AdminServiceIntegrationTest {
             .map(rs -> rs.iterator().next().getLong("id")));
     }
 
+    // ── Slug reclaimed on merge ───────────────────────────────────────────────
+
+    @Test
+    void mergeManagers_survivorReclaimsThePlainSlugTheDuplicateWasHolding() throws Exception {
+        /*
+          The slug is decided once, at INSERT, and nothing recomputed it afterwards.
+
+          generateUniqueSlug falls back to "<name>-<company>" when the plain name slug is already
+          taken, so a second "Poonam Yadav" became poonam-yadav-aditya-birla-group. Merging the two
+          is exactly the act that frees the plain slug - and merge never looked at slugs, so the
+          survivor kept the collision-breaker for ever, on a collision that no longer existed.
+
+          Old links must keep working, so the pre-merge pair is recorded in manager_url_history
+          first; both backends resolve through it.
+        */
+        String adminAuth0 = insertUser("auth0|admin-slug1", "AdminSlug1", "admin");
+
+        // The duplicate holds the plain slug; the survivor wears the collision-breaker that
+        // generateUniqueSlug hands out when the plain one is taken.
+        long mergeId = insertManagerWithSlug("Poonam Yadav", "Aditya Birla Group", "poonam-yadav");
+        long keepId  = insertManagerWithSlug("Poonam Yadav", "Aditya Birla Group",
+                                             "poonam-yadav-aditya-birla-group");
+
+        String keepSlugBefore = slugOf(keepId);
+        assertEquals("poonam-yadav-aditya-birla-group", keepSlugBefore);
+        assertEquals("poonam-yadav", slugOf(mergeId));
+
+        await(service.mergeManagers(adminAuth0, keepId, mergeId));
+
+        assertEquals("poonam-yadav", slugOf(keepId),
+            "the survivor should hold the plain slug once the duplicate no longer needs it");
+
+        // And the URL somebody may already have shared still resolves to the survivor.
+        Long viaHistory = await(pool.preparedQuery(
+                "SELECT manager_id FROM manager_url_history WHERE manager_slug = $1")
+            .execute(Tuple.of(keepSlugBefore))
+            .map(rs -> rs.iterator().hasNext() ? rs.iterator().next().getLong("manager_id") : null));
+        if (!"poonam-yadav".equals(keepSlugBefore)) {
+            assertEquals(keepId, viaHistory, "the old slug must redirect, not 404");
+        }
+    }
+
+    @Test
+    void mergeManagers_doesNotStealASlugAnotherManagerStillHolds() throws Exception {
+        // Reclaiming is only safe when the plain slug is genuinely free. A different person of the
+        // same name keeps theirs, and the survivor keeps the one it had.
+        String adminAuth0 = insertUser("auth0|admin-slug2", "AdminSlug2", "admin");
+
+        long otherPerson = insertManagerWithSlug("Sam Rivera", "Northwind", "sam-rivera");
+        long keepId      = insertManagerWithSlug("Sam Rivera", "Contoso", "sam-rivera-contoso");
+        long mergeId     = insertManagerWithSlug("Sam Rivera", "Contoso", "sam-rivera-contoso-2");
+
+        String otherSlug = slugOf(otherPerson);
+        String keepBefore = slugOf(keepId);
+
+        await(service.mergeManagers(adminAuth0, keepId, mergeId));
+
+        assertEquals(otherSlug, slugOf(otherPerson), "an unrelated manager keeps its slug");
+        assertEquals(keepBefore, slugOf(keepId), "and the survivor does not take it");
+    }
+
+    /** A manager with a known slug at a known company - the collision setup these tests need. */
+    private long insertManagerWithSlug(String name, String company, String slug) throws Exception {
+        Long companyId = await(pool.preparedQuery(
+                "INSERT INTO companies(name,status,slug) VALUES ($1,'approved',$2) "
+                + "ON CONFLICT ((lower(trim(name)))) DO UPDATE SET updated_at = now() RETURNING id")
+            .execute(Tuple.of(company, toSlug(company)))
+            .map(rs -> rs.iterator().next().getLong("id")));
+        return await(pool.preparedQuery(
+            "INSERT INTO managers(name,company,title,image,status,approval_status,overall_rating,"
+            + "reviews_count,category_averages,company_id,slug) "
+            + "VALUES ($1,$2,'Manager','img','active','approved',0,0,'{}',$3,$4) RETURNING id")
+            .execute(Tuple.of(name, company, companyId, slug))
+            .map(rs -> rs.iterator().next().getLong("id")));
+    }
+
+    private static String toSlug(String v) {
+        return v.toLowerCase().replaceAll("[^a-z0-9\\s-]", "").trim().replaceAll("\\s+", "-");
+    }
+
+    private String slugOf(long managerId) throws Exception {
+        return await(pool.preparedQuery("SELECT slug FROM managers WHERE id = $1")
+            .execute(Tuple.of(managerId))
+            .map(rs -> rs.iterator().next().getString("slug")));
+    }
+
     private long insertApprovedManager(String name, String company, String title) throws Exception {
         return await(pool.preparedQuery(
             "INSERT INTO managers(name,company,title,image,status,approval_status,overall_rating,reviews_count,category_averages) " +

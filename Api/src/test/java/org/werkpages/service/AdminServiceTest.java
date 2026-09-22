@@ -605,6 +605,8 @@ class AdminServiceTest {
         when(managerRepo.mergeInto(1L, 2L)).thenReturn(Future.succeededFuture(
             new JsonObject().put("moved", 3).put("parked", 0)));
         when(managerRepo.mergeInlineRecalculate(1L)).thenReturn(Future.succeededFuture());
+        // The merge now asks for the plain slug back once the duplicate is retired.
+        when(managerRepo.reclaimBaseSlug(1L)).thenReturn(Future.succeededFuture(false));
 
         JsonObject result = await(service.mergeManagers(ADMIN_AUTH0_ID, 1L, 2L));
         assertTrue(result.getBoolean("success"));
@@ -626,6 +628,8 @@ class AdminServiceTest {
         when(managerRepo.mergeInto(1L, 3L)).thenReturn(Future.succeededFuture(
             new JsonObject().put("moved", 0).put("parked", 0)));
         when(managerRepo.mergeInlineRecalculate(1L)).thenReturn(Future.succeededFuture());
+        // The merge now asks for the plain slug back once the duplicate is retired.
+        when(managerRepo.reclaimBaseSlug(1L)).thenReturn(Future.succeededFuture(false));
 
         await(service.mergeManagers(ADMIN_AUTH0_ID, 1L, 3L));
 

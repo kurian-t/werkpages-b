@@ -795,6 +795,13 @@ public class AdminService {
                     .compose(v -> doMerge(keepId, mergeId));
             })
             .compose(counts -> managerRepo.mergeInlineRecalculate(keepId).map(v -> counts))
+            /*
+              The duplicate held the plain name slug, or forced the survivor onto a
+              collision-breaker; either way the merge is what frees it. Nothing recomputed slugs
+              before, so survivors kept "<name>-<company>" for ever. Conservative and guarded -
+              see ManagerRepository.reclaimBaseSlug - and the old URL keeps resolving.
+            */
+            .compose(counts -> managerRepo.reclaimBaseSlug(keepId).map(moved -> counts))
             .compose(counts -> {
                 JsonObject ok = new JsonObject().put("success", true).put("keepId", keepId)
                     // Said out loud. A review that could not come across was set aside, not

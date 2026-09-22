@@ -1275,6 +1275,91 @@ public class ManagerRepository {
         });
     }
 
+    /**
+     * Gives a manager back the plain slug for its name, when nothing else holds it any more.
+     *
+     * <p>{@link #generateUniqueSlug} appends the company when the plain name slug is taken, so a
+     * second "Poonam Yadav" becomes {@code poonam-yadav-aditya-birla-group}. The slug is decided
+     * once, at INSERT, and nothing recomputed it - so merging the two, which is precisely the act
+     * that frees the plain slug, left the survivor wearing a collision-breaker for a collision
+     * that no longer existed.
+     *
+     * <p>Called after a merge commits. It is deliberately conservative:
+     *
+     * <ul>
+     *   <li>it does nothing unless the plain slug is genuinely unheld, so a different person of
+     *       the same name keeps theirs;
+     *   <li>it records the outgoing {@code (company_slug, manager_slug)} pair in
+     *       {@code manager_url_history} <em>before</em> moving, so links already shared - and
+     *       anything a search engine indexed - resolve through the history table instead of 404ing.
+     *       Both backends read that table, and {@code managers} is shared between them;
+     *   <li>the UPDATE is guarded on the old slug and tolerates a unique violation, so two merges
+     *       racing for the same freed slug leave one winner rather than an error.
+     * </ul>
+     *
+     * @return true when the slug moved
+     */
+    public Future<Boolean> reclaimBaseSlug(long managerId) {
+        return db.preparedQuery("""
+                SELECT m.name, m.slug, c.slug AS company_slug
+                FROM managers m
+                LEFT JOIN companies c ON c.id = m.company_id
+                WHERE m.id = $1
+                """)
+            .execute(Tuple.of(managerId))
+            .compose(rows -> {
+                if (!rows.iterator().hasNext()) return Future.succeededFuture(false);
+                Row row = rows.iterator().next();
+                String name = row.getString("name");
+                String current = row.getString("slug");
+                if (name == null || current == null) return Future.succeededFuture(false);
+
+                String base = toBaseSlug(name.trim());
+                if (base.isEmpty() || base.equals(current)) return Future.succeededFuture(false);
+
+                String oldCompanySlug = row.getString("company_slug");
+                /*
+                  The duplicate usually IS the holder.
+
+                  A merge retires the absorbed row rather than deleting it, and a retired row keeps
+                  its slug - so the plain slug is still taken by the very manager we just merged
+                  away, and the survivor could never reclaim it. Park that row's slug so it stops
+                  holding the name it no longer represents.
+
+                  Narrow on purpose: only a row whose merged_into points at THIS manager is parked.
+                  A different person of the same name is untouched, and nothing is parked outside
+                  the merge that just happened. The parked row is invisible anyway - every public
+                  surface filters approval_status to approved and ghost.
+                */
+                return releaseSlugFromMergedDuplicate(base, managerId)
+                    .compose(v -> slugAvailable(base))
+                    .compose(free -> {
+                    if (!free) return Future.succeededFuture(false);
+                    Future<Void> history = oldCompanySlug == null
+                        ? Future.succeededFuture()
+                        : recordUrlHistory(managerId, oldCompanySlug, current);
+                    return history.compose(v -> db.preparedQuery(
+                            "UPDATE managers SET slug = $1, updated_at = now() WHERE id = $2 AND slug = $3")
+                        .execute(Tuple.of(base, managerId, current))
+                        .map(res -> res.rowCount() > 0)
+                        // Another merge took the same freed slug between the check and the write.
+                        // Keeping the one we have is the correct outcome, not an error.
+                        .recover(err -> Future.succeededFuture(false)));
+                });
+            });
+    }
+
+    /** Parks the slug of a row merged into {@code survivorId}, so the survivor can take it back. */
+    private Future<Void> releaseSlugFromMergedDuplicate(String slug, long survivorId) {
+        return db.preparedQuery("""
+                UPDATE managers
+                   SET slug = slug || '-merged-' || id, updated_at = now()
+                 WHERE slug = $1 AND merged_into = $2
+                """)
+            .execute(Tuple.of(slug, survivorId))
+            .mapEmpty();
+    }
+
     private Future<Boolean> slugAvailable(String candidate) {
         return db.preparedQuery("SELECT 1 FROM managers WHERE slug = $1 LIMIT 1")
             .execute(Tuple.of(candidate))
