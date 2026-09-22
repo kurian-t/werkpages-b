@@ -87,6 +87,24 @@
 			<version>4.5.0</version>
 			<scope>compile</scope>
 		</dependency>
+		<!--
+		  Reads the location corpus: partitioned Parquet in s3://location-corpus, queried in
+		  process. Embedded - no server, no daemon, no extra infrastructure.
+
+		  It is here rather than the corpus being in Postgres because the corpus is 73.6M rows
+		  and ~13GB, refreshed from Overture on demand. Loading that into the shared production
+		  database would cost roughly 35GB on a 20GB volume and a rebuild window, to hold data
+		  that is reference material rather than our own.
+
+		  Cap memory_limit explicitly wherever this is used: DuckDB claims a large share of
+		  available RAM by default, and this instance also runs RateMyManagers.
+		-->
+		<dependency>
+			<groupId>org.duckdb</groupId>
+			<artifactId>duckdb_jdbc</artifactId>
+			<version>1.5.5.0</version>
+			<scope>compile</scope>
+		</dependency>
 		<!-- ── Test dependencies ──────────────────────────────────────────── -->
 		<dependency>
 			<groupId>org.junit.jupiter</groupId>

@@ -5,6 +5,7 @@ import io.vertx.core.json.JsonArray;
 import io.vertx.core.json.JsonObject;
 import io.vertx.sqlclient.Row;
 import org.werkpages.repository.CompanyRepository;
+import org.werkpages.repository.CapturedDraftRepository;
 import org.werkpages.repository.CompanyReviewRepository;
 import org.werkpages.repository.UserRepository;
 
@@ -32,6 +33,10 @@ public class CompanyReviewService {
     private final CompanyReviewRepository reviewRepo;
     private final CompanyRepository companyRepo;
     private final UserRepository userRepo;
+    /* Stateless, and constructed in place like the other collaborators in this package. */
+    private final CapturedDraftRepository drafts;
+    /* Stateless, and constructed in place like the other collaborators in this package. */
+    private final DeclaredLocationResolver declaredLocations;
 
     public CompanyReviewService(CompanyReviewRepository reviewRepo,
                                 CompanyRepository companyRepo,
@@ -39,6 +44,9 @@ public class CompanyReviewService {
         this.reviewRepo  = reviewRepo;
         this.companyRepo = companyRepo;
         this.userRepo    = userRepo;
+        this.drafts      = new CapturedDraftRepository(reviewRepo.client());
+        this.declaredLocations = new DeclaredLocationResolver(
+            new org.werkpages.repository.CompanyLocationRepository(reviewRepo.client()));
     }
 
     /**
@@ -118,12 +126,81 @@ public class CompanyReviewService {
                     }
                 }
 
-                return reviewRepo.upsert(companyId, userId, overall, values, from, until, author)
+                /*
+                  Where the work happened, resolved against the company being rated.
+
+                  company_reviews has carried the ladder since V68 and nothing wrote to it, so a
+                  workplace rating could only ever be filed against the company as a whole - while
+                  a manager review or an interview at the same company could name the branch. Ten
+                  Walmarts in one city can be ten different places to work, which is the entire
+                  reason the ladder exists.
+
+                  Resolution is what makes an exact pick trustworthy: it rejects a building
+                  belonging to another company, promotes one chosen from the corpus, and derives
+                  the coarse rungs from the location row rather than from whatever the form sent.
+                */
+                final String signedAs = author;
+                return declaredLocations.resolve(reviewRepo.client(),
+                        DeclaredLocation.fromBody(body),
+                        CorpusPlace.fromBody(body), companyId)
+                    .compose(declared ->
+                       reviewRepo.upsert(companyId, userId, overall, values, from, until, signedAs,
+                                         declared))
+                    // The draft this rating came from is finished work now, not a queue item.
+                    // Clearing it here rather than on a schedule means an admin never opens one
+                    // whose author came back a minute later.
+                    .compose(row -> drafts.clear(reviewRepo.client(), parseUuid(body.getString("draftToken")))
+                        .map(v -> row))
+                    /*
+                      The company's read-model row is recomputed as part of this write.
+
+                      company_stats_live carries the workplace average that the tiles and the
+                      listing read, and a projection nothing updates is not a cache - it is a
+                      second source of truth that drifts. syncStatsForCompany awaits the write
+                      and swallows its failure, so a stats problem can never fail somebody's
+                      rating; the reconciler is what catches it if it does.
+                    */
+                    .compose(row -> companyRepo.syncStatsForCompany(companyId).map(v -> row))
                     .map(CompanyReviewService::reviewToJson);
             }));
     }
 
     /** This person's own rating of a company, for pre-filling the form and showing the done state. */
+
+    /**
+     * Keeps a workplace rating somebody assembled but could not submit.
+     *
+     * <p>The form lets an unauthenticated person fill in every answer and then sends them to sign
+     * in. Many do not come back, and until this existed everything they wrote was discarded at
+     * exactly the moment it was complete enough to be worth something — the manager forms had
+     * captured that moment for a long time, and this one silently did not.
+     *
+     * <p>Never published and never aggregated: a draft is one person's unfinished answer, not a
+     * rating. It goes to the admin queue and nowhere else.
+     *
+     * <p>Failure is swallowed by the caller, not here. Capturing is a courtesy to a person who is
+     * already leaving; it must never be the reason a redirect to sign-in does not happen.
+     */
+    public Future<JsonObject> captureDraft(String companySlug, JsonObject body) {
+        if (body == null || body.isEmpty()) {
+            return Future.failedFuture(ServiceException.badRequest("Nothing to capture"));
+        }
+        UUID draftToken = parseUuid(body.getString("draftToken"));
+        return companyRepo.findBySlug(companySlug)
+            .map(opt -> opt.map(row -> row.getLong("id")).orElse(null))
+            .compose(companyId -> drafts.capture(
+                CapturedDraftRepository.COMPANY_RATING, companyId, null, null, draftToken,
+                // The token is stored in its own column; keeping a copy in the payload would let
+                // the two disagree.
+                body.copy().put("companySlug", companySlug))
+                .map(v -> new JsonObject().put("captured", true)));
+    }
+
+    private static UUID parseUuid(String raw) {
+        if (raw == null || raw.isBlank()) return null;
+        try { return UUID.fromString(raw.trim()); } catch (IllegalArgumentException e) { return null; }
+    }
+
     public Future<JsonObject> findMine(String auth0Id, String companySlug) {
         if (auth0Id == null) return Future.succeededFuture(new JsonObject().putNull("review"));
         return resolveUser(auth0Id).compose(userId ->
@@ -136,11 +213,13 @@ public class CompanyReviewService {
     /** Withdraws this person's rating. */
     public Future<JsonObject> delete(String auth0Id, UUID reviewId) {
         return resolveUser(auth0Id).compose(userId ->
-            reviewRepo.softDelete(reviewId, userId).compose(count -> count == 0
+            reviewRepo.softDelete(reviewId, userId).compose(companyId -> companyId.isEmpty()
                 // Ownership and existence are the same answer on purpose: telling someone their
                 // id was real but not theirs confirms it exists.
                 ? Future.failedFuture(ServiceException.notFound("Rating not found"))
-                : Future.succeededFuture(new JsonObject().put("success", true))));
+                // A removed rating changes the company's average, so the read model is told.
+                : companyRepo.syncStatsForCompany(companyId.get())
+                    .map(v -> new JsonObject().put("success", true))));
     }
 
     /**
@@ -170,6 +249,15 @@ public class CompanyReviewService {
      * <p>Anonymous, with one exception: the caller's own rating is marked so the page can show it
      * back to them expanded. That mark is derived from the token, never from anything the client
      * sends, so nobody can ask which rating belongs to somebody else.
+     *
+     * <p><b>Gated on the workplace gate, server-side.</b> Rating a workplace is what buys the
+     * individual accounts, exactly as sharing an interview buys the interview ones - one gate per
+     * dataset, {@code hasRatedCompany}, the same one the tab's figures use.
+     *
+     * <p>This endpoint used to hand every rating to anybody who asked. Nothing leaked visibly,
+     * because the page simply did not mount the list for a locked reader - which is frontend
+     * hiding standing in for access control, and the rows were one devtools tab away the whole
+     * time. The gate belongs here; the page now always renders the section and says it is locked.
      */
     public Future<JsonObject> listFor(String auth0Id, String companySlug, int limit, int offset) {
         int cappedLimit  = Math.min(Math.max(limit, 1), 50);
@@ -181,18 +269,34 @@ public class CompanyReviewService {
 
         return resolveCompany(companySlug).compose(company -> {
             long companyId = company.getLong("id");
-            return viewer.compose(viewerId ->
-                reviewRepo.findByCompany(companyId, cappedLimit, safeOffset).map(rows -> {
+            return viewer.compose(viewerId -> contributedToWorkplaceData(viewerId).compose(unlocked -> {
+                /*
+                  The gate withholds the SCORES, not the ratings themselves.
+
+                  A locked reader gets the real cards - who wrote it, their tenure, when - with
+                  every number stripped out server-side, and the page blurs the space where they
+                  would be. That is what the manager profile does, so the three tabs finally
+                  read the same way, and it is a better ask than an empty column: you can see
+                  that eleven people rated this workplace and that you cannot see what they said.
+
+                  Stripped here rather than hidden there. A blur is a visual effect - the value
+                  would still be in the payload, still readable in devtools - so a withheld
+                  number must never leave the server in the first place.
+                */
+                return reviewRepo.findByCompany(companyId, cappedLimit, safeOffset).map(rows -> {
+                    boolean withholdScores = !unlocked;
                     JsonArray data = new JsonArray();
                     for (Row row : rows) {
                         JsonObject categories = new JsonObject();
-                        for (String c : CompanyReviewRepository.CATEGORIES) {
-                            categories.put(c, numberOrNull(row, c));
+                        if (!withholdScores) {
+                            for (String c : CompanyReviewRepository.CATEGORIES) {
+                                categories.put(c, numberOrNull(row, c));
+                            }
                         }
                         UUID author = row.getUUID("user_id");
                         data.add(new JsonObject()
                             .put("id",            row.getUUID("id").toString())
-                            .put("overallRating", numberOrNull(row, "overall_rating"))
+                            .put("overallRating", withholdScores ? null : numberOrNull(row, "overall_rating"))
                             .put("categories",    categories)
                             .put("workedFrom",    row.getLocalDate("worked_from") == null
                                                   ? null : row.getLocalDate("worked_from").toString())
@@ -210,9 +314,22 @@ public class CompanyReviewService {
                             .put("author",        row.getString("author"))
                             .put("mine",          viewerId != null && viewerId.equals(author)));
                     }
-                    return new JsonObject().put("data", data).put("limit", cappedLimit).put("offset", safeOffset);
-                }));
+                    return new JsonObject().put("data", data).put("gated", withholdScores)
+                        .put("limit", cappedLimit).put("offset", safeOffset);
+                });
+            }));
         });
+    }
+
+    /**
+     * Has this reader earned the workplace detail? Anonymous never has.
+     *
+     * <p>Any company, not this one: the point is that somebody has contributed to the corpus they
+     * are reading, not to the exact page they happen to be on. Same rule as the manager gate.
+     */
+    private Future<Boolean> contributedToWorkplaceData(UUID viewerId) {
+        if (viewerId == null) return Future.succeededFuture(false);
+        return userRepo.hasRatedCompany(viewerId);
     }
 
     // ── helpers ───────────────────────────────────────────────────────────────
@@ -289,6 +406,17 @@ public class CompanyReviewService {
         LocalDate until = row.getLocalDate("worked_until");
         json.put("workedUntil", until == null ? null : until.toString());
         json.put("author", row.getString("author"));
+        /*
+          Handed back so the form opens on the location already filed, the same way it opens on the
+          ratings and the period already given. Editing a rating means changing an answer, and a
+          location field that came back empty over a stored one reads as the answer having been
+          thrown away.
+        */
+        json.put("declaredCountry",   row.getString("declared_country"))
+            .put("declaredState",     row.getString("declared_state"))
+            .put("declaredCity",      row.getString("declared_city"))
+            .put("declaredPrecision", row.getString("declared_precision"))
+            .put("companyLocationId", row.getLong("company_location_id"));
         return json;
     }
 

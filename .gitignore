@@ -68,6 +68,11 @@ target/
 __pycache__/
 *.pyc
 
+# Project venv for the location-corpus scripts. Recreate with:
+#   python3 -m venv .venv-location-corpus
+#   pip install -r scripts/requirements-location-corpus.txt
+.venv-location-corpus/
+
 # Java
 *.class
 *.jar

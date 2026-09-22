@@ -173,7 +173,11 @@ class ProofOfWorkIntegrationTest {
         assertEquals(0, m.getInteger("reviews_count"), "held ratings must not reach the cached count");
         assertNull(m.getBigDecimal("overall_rating"), "nor the cached rating");
 
-        Long visible = await(pool.preparedQuery("SELECT COUNT(*) AS c FROM published_reviews WHERE manager_id = $1")
+        // Was: SELECT ... FROM published_reviews. That view was dropped (V74) once both backends
+        // stopped querying it - it was a SELECT * view, which freezes its column list at creation
+        // and silently hides columns added later. The rule it expressed now lives in application
+        // code as ReviewSql.live(alias); this asserts the same thing with the same predicate.
+        Long visible = await(pool.preparedQuery("SELECT COUNT(*) AS c FROM reviews r WHERE r.manager_id = $1 AND r.disposition = 'live' AND r.deleted_at IS NULL")
             .execute(Tuple.of(mgr)).map(rows -> rows.iterator().next().getLong("c")));
         assertEquals(0L, visible, "nor any public listing");
 
@@ -222,7 +226,7 @@ class ProofOfWorkIntegrationTest {
         insertReview(mgr, user);
         await(pool.query("UPDATE reviews SET deleted_at = now()").execute().mapEmpty());
 
-        Long visible = await(pool.preparedQuery("SELECT COUNT(*) AS c FROM published_reviews WHERE manager_id = $1")
+        Long visible = await(pool.preparedQuery("SELECT COUNT(*) AS c FROM reviews r WHERE r.manager_id = $1 AND r.disposition = 'live' AND r.deleted_at IS NULL")
             .execute(Tuple.of(mgr)).map(rows -> rows.iterator().next().getLong("c")));
         assertEquals(0L, visible);
     }

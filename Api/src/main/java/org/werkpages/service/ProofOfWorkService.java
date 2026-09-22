@@ -29,6 +29,9 @@ public class ProofOfWorkService {
     private final ProofChallengeRepository challenges;
     private final ConfidenceRepository confidence;
 
+    /* Stateless, and constructed in place for the same reason this service itself is. */
+    private final ReviewDisposition disposition = new ReviewDisposition();
+
     public ProofOfWorkService(ProofChallengeRepository challenges, ConfidenceRepository confidence) {
         this.challenges = challenges;
         this.confidence = confidence;
@@ -102,13 +105,12 @@ public class ProofOfWorkService {
                              UUID reviewId, SubmissionTier tier) {
         // RETURNING, so the caller can answer with the rating as it now stands rather than issuing
         // a second query for a row it just wrote.
-        return conn.preparedQuery("""
-                UPDATE reviews
-                SET disposition = 'held', gate_eligible = FALSE, live_since = NULL
-                WHERE id = $1
-                RETURNING *
-                """)
-            .execute(Tuple.of(reviewId))
+        // Through ReviewDisposition, which owns the companion columns and moves the rating out of
+        // the location figures in the same transaction. Held means withheld from the public, and a
+        // rating the page will not show must not be counted in the numbers beside it.
+        return disposition.set(conn, reviewId, ReviewDisposition.HELD)
+            .compose(v -> conn.preparedQuery("SELECT * FROM reviews WHERE id = $1")
+                .execute(Tuple.of(reviewId)))
             .compose(updated -> conn.preparedQuery("""
                     INSERT INTO manager_proof_challenges (user_id, manager_id, review_id, reason)
                     VALUES ($1, $2, $3, $4)

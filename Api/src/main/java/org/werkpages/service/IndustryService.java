@@ -92,7 +92,19 @@ public class IndustryService {
                         .put("slug",         row.getString("slug"))
                         .put("managerCount", row.getLong("manager_count"))
                         .put("totalReviews", row.getLong("total_reviews"))
-                        .put("avgRating",    row.getBigDecimal("avg_rating"));
+                        .put("avgRating",    row.getBigDecimal("avg_rating"))
+                        /*
+                          All three datasets, named for what they are.
+
+                          One bare "avgRating" on a tile reads as a verdict on the company; it is
+                          the mean of its managers' ratings and says nothing about working there
+                          or interviewing there, both of which are separately rated. The tile can
+                          only say so if it is sent all three.
+                        */
+                        .put("workplaceCount",  row.getLong("workplace_count"))
+                        .put("workplaceRating", row.getBigDecimal("workplace_avg_rating"))
+                        .put("interviewCount",  row.getLong("interview_count"))
+                        .put("interviewRating", row.getBigDecimal("interview_avg_rating"));
                     if (logoUrl != null && !logoUrl.isBlank()) co.put("logoUrl", logoUrl);
                     companies.add(co);
                 }
@@ -103,6 +115,17 @@ public class IndustryService {
                     .put("managerCount",     statsOpt.map(r -> r.getLong("manager_count")).orElse(0L))
                     .put("totalReviews",     statsOpt.map(r -> r.getLong("total_reviews")).orElse(0L))
                     .put("avgRating",        statsOpt.map(r -> r.getBigDecimal("avg_rating")).orElse(null))
+                    /*
+                      The same industry, rated as a place to work and as a place to interview.
+
+                      Three separate datasets, three separate averages. The page used to present
+                      the manager average alone under the label "industry rating", which reads as
+                      a summary of everything known about the industry and is not one.
+                    */
+                    .put("workplaceCount",   statsOpt.map(r -> r.getLong("workplace_count")).orElse(0L))
+                    .put("workplaceRating",  statsOpt.map(r -> r.getBigDecimal("workplace_avg_rating")).orElse(null))
+                    .put("interviewCount",   statsOpt.map(r -> r.getLong("interview_count")).orElse(0L))
+                    .put("interviewRating",  statsOpt.map(r -> r.getBigDecimal("interview_avg_rating")).orElse(null))
                     .put("categoryAverages", aggregateCategoryAverages(catRows))
                     .put("companies",        companies);
                 return result;

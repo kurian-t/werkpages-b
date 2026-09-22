@@ -6,6 +6,8 @@ import io.vertx.sqlclient.RowSet;
 import io.vertx.sqlclient.SqlClient;
 import io.vertx.sqlclient.Tuple;
 
+import org.werkpages.service.DeclaredLocation;
+
 import java.time.LocalDate;
 import java.util.List;
 import java.util.Optional;
@@ -33,13 +35,28 @@ public class CompanyReviewRepository {
 
     private final SqlClient db;
 
+    /**
+     * The client this repository was built on.
+     *
+     * <p>Exposed so a service can construct a sibling repository on the same connection rather than
+     * having one threaded through every constructor overload — the convention this package already
+     * follows for stateless collaborators.
+     */
+    public SqlClient client() { return db; }
+
     public CompanyReviewRepository(SqlClient db) {
         this.db = db;
     }
 
+    /*
+      The declared ladder is read back as well as written, because the form opens on what is
+      already stored: a rating being edited has to show the location it was filed against, and a
+      field that comes back empty over a stored answer reads as data loss.
+    */
     private static final String COLUMNS =
         "id, company_id, user_id, overall_rating, " + String.join(", ", CATEGORIES)
-        + ", worked_from, worked_until, author, created_at, updated_at";
+        + ", worked_from, worked_until, author, created_at, updated_at, "
+        + "declared_country, declared_state, declared_city, declared_precision, company_location_id";
 
     /**
      * Inserts, or replaces this person's existing rating of this company.
@@ -49,7 +66,8 @@ public class CompanyReviewRepository {
      * The unique index is partial on {@code deleted_at}, so this targets it explicitly.
      */
     public Future<Row> upsert(long companyId, UUID userId, double overall, List<Double> categories,
-                              LocalDate workedFrom, LocalDate workedUntil, String author) {
+                              LocalDate workedFrom, LocalDate workedUntil, String author,
+                              DeclaredLocation declared) {
         if (categories.size() != CATEGORIES.size()) {
             return Future.failedFuture(
                 "Expected " + CATEGORIES.size() + " category ratings, got " + categories.size());
@@ -62,14 +80,31 @@ public class CompanyReviewRepository {
             updates.append(CATEGORIES.get(i)).append(" = EXCLUDED.").append(CATEGORIES.get(i)).append(", ");
         }
 
+        DeclaredLocation loc = declared == null ? DeclaredLocation.NONE : declared;
+
         Tuple tuple = Tuple.of(companyId, userId, overall, workedFrom);
         for (Double c : categories) tuple.addDouble(c);
         tuple.addValue(workedUntil);
         tuple.addValue(author);
+        tuple.addValue(loc.country());
+        tuple.addValue(loc.state());
+        tuple.addValue(loc.city());
+        tuple.addValue(loc.precision());
+        tuple.addValue(loc.companyLocationId());
+
+        int workedUntilParam = 5 + CATEGORIES.size();
+        int authorParam      = workedUntilParam + 1;
+        int countryParam     = authorParam + 1;
+        int stateParam       = countryParam + 1;
+        int cityParam        = stateParam + 1;
+        int precisionParam   = cityParam + 1;
+        int locationIdParam  = precisionParam + 1;
 
         return db.preparedQuery("""
-                INSERT INTO company_reviews (company_id, user_id, overall_rating, worked_from, %s, worked_until, author)
-                VALUES ($1, $2, $3, $4%s, $%d, $%d)
+                INSERT INTO company_reviews (company_id, user_id, overall_rating, worked_from, %s, worked_until, author,
+                                             declared_country, declared_state, declared_city,
+                                             declared_precision, company_location_id)
+                VALUES ($1, $2, $3, $4%s, $%d, $%d, $%d, $%d, $%d, $%d, $%d)
                 ON CONFLICT (user_id, company_id) WHERE deleted_at IS NULL
                 DO UPDATE SET overall_rating = EXCLUDED.overall_rating,
                               %s
@@ -79,9 +114,28 @@ public class CompanyReviewRepository {
                               -- identity a reader already saw on this rating, and silently
                               -- replacing it on an edit would make one person look like two.
                               author       = COALESCE(EXCLUDED.author, company_reviews.author),
+                              -- All five move together, or none of them do.
+                              --
+                              -- Not COALESCE per column: coarsening an exact pick to a city sends
+                              -- a precision with no location id, and keeping the old id column by
+                              -- column would leave a row claiming 'city' while still pointing at a
+                              -- building. A submission that declares nothing keeps what is stored,
+                              -- so an older client cannot silently erase a location it never knew
+                              -- to send.
+                              declared_country    = CASE WHEN EXCLUDED.declared_precision IS NULL
+                                                    THEN company_reviews.declared_country    ELSE EXCLUDED.declared_country    END,
+                              declared_state      = CASE WHEN EXCLUDED.declared_precision IS NULL
+                                                    THEN company_reviews.declared_state      ELSE EXCLUDED.declared_state      END,
+                              declared_city       = CASE WHEN EXCLUDED.declared_precision IS NULL
+                                                    THEN company_reviews.declared_city       ELSE EXCLUDED.declared_city       END,
+                              company_location_id = CASE WHEN EXCLUDED.declared_precision IS NULL
+                                                    THEN company_reviews.company_location_id ELSE EXCLUDED.company_location_id END,
+                              declared_precision  = COALESCE(EXCLUDED.declared_precision, company_reviews.declared_precision),
                               updated_at   = now()
                 RETURNING %s
-                """.formatted(cols, placeholders, 5 + CATEGORIES.size(), 6 + CATEGORIES.size(), updates, COLUMNS))
+                """.formatted(cols, placeholders, workedUntilParam, authorParam,
+                              countryParam, stateParam, cityParam, precisionParam, locationIdParam,
+                              updates, COLUMNS))
             .execute(tuple)
             .map(rs -> rs.iterator().next());
     }
@@ -147,12 +201,25 @@ public class CompanyReviewRepository {
      * <p>Scoped by user as well as id so the query itself enforces ownership — the service checks
      * too, and neither is a substitute for the other.
      */
-    public Future<Integer> softDelete(UUID reviewId, UUID userId) {
+    /**
+     * Soft-deletes one person's rating, returning the company it belonged to.
+     *
+     * <p>The company id is what the caller needs: removing a rating changes that company's
+     * averages, and the read model has to be told which row to recompute. It used to return only
+     * a row count, so a delete left {@code company_stats_live} reporting a rating that no longer
+     * existed until something unrelated happened to touch the same company.
+     *
+     * <p>Empty means nothing was deleted - either no such rating, or not this person's.
+     */
+    public Future<Optional<Long>> softDelete(UUID reviewId, UUID userId) {
         return db.preparedQuery(
                 "UPDATE company_reviews SET deleted_at = now(), updated_at = now() "
-                + "WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL")
+                + "WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL "
+                + "RETURNING company_id")
             .execute(Tuple.of(reviewId, userId))
-            .map(RowSet::rowCount);
+            .map(rs -> rs.iterator().hasNext()
+                ? Optional.of(rs.iterator().next().getLong("company_id"))
+                : Optional.empty());
     }
 
     /**

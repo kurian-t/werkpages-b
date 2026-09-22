@@ -257,6 +257,29 @@ public class ManagersHandler {
             .onFailure(err -> handleError(ctx, err));
     }
 
+    // ── GET /api/company-locations/suggest ────────────────────────────────────
+
+    /**
+     * Places for a company: its buildings, and geography already confirmed for it.
+     *
+     * <p>Public, because the add and rate forms use it before anybody has signed in — the same
+     * reason company suggestions are public.
+     */
+    public void handleSuggestCompanyLocations(RoutingContext ctx) {
+        String q       = ctx.queryParam("q").stream().findFirst().orElse(null);
+        String country = ctx.queryParam("country").stream().findFirst().orElse(null);
+        String state   = ctx.queryParam("state").stream().findFirst().orElse(null);
+        Long companyId = null;
+        String rawId   = ctx.queryParam("companyId").stream().findFirst().orElse(null);
+        if (rawId != null && !rawId.isBlank()) {
+            try { companyId = Long.parseLong(rawId); } catch (NumberFormatException ignored) {}
+        }
+        String company = ctx.queryParam("company").stream().findFirst().orElse(null);
+        service.suggestCompanyLocations(companyId, company, q, country, state)
+            .onSuccess(arr -> ctx.response().putHeader("Content-Type", "application/json").end(arr.encode()))
+            .onFailure(err -> handleError(ctx, err));
+    }
+
     public void handleSuggestCompanies(RoutingContext ctx) {
         String query = ctx.queryParam("query").stream().findFirst().orElse("").trim();
         if (query.isBlank()) {
@@ -318,6 +341,13 @@ public class ManagersHandler {
                         .put("id", row.getLong("id"))
                         .put("name", row.getString("name"))
                         .put("company", co)
+                        /*
+                          The company row, not just its label. A company page decides which of
+                          these tiles belong to it, and deciding that on the name would put a
+                          submission filed as "Revvity Inc." on no page at all - or on the wrong
+                          one. The identity travels with the tile.
+                        */
+                        .put("companyId", row.getLong("company_id"))
                         .put("title", row.getString("title"))
                         .put("image", row.getString("image"))
                         .put("overallRating", row.getBigDecimal("overall_rating"))
@@ -602,7 +632,9 @@ public class ManagersHandler {
         GeoUtils.stampGeo(ctx, body);
         String company = body != null ? body.getString("company") : null;
         String logoUrl = CompanyLogoUtils.resolveLogoUrl(company);
-        service.createGhostManager(body, logoUrl, SubmissionContext.of(GeoUtils.observed(ctx), body))
+        service.createGhostManager(body, logoUrl,
+                                   SubmissionContext.of(GeoUtils.observed(ctx), body,
+                                                        RateLimitHandler.clientIpOf(ctx)))
             .onSuccess(json -> {
                 int status = Boolean.TRUE.equals(json.getBoolean("created")) ? 201 : 200;
                 ctx.response().setStatusCode(status).putHeader("Content-Type", "application/json").end(json.encode());

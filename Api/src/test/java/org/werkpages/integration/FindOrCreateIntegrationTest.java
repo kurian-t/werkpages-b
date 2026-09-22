@@ -361,6 +361,173 @@ class FindOrCreateIntegrationTest {
             .map(rs -> rs.iterator().next().getBoolean("has_auto_created_manager")));
     }
 
+
+    // ── Company identity, and names that nearly match ─────────────────────────
+
+    /*
+      Reported from the running site: somebody searched "Daniel Pa" at
+      "Revvity Chemagen Technologie" and got nothing, while Daniel Perovic was on file at
+      "Revvity" - the same employer under the name its subsidiary is recorded as.
+
+      Two independent failures produced that, and both are covered here.
+
+        1. The company half matched on TEXT. "Revvity" does not contain
+           "Revvity Chemagen Technologie", so a manager at the child was invisible to a search
+           of the parent no matter how the name was spelled.
+
+        2. The name half accepted only an exact, case-insensitive match on the whole string, which
+           made the search that preceded it decorative - anything it returned was discarded unless
+           the reader had typed the manager's name character for character.
+
+      The cost was not merely an empty result. A logged-in searcher who matches nothing goes on to
+      CREATE, so that search minted a second Daniel at the same employer.
+    */
+
+    @Test
+    void searchingAParentSurfacesAManagerAtItsChild() throws Exception {
+        String auth0Id = insertUser("auth0|hier-1", "hier1");
+        long parent = insertCompanyRow("ParentCo Holdings", "parentco-holdings");
+        long child  = insertCompanyRow("ChildCo Labs", "childco-labs");
+        relate(child, parent);
+        insertManagerAt(child, "Daniel Perovic", "Engineering Manager");
+
+        JsonObject result = await(service.findOrCreate(
+            auth0Id, "Daniel", "Perovic", "Engineering Manager", "ParentCo Holdings",
+            "CA", null, null, null, parent));
+
+        assertFalse(result.getBoolean("created"), "he already exists - nothing should be created");
+        JsonArray data = result.getJsonArray("data");
+        assertEquals(1, data.size(), "the child's manager is in the parent's scope");
+        assertEquals("Daniel Perovic", data.getJsonObject(0).getString("name"));
+    }
+
+    @Test
+    void searchingASiblingDoesNotSurfaceTheOtherChildsManager() throws Exception {
+        /*
+          The test that proves we traverse DOWNWARD from the company that was selected rather than
+          treating the whole connected tree as one pool. Daniel works at ChildCo; somebody
+          searching SiblingCo must not find him, and must not be told he is theirs.
+        */
+        String auth0Id = insertUser("auth0|hier-2", "hier2");
+        long parent  = insertCompanyRow("ParentCo Holdings", "parentco-holdings");
+        long child   = insertCompanyRow("ChildCo Labs", "childco-labs");
+        long sibling = insertCompanyRow("SiblingCo Works", "siblingco-works");
+        relate(child, parent);
+        relate(sibling, parent);
+        insertManagerAt(child, "Daniel Perovic", "Engineering Manager");
+
+        JsonObject result = await(service.findOrCreate(
+            auth0Id, "Daniel", "Perovic", "Engineering Manager", "SiblingCo Works",
+            "CA", null, null, null, sibling));
+
+        for (int i = 0; i < result.getJsonArray("data").size(); i++) {
+            assertNotEquals("ChildCo Labs",
+                result.getJsonArray("data").getJsonObject(i).getString("company"),
+                "a sibling's managers are not in this company's scope");
+        }
+    }
+
+    @Test
+    void aPartialSurnameSurfacesTheManagerRatherThanCreatingASecondOne() throws Exception {
+        /*
+          The reported case, in miniature. "Daniel Pa" is not a prefix of "Perovic" - it is two
+          letters that merely share an initial - so this is the threshold the design deliberately
+          tolerates: surface a candidate, let the reader decide, and above all do not create.
+        */
+        String auth0Id = insertUser("auth0|hier-3", "hier3");
+        long parent = insertCompanyRow("ParentCo Holdings", "parentco-holdings");
+        long child  = insertCompanyRow("ChildCo Labs", "childco-labs");
+        relate(child, parent);
+        insertManagerAt(child, "Daniel Perovic", "Engineering Manager");
+        long before = managerCount();
+
+        JsonObject result = await(service.findOrCreate(
+            auth0Id, "Daniel", "Pa", "Engineering Manager", "ParentCo Holdings",
+            "CA", null, null, null, parent));
+
+        assertFalse(result.getBoolean("created"));
+        assertTrue(result.getBoolean("candidates", false),
+            "surfaced as a candidate, not asserted to be the same person");
+        assertEquals("Daniel Perovic",
+            result.getJsonArray("data").getJsonObject(0).getString("name"));
+        assertEquals(before, managerCount(), "and no second Daniel was minted");
+        assertFalse(ghostSlotClaimed(findUserId(auth0Id)),
+            "showing somebody who already exists must not spend the one-time ghost slot");
+    }
+
+    @Test
+    void aDifferentFirstNameIsNotACandidate() throws Exception {
+        // The rule is anchored on the first name. Without that anchor a two-letter surname
+        // fragment would drag in every manager at the company.
+        String auth0Id = insertUser("auth0|hier-4", "hier4");
+        long parent = insertCompanyRow("ParentCo Holdings", "parentco-holdings");
+        long child  = insertCompanyRow("ChildCo Labs", "childco-labs");
+        relate(child, parent);
+        insertManagerAt(child, "Daniel Perovic", "Engineering Manager");
+
+        JsonObject result = await(service.findOrCreate(
+            auth0Id, "Xavier", "Pa", "Engineering Manager", "ParentCo Holdings",
+            "CA", null, null, null, parent));
+
+        for (int i = 0; i < result.getJsonArray("data").size(); i++) {
+            assertNotEquals("Daniel Perovic",
+                result.getJsonArray("data").getJsonObject(i).getString("name"));
+        }
+    }
+
+    @Test
+    void aGenuinelyNewManagerStillBecomesAGhost() throws Exception {
+        /*
+          The behaviour the candidate branch must not have cost anybody: fall through every match
+          with an unspent slot and the manager is still created, live and clickable. This is the
+          invariant in CLAUDE.md section 15 and the corpus's ghost flow.
+        */
+        String auth0Id = insertUser("auth0|hier-5", "hier5");
+        long parent = insertCompanyRow("ParentCo Holdings", "parentco-holdings");
+        long child  = insertCompanyRow("ChildCo Labs", "childco-labs");
+        relate(child, parent);
+        insertManagerAt(child, "Daniel Perovic", "Engineering Manager");
+
+        JsonObject result = await(service.findOrCreate(
+            auth0Id, "Marguerite", "Ashworth", "Director", "ParentCo Holdings",
+            "CA", null, null, null, parent));
+
+        assertTrue(result.getBoolean("created"), "nobody close by, so it is created");
+        assertEquals("ghost", result.getJsonArray("data").getJsonObject(0).getString("approvalStatus"));
+        assertTrue(ghostSlotClaimed(findUserId(auth0Id)), "and that one does spend the slot");
+    }
+
+    // ── helpers for the hierarchy cases ───────────────────────────────────────
+
+    private long insertCompanyRow(String name, String slug) throws Exception {
+        return await(pool.preparedQuery(
+                "INSERT INTO companies(name, slug, status) VALUES ($1,$2,'approved') RETURNING id")
+            .execute(Tuple.of(name, slug))
+            .map(rs -> rs.iterator().next().getLong("id")));
+    }
+
+    private void relate(long childId, long parentId) throws Exception {
+        await(pool.preparedQuery(
+                "INSERT INTO company_relationships(child_company_id, parent_company_id, relationship_type) "
+                + "VALUES ($1,$2,'SUBSIDIARY_OF')")
+            .execute(Tuple.of(childId, parentId)).mapEmpty());
+    }
+
+    private void insertManagerAt(long companyId, String name, String title) throws Exception {
+        await(pool.preparedQuery("""
+                INSERT INTO managers(name, title, company, company_id, status, approval_status, slug)
+                SELECT $1, $2, c.name, c.id, 'active', 'approved',
+                       lower(regexp_replace($1, '[^a-zA-Z0-9]+', '-', 'g')) || '-' || c.id
+                FROM companies c WHERE c.id = $3
+                """)
+            .execute(Tuple.of(name, title, companyId)).mapEmpty());
+    }
+
+    private long managerCount() throws Exception {
+        return await(pool.query("SELECT COUNT(*) AS c FROM managers")
+            .execute().map(rs -> rs.iterator().next().getLong("c")));
+    }
+
     private String insertUser(String auth0Id, String username) throws Exception {
         await(pool.preparedQuery(
             "INSERT INTO users(auth0_id, email, username, first_name, last_name, role) " +

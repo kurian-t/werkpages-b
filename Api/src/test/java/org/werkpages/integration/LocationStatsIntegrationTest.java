@@ -30,6 +30,7 @@ import org.werkpages.service.SubmissionContext;
 
 import java.math.BigDecimal;
 import java.util.List;
+import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -232,6 +233,96 @@ class LocationStatsIntegrationTest {
         // And a rebuild is the repair.
         await(rebuilder.rebuildManagerStats());
         assertTrue(await(rebuilder.reconcile()).isEmpty(), "a rebuild must put it right");
+    }
+
+
+    // ── Leaving and re-entering the projection ────────────────────────────────
+
+    /*
+      The rebuild defines what belongs in the read model:
+
+          disposition = 'live' AND deleted_at IS NULL AND weight = FALSE AND company_id IS NOT NULL
+
+      Every way a review crosses that line has to move its contribution with it, or the live table
+      and a rebuild disagree - which is the failure that makes a derived table frightening. Only
+      creation maintained it; the other four transitions did not, so reconcile() is the assertion
+      throughout: it compares the projection against the source and is the same check that runs in
+      production.
+    */
+
+    @Test
+    void deletingARatingTakesItOutOfTheProjection() throws Exception {
+        long companyId = insertCompany("Walmart");
+        long managerId = ghost("Deb Deleted", companyId);
+        rate("auth0|del", managerId, cityLevel("Canada", "Ontario", "Toronto"));
+
+        await(service.deleteReview("auth0|del", managerId, ownReviewId("auth0|del", managerId)));
+
+        assertTrue(await(rebuilder.reconcile()).isEmpty(),
+            "a deleted rating is hidden from the public, so it must stop counting toward the figures");
+    }
+
+    @Test
+    void aRatingThatComesBackAfterTheDeleteWindowCountsAgain() throws Exception {
+        /*
+          A delete here is a soft delete: the row is hidden for three days and then resurfaces as
+          anonymous. So the projection has to move in BOTH directions - subtracting on delete and
+          adding back on restore. Subtracting only would leave every restored rating permanently
+          uncounted, and nothing would ever say so.
+        */
+        long companyId = insertCompany("Walmart");
+        long managerId = ghost("Rea Restored", companyId);
+        rate("auth0|res", managerId, cityLevel("Canada", "Ontario", "Toronto"));
+        await(service.deleteReview("auth0|res", managerId, ownReviewId("auth0|res", managerId)));
+
+        // Age the deletion past the window, exactly as three days would.
+        await(pool.query("UPDATE reviews SET deleted_at = now() - INTERVAL '4 days' WHERE deleted_at IS NOT NULL").execute());
+        await(service.restoreExpiredReviewDeletions());
+
+        assertTrue(await(rebuilder.reconcile()).isEmpty(),
+            "a restored rating is public again, so it must count again");
+    }
+
+    @Test
+    void holdingARatingTakesItOutUntilItIsReleased() throws Exception {
+        /*
+          A held rating is withheld from the public until its author proves the submission was
+          human. It is invisible on the page, so it must be invisible in the figures - and visible
+          again the moment it is released.
+        */
+        long companyId = insertCompany("Walmart");
+        long managerId = ghost("Hal Held", companyId);
+        rate("auth0|held", managerId, cityLevel("Canada", "Ontario", "Toronto"));
+        UUID reviewId = ownReviewId("auth0|held", managerId);
+
+        await(service.setReviewDisposition(reviewId, "held"));
+        assertTrue(await(rebuilder.reconcile()).isEmpty(), "held is not public, so it must not count");
+
+        await(service.setReviewDisposition(reviewId, "live"));
+        assertTrue(await(rebuilder.reconcile()).isEmpty(), "released is public again, so it must count");
+    }
+
+    @Test
+    void aRejectedRatingStaysOut() throws Exception {
+        long companyId = insertCompany("Walmart");
+        long managerId = ghost("Rex Rejected", companyId);
+        rate("auth0|rej", managerId, cityLevel("Canada", "Ontario", "Toronto"));
+
+        await(service.setReviewDisposition(ownReviewId("auth0|rej", managerId), "rejected"));
+
+        assertTrue(await(rebuilder.reconcile()).isEmpty(),
+            "a rejected rating is never published, so it must never count");
+    }
+
+    /** The id of the one rating this user left on this manager. */
+    private static UUID ownReviewId(String auth0Id, long managerId) throws Exception {
+        return await(pool.preparedQuery("""
+                SELECT r.id FROM reviews r
+                JOIN users u ON u.id = r.user_id
+                WHERE u.auth0_id = $1 AND r.manager_id = $2
+                """)
+            .execute(io.vertx.sqlclient.Tuple.of(auth0Id, managerId))
+            .map(rs -> rs.iterator().next().getUUID("id")));
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────

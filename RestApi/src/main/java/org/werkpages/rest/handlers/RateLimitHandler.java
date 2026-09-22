@@ -73,6 +73,18 @@ public class RateLimitHandler {
      * reflects the real visitor IP and cannot be spoofed from outside Cloudflare.
      * Falls back to the first entry of X-Forwarded-For for non-Cloudflare proxies.
      */
+    /**
+     * The address behind this request, honouring the proxy chain.
+     *
+     * <p>Public and static because the ghost quota needs exactly this answer. Behind Cloudflare the
+     * socket address is Cloudflare's, so a second implementation that read it directly would see
+     * one address for every visitor on earth - and silently give the whole internet a single
+     * shared quota.
+     */
+    public static String clientIpOf(RoutingContext ctx) {
+        return new RateLimitHandler(0, 0).getClientIp(ctx);
+    }
+
     private String getClientIp(RoutingContext ctx) {
         String remoteIp = ctx.request().remoteAddress().host();
         if (isTrustedProxy(remoteIp)) {

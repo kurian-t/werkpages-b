@@ -6,6 +6,7 @@ import io.vertx.core.json.JsonObject;
 import io.vertx.sqlclient.Row;
 import io.vertx.sqlclient.RowSet;
 import org.werkpages.repository.CompanyRepository;
+import org.werkpages.repository.CapturedDraftRepository;
 import org.werkpages.repository.InterviewRepository;
 import org.werkpages.repository.UserRepository;
 
@@ -63,11 +64,49 @@ public class InterviewService {
     private final InterviewRepository interviewRepo;
     private final CompanyRepository   companyRepo;
     private final UserRepository      userRepo;
+    /* Stateless, and constructed in place like the other collaborators in this package. */
+    private final CapturedDraftRepository drafts;
+    /* Stateless, and constructed in place like the other collaborators in this package. */
+    private final DeclaredLocationResolver declaredLocations;
 
     public InterviewService(InterviewRepository interviewRepo, CompanyRepository companyRepo, UserRepository userRepo) {
         this.interviewRepo = interviewRepo;
         this.companyRepo   = companyRepo;
         this.userRepo      = userRepo;
+        this.drafts        = new CapturedDraftRepository(interviewRepo.client());
+        this.declaredLocations = new DeclaredLocationResolver(
+            new org.werkpages.repository.CompanyLocationRepository(interviewRepo.client()));
+    }
+
+
+    /**
+     * Keeps an interview experience somebody assembled but could not submit.
+     *
+     * <p>This form used to render a sign-in wall instead of its fields, so a logged-out person never
+     * saw a single question — out of step with every other contribution form, and impossible to
+     * capture from, because a form that never rendered has no answers to keep. Now they fill it in
+     * and the account is asked for at submit, which is the moment this exists for.
+     *
+     * <p>Never published and never aggregated: a draft is one person's unfinished answer, not an
+     * experience. It goes to the admin queue and nowhere else.
+     */
+    public Future<JsonObject> captureDraft(String companySlug, JsonObject body) {
+        if (body == null || body.isEmpty()) {
+            return Future.failedFuture(ServiceException.badRequest("Nothing to capture"));
+        }
+        UUID draftToken = parseDraftToken(body.getString("draftToken"));
+        return companyRepo.findBySlug(companySlug)
+            .map(opt -> opt.map(row -> row.getLong("id")).orElse(null))
+            .compose(companyId -> drafts.capture(
+                CapturedDraftRepository.INTERVIEW, companyId, null, null, draftToken,
+                // The token lives in its own column; a copy in the payload could disagree with it.
+                body.copy().put("companySlug", companySlug))
+                .map(v -> new JsonObject().put("captured", true)));
+    }
+
+    private static UUID parseDraftToken(String raw) {
+        if (raw == null || raw.isBlank()) return null;
+        try { return UUID.fromString(raw.trim()); } catch (IllegalArgumentException e) { return null; }
     }
 
     // ── Create ────────────────────────────────────────────────────────────────
@@ -90,15 +129,41 @@ public class InterviewService {
                         if (exists) {
                             return Future.failedFuture(ServiceException.conflict("interview_review_exists_for_year"));
                         }
-                        return interviewRepo.create(companyId, userId, draft.overall, draft.communication,
+                        /*
+                          Where the interviewing happened, resolved against the company it was at.
+                          interview_reviews has carried the ladder since V68 and nothing wrote to
+                          it, so an interview could never be filed against the branch it happened
+                          at while a manager review at the same company could.
+                        */
+                        return declaredLocations.resolve(interviewRepo.client(),
+                                DeclaredLocation.fromBody(body),
+                                CorpusPlace.fromBody(body.getJsonObject("corpusPlace")), companyId)
+                            .compose(declared ->
+                        interviewRepo.create(companyId, userId, draft.overall, draft.communication,
                             draft.respectForTime, draft.roleClarity, draft.processFairness,
                             draft.nextStepTransparency, draft.jobRelevance, draft.difficulty, draft.outcome,
                             draft.roundCount(), draft.processLength, draft.roleCategory,
-                            draft.country, draft.city, draft.interviewYear, draft.author);
+                            draft.country, draft.city, draft.interviewYear, draft.author,
+                            draft.interviewedFrom, draft.interviewedUntil, declared));
                     })
                     .compose(row -> interviewRepo
                         .insertRounds(row.getUUID("id"), draft.rounds)
                         .map(ignored -> row))
+                    // The draft this came from is finished work now, not a queue item. Clearing it
+                    // here means an admin never opens one whose author came back and completed it.
+                    .compose(row -> drafts.clear(interviewRepo.client(),
+                                                 parseDraftToken(body.getString("draftToken")))
+                        .map(v -> row))
+                    /*
+                      The company's read-model row is recomputed as part of this write.
+
+                      company_stats_live carries the interview average the tiles and the listing
+                      read, and a projection nothing updates is not a cache - it is a second
+                      source of truth that drifts. The sync awaits and swallows its own failure,
+                      so a stats problem can never fail somebody's submission.
+                    */
+                    .compose(row -> companyRepo.syncStatsForCompany(row.getLong("company_id"))
+                        .map(v -> row))
                     .map(InterviewService::reviewToJson);
             }));
     }
@@ -121,11 +186,30 @@ public class InterviewService {
 
         return resolveUser(auth0Id).compose(userId -> {
             Draft draft = parseDraft(body);
-            return interviewRepo.update(id, userId, draft.overall, draft.communication,
+            /*
+              The edit carries the location too.
+
+              The form has always sent it and this path dropped it, so somebody who filed an
+              experience against the wrong branch - or against no branch at all, before the field
+              existed - could correct every other answer and never that one. The company is read
+              first because a workplace belongs to exactly one company, and a request naming
+              another company's building has to be refused rather than stored.
+            */
+            return interviewRepo.findCompanyIdFor(id, userId).compose(companyId -> {
+                if (companyId.isEmpty()) {
+                    return Future.<JsonObject>failedFuture(
+                        ServiceException.notFound("Interview review not found"));
+                }
+                return declaredLocations.resolve(interviewRepo.client(),
+                        DeclaredLocation.fromBody(body),
+                        CorpusPlace.fromBody(body), companyId.get())
+                    .compose(declared ->
+            interviewRepo.update(id, userId, draft.overall, draft.communication,
                     draft.respectForTime, draft.roleClarity, draft.processFairness,
                     draft.nextStepTransparency, draft.jobRelevance, draft.difficulty, draft.outcome,
                     draft.roundCount(), draft.processLength, draft.roleCategory,
-                    draft.country, draft.city, draft.interviewYear)
+                    draft.country, draft.city, draft.interviewYear,
+                    draft.interviewedFrom, draft.interviewedUntil, declared)
                 .compose(updated -> {
                     if (updated.isEmpty()) {
                         return Future.failedFuture(ServiceException.notFound("Interview review not found"));
@@ -134,8 +218,12 @@ public class InterviewService {
                     // would leave rounds from the old process stranded in the middle of the new one.
                     return interviewRepo.deleteRounds(id)
                         .compose(ignored -> interviewRepo.insertRounds(id, draft.rounds))
+                        // An edited score moves the company's interview average, so the read
+                        // model is recomputed as part of the write. See CLAUDE.md section 21.
+                        .compose(ignored -> companyRepo.syncStatsForCompany(companyId.get()))
                         .map(ignored -> reviewToJson(updated.get()));
-                });
+                }));
+            });
         });
     }
 
@@ -144,7 +232,8 @@ public class InterviewService {
                          BigDecimal roleClarity, BigDecimal processFairness,
                          BigDecimal nextStepTransparency, BigDecimal jobRelevance, Integer difficulty, String outcome,
                          String processLength, String roleCategory, String country, String city,
-                         int interviewYear, List<String> rounds, String author) {
+                         int interviewYear, LocalDate interviewedFrom, LocalDate interviewedUntil,
+                         List<String> rounds, String author) {
         /** The count follows the list, so the two cannot contradict each other. */
         Integer roundCount() {
             return rounds.isEmpty() ? null : rounds.size();
@@ -169,6 +258,8 @@ public class InterviewService {
             optionalText(body, "country", 100),
             optionalText(body, "city", 100),
             requiredYear(body),
+            parseYearMonth(body, "interviewedFrom"),
+            parseYearMonth(body, "interviewedUntil"),
             parseRounds(body),
             // The handle the author picked, the way a manager review is signed. Blank means none:
             // an empty string would put a nameless byline on the card rather than leaving it bare.
@@ -199,7 +290,10 @@ public class InterviewService {
                 }
                 // Recorded so the same person cannot replace what is going to come back, which
                 // would leave the company counting one contributor twice.
-                return interviewRepo.recordDeletion(userId, companyId.get());
+                return interviewRepo.recordDeletion(userId, companyId.get())
+                    // A removed experience changes the company's interview average.
+                    .compose(result -> companyRepo.syncStatsForCompany(companyId.get())
+                        .map(v -> result));
             }));
     }
 
@@ -377,33 +471,43 @@ public class InterviewService {
         final int safeOffset  = Math.max(0, offset);
         return resolveCompanyId(companySlug).compose(companyId ->
             isInterviewContributor(auth0Id).compose(contributor -> {
-                if (!contributor) {
-                    return Future.succeededFuture(new JsonObject()
-                        .put("data", new JsonArray()).put("gated", true));
-                }
+                /*
+                  The gate withholds the SCORES, not the experiences.
+
+                  A locked reader gets the real cards - the role, the year, the outcome, the
+                  rounds, who wrote it - with every number stripped out server-side, and the page
+                  blurs the space where they would be. Returning an empty array instead left this
+                  tab looking like a company nobody had interviewed at, which is both wrong and
+                  the least persuasive thing it could say.
+
+                  Stripped here rather than hidden there: a blur is a visual effect, and the
+                  value would still be in the payload.
+                */
+                final boolean withholdScores = !contributor;
                 return interviewRepo.findByCompany(companyId, cappedLimit, safeOffset).map(rows -> {
                     JsonArray data = new JsonArray();
                     for (Row row : rows) {
                         data.add(new JsonObject()
                             .put("id",            row.getUUID("id").toString())
-                            .put("overallRating", numberOrNull(row, "overall_rating"))
-                            .put("difficulty",    numberOrNull(row, "difficulty"))
+                            .put("overallRating", withholdScores ? null : numberOrNull(row, "overall_rating"))
+                            .put("difficulty",    withholdScores ? null : numberOrNull(row, "difficulty"))
                             // The per-part scores, so a card can open the way a workplace rating
                             // does. Already selected by the query; withholding them here just made
                             // the reader take the average on trust.
-                            .put("categories",    new JsonObject()
+                            .put("categories",    withholdScores ? new JsonObject() : new JsonObject()
                                 .put("communication",        numberOrNull(row, "communication"))
                                 .put("respectForTime",       numberOrNull(row, "respect_for_time"))
                                 .put("roleClarity",          numberOrNull(row, "role_clarity"))
                                 .put("processFairness",      numberOrNull(row, "process_fairness"))
                                 .put("nextStepTransparency", numberOrNull(row, "next_step_transparency"))
-            .put("jobRelevance", numberOrNull(row, "job_relevance"))
-                                .put("jobRelevance", numberOrNull(row, "job_relevance")))
+                                .put("jobRelevance",         numberOrNull(row, "job_relevance")))
                             .put("outcome",       row.getString("outcome"))
                             .put("rounds",        row.getInteger("rounds"))
                             .put("processLength", row.getString("process_length"))
                             .put("roleCategory",  row.getString("role_category"))
                             .put("interviewYear", row.getInteger("interview_year"))
+                            .put("interviewedFrom",  ym(row, "interviewed_from"))
+                            .put("interviewedUntil", ym(row, "interviewed_until"))
                             .put("country",       row.getString("country"))
                             // Null on experiences written before authors existed; those render
                             // without a byline, exactly as they always did.
@@ -413,7 +517,7 @@ public class InterviewService {
                                                   ? null : row.getOffsetDateTime("updated_at").toString()));
                     }
                     return new JsonObject()
-                        .put("data", data).put("gated", false)
+                        .put("data", data).put("gated", withholdScores)
                         .put("limit", cappedLimit).put("offset", safeOffset);
                 });
             }));
@@ -447,7 +551,17 @@ public class InterviewService {
             .put("roleCategory",         row.getString("role_category"))
             .put("country",              row.getString("country"))
             .put("city",                 row.getString("city"))
-            .put("interviewYear",        row.getValue("interview_year"));
+            .put("interviewYear",        row.getValue("interview_year"))
+            // The range the form now asks for. Null on rows written before it existed, where only
+            // the year was ever recorded.
+            .put("interviewedFrom",      ym(row, "interviewed_from"))
+            .put("interviewedUntil",     ym(row, "interviewed_until"))
+            // Where the interviewing happened, so the edit form opens with what is stored.
+            .put("declaredCountry",      row.getString("declared_country"))
+            .put("declaredState",        row.getString("declared_state"))
+            .put("declaredCity",         row.getString("declared_city"))
+            .put("declaredPrecision",    row.getString("declared_precision"))
+            .put("companyLocationId",    row.getLong("company_location_id"));
     }
 
     /**
@@ -629,8 +743,41 @@ public class InterviewService {
         return trimmed;
     }
 
+    /**
+     * A month, as the shared timeline control sends it: {@code "2024-06"}.
+     *
+     * <p>Month precision matches the manager and workplace forms — nobody remembers the day of an
+     * interview, and asking for one invites invention.
+     */
+    private static LocalDate parseYearMonth(JsonObject body, String field) {
+        String raw = body.getString(field);
+        if (raw == null || raw.isBlank()) return null;
+        try {
+            return LocalDate.parse(raw.trim() + "-01");
+        } catch (Exception e) {
+            throw ServiceException.badRequest(field + " must be a month, as YYYY-MM");
+        }
+    }
+
+    /** A stored date as the form holds it: the month, without a day nobody supplied. */
+    private static String ym(Row row, String column) {
+        LocalDate d = row.getLocalDate(column);
+        return d == null ? null : String.format("%04d-%02d", d.getYear(), d.getMonthValue());
+    }
+
     private static int requiredYear(JsonObject body) {
-        Integer raw = body.getInteger("interviewYear");
+        /*
+          Derived from the range when the form sends one, so the same question is not asked twice.
+          interview_year still backs the one-per-company-per-year rule and the existing filters, and
+          rows written before the range existed have nothing else.
+        */
+        LocalDate from = parseYearMonth(body, "interviewedFrom");
+        /*
+          Both branches are Integer on purpose. A ternary mixing int and Integer unboxes the
+          Integer, so `from != null ? from.getYear() : body.getInteger(...)` throws a
+          NullPointerException on the very body this method exists to reject.
+        */
+        Integer raw = from != null ? Integer.valueOf(from.getYear()) : body.getInteger("interviewYear");
         if (raw == null) throw ServiceException.badRequest("interviewYear is required");
         int currentYear = LocalDate.now().getYear();
         if (raw < OLDEST_YEAR || raw > currentYear) {

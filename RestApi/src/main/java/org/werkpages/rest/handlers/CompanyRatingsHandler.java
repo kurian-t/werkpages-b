@@ -31,6 +31,20 @@ public class CompanyRatingsHandler {
             .onFailure(err -> ManagersHandler.handleError(ctx, err));
     }
 
+    // ── POST /api/companies/{companySlug}/rating/draft ────────────────────────
+
+    /**
+     * Keeps a rating somebody assembled but could not submit.
+     *
+     * <p>Deliberately open: the person this exists for is the one with no account yet, who filled
+     * the form in and is about to be sent to sign in.
+     */
+    public void handleCaptureDraft(RoutingContext ctx) {
+        service.captureDraft(ctx.pathParam("companySlug"), ctx.body().asJsonObject())
+            .onSuccess(json -> respond(ctx, 200, json))
+            .onFailure(err -> ManagersHandler.handleError(ctx, err));
+    }
+
     // ── GET /api/companies/{companySlug}/rating ───────────────────────────────
 
     public void handleGetMine(RoutingContext ctx) {

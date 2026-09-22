@@ -375,7 +375,32 @@ public class CompanyRepository {
                        COUNT(DISTINCT m.id)                    AS manager_count,
                        COALESCE(SUM(m.reviews_count), 0)       AS total_reviews,
                        ROUND(AVG(m.overall_rating) FILTER (WHERE m.overall_rating IS NOT NULL
-                             AND m.reviews_count > 0)::NUMERIC, 1) AS avg_rating
+                             AND m.reviews_count > 0)::NUMERIC, 1) AS avg_rating,
+                       /*
+                          The industry's other two averages, computed independently of the
+                          managers join above.
+
+                          Joining them in would fan the manager rows out and quietly inflate every
+                          count and average beside them. These are whole-industry scalars, so they
+                          are correlated on c.industry rather than on any one company.
+
+                          Unlike the read model on company_stats_live, these are computed live:
+                          an industry page is read far less often than the company listing, and
+                          a second projection is only worth its maintenance cost once the query
+                          is measurably too slow.
+                       */
+                       (SELECT COUNT(*) FROM company_reviews cr
+                          JOIN companies wc ON wc.id = cr.company_id
+                         WHERE wc.industry = $1 AND cr.deleted_at IS NULL) AS workplace_count,
+                       (SELECT ROUND(AVG(cr.overall_rating)::NUMERIC, 1) FROM company_reviews cr
+                          JOIN companies wc ON wc.id = cr.company_id
+                         WHERE wc.industry = $1 AND cr.deleted_at IS NULL) AS workplace_avg_rating,
+                       (SELECT COUNT(*) FROM interview_reviews ir
+                          JOIN companies ic ON ic.id = ir.company_id
+                         WHERE ic.industry = $1 AND ir.deleted_at IS NULL) AS interview_count,
+                       (SELECT ROUND(AVG(ir.overall_rating)::NUMERIC, 1) FROM interview_reviews ir
+                          JOIN companies ic ON ic.id = ir.company_id
+                         WHERE ic.industry = $1 AND ir.deleted_at IS NULL) AS interview_avg_rating
                 FROM companies c
                 JOIN managers m ON m.company_id = c.id
                 WHERE c.industry = $1
@@ -405,7 +430,8 @@ public class CompanyRepository {
     /** Companies within an industry, same card shape as findCompanyListing(). */
     public Future<RowSet<Row>> findCompaniesByIndustry(String industry) {
         return db.preparedQuery("""
-                SELECT c.id, c.name, c.slug, c.industry, cs.logo_url, cs.manager_count, cs.total_reviews, cs.avg_rating
+                SELECT c.id, c.name, c.slug, c.industry, cs.logo_url, cs.manager_count, cs.total_reviews, cs.avg_rating,
+                       cs.workplace_count, cs.workplace_avg_rating, cs.interview_count, cs.interview_avg_rating
                 FROM company_stats_live cs
                 JOIN companies c ON c.id = cs.company_id
                 WHERE cs.manager_count > 0 AND c.industry = $1
@@ -420,7 +446,8 @@ public class CompanyRepository {
      */
     public Future<RowSet<Row>> findCompanyListing() {
         return db.query("""
-                SELECT c.id, c.name, c.slug, c.industry, cs.logo_url, cs.manager_count, cs.total_reviews, cs.avg_rating
+                SELECT c.id, c.name, c.slug, c.industry, cs.logo_url, cs.manager_count, cs.total_reviews, cs.avg_rating,
+                       cs.workplace_count, cs.workplace_avg_rating, cs.interview_count, cs.interview_avg_rating
                 FROM company_stats_live cs
                 JOIN companies c ON c.id = cs.company_id
                 WHERE cs.manager_count > 0
@@ -466,12 +493,29 @@ public class CompanyRepository {
 
     public Future<Void> updateCompanyStatsForManager(long managerId) {
         return db.preparedQuery("""
-                INSERT INTO company_stats_live (company_id, manager_count, total_reviews, avg_rating, logo_url, updated_at)
+                INSERT INTO company_stats_live (company_id, manager_count, total_reviews, avg_rating, logo_url,
+                                workplace_count, workplace_avg_rating,
+                                interview_count, interview_avg_rating, updated_at)
                 SELECT c.id,
                        COUNT(DISTINCT m.id),
                        COALESCE(SUM(m.reviews_count), 0),
                        ROUND(AVG(m.overall_rating) FILTER (WHERE m.overall_rating IS NOT NULL AND m.reviews_count > 0)::NUMERIC, 1),
                        COALESCE(MIN(m.company_logo_url) FILTER (WHERE m.company_logo_url LIKE 'https://img.logo.dev/%'), c.logo_url, MIN(m.company_logo_url) FILTER (WHERE m.company_logo_url IS NOT NULL)),
+                       /*
+                          The other two datasets, as correlated subqueries rather than joins.
+
+                          A join to company_reviews and interview_reviews alongside the managers
+                          join would multiply the rows out, and every COUNT and AVG above it
+                          would silently inflate. Correlated scalars cannot fan out.
+                       */
+                       (SELECT COUNT(*) FROM company_reviews cr
+                         WHERE cr.company_id = c.id AND cr.deleted_at IS NULL),
+                       (SELECT ROUND(AVG(cr.overall_rating)::NUMERIC, 1) FROM company_reviews cr
+                         WHERE cr.company_id = c.id AND cr.deleted_at IS NULL),
+                       (SELECT COUNT(*) FROM interview_reviews ir
+                         WHERE ir.company_id = c.id AND ir.deleted_at IS NULL),
+                       (SELECT ROUND(AVG(ir.overall_rating)::NUMERIC, 1) FROM interview_reviews ir
+                         WHERE ir.company_id = c.id AND ir.deleted_at IS NULL),
                        now()
                 FROM companies c
                 JOIN managers m ON m.company_id = c.id
@@ -484,6 +528,10 @@ public class CompanyRepository {
                     total_reviews = EXCLUDED.total_reviews,
                     avg_rating    = EXCLUDED.avg_rating,
                     logo_url      = EXCLUDED.logo_url,
+                    workplace_count      = EXCLUDED.workplace_count,
+                    workplace_avg_rating = EXCLUDED.workplace_avg_rating,
+                    interview_count      = EXCLUDED.interview_count,
+                    interview_avg_rating = EXCLUDED.interview_avg_rating,
                     updated_at    = now()
                 """)
             .execute(Tuple.of(managerId))
@@ -493,12 +541,29 @@ public class CompanyRepository {
     /** Targeted upsert for a specific company. Used after rename/merge. */
     public Future<Void> updateCompanyStatsForCompany(long companyId) {
         return db.preparedQuery("""
-                INSERT INTO company_stats_live (company_id, manager_count, total_reviews, avg_rating, logo_url, updated_at)
+                INSERT INTO company_stats_live (company_id, manager_count, total_reviews, avg_rating, logo_url,
+                                workplace_count, workplace_avg_rating,
+                                interview_count, interview_avg_rating, updated_at)
                 SELECT c.id,
                        COUNT(DISTINCT m.id),
                        COALESCE(SUM(m.reviews_count), 0),
                        ROUND(AVG(m.overall_rating) FILTER (WHERE m.overall_rating IS NOT NULL AND m.reviews_count > 0)::NUMERIC, 1),
                        COALESCE(MIN(m.company_logo_url) FILTER (WHERE m.company_logo_url LIKE 'https://img.logo.dev/%'), c.logo_url, MIN(m.company_logo_url) FILTER (WHERE m.company_logo_url IS NOT NULL)),
+                       /*
+                          The other two datasets, as correlated subqueries rather than joins.
+
+                          A join to company_reviews and interview_reviews alongside the managers
+                          join would multiply the rows out, and every COUNT and AVG above it
+                          would silently inflate. Correlated scalars cannot fan out.
+                       */
+                       (SELECT COUNT(*) FROM company_reviews cr
+                         WHERE cr.company_id = c.id AND cr.deleted_at IS NULL),
+                       (SELECT ROUND(AVG(cr.overall_rating)::NUMERIC, 1) FROM company_reviews cr
+                         WHERE cr.company_id = c.id AND cr.deleted_at IS NULL),
+                       (SELECT COUNT(*) FROM interview_reviews ir
+                         WHERE ir.company_id = c.id AND ir.deleted_at IS NULL),
+                       (SELECT ROUND(AVG(ir.overall_rating)::NUMERIC, 1) FROM interview_reviews ir
+                         WHERE ir.company_id = c.id AND ir.deleted_at IS NULL),
                        now()
                 FROM companies c
                 LEFT JOIN managers m ON m.company_id = c.id
@@ -511,6 +576,10 @@ public class CompanyRepository {
                     total_reviews = EXCLUDED.total_reviews,
                     avg_rating    = EXCLUDED.avg_rating,
                     logo_url      = EXCLUDED.logo_url,
+                    workplace_count      = EXCLUDED.workplace_count,
+                    workplace_avg_rating = EXCLUDED.workplace_avg_rating,
+                    interview_count      = EXCLUDED.interview_count,
+                    interview_avg_rating = EXCLUDED.interview_avg_rating,
                     updated_at    = now()
                 """)
             .execute(Tuple.of(companyId))
@@ -521,7 +590,9 @@ public class CompanyRepository {
      *  Background safety net — guarded by AtomicBoolean in MainVerticle, do not call on hot paths. */
     public Future<Void> refreshCompanyStats() {
         return db.query("""
-                INSERT INTO company_stats_live (company_id, manager_count, total_reviews, avg_rating, logo_url, updated_at)
+                INSERT INTO company_stats_live (company_id, manager_count, total_reviews, avg_rating, logo_url,
+                                workplace_count, workplace_avg_rating,
+                                interview_count, interview_avg_rating, updated_at)
                 SELECT c.id,
                        COUNT(DISTINCT m.id),
                        COALESCE(SUM(m.reviews_count), 0),
@@ -531,6 +602,21 @@ public class CompanyRepository {
                            c.logo_url,
                            MIN(m.company_logo_url) FILTER (WHERE m.company_logo_url IS NOT NULL)
                        ),
+                       /*
+                          The other two datasets, as correlated subqueries rather than joins.
+
+                          A join to company_reviews and interview_reviews alongside the managers
+                          join would multiply the rows out, and every COUNT and AVG above it
+                          would silently inflate. Correlated scalars cannot fan out.
+                       */
+                       (SELECT COUNT(*) FROM company_reviews cr
+                         WHERE cr.company_id = c.id AND cr.deleted_at IS NULL),
+                       (SELECT ROUND(AVG(cr.overall_rating)::NUMERIC, 1) FROM company_reviews cr
+                         WHERE cr.company_id = c.id AND cr.deleted_at IS NULL),
+                       (SELECT COUNT(*) FROM interview_reviews ir
+                         WHERE ir.company_id = c.id AND ir.deleted_at IS NULL),
+                       (SELECT ROUND(AVG(ir.overall_rating)::NUMERIC, 1) FROM interview_reviews ir
+                         WHERE ir.company_id = c.id AND ir.deleted_at IS NULL),
                        now()
                 FROM companies c
                 JOIN managers m ON m.company_id = c.id
@@ -542,6 +628,10 @@ public class CompanyRepository {
                     total_reviews = EXCLUDED.total_reviews,
                     avg_rating    = EXCLUDED.avg_rating,
                     logo_url      = EXCLUDED.logo_url,
+                    workplace_count      = EXCLUDED.workplace_count,
+                    workplace_avg_rating = EXCLUDED.workplace_avg_rating,
+                    interview_count      = EXCLUDED.interview_count,
+                    interview_avg_rating = EXCLUDED.interview_avg_rating,
                     updated_at    = now()
                 """)
             .execute()
@@ -612,6 +702,40 @@ public class CompanyRepository {
         return db.preparedQuery("UPDATE companies SET logo_url = $1, updated_at = now() WHERE id = $2")
             .execute(Tuple.of(logoUrl, id))
             .map(rows -> rows.rowCount() > 0);
+    }
+
+    /**
+     * Pins whatever logo this company currently resolves to, before something changes it.
+     *
+     * <p>A company with no {@code logo_url} of its own is rendered from a logo.dev URL <em>guessed
+     * from its name</em>. That is fine until the name changes: renaming "Macy's" re-guesses a
+     * different domain, the request 404s, and the card falls back to a grey letter — which is what
+     * an admin sees when a rename appears to "lose" the logo.
+     *
+     * <p>So before a rename, the logo that works today is written down. It is taken from the
+     * managers already linked to the company, which is the same source
+     * {@code company_stats_live} prefers, so this pins what is actually on screen rather than a
+     * fresh guess.
+     *
+     * <p>Only ever fills a gap: a company that already has its own {@code logo_url} is untouched,
+     * and if no manager has a usable one there is nothing to pin and nothing is written.
+     */
+    public Future<Void> pinCurrentLogo(long companyId) {
+        return db.preparedQuery("""
+                UPDATE companies c
+                   SET logo_url = sub.logo, updated_at = now()
+                  FROM (
+                        SELECT MIN(m.company_logo_url) FILTER (
+                                   WHERE m.company_logo_url LIKE 'https://img.logo.dev/%') AS logo
+                          FROM managers m
+                         WHERE m.company_id = $1
+                       ) AS sub
+                 WHERE c.id = $1
+                   AND c.logo_url IS NULL
+                   AND sub.logo IS NOT NULL
+                """)
+            .execute(Tuple.of(companyId))
+            .mapEmpty();
     }
 
     /** All companies ordered by name, for the admin panel. */
@@ -813,6 +937,45 @@ public class CompanyRepository {
      * cycle trigger's: loops are already impossible, and this is the backstop that keeps a bug
      * from becoming a hang.
      */
+    /**
+     * A company and everything beneath it, as ids.
+     *
+     * <p>The identity scope a search should run over. Somebody looking for a colleague at a group
+     * should not have to know which legal entity payroll uses, so selecting a parent considers its
+     * subsidiaries too.
+     *
+     * <p><b>Downward only.</b> Selecting a child must NOT pull in its parent or its siblings: those
+     * people do not work at the company that was chosen, and on a large group they would bury the
+     * answer somebody actually asked for. The recursion therefore walks from the selected company
+     * to its descendants and stops.
+     *
+     * <p>Depth-capped at 10, matching {@link #findGroupStats}: loops are already impossible thanks
+     * to the cycle trigger, and this is the backstop that stops a bug becoming a hang.
+     *
+     * @return the selected id plus every descendant; never empty when the company exists
+     */
+    public Future<java.util.List<Long>> findDescendantIds(long rootId) {
+        return db.preparedQuery("""
+                WITH RECURSIVE tree AS (
+                    SELECT id, 0 AS depth FROM companies WHERE id = $1
+                    UNION ALL
+                    SELECT r.child_company_id, t.depth + 1
+                    FROM company_relationships r
+                    JOIN tree t ON r.parent_company_id = t.id
+                    WHERE t.depth < 10
+                )
+                SELECT c.id
+                FROM tree
+                JOIN companies c ON c.id = tree.id AND c.status <> 'merged'
+                """)
+            .execute(Tuple.of(rootId))
+            .map(rows -> {
+                java.util.List<Long> ids = new java.util.ArrayList<>();
+                for (Row row : rows) ids.add(row.getLong("id"));
+                return ids;
+            });
+    }
+
     public Future<Optional<Row>> findGroupStats(long parentId) {
         return db.preparedQuery("""
                 WITH RECURSIVE tree AS (

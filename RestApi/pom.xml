@@ -190,6 +190,44 @@
 							<shadedArtifactAttached>true</shadedArtifactAttached>
 							<shadedClassifierName>shaded</shadedClassifierName>
 							<createDependencyReducedPom>false</createDependencyReducedPom>
+							<filters>
+								<!--
+								  duckdb_jdbc is not a driver in the usual sense: it embeds the
+								  whole DuckDB engine as a native library, and ships one for every
+								  platform so a single jar runs anywhere. Only 43 of its entries
+								  are class files; 246MB of it is native code.
+
+								  The container is eclipse-temurin:21-jre-jammy built on a
+								  GitHub-hosted runner, so it is linux/amd64. The other three
+								  binaries can never load there and are pure weight in the image:
+
+								    libduckdb_java.so_osx_universal    103.6 MB
+								    libduckdb_java.so_linux_arm64       51.1 MB
+								    libduckdb_java.so_windows_amd64     33.5 MB
+
+								  Dropping them removes ~188MB uncompressed from the fat jar,
+								  leaving the 58.0MB linux/amd64 engine that actually runs.
+
+								  Sizes are for duckdb_jdbc 1.5.5.0. The four entry NAMES have
+								  not changed since 1.3.1.0, which is what this filter matches
+								  on - check them on any future upgrade, because a rename here
+								  fails silently by shipping 188MB of unusable native code.
+
+								  IF THE DEPLOY TARGET EVER MOVES TO ARM - a Graviton instance,
+								  or a multi-arch image - keep linux_arm64 instead, or the
+								  container will start and then fail on the first location query
+								  with an UnsatisfiedLinkError. Local development is unaffected:
+								  Eclipse and `mvn test` use the unshaded dependency.
+								-->
+								<filter>
+									<artifact>org.duckdb:duckdb_jdbc</artifact>
+									<excludes>
+										<exclude>libduckdb_java.so_osx_universal</exclude>
+										<exclude>libduckdb_java.so_linux_arm64</exclude>
+										<exclude>libduckdb_java.so_windows_amd64</exclude>
+									</excludes>
+								</filter>
+							</filters>
 							<transformers>
 								<!-- Merge all META-INF/services files so Flyway
 								discovers PostgreSQL -->

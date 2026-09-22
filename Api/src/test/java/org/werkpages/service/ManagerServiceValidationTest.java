@@ -8,6 +8,7 @@ import io.vertx.sqlclient.PreparedQuery;
 import io.vertx.sqlclient.Row;
 import io.vertx.sqlclient.RowIterator;
 import io.vertx.sqlclient.RowSet;
+import io.vertx.sqlclient.SqlClient;
 import io.vertx.sqlclient.SqlConnection;
 import io.vertx.sqlclient.Tuple;
 import org.junit.jupiter.api.BeforeEach;
@@ -977,11 +978,12 @@ class ManagerServiceValidationTest {
         when(reviewRepo.findByUserForValidation(eq(USER_ID), anyString())).thenReturn(Future.succeededFuture(rs));
 
         Row updatedRow = mock(Row.class);
+        stubTransaction();
         when(reviewRepo.update(
-                any(), anyLong(), any(), any(),
+                any(SqlClient.class), any(), anyLong(), any(), any(),
                 anyDouble(), anyDouble(), anyDouble(), anyDouble(), anyDouble(), anyDouble(),
                 anyDouble(), anyDouble(), anyDouble(), anyDouble(), anyDouble(),
-                any(), any(), any(), any(), any(), any(), any()))
+                any(), any(), any(), any(), any(), any(), any(), any()))
             .thenReturn(Future.succeededFuture(Optional.of(updatedRow)));
 
         Row result = await(service.updateReview(AUTH0_ID, MANAGER_ID, reviewId, validBody()));
@@ -991,11 +993,12 @@ class ManagerServiceValidationTest {
     @Test
     void updateReview_reviewNotFound_returns404() {
         UUID reviewId = UUID.randomUUID();
+        stubTransaction();
         when(reviewRepo.update(
-                any(), anyLong(), any(), any(),
+                any(SqlClient.class), any(), anyLong(), any(), any(),
                 anyDouble(), anyDouble(), anyDouble(), anyDouble(), anyDouble(), anyDouble(),
                 anyDouble(), anyDouble(), anyDouble(), anyDouble(), anyDouble(),
-                any(), any(), any(), any(), any(), any(), any()))
+                any(), any(), any(), any(), any(), any(), any(), any()))
             .thenReturn(Future.succeededFuture(Optional.empty()));
 
         ServiceException ex = assertServiceFails(service.updateReview(AUTH0_ID, MANAGER_ID, reviewId, validBody()));
@@ -1006,16 +1009,52 @@ class ManagerServiceValidationTest {
     void updateReview_success_recalculatesManager() throws Exception {
         UUID reviewId  = UUID.randomUUID();
         Row updatedRow = mock(Row.class);
+        stubTransaction();
         when(reviewRepo.update(
-                any(), anyLong(), any(), any(),
+                any(SqlClient.class), any(), anyLong(), any(), any(),
                 anyDouble(), anyDouble(), anyDouble(), anyDouble(), anyDouble(), anyDouble(),
                 anyDouble(), anyDouble(), anyDouble(), anyDouble(), anyDouble(),
-                any(), any(), any(), any(), any(), any(), any()))
+                any(), any(), any(), any(), any(), any(), any(), any()))
             .thenReturn(Future.succeededFuture(Optional.of(updatedRow)));
 
         Row result = await(service.updateReview(AUTH0_ID, MANAGER_ID, reviewId, validBody()));
         assertNotNull(result);
         verify(managerRepo).recalculateInBackground(MANAGER_ID);
+    }
+
+
+    /**
+     * Teaches the mocks about the transaction {@code updateReview} now runs in.
+     *
+     * <p>Editing a review can restate where it happened, and the location read model has to be
+     * updated in the same transaction as the row it describes - so the update reads the review's
+     * previous state, writes, and reprojects together. These tests assert what they always did;
+     * they simply have to know the call exists.
+     */
+    @SuppressWarnings("unchecked")
+    private void stubTransaction() {
+        SqlConnection conn = mock(SqlConnection.class);
+        /*
+          Any query on the transaction's connection answers with no rows. These tests are about the
+          service's own logic; the projection reads "this review contributes nothing", which is a
+          real answer and means it has nothing to move. The projection's own arithmetic is covered
+          against a live database in LocationStatsIntegrationTest.
+        */
+        // Built before the stubbing starts: rowSetOf() stubs mocks of its own, and Mockito rejects
+        // a stubbing begun inside another one.
+        RowSet<Row> empty = rowSetOf();
+        PreparedQuery<RowSet<Row>> anyQuery = mock(PreparedQuery.class);
+        when(anyQuery.execute(any(Tuple.class))).thenReturn(Future.succeededFuture(empty));
+        when(anyQuery.execute()).thenReturn(Future.succeededFuture(empty));
+        when(conn.preparedQuery(anyString())).thenReturn(anyQuery);
+        when(pool.withTransaction(any())).thenAnswer(inv -> {
+            Function<SqlConnection, Future<Row>> fn = inv.getArgument(0);
+            return fn.apply(conn);
+        });
+        // Empty: with no previous state there is nothing to move, so the projection is skipped.
+        // What these tests are about is the update itself.
+        when(reviewRepo.findForProjection(any(SqlClient.class), any()))
+            .thenReturn(Future.succeededFuture(Optional.empty()));
     }
 
     // ══════════════════════════════════════════════════════════════════════════
@@ -1064,7 +1103,10 @@ class ManagerServiceValidationTest {
         UUID reviewId = UUID.randomUUID();
         when(reviewRepo.findOwnerUserId(reviewId, MANAGER_ID))
             .thenReturn(Future.succeededFuture(Optional.of(USER_ID)));
-        when(reviewRepo.delete(reviewId, MANAGER_ID)).thenReturn(Future.succeededFuture(null));
+        // The hide and the projection move together now, so the delete runs in a transaction.
+        stubTransaction();
+        when(reviewRepo.delete(any(SqlClient.class), eq(reviewId), eq(MANAGER_ID)))
+            .thenReturn(Future.succeededFuture(null));
         when(reviewRepo.recordDeletion(USER_ID, MANAGER_ID)).thenReturn(Future.succeededFuture(null));
 
         JsonObject result = (JsonObject) await(service.deleteReview(AUTH0_ID, MANAGER_ID, reviewId));

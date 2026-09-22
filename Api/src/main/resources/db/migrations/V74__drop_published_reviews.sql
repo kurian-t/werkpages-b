@@ -1,0 +1,21 @@
+-- Drops the published_reviews view.
+--
+-- Release 1 removed every query against it from BOTH backends, which was the blocker: the view
+-- lives in the shared database, so dropping it while RateMyManagers still read it would have taken
+-- RMM down. Verified before shipping - a grep for `published_reviews` across both repositories
+-- returns only the explanatory comment in ReviewSql and the migrations that created it.
+--
+-- The rule the view expressed - a review is live and not deleted - now lives in application code
+-- as ReviewSql.live(alias), where it is greppable and cannot silently freeze a column list.
+--
+-- ── Why it had to go rather than just sit there ─────────────────────────────────────────────
+--
+-- It was defined as SELECT *, and PostgreSQL expands that once, when the view is created. Columns
+-- added to `reviews` afterwards are invisible through it: queries fail with
+-- `column "..." does not exist` while the column plainly exists on the table. That is not
+-- theoretical - it is what forced V71 to re-expand the view after the declared location columns
+-- were added, and it would have happened again with the next column.
+--
+-- See CLAUDE.md section 21.
+
+DROP VIEW IF EXISTS published_reviews;

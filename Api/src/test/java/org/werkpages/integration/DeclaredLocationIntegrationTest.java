@@ -16,6 +16,7 @@ import org.junit.jupiter.api.Test;
 import org.testcontainers.containers.PostgreSQLContainer;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
+import org.werkpages.repository.CompanyLocationRepository;
 import org.werkpages.repository.EditRepository;
 import org.werkpages.repository.GeoObservation;
 import org.werkpages.repository.ManagerRepository;
@@ -26,6 +27,7 @@ import org.werkpages.service.DeclaredLocation;
 import org.werkpages.service.ManagerService;
 import org.werkpages.service.SubmissionContext;
 
+import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -297,9 +299,156 @@ class DeclaredLocationIntegrationTest {
         return SubmissionContext.of(new GeoObservation("Canada", "Ontario", "Toronto"), body);
     }
 
+
+    // ── Editing an opinion ────────────────────────────────────────────────────
+
+    /*
+      The shared manager form lets somebody change company, title, dates and location while editing
+      a review they already left. That makes "which edits move an opinion" a question the server has
+      to answer, rather than one that never came up because the field was not on the form.
+
+      The rule: a declaration that is not sent is not a declaration. An ordinary edit to the stars
+      carries no declaredPrecision, and the stored location must survive it untouched - otherwise
+      fixing a typo in a 2019 opinion would silently re-file it wherever the manager works today,
+      which is the exact failure `movingAManagerDoesNotMoveTheOpinionsLeftAboutThem` exists to
+      prevent, arriving through a different door.
+    */
+
+    @Test
+    void editingTheRatingsLeavesTheOpinionWhereItHappened() throws Exception {
+        insertUser("auth0|dl-edit-keep", "DlEditKeep");
+        long companyId = insertCompany("Keepmart");
+        long gerrard   = insertLocation(companyId, "1000 Gerrard St E", "Toronto", "Ontario", "Canada");
+
+        long managerId = ghostManagerAt(companyId, "Nina Keep", "Keepmart");
+        UUID reviewId = reviewIdOf(await(service.createReview("auth0|dl-edit-keep", managerId,
+            reviewWithLocation("Keepmart", gerrard), null,
+            submission(reviewWithLocation("Keepmart", gerrard)))));
+
+        // The edit a person actually makes most often: same everything, different stars. No
+        // location keys at all, because the form did not reopen that field.
+        JsonObject edit = validReviewBody("Keepmart", "Store Manager").put("overallRating", 2.0);
+        await(service.updateReview("auth0|dl-edit-keep", managerId, reviewId, edit));
+
+        Row after = review(reviewId);
+        assertEquals(gerrard, after.getLong("company_location_id"),
+            "an edit that says nothing about location must not move the opinion");
+        assertEquals("Toronto", after.getString("declared_city"));
+        assertEquals(2.0, after.getBigDecimal("overall_rating").doubleValue(),
+            "while the thing that WAS edited did change");
+    }
+
+    @Test
+    void changingTheLocationOnAnEditMovesThatOpinionOnly() throws Exception {
+        insertUser("auth0|dl-edit-move", "DlEditMove");
+        long companyId = insertCompany("Movemart");
+        long gerrard   = insertLocation(companyId, "1000 Gerrard St E", "Toronto", "Ontario", "Canada");
+        long dufferin  = insertLocation(companyId, "900 Dufferin St",   "Toronto", "Ontario", "Canada");
+
+        long managerId = ghostManagerAt(companyId, "Omar Move", "Movemart");
+        UUID reviewId = reviewIdOf(await(service.createReview("auth0|dl-edit-move", managerId,
+            reviewWithLocation("Movemart", gerrard), null,
+            submission(reviewWithLocation("Movemart", gerrard)))));
+
+        // They picked the wrong store and are correcting it. This one IS a declaration.
+        JsonObject edit = validReviewBody("Movemart", "Store Manager")
+            .put("companyLocationId", dufferin)
+            .put("declaredPrecision", DeclaredLocation.EXACT);
+        await(service.updateReview("auth0|dl-edit-move", managerId, reviewId, edit));
+
+        assertEquals(dufferin, review(reviewId).getLong("company_location_id"));
+        /*
+          Writing the review set the manager's own location, because rating somebody is fresh
+          evidence of where they work (see ratingAManagerUpdatesWhereTheyWorkNow). Correcting that
+          opinion afterwards is not: it says where the WORK happened, which may be years ago. So
+          the manager stays at Gerrard while the opinion moves to Dufferin.
+        */
+        assertEquals(gerrard, manager(managerId).getLong("company_location_id"),
+            "editing a review must not restate where the manager works now");
+    }
+
+    @Test
+    void anEditCanCoarsenAnExactLocation() throws Exception {
+        insertUser("auth0|dl-edit-coarse", "DlEditCoarse");
+        long companyId = insertCompany("Broadmart");
+        long store     = insertLocation(companyId, "5 Yonge St", "Toronto", "Ontario", "Canada");
+
+        long managerId = ghostManagerAt(companyId, "Pat Broad", "Broadmart");
+        UUID reviewId = reviewIdOf(await(service.createReview("auth0|dl-edit-coarse", managerId,
+            reviewWithLocation("Broadmart", store), null,
+            submission(reviewWithLocation("Broadmart", store)))));
+
+        // "I was at one of the Toronto ones, I could not tell you which." A downgrade is a real
+        // answer, so it has to clear the building rather than leave a contradiction on the row.
+        JsonObject edit = validReviewBody("Broadmart", "Store Manager")
+            .put("declaredCountry", "Canada").put("declaredState", "Ontario")
+            .put("declaredCity", "Toronto")
+            .put("declaredPrecision", DeclaredLocation.CITY);
+        await(service.updateReview("auth0|dl-edit-coarse", managerId, reviewId, edit));
+
+        Row after = review(reviewId);
+        assertEquals("city", after.getString("declared_precision"));
+        assertEquals("Toronto", after.getString("declared_city"));
+        assertNull(after.getLong("company_location_id"),
+            "coarsening must clear the building, not leave a city that contradicts it");
+    }
+
+    @Test
+    void anEditCannotAttachAnotherCompanysWorkplace() throws Exception {
+        insertUser("auth0|dl-edit-wrong", "DlEditWrong");
+        long mine   = insertCompany("Minemart");
+        long theirs = insertCompany("Theirsmart");
+        long myStore    = insertLocation(mine,   "1 Main St", "Toronto", "Ontario", "Canada");
+        long theirStore = insertLocation(theirs, "2 Other St", "Toronto", "Ontario", "Canada");
+
+        long managerId = ghostManagerAt(mine, "Quinn Wrong", "Minemart");
+        UUID reviewId = reviewIdOf(await(service.createReview("auth0|dl-edit-wrong", managerId,
+            reviewWithLocation("Minemart", myStore), null,
+            submission(reviewWithLocation("Minemart", myStore)))));
+
+        JsonObject edit = validReviewBody("Minemart", "Store Manager")
+            .put("companyLocationId", theirStore)
+            .put("declaredPrecision", DeclaredLocation.EXACT);
+
+        assertThrows(Exception.class,
+            () -> await(service.updateReview("auth0|dl-edit-wrong", managerId, reviewId, edit)),
+            "the ownership check must hold on edit exactly as it does on create");
+        assertEquals(myStore, review(reviewId).getLong("company_location_id"),
+            "and the rejected edit must not have half-applied");
+    }
+
+    // ── Helpers for the edit cases ────────────────────────────────────────────
+
+    /** A manager already attached to a company, so a workplace can belong to them. */
+    private static long ghostManagerAt(long companyId, String name, String company) throws Exception {
+        JsonObject ghost = await(service.createGhostManager(new JsonObject()
+            .put("name", name).put("company", company)
+            .put("title", "Store Manager").put("country", "Canada")
+            .put("companyId", companyId), null));
+        return ghost.getLong("id");
+    }
+
+    private static JsonObject reviewWithLocation(String company, long locationId) {
+        return validReviewBody(company, "Store Manager")
+            .put("companyLocationId", locationId)
+            .put("declaredPrecision", DeclaredLocation.EXACT);
+    }
+
+    private static UUID reviewIdOf(Row created) {
+        return created.getUUID("id");
+    }
+
+    private static Row review(UUID id) throws Exception {
+        return await(pool.preparedQuery("""
+                SELECT overall_rating, declared_country, declared_state, declared_city,
+                       declared_precision, company_location_id
+                FROM reviews WHERE id = $1
+                """).execute(Tuple.of(id)).map(rs -> rs.iterator().next()));
+    }
+
     private static Row manager(long id) throws Exception {
         return await(pool.preparedQuery("""
-                SELECT city, declared_country, declared_state, declared_city,
+                SELECT city, status, declared_country, declared_state, declared_city,
                        declared_precision, company_location_id
                 FROM managers WHERE id = $1
                 """).execute(Tuple.of(id)).map(rs -> rs.iterator().next()));
@@ -312,6 +461,144 @@ class DeclaredLocationIntegrationTest {
             .map(rs -> rs.iterator().next().getLong("id")));
     }
 
+
+    // ── What the picker offers, and in what order ─────────────────────────────
+
+    /*
+      Reported from the running site: the general location was at the bottom of the list, under
+      eight street addresses. A city or a province is the answer most people actually have - the
+      exact branch is the specialist case - so leading with buildings buried the usable answer
+      beneath ones nobody had asked about.
+    */
+
+    @Test
+    void confirmedGeographyIsOfferedAheadOfConfirmedBuildings() throws Exception {
+        insertUser("auth0|sug-order", "SugOrder");
+        long walmart = insertCompany("Walmart");
+        insertLocation(walmart, "1005 Toronto St", "Toronto", "Ontario", "Canada");
+        insertManagerWithDeclared(walmart, "Toronto", "Ontario", "Canada");
+
+        var rows = await(new CompanyLocationRepository(pool)
+            .suggest(walmart, "Walmart", "toronto", null, null));
+
+        var kinds = new java.util.ArrayList<String>();
+        rows.forEach(r -> kinds.add(r.getString("kind")));
+        assertEquals("geo", kinds.get(0),
+            "the coarse answer leads; the branch is the specialist case, not the default");
+        assertTrue(kinds.contains("place"), "and the branch is still offered");
+    }
+
+    @Test
+    void manyBranchesCannotCrowdOutTheCoarseAnswer() throws Exception {
+        /*
+          The list is capped at eight. While buildings led it, a company with eight matching
+          branches pushed every coarse answer off the end - and the companies with the most
+          locations are exactly the ones where somebody is least likely to know which branch they
+          worked at.
+        */
+        insertUser("auth0|sug-crowd", "SugCrowd");
+        long walmart = insertCompany("Walmart");
+        for (int i = 1; i <= 10; i++) {
+            insertLocation(walmart, i + " Toronto Ave", "Toronto", "Ontario", "Canada");
+        }
+        insertManagerWithDeclared(walmart, "Toronto", "Ontario", "Canada");
+
+        var rows = await(new CompanyLocationRepository(pool)
+            .suggest(walmart, "Walmart", "toronto", null, null));
+
+        var kinds = new java.util.ArrayList<String>();
+        rows.forEach(r -> kinds.add(r.getString("kind")));
+        assertTrue(kinds.contains("geo"),
+            "the one answer somebody who only knows the city can give was off the list entirely");
+        assertEquals("geo", kinds.get(0));
+    }
+
+    /** A manager carrying confirmed geography, which is the second tier the picker reads. */
+    private static void insertManagerWithDeclared(long companyId, String city, String state,
+                                                  String country) throws Exception {
+        await(pool.preparedQuery("""
+                INSERT INTO managers (name, title, company, company_id, status,
+                                      approval_status, declared_country, declared_state,
+                                      declared_city, declared_precision)
+                VALUES ('Coarse Answer', 'Manager', 'Walmart', $1, 'active', 'approved', $2, $3, $4, 'city')
+                """)
+            .execute(Tuple.of(companyId, country, state, city)).mapEmpty());
+    }
+
+
+    // ── The manager's status, told by a reviewer ──────────────────────────────
+
+    /*
+      The last field the add-manager form asked for that the review form could not: whether the
+      manager is still in the role. It is snapshotted on the review like their company and title,
+      and the manager's own status is derived from the most current opinion - so one contributor
+      cannot overwrite another's answer, and somebody retiring corrects itself as ratings arrive.
+    */
+
+    @Test
+    void aReviewCanSayTheManagerHasRetired() throws Exception {
+        insertUser("auth0|ms-1", "MsOne");
+        long companyId = insertCompany("Walmart");
+        JsonObject ghost = await(service.createGhostManager(new JsonObject()
+            .put("name", "Retired Soon").put("company", "Walmart")
+            .put("title", "Store Manager").put("country", "Canada")
+            .put("companyId", companyId), null));
+        long managerId = ghost.getLong("id");
+        assertEquals("active", manager(managerId).getString("status"), "a ghost starts active");
+
+        JsonObject body = validReviewBody("Walmart", "Store Manager")
+            .put("managerStatus", "retired");
+        await(service.createReview("auth0|ms-1", managerId, body, null, submission(body)));
+
+        assertEquals("retired", manager(managerId).getString("status"),
+            "the manager follows the most current opinion, as their company and title already do");
+    }
+
+    @Test
+    void aReviewThatSaysNothingLeavesTheStatusAlone() throws Exception {
+        /*
+          Silence is not a claim that somebody retired. A client that never asks the question - an
+          older tab, another consumer of the API - must not be able to change a manager's status
+          by omitting it.
+        */
+        insertUser("auth0|ms-2", "MsTwo");
+        long companyId = insertCompany("Walmart");
+        JsonObject ghost = await(service.createGhostManager(new JsonObject()
+            .put("name", "Still Here").put("company", "Walmart")
+            .put("title", "Store Manager").put("country", "Canada")
+            .put("companyId", companyId), null));
+        long managerId = ghost.getLong("id");
+        await(pool.preparedQuery("UPDATE managers SET status = 'retired' WHERE id = $1")
+            .execute(Tuple.of(managerId)).mapEmpty());
+
+        JsonObject body = validReviewBody("Walmart", "Store Manager");
+        await(service.createReview("auth0|ms-2", managerId, body, null, submission(body)));
+
+        assertEquals("retired", manager(managerId).getString("status"),
+            "a review that declared nothing about the status left it as it was");
+    }
+
+    @Test
+    void anUnknownStatusIsRefusedRatherThanStored() throws Exception {
+        // The vocabulary is active or retired. Anything else is a broken client, and storing it
+        // would put a value on the manager row that no surface knows how to render.
+        insertUser("auth0|ms-3", "MsThree");
+        long companyId = insertCompany("Walmart");
+        JsonObject ghost = await(service.createGhostManager(new JsonObject()
+            .put("name", "Bad Status").put("company", "Walmart")
+            .put("title", "Store Manager").put("country", "Canada")
+            .put("companyId", companyId), null));
+        long managerId = ghost.getLong("id");
+
+        JsonObject body = validReviewBody("Walmart", "Store Manager")
+            .put("managerStatus", "on sabbatical");
+
+        assertThrows(Exception.class,
+            () -> await(service.createReview("auth0|ms-3", managerId, body, null, submission(body))));
+        assertEquals("active", manager(managerId).getString("status"), "and nothing was changed");
+    }
+
+    /** A locking caller has one string, not two - see ManagerFormFields. */
     private static long insertLocation(long companyId, String street, String city,
                                        String state, String country) throws Exception {
         return await(pool.preparedQuery("""

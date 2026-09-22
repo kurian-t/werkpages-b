@@ -11,6 +11,9 @@ import java.time.OffsetDateTime;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
+import org.werkpages.service.DeclaredLocation;
+
+import java.time.LocalDate;
 import java.util.UUID;
 
 /**
@@ -29,6 +32,14 @@ public class InterviewRepository {
 
     private final SqlClient db;
 
+    /**
+     * The client this repository was built on.
+     *
+     * <p>Exposed so a service can construct a sibling repository on the same connection rather than
+     * having one threaded through every constructor - the convention this package already follows.
+     */
+    public SqlClient client() { return db; }
+
     public InterviewRepository(SqlClient db) {
         this.db = db;
     }
@@ -42,20 +53,27 @@ public class InterviewRepository {
                               Integer difficulty,
                               String outcome, Integer rounds, String processLength,
                               String roleCategory, String country, String city, int interviewYear,
-                              String author) {
+                              String author,
+                              LocalDate interviewedFrom, LocalDate interviewedUntil,
+                              DeclaredLocation declared) {
         return db.preparedQuery("""
                 INSERT INTO interview_reviews
                     (company_id, user_id, overall_rating, communication, respect_for_time,
                      role_clarity, process_fairness, next_step_transparency, job_relevance,
                      difficulty, outcome, rounds, process_length, role_category, country, city,
-                     interview_year, author)
-                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
+                     interview_year, author, interviewed_from, interviewed_until,
+                     declared_country, declared_state, declared_city, declared_precision,
+                     company_location_id)
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,
+                        $21,$22,$23,$24,$25)
                 RETURNING *
                 """)
             .execute(Tuple.of(companyId, userId, overall, communication, respectForTime,
                               roleClarity, processFairness, nextStepTransparency, jobRelevance,
                               difficulty, outcome, rounds, processLength, roleCategory, country, city, interviewYear,
-                              author))
+                              author, interviewedFrom, interviewedUntil,
+                              declared.country(), declared.state(), declared.city(),
+                              declared.precision(), declared.companyLocationId()))
             .map(rs -> rs.iterator().next());
     }
 
@@ -79,9 +97,10 @@ public class InterviewRepository {
     public Future<RowSet<Row>> findByCompany(long companyId, int limit, int offset) {
         return db.preparedQuery("""
                 SELECT id, user_id, overall_rating, communication, respect_for_time, role_clarity,
-                       process_fairness, next_step_transparency, difficulty, outcome, rounds,
-                       process_length, role_category, interview_year, country, author,
-                       created_at, updated_at
+                       process_fairness, next_step_transparency, job_relevance, difficulty,
+                       outcome, rounds, process_length, role_category, interview_year, country,
+                       interviewed_from, interviewed_until,
+                       author, created_at, updated_at
                 FROM interview_reviews
                 WHERE company_id = $1 AND deleted_at IS NULL
                 ORDER BY created_at DESC
@@ -145,6 +164,23 @@ public class InterviewRepository {
      *
      * @return the company the review belonged to, or empty if it was not this user's to delete
      */
+    /**
+     * The company one of this person's experiences is about.
+     *
+     * <p>An edit has to know it before it can accept a location: a workplace belongs to exactly one
+     * company, and a request naming another company's building must be refused rather than stored.
+     * Scoped by user as well as id, so this cannot be used to probe for somebody else's review.
+     */
+    public Future<Optional<Long>> findCompanyIdFor(UUID reviewId, UUID userId) {
+        return db.preparedQuery(
+                "SELECT company_id FROM interview_reviews "
+                + "WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL")
+            .execute(Tuple.of(reviewId, userId))
+            .map(rs -> rs.iterator().hasNext()
+                ? Optional.of(rs.iterator().next().getLong("company_id"))
+                : Optional.empty());
+    }
+
     public Future<Optional<Long>> softDelete(UUID reviewId, UUID userId) {
         return db.preparedQuery("""
                 UPDATE interview_reviews
@@ -362,21 +398,38 @@ public class InterviewRepository {
                                         BigDecimal nextStepTransparency, BigDecimal jobRelevance,
                                         Integer difficulty,
                                         String outcome, Integer rounds, String processLength,
-                                        String roleCategory, String country, String city, int interviewYear) {
+                                        String roleCategory, String country, String city, int interviewYear,
+                                        LocalDate interviewedFrom, LocalDate interviewedUntil,
+                                        DeclaredLocation declared) {
+        DeclaredLocation loc = declared == null ? DeclaredLocation.NONE : declared;
         return db.preparedQuery("""
                 UPDATE interview_reviews SET
                     overall_rating = $3, communication = $4, respect_for_time = $5,
                     role_clarity = $6, process_fairness = $7, next_step_transparency = $8,
                     job_relevance = $9,
                     difficulty = $10, outcome = $11, rounds = $12, process_length = $13,
-                    role_category = $14, country = $15, city = $16, interview_year = $17, updated_at = now()
+                    role_category = $14, country = $15, city = $16, interview_year = $17,
+                    interviewed_from = $18, interviewed_until = $19,
+                    -- All five move together, or none of them do. A submission that declares
+                    -- nothing keeps what is stored, so a client that predates the field cannot
+                    -- erase it; one that declares something replaces the lot, because coarsening
+                    -- an exact pick sends a precision with no id and keeping the old id would
+                    -- leave the row pointing at a building it no longer claims.
+                    declared_country    = CASE WHEN $23::text IS NULL THEN declared_country    ELSE $20 END,
+                    declared_state      = CASE WHEN $23::text IS NULL THEN declared_state      ELSE $21 END,
+                    declared_city       = CASE WHEN $23::text IS NULL THEN declared_city       ELSE $22 END,
+                    company_location_id = CASE WHEN $23::text IS NULL THEN company_location_id ELSE $24 END,
+                    declared_precision  = COALESCE($23, declared_precision),
+                    updated_at = now()
                 WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL
                 RETURNING *
                 """)
             .execute(Tuple.of(reviewId, userId, overall, communication, respectForTime,
                               roleClarity, processFairness, nextStepTransparency, jobRelevance,
                               difficulty, outcome, rounds, processLength, roleCategory, country,
-                              city, interviewYear))
+                              city, interviewYear, interviewedFrom, interviewedUntil,
+                              loc.country(), loc.state(), loc.city(),
+                              loc.precision(), loc.companyLocationId()))
             .map(rs -> rs.iterator().hasNext() ? Optional.of(rs.iterator().next()) : Optional.empty());
     }
 

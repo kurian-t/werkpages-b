@@ -8,6 +8,8 @@ import io.vertx.sqlclient.Tuple;
 import java.math.BigDecimal;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Optional;
+import java.util.UUID;
 
 /**
  * Maintains the {@code *_location_stats_live} read model.
@@ -89,6 +91,65 @@ public class LocationStatsProjector {
                 review.getBigDecimal("overall_rating"),
                 values);
         }
+    }
+
+
+    // ── Membership ────────────────────────────────────────────────────────────
+
+    /**
+     * What this review currently contributes, or empty when it does not belong in the projection.
+     *
+     * <p>The predicate is the rebuild's, word for word. That is the point: the live table and a
+     * rebuild have to agree, and they cannot if each decides membership for itself. A review that
+     * is deleted, held, rejected, weighted, or attached to a manager with no company contributes
+     * nothing — and "contributes nothing" is a perfectly good answer here, not an error.
+     */
+    public Future<Optional<ManagerReviewFacts>> contributionOf(SqlClient conn, UUID reviewId) {
+        return conn.preparedQuery("""
+                SELECT m.company_id,
+                       r.declared_country, r.declared_state, r.declared_city, r.company_location_id,
+                       r.overall_rating,
+                       r.communication_style, r.perceived_approachability,
+                       r.perceived_clarity_of_expectations, r.feedback_style,
+                       r.perceived_supportiveness, r.decision_making_style,
+                       r.organization_and_planning_style, r.delegation_style,
+                       r.perceived_professional_demeanor, r.overall_working_experience
+                  FROM reviews r
+                  JOIN managers m ON m.id = r.manager_id
+                 WHERE r.id = $1
+                   AND r.disposition = 'live' AND r.deleted_at IS NULL
+                   AND r.weight = FALSE
+                   AND m.company_id IS NOT NULL
+                """)
+            .execute(Tuple.of(reviewId))
+            .map(rs -> {
+                var it = rs.iterator();
+                if (!it.hasNext()) return Optional.<ManagerReviewFacts>empty();
+                Row row = it.next();
+                return Optional.of(ManagerReviewFacts.from(row, row.getLong("company_id")));
+            });
+    }
+
+    /**
+     * Moves a review's contribution from what it was to whatever it now is.
+     *
+     * <p>Every way a review crosses the projection boundary goes through here: deleted, restored
+     * three days later, held pending proof, released, rejected, edited. Each of those is a
+     * different statement in a different file, and each one previously had to remember to maintain
+     * a derived table — which is how only creation ended up doing it. Read the contribution before
+     * the change, call this after, in the same transaction.
+     *
+     * <p>Both states are optional and either may be empty: empty → present is an addition, present
+     * → empty a removal, present → present a move, and empty → empty does nothing at all.
+     */
+    public Future<Void> resyncManagerReview(SqlClient conn, UUID reviewId,
+                                            Optional<ManagerReviewFacts> before) {
+        return contributionOf(conn, reviewId).compose(after -> {
+            Future<Void> chain = Future.succeededFuture();
+            if (before.isPresent()) chain = chain.compose(v -> removeManagerReview(conn, before.get()));
+            if (after.isPresent())  chain = chain.compose(v -> applyManagerReview(conn, after.get()));
+            return chain;
+        });
     }
 
     /** Adds a contribution to every scope it belongs to. */

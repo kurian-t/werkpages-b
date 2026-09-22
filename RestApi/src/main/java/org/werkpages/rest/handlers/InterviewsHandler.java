@@ -69,6 +69,20 @@ public class InterviewsHandler {
             .onFailure(err -> ManagersHandler.handleError(ctx, err));
     }
 
+    // ── POST /api/companies/{companySlug}/interviews/draft ────────────────────
+
+    /**
+     * Keeps an interview experience somebody assembled but could not submit.
+     *
+     * <p>Deliberately open: the person this exists for is the one with no account yet, who filled
+     * the form in and is about to be sent to sign in.
+     */
+    public void handleCaptureInterviewDraft(RoutingContext ctx) {
+        service.captureDraft(ctx.pathParam("companySlug"), ctx.body().asJsonObject())
+            .onSuccess(json -> respond(ctx, 200, json))
+            .onFailure(err -> ManagersHandler.handleError(ctx, err));
+    }
+
     // ── PUT /api/interviews/{reviewId} ────────────────────────────────────────
 
     public void handleUpdateInterviewReview(RoutingContext ctx) {

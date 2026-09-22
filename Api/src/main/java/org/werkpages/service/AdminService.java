@@ -7,6 +7,7 @@ import io.vertx.sqlclient.Row;
 import io.vertx.sqlclient.RowSet;
 import io.vertx.sqlclient.SqlClient;
 import io.vertx.sqlclient.Tuple;
+import org.werkpages.repository.CapturedDraftRepository;
 import org.werkpages.repository.CompanyRepository;
 import org.werkpages.repository.ConfidenceRepository;
 import org.werkpages.repository.EditRepository;
@@ -30,12 +31,17 @@ import java.util.function.Consumer;
  */
 public class AdminService {
 
+    /* Stateless, and constructed in place like the other collaborators here. */
+    private final ReviewDisposition reviewDisposition = new ReviewDisposition();
+    private final CapturedDraftRepository capturedDrafts;
+
     private final UserRepository              userRepo;
     private final ManagerRepository           managerRepo;
     private final ReviewRepository            reviewRepo;
     private final EditRepository              editRepo;
     private final NotificationRepository      notifRepo;
     private final CompanyRepository           companyRepo;
+    private final org.werkpages.repository.AnonymousGhostSlotRepository ghostSlots;
     private final MergeSuggestionsRepository  mergeSuggestionsRepo;
     private final SqlClient                   db;
     private final ProofChallengeRepository    challengeRepo;
@@ -70,10 +76,16 @@ public class AdminService {
         this.editRepo             = editRepo;
         this.notifRepo            = notifRepo;
         this.companyRepo          = companyRepo;
+        // Guarded like challengeRepo below: several constructors are used by unit tests with no
+        // client at all, and an unconditional construction would fail them on load.
+        this.ghostSlots = db == null ? null
+            : new org.werkpages.repository.AnonymousGhostSlotRepository(db);
         this.mergeSuggestionsRepo = mergeSuggestionsRepo;
         this.db                   = db;
         this.challengeRepo  = db == null ? null : new ProofChallengeRepository(db);
         this.confidenceRepo = db == null ? null : new ConfidenceRepository(db);
+        // Guarded for the same reason as the two above.
+        this.capturedDrafts = db == null ? null : new CapturedDraftRepository(db);
     }
 
     // ── Guard: verify admin ───────────────────────────────────────────────────
@@ -299,16 +311,16 @@ public class AdminService {
                     UUID userId   = c.getUUID("user_id");
                     UUID reviewId = c.getUUID("review_id");
 
+                    /*
+                      Through ReviewDisposition: approving publishes the rating, so it starts
+                      counting toward the location figures, and rejecting takes it back out.
+                      Writing the column here directly is how releasing a held rating used to
+                      leave it permanently uncounted.
+                    */
                     Future<Void> disposition = reviewId == null
                         ? Future.succeededFuture()
-                        : db.preparedQuery(approve
-                            // live_since starts now, not when it was written: thirty days of
-                            // standing has to mean thirty days actually live.
-                            ? "UPDATE reviews SET disposition = 'live', gate_eligible = TRUE, "
-                              + "live_since = now() WHERE id = $1"
-                            : "UPDATE reviews SET disposition = 'rejected', gate_eligible = FALSE, "
-                              + "live_since = NULL WHERE id = $1")
-                            .execute(Tuple.of(reviewId)).mapEmpty();
+                        : reviewDisposition.set(db, reviewId,
+                            approve ? ReviewDisposition.LIVE : ReviewDisposition.REJECTED);
 
                     Future<Void> score = confidenceRepo.apply(userId,
                         approve ? ConfidenceRepository.CHALLENGE_APPROVED
@@ -836,7 +848,11 @@ public class AdminService {
                 if (existing.isPresent() && existing.get().getLong("id") != companyId)
                     return Future.failedFuture(ServiceException.conflict(
                         "A company named \"" + newName.trim() + "\" already exists — use the merge tool instead"));
-                return companyRepo.renameCompany(companyId, newName);
+                // Pin the logo BEFORE the name changes. Without its own logo_url a company is drawn
+                // from a logo.dev URL guessed from its name, so renaming re-guesses a domain that
+                // usually does not exist and the card drops to a grey letter.
+                return companyRepo.pinCurrentLogo(companyId)
+                    .compose(v -> companyRepo.renameCompany(companyId, newName));
             })
             .compose(v -> companyRepo.updateCompanyStatsForCompany(companyId))
             .map(v -> new JsonObject().put("success", true));
@@ -1005,6 +1021,49 @@ public class AdminService {
             .map(count -> new JsonObject().put("success", true).put("deleted", count));
     }
 
+
+    // ── Captured drafts ───────────────────────────────────────────────────────
+
+    /**
+     * Contribution forms somebody filled in but never submitted.
+     *
+     * <p>Only the forms with no domain row to create appear here. The manager forms capture into
+     * real {@code pending_approval} rows, which already have their own queue — listing them twice
+     * would mean reviewing the same submission in two places.
+     */
+    public Future<JsonObject> getCapturedDrafts(String auth0Id, int limit, int offset) {
+        return requireAdmin(auth0Id)
+            .compose(adminId -> Future.all(capturedDrafts.findUnreviewed(limit, offset),
+                                           capturedDrafts.countUnreviewed()))
+            .map(cf -> {
+                JsonArray out = new JsonArray();
+                for (Row row : cf.<RowSet<Row>>resultAt(0)) {
+                    out.add(new JsonObject()
+                        .put("id",          row.getLong("id"))
+                        .put("kind",        row.getString("kind"))
+                        .put("payload",     row.getJsonObject("payload"))
+                        .put("companyId",   row.getLong("company_id"))
+                        .put("companyName", row.getString("company_name"))
+                        .put("companySlug", row.getString("company_slug"))
+                        .put("managerId",   row.getLong("manager_id"))
+                        .put("managerName", row.getString("manager_name"))
+                        .put("author",      row.getString("author_username"))
+                        .put("createdAt",   row.getOffsetDateTime("created_at").toString()));
+                }
+                return new JsonObject()
+                    .put("data", out)
+                    .put("total", cf.resultAt(1))
+                    .put("limit", limit).put("offset", offset);
+            });
+    }
+
+    /** Marks one draft dealt with. Kept rather than deleted, so the queue can be audited. */
+    public Future<JsonObject> markDraftReviewed(String auth0Id, long draftId) {
+        return requireAdmin(auth0Id)
+            .compose(adminId -> capturedDrafts.markReviewed(draftId))
+            .map(done -> new JsonObject().put("success", done));
+    }
+
     public Future<JsonObject> getCountryStats(String auth0Id) {
         if (db == null) return Future.failedFuture(ServiceException.forbidden("DB not configured"));
         return requireAdmin(auth0Id)
@@ -1046,5 +1105,30 @@ public class AdminService {
                     .put("managers", managers)
                     .put("reviews",  reviews);
             });
+    }
+
+    /**
+     * Whether automatic manager creation is currently paused, and the numbers behind it.
+     *
+     * <p>Exists because a circuit breaker nobody can see is indistinguishable from the feature
+     * quietly not working. When the ceiling holds, anonymous searches fall back to the pending
+     * queue and no user is shown an error - so the admin panel is the only place this surfaces.
+     *
+     * <p>The counts double as a way to learn the real baseline: the defaults were chosen against
+     * total daily volume from all sources, not against the anonymous-ghost slice specifically.
+     */
+    public Future<JsonObject> ghostCreationStatus(String auth0Id) {
+        return requireAdmin(auth0Id)
+            .compose(adminId -> ghostSlots == null
+                ? Future.succeededFuture(
+                    new org.werkpages.repository.AnonymousGhostSlotRepository.SiteWideRate(0, 0))
+                : ghostSlots.siteWideRates())
+            .map(rate -> new JsonObject()
+                .put("lastHour",   rate.lastHour())
+                .put("lastDay",    rate.lastDay())
+                .put("maxPerHour", org.werkpages.repository.AnonymousGhostSlotRepository.MAX_PER_HOUR_SITE_WIDE)
+                .put("maxPerDay",  org.werkpages.repository.AnonymousGhostSlotRepository.MAX_PER_DAY_SITE_WIDE)
+                .put("paused",     !rate.withinCeiling())
+                .put("trippedBy",  rate.trippedBy()));
     }
 }

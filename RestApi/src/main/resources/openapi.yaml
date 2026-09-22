@@ -345,6 +345,50 @@ paths:
   # Attached to a company, not a manager. Structured only: no free text, because an interview
   # review naming an interviewer is a defamation surface with no employment relationship behind it.
 
+  /api/companies/{companySlug}/interviews/draft:
+    post:
+      operationId: captureInterviewDraft
+      summary: Keep an interview experience somebody assembled but could not submit
+      description: >-
+        The form renders for everybody; the account is asked for at submit. Somebody who is not
+        signed in has answered every question by then, and most do not come back from the sign-in
+        page - this keeps what they had for an admin to read. Never published, never aggregated.
+        Unauthenticated by design.
+      tags:
+        - Interviews
+      security: []
+      parameters:
+        - in: path
+          name: companySlug
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              description: Whatever the form held. Stored verbatim; no key is required.
+              properties:
+                draftToken:
+                  type: string
+                  format: uuid
+                  description: >-
+                    Carried into the real submission so the draft is deleted when the form is
+                    finished, rather than leaving an admin to review completed work.
+      responses:
+        '200':
+          description: Captured
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  captured: { type: boolean }
+        '400':
+          description: Nothing to capture
+
   /api/companies/{companySlug}/interviews/list:
     get:
       operationId: listCompanyInterviews
@@ -613,6 +657,37 @@ paths:
         '404':
           description: Challenge not found
 
+  /api/admin/ghost-creation-status:
+    get:
+      operationId: adminGhostCreationStatus
+      summary: Whether automatic manager creation is currently paused
+      description: >-
+        Anonymous searches auto-create publicly visible managers. Two rolling ceilings cap that
+        site-wide, and when either holds the searches fall back to the pending queue with no error
+        shown to anybody - so this endpoint is the only place a pause is visible. The counts also
+        reveal the real baseline, which the ceilings were sized against total volume rather than
+        measured against.
+      tags:
+        - Admin
+      responses:
+        '200':
+          description: Current rates and ceilings
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  lastHour:   { type: integer }
+                  lastDay:    { type: integer }
+                  maxPerHour: { type: integer }
+                  maxPerDay:  { type: integer }
+                  paused:     { type: boolean }
+                  trippedBy:  { type: string, nullable: true, enum: [hourly, daily] }
+        '401':
+          description: Unauthorized
+        '403':
+          description: Forbidden
+
   /api/admin/high-profile-figures:
     get:
       operationId: adminListHighProfileFigures
@@ -728,6 +803,50 @@ paths:
           description: The ratings
         '404':
           description: Company not found
+
+  /api/companies/{companySlug}/rating/draft:
+    post:
+      operationId: captureCompanyRatingDraft
+      summary: Keep a workplace rating somebody assembled but could not submit
+      description: >-
+        The rating form lets an unauthenticated person answer every question and then sends them to
+        sign in. Many do not come back. This keeps what they had for an admin to read; it is never
+        published and never aggregated. Unauthenticated by design - the whole point is the person
+        who has no account yet.
+      tags:
+        - Companies
+      security: []
+      parameters:
+        - in: path
+          name: companySlug
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              description: Whatever the form held. Stored verbatim; no key is required.
+              properties:
+                draftToken:
+                  type: string
+                  format: uuid
+                  description: >-
+                    Carried into the real submission so the draft is deleted when the form is
+                    finished, rather than leaving an admin to review completed work.
+      responses:
+        '200':
+          description: Captured
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  captured: { type: boolean }
+        '400':
+          description: Nothing to capture
 
   /api/companies/{companySlug}/rating:
     post:
@@ -1109,6 +1228,74 @@ paths:
                     items:
                       type: string
 
+  /api/company-locations/suggest:
+    get:
+      operationId: suggestCompanyLocations
+      summary: Suggest places for a company - coarse geography and exact workplaces (public)
+      description: >
+        The company is always known before this is called, so this is not general maps search.
+        Results are that company's places, narrowed by whatever geography the caller has already
+        settled on. Both kinds are returned: a `geo` row is a place on the map and is always a
+        valid answer on its own; a `place` row is a specific building.
+      tags:
+        - Managers
+      security: []
+      parameters:
+        - in: query
+          name: q
+          required: true
+          schema:
+            type: string
+        - in: query
+          name: companyId
+          required: false
+          schema:
+            type: integer
+            format: int64
+        - in: query
+          name: company
+          required: false
+          schema:
+            type: string
+        - in: query
+          name: country
+          required: false
+          schema:
+            type: string
+        - in: query
+          name: state
+          required: false
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Matching locations, coarse and exact
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    kind:
+                      type: string
+                      enum: [geo, place]
+                    label:
+                      type: string
+                    detail:
+                      type: string
+                    country:
+                      type: string
+                    state:
+                      type: string
+                    city:
+                      type: string
+                    precision:
+                      type: string
+                      enum: [country, state, city, exact]
+                    companyLocationId:
+                      type: integer
+                      format: int64
   /api/companies/suggest:
     get:
       operationId: suggestCompanies
@@ -1552,6 +1739,44 @@ paths:
                 city:
                   type: string
                   nullable: true
+                declaredCountry:
+                  type: string
+                  nullable: true
+                  description: Country the contributor confirmed for this manager.
+                declaredState:
+                  type: string
+                  nullable: true
+                declaredCity:
+                  type: string
+                  nullable: true
+                declaredPrecision:
+                  type: string
+                  nullable: true
+                  enum: [country, state, city, exact]
+                  description: >
+                    How specific the declaration is. Stated rather than inferred from which fields
+                    happen to be filled, so "city only" and "we only knew the city" stay distinct.
+                companyLocationId:
+                  type: integer
+                  format: int64
+                  nullable: true
+                  description: An existing company_locations row, at exact precision.
+                corpusPlace:
+                  type: object
+                  nullable: true
+                  description: >
+                    A building chosen from the search corpus, which has no id yet. Sent instead of
+                    companyLocationId; the server promotes it to a real location on submit, so rows
+                    are only created for places somebody actually picked.
+                  properties:
+                    sourcePlaceId: { type: string }
+                    name:          { type: string }
+                    brandName:     { type: string, nullable: true }
+                    street:        { type: string, nullable: true }
+                    city:          { type: string, nullable: true }
+                    stateCode:     { type: string, nullable: true }
+                    countryCode:   { type: string, nullable: true }
+                    postalCode:    { type: string, nullable: true }
                 linkedinUrl:
                   type: string
                   nullable: true
@@ -2164,6 +2389,76 @@ paths:
           description: Forbidden
         '404':
           description: Ban not found
+
+  /api/admin/captured-drafts:
+    get:
+      operationId: getAdminCapturedDrafts
+      summary: Contribution forms somebody filled in but never submitted
+      description: >-
+        Only forms with no domain row to create appear here. The manager forms capture into real
+        pending_approval rows, which have their own queue; listing them twice would mean reviewing
+        one submission in two places.
+      tags:
+        - Admin
+      parameters:
+        - in: query
+          name: limit
+          schema: { type: integer, default: 50, minimum: 1, maximum: 200 }
+        - in: query
+          name: offset
+          schema: { type: integer, default: 0, minimum: 0 }
+      responses:
+        '200':
+          description: Unreviewed drafts, newest first
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id:          { type: integer, format: int64 }
+                        kind:        { type: string, enum: [company_rating, interview, manager_review] }
+                        payload:     { type: object }
+                        companyId:   { type: integer, format: int64, nullable: true }
+                        companyName: { type: string, nullable: true }
+                        companySlug: { type: string, nullable: true }
+                        managerId:   { type: integer, format: int64, nullable: true }
+                        managerName: { type: string, nullable: true }
+                        author:      { type: string, nullable: true }
+                        createdAt:   { type: string }
+                  total:  { type: integer }
+                  limit:  { type: integer }
+                  offset: { type: integer }
+        '403':
+          description: Not an admin
+
+  /api/admin/captured-drafts/{draftId}/reviewed:
+    post:
+      operationId: markCapturedDraftReviewed
+      summary: Mark one captured draft as dealt with
+      description: Kept rather than deleted, so the queue can be audited.
+      tags:
+        - Admin
+      parameters:
+        - in: path
+          name: draftId
+          required: true
+          schema: { type: integer, format: int64 }
+      responses:
+        '200':
+          description: Marked
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+        '403':
+          description: Not an admin
 
   /api/admin/ghost-managers:
     get:
@@ -3398,6 +3693,49 @@ components:
             The randomly generated handle the author picked, the way a manager review is signed.
             Anonymous but consistent, so a page of several ratings reads as several people rather
             than one voice repeated. Null leaves the rating unsigned.
+        draftToken:
+          type: string
+          format: uuid
+          description: >-
+            The token of the captured draft this rating came from. Sending it deletes that draft,
+            so an admin does not review work the author came back and finished.
+        declaredCountry:
+          type: string
+          nullable: true
+          description: >-
+            Where the work happened, on the same ladder every contribution uses. Ten Walmarts in
+            one city can be ten different places to work, so a rating names a branch when the
+            person knows it and a province when that is all they know.
+        declaredState:
+          type: string
+          nullable: true
+        declaredCity:
+          type: string
+          nullable: true
+        declaredPrecision:
+          type: string
+          nullable: true
+          enum: [country, state, city, exact]
+          description: >-
+            Stated, not inferred from which fields happen to be filled. Omitted entirely on an
+            edit, the stored location is kept rather than cleared.
+        companyLocationId:
+          type: integer
+          format: int64
+          nullable: true
+        corpusPlace:
+          type: object
+          nullable: true
+          description: A building chosen from the search corpus; promoted to a real location on submit.
+          properties:
+            sourcePlaceId: { type: string }
+            name:          { type: string }
+            brandName:     { type: string, nullable: true }
+            street:        { type: string, nullable: true }
+            city:          { type: string, nullable: true }
+            stateCode:     { type: string, nullable: true }
+            countryCode:   { type: string, nullable: true }
+            postalCode:    { type: string, nullable: true }
 
     CompanyRating:
       type: object
@@ -3409,6 +3747,11 @@ components:
         workedFrom:    { type: string, nullable: true }
         workedUntil:   { type: string, nullable: true }
         author:        { type: string, nullable: true }
+        declaredCountry:   { type: string,  nullable: true }
+        declaredState:     { type: string,  nullable: true }
+        declaredCity:      { type: string,  nullable: true }
+        declaredPrecision: { type: string,  nullable: true, enum: [country, state, city, exact] }
+        companyLocationId: { type: integer, nullable: true, format: int64 }
 
     InterviewReviewRequest:
       type: object
@@ -3494,6 +3837,55 @@ components:
         interviewYear:
           description: Hiring processes track the market closely, so year is a filtering axis.
           type: integer
+        draftToken:
+          type: string
+          format: uuid
+          description: >-
+            The token of the captured draft this experience came from. Sending it deletes that
+            draft, so an admin does not review work the author came back and finished.
+        interviewedFrom:
+          type: string
+          nullable: true
+          description: >-
+            Month the process started, as YYYY-MM. The same range the manager and workplace forms
+            ask for. interviewYear is derived from it when present.
+        interviewedUntil:
+          type: string
+          nullable: true
+          description: >-
+            Month it finished, as YYYY-MM. May equal interviewedFrom - a single-day process is one
+            interview, not a malformed range.
+        declaredCountry:
+          type: string
+          nullable: true
+          description: Where the interviewing happened, on the same ladder every contribution uses.
+        declaredState:
+          type: string
+          nullable: true
+        declaredCity:
+          type: string
+          nullable: true
+        declaredPrecision:
+          type: string
+          nullable: true
+          enum: [country, state, city, exact]
+        companyLocationId:
+          type: integer
+          format: int64
+          nullable: true
+        corpusPlace:
+          type: object
+          nullable: true
+          description: A building chosen from the search corpus; promoted to a real location on submit.
+          properties:
+            sourcePlaceId: { type: string }
+            name:          { type: string }
+            brandName:     { type: string, nullable: true }
+            street:        { type: string, nullable: true }
+            city:          { type: string, nullable: true }
+            stateCode:     { type: string, nullable: true }
+            countryCode:   { type: string, nullable: true }
+            postalCode:    { type: string, nullable: true }
 
     InterviewReview:
       type: object
@@ -3532,6 +3924,49 @@ components:
           nullable: true
         interviewYear:
           type: integer
+        interviewedFrom:
+          type: string
+          nullable: true
+          description: >-
+            Month the process started, as YYYY-MM. The same range the manager and workplace forms
+            ask for. interviewYear is derived from it when present.
+        interviewedUntil:
+          type: string
+          nullable: true
+          description: >-
+            Month it finished, as YYYY-MM. May equal interviewedFrom - a single-day process is one
+            interview, not a malformed range.
+        declaredCountry:
+          type: string
+          nullable: true
+          description: Where the interviewing happened, on the same ladder every contribution uses.
+        declaredState:
+          type: string
+          nullable: true
+        declaredCity:
+          type: string
+          nullable: true
+        declaredPrecision:
+          type: string
+          nullable: true
+          enum: [country, state, city, exact]
+        companyLocationId:
+          type: integer
+          format: int64
+          nullable: true
+        corpusPlace:
+          type: object
+          nullable: true
+          description: A building chosen from the search corpus; promoted to a real location on submit.
+          properties:
+            sourcePlaceId: { type: string }
+            name:          { type: string }
+            brandName:     { type: string, nullable: true }
+            street:        { type: string, nullable: true }
+            city:          { type: string, nullable: true }
+            stateCode:     { type: string, nullable: true }
+            countryCode:   { type: string, nullable: true }
+            postalCode:    { type: string, nullable: true }
 
     InterviewCategorySeries:
       description: >-
@@ -3798,10 +4233,38 @@ components:
               type: number
         managerCompany:
           type: string
+        managerStatus:
+          type: string
+          nullable: true
+          enum: [active, retired]
+          description: >-
+            Whether the manager was still in the role, as this reviewer knew it - snapshotted on
+            the review like managerCompany and managerTitle. The manager's own status is derived
+            from the most current review carrying one, so one contributor cannot overwrite
+            another's answer. Omitted leaves the manager's status untouched; silence is not a claim
+            that somebody retired.
         managerTitle:
           type: string
         text:
           type: string
+          nullable: true
+        declaredCountry:
+          type: string
+          nullable: true
+          description: Where the contributor said this particular opinion happened.
+        declaredState:
+          type: string
+          nullable: true
+        declaredCity:
+          type: string
+          nullable: true
+        declaredPrecision:
+          type: string
+          nullable: true
+          enum: [country, state, city, exact]
+        companyLocationId:
+          type: integer
+          format: int64
           nullable: true
         workedFrom:
           type: string
@@ -3863,6 +4326,45 @@ components:
           type: string
           nullable: true
           description: "YYYY-MM date the manager left this role (null = still in role)"
+        declaredCountry:
+          type: string
+          nullable: true
+          description: Country the contributor confirmed for this opinion.
+        declaredState:
+          type: string
+          nullable: true
+        declaredCity:
+          type: string
+          nullable: true
+        declaredPrecision:
+          type: string
+          nullable: true
+          enum: [country, state, city, exact]
+          description: >
+            How specific the declaration is. Stated rather than inferred from which fields happen
+            to be filled. On an update, its ABSENCE means "leave the stored location alone" - an
+            ordinary edit to the ratings must not move an opinion to wherever the manager works
+            now.
+        companyLocationId:
+          type: integer
+          format: int64
+          nullable: true
+          description: An existing company_locations row, at exact precision.
+        corpusPlace:
+          type: object
+          nullable: true
+          description: >
+            A building chosen from the search corpus, which has no id yet. Sent instead of
+            companyLocationId; the server promotes it to a real location on submit.
+          properties:
+            sourcePlaceId: { type: string }
+            name:          { type: string }
+            brandName:     { type: string, nullable: true }
+            street:        { type: string, nullable: true }
+            city:          { type: string, nullable: true }
+            stateCode:     { type: string, nullable: true }
+            countryCode:   { type: string, nullable: true }
+            postalCode:    { type: string, nullable: true }
         draftToken:
           type: string
           format: uuid
@@ -3903,6 +4405,44 @@ components:
         managerRoleEnd:
           type: string
           nullable: true
+        declaredCountry:
+          type: string
+          nullable: true
+          description: Country the contributor confirmed for this opinion.
+        declaredState:
+          type: string
+          nullable: true
+        declaredCity:
+          type: string
+          nullable: true
+        declaredPrecision:
+          type: string
+          nullable: true
+          enum: [country, state, city, exact]
+          description: >
+            How specific the declaration is. Its ABSENCE means "leave the stored location alone" -
+            an ordinary edit to the ratings must not move an opinion to wherever the manager works
+            now.
+        companyLocationId:
+          type: integer
+          format: int64
+          nullable: true
+          description: An existing company_locations row, at exact precision.
+        corpusPlace:
+          type: object
+          nullable: true
+          description: >
+            A building chosen from the search corpus, which has no id yet. Sent instead of
+            companyLocationId; the server promotes it to a real location on submit.
+          properties:
+            sourcePlaceId: { type: string }
+            name:          { type: string }
+            brandName:     { type: string, nullable: true }
+            street:        { type: string, nullable: true }
+            city:          { type: string, nullable: true }
+            stateCode:     { type: string, nullable: true }
+            countryCode:   { type: string, nullable: true }
+            postalCode:    { type: string, nullable: true }
 
     User:
       type: object

@@ -269,6 +269,37 @@ class ManagerServiceCoverage3IntegrationTest {
         assertTrue(rows.size() > 0, "Should return pending managers");
     }
 
+    /*
+      A submitted manager comes back carrying its company's id, not only the company's name.
+
+      The company page lists your own pending submissions beside the live managers - a manager you
+      just added is invisible to the public listing, and without this the page looked completely
+      unchanged, so the obvious next move was to add them again. Deciding which pending rows belong
+      on which page is done on the company row, never on the label: "Revvity" and "Revvity Inc."
+      are one employer and two strings, and matching on text drops a tile from the page it belongs
+      on or puts one on a page it does not.
+
+      The projection omitted company_id entirely, so the page had nothing but the label to go on.
+    */
+    @Test
+    void getMySubmittedManagers_carriesTheCompanyId() throws Exception {
+        String auth0Id = insertUser("auth0|submitted-company-id");
+        await(service.createManager(auth0Id,
+            validCreateBody().put("name", "Priya Raghunathan").put("company", "Identity Scoped Co"),
+            null));
+
+        Long expected = await(pool.preparedQuery("SELECT id FROM companies WHERE LOWER(TRIM(name)) = 'identity scoped co'")
+            .execute().map(rs -> rs.iterator().next().getLong("id")));
+        assertNotNull(expected, "the submission created the company row");
+
+        var rows = await(service.getMySubmittedManagers(auth0Id));
+        Row mine = null;
+        for (Row r : rows) if ("Priya Raghunathan".equals(r.getString("name"))) mine = r;
+        assertNotNull(mine, "the submitter's own pending manager comes back");
+        assertEquals(expected, mine.getLong("company_id"),
+            "the company page scopes these tiles on this id - without it there is only the label");
+    }
+
     // ── createManager — validation ────────────────────────────────────────────
 
     @Test

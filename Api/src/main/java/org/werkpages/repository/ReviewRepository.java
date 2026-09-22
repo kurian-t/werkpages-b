@@ -5,6 +5,7 @@ import io.vertx.sqlclient.Row;
 import io.vertx.sqlclient.RowSet;
 import io.vertx.sqlclient.SqlClient;
 import io.vertx.sqlclient.Tuple;
+import org.werkpages.service.DeclaredLocation;
 
 import java.time.LocalDate;
 import java.time.LocalDateTime;
@@ -257,6 +258,13 @@ public class ReviewRepository {
             .map(rows -> rows.iterator().next());
     }
 
+    /**
+     * Edits a review, leaving its location exactly as it was.
+     *
+     * <p>The overload below is for the case where the person actually reopened the location field.
+     * Keeping them separate is deliberate: "no location was sent" and "the location was cleared"
+     * are different intents, and a single nullable parameter cannot tell them apart.
+     */
     public Future<Optional<Row>> update(UUID reviewId, long managerId, UUID callerId, String author,
                                          double overallRating,
                                          double communicationStyle, double perceivedApproachability,
@@ -267,7 +275,57 @@ public class ReviewRepository {
                                          String managerCompany, String managerTitle, String text,
                                          LocalDate workedFrom, LocalDate workedUntil,
                                          LocalDate managerRoleStart, LocalDate managerRoleEnd) {
-        return db.preparedQuery("""
+        return update(db, reviewId, managerId, callerId, author, overallRating,
+            communicationStyle, perceivedApproachability, perceivedClarityOfExpectations,
+            feedbackStyle, perceivedSupportiveness, decisionMakingStyle,
+            organizationAndPlanningStyle, delegationStyle, perceivedProfessionalDemeanor,
+            overallWorkingExperience, managerCompany, managerTitle, text,
+            workedFrom, workedUntil, managerRoleStart, managerRoleEnd, null);
+    }
+
+    /**
+     * Edits a review and, when {@code declared} is non-null, restates where it happened.
+     *
+     * <p>A null {@code declared} means the request carried no {@code declaredPrecision} at all, and
+     * the stored location is left untouched. That is the common case - somebody fixing their stars
+     * - and re-copying the manager's current location there would silently migrate an old opinion
+     * every time the manager changed branch.
+     *
+     * <p>A non-null one replaces all five columns together, so coarsening an exact pick clears the
+     * building rather than leaving a city that contradicts an address.
+     */
+    public Future<Optional<Row>> update(SqlClient conn,
+                                         UUID reviewId, long managerId, UUID callerId, String author,
+                                         double overallRating,
+                                         double communicationStyle, double perceivedApproachability,
+                                         double perceivedClarityOfExpectations, double feedbackStyle,
+                                         double perceivedSupportiveness, double decisionMakingStyle,
+                                         double organizationAndPlanningStyle, double delegationStyle,
+                                         double perceivedProfessionalDemeanor, double overallWorkingExperience,
+                                         String managerCompany, String managerTitle, String text,
+                                         LocalDate workedFrom, LocalDate workedUntil,
+                                         LocalDate managerRoleStart, LocalDate managerRoleEnd,
+                                         DeclaredLocation declared) {
+        // COALESCE is not an option here: it cannot express "clear this column", which is exactly
+        // what coarsening an exact pick has to do. Two statements, one intent each.
+        String locationSql = declared == null ? "" : """
+                    , declared_country = $23, declared_state = $24, declared_city = $25,
+                      declared_precision = $26, company_location_id = $27
+                """;
+        Tuple params = Tuple.of(
+            overallRating, communicationStyle, perceivedApproachability,
+            perceivedClarityOfExpectations, feedbackStyle, perceivedSupportiveness,
+            decisionMakingStyle, organizationAndPlanningStyle, delegationStyle,
+            perceivedProfessionalDemeanor, overallWorkingExperience,
+            managerCompany, managerTitle, text, workedFrom, workedUntil,
+            author, reviewId, managerId, callerId,
+            managerRoleStart, managerRoleEnd);
+        if (declared != null) {
+            params.addString(declared.country()).addString(declared.state())
+                  .addString(declared.city()).addString(declared.precision())
+                  .addValue(declared.companyLocationId());
+        }
+        return conn.preparedQuery("""
                 UPDATE reviews SET
                     overall_rating = $1,
                     communication_style = $2, perceived_approachability = $3,
@@ -279,18 +337,36 @@ public class ReviewRepository {
                     worked_from = $15, worked_until = $16, author = $17,
                     manager_role_start = $21, manager_role_end = $22,
                     updated_at = now()
+                """ + locationSql + """
                 WHERE id = $18 AND manager_id = $19 AND user_id = $20
                 RETURNING *
                 """)
-            .execute(Tuple.of(
-                overallRating, communicationStyle, perceivedApproachability,
-                perceivedClarityOfExpectations, feedbackStyle, perceivedSupportiveness,
-                decisionMakingStyle, organizationAndPlanningStyle, delegationStyle,
-                perceivedProfessionalDemeanor, overallWorkingExperience,
-                managerCompany, managerTitle, text, workedFrom, workedUntil,
-                author, reviewId, managerId, callerId,
-                managerRoleStart, managerRoleEnd
-            ))
+            .execute(params)
+            .map(rows -> rows.iterator().hasNext()
+                ? Optional.of(rows.iterator().next())
+                : Optional.empty());
+    }
+
+    /**
+     * The columns the location read model counts, for one review, inside a caller's transaction.
+     *
+     * <p>Read before an edit so the projection can subtract what the review used to contribute
+     * before adding what it now does. Named explicitly rather than {@code SELECT *} - a projection
+     * that silently picks up a new column is a projection whose arithmetic changed without anyone
+     * deciding it should.
+     */
+    public Future<Optional<Row>> findForProjection(SqlClient conn, UUID reviewId) {
+        return conn.preparedQuery("""
+                SELECT overall_rating,
+                       communication_style, perceived_approachability,
+                       perceived_clarity_of_expectations, feedback_style,
+                       perceived_supportiveness, decision_making_style,
+                       organization_and_planning_style, delegation_style,
+                       perceived_professional_demeanor, overall_working_experience,
+                       declared_country, declared_state, declared_city, company_location_id
+                FROM reviews WHERE id = $1
+                """)
+            .execute(Tuple.of(reviewId))
             .map(rows -> rows.iterator().hasNext()
                 ? Optional.of(rows.iterator().next())
                 : Optional.empty());
@@ -308,7 +384,12 @@ public class ReviewRepository {
     /** Soft-deletes a review: hides it from public queries and strips user_id immediately.
      *  After 3 days the review resurfaces as anonymous via {@link #restoreExpiredDeletions()}. */
     public Future<Void> delete(UUID reviewId, long managerId) {
-        return db.preparedQuery(
+        return delete(db, reviewId, managerId);
+    }
+
+    /** As above, inside a caller's transaction - so the projection moves with the hide. */
+    public Future<Void> delete(SqlClient conn, UUID reviewId, long managerId) {
+        return conn.preparedQuery(
                 "UPDATE reviews SET deleted_at = now(), user_id = NULL WHERE id = $1 AND manager_id = $2")
             .execute(Tuple.of(reviewId, managerId))
             .mapEmpty();

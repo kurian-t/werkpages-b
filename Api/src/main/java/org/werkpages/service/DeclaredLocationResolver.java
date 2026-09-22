@@ -12,6 +12,9 @@ import org.werkpages.repository.CompanyLocationRepository;
  * is about. The second is the one that matters — without it, a request could attach a Walmart
  * address to a review of somebody at Loblaws, and the company page would then show a location
  * nobody there has ever worked at.
+ *
+ * <p>It is also where a place chosen from the search corpus becomes a real location, because that
+ * too needs the database and must happen inside the caller's transaction.
  */
 public final class DeclaredLocationResolver {
 
@@ -29,7 +32,44 @@ public final class DeclaredLocationResolver {
      * @return the declaration as it should be stored, or a failed future carrying a bad-request
      */
     public Future<DeclaredLocation> resolve(SqlClient conn, DeclaredLocation declared, Long companyId) {
+        return resolve(conn, declared, null, companyId);
+    }
+
+    /**
+     * As above, additionally promoting a place chosen from the search corpus.
+     *
+     * <p>A corpus place has no {@code company_locations} id — it is Parquet in S3 until somebody
+     * picks it — so it is promoted here, on submit, and the resulting id is what gets stored. This
+     * runs <em>before</em> {@link DeclaredLocation#validate()} because that method requires an id at
+     * exact precision, and until promotion there is not one.
+     *
+     * <p>A corpus place is only ever promoted for a known company. Without a company there is
+     * nothing to attach the building to, and a location with no owner cannot be deduplicated,
+     * merged, or shown on any page.
+     */
+    public Future<DeclaredLocation> resolve(SqlClient conn, DeclaredLocation declared,
+                                            CorpusPlace corpusPlace, Long companyId) {
         if (declared == null || declared.isEmpty()) return Future.succeededFuture(DeclaredLocation.NONE);
+
+        boolean needsPromotion = DeclaredLocation.EXACT.equals(declared.precision())
+                              && declared.companyLocationId() == null
+                              && corpusPlace != null;
+
+        if (needsPromotion) {
+            if (companyId == null) {
+                return Future.failedFuture(ServiceException.badRequest(
+                    "A workplace can only be chosen once the company is known"));
+            }
+            String placeProblem = corpusPlace.validate();
+            if (placeProblem != null) {
+                return Future.failedFuture(ServiceException.badRequest(placeProblem));
+            }
+            return locationRepo.findOrCreate(conn, companyId, corpusPlace)
+                .compose(id -> resolve(conn,
+                    new DeclaredLocation(declared.country(), declared.state(), declared.city(),
+                                         DeclaredLocation.EXACT, id),
+                    null, companyId));
+        }
 
         String problem = declared.validate();
         if (problem != null) return Future.failedFuture(ServiceException.badRequest(problem));

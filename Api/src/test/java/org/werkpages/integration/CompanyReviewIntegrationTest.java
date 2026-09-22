@@ -5,6 +5,7 @@ import io.vertx.core.json.JsonObject;
 import io.vertx.pgclient.PgConnectOptions;
 import io.vertx.pgclient.PgPool;
 import io.vertx.sqlclient.Pool;
+import io.vertx.sqlclient.Row;
 import io.vertx.sqlclient.PoolOptions;
 import io.vertx.sqlclient.Tuple;
 import org.flywaydb.core.Flyway;
@@ -14,6 +15,7 @@ import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
 import org.werkpages.repository.*;
 import org.werkpages.service.CompanyReviewService;
+import org.werkpages.service.DeclaredLocation;
 
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
@@ -57,7 +59,7 @@ class CompanyReviewIntegrationTest {
 
     @BeforeEach
     void cleanDb() throws Exception {
-        await(pool.query("TRUNCATE company_reviews, companies, users CASCADE").execute().mapEmpty());
+        await(pool.query("TRUNCATE captured_drafts, company_reviews, companies, users CASCADE").execute().mapEmpty());
     }
 
     @AfterAll
@@ -713,6 +715,293 @@ class CompanyReviewIntegrationTest {
             .put("ratings", ratings)
             .put("workedFrom", "2021-04")
             .putNull("workedUntil");
+    }
+
+
+    // ── Unfinished forms ──────────────────────────────────────────────────────
+
+    /*
+      The rating form lets somebody answer every question and only then sends them to sign in. Most
+      do not come back. The manager forms have captured that moment for a long time; this one threw
+      it away, so a complete workplace rating was lost every time a person rated before making an
+      account. What is kept is never published and never aggregated - it goes to the admin queue
+      and nowhere else.
+    */
+
+    @Test
+    void anUnfinishedRatingIsKeptForAnAdmin() throws Exception {
+        insertCompany("Red Hat", "red-hat");
+
+        await(service.captureDraft("red-hat", validBody(4.0).put("author", "QuietOtter77")));
+
+        Row draft = await(pool.query("SELECT kind, company_id, payload FROM captured_drafts")
+            .execute().map(rs -> rs.iterator().next()));
+        assertEquals("company_rating", draft.getString("kind"));
+        assertNotNull(draft.getLong("company_id"), "it was about a company we already hold");
+        assertEquals("QuietOtter77", draft.getJsonObject("payload").getString("author"),
+            "the answers are kept verbatim, because every form carries different fields");
+    }
+
+    @Test
+    void anUnfinishedRatingIsNotAPublishedOne() throws Exception {
+        insertCompany("Red Hat", "red-hat");
+
+        await(service.captureDraft("red-hat", validBody(4.0)));
+
+        assertEquals(0L, count("SELECT count(*) AS c FROM company_reviews"),
+            "a draft is one person's unfinished answer, not a rating - it must not reach the table "
+            + "the public averages are computed from");
+    }
+
+    @Test
+    void finishingTheFormRemovesTheDraftItCameFrom() throws Exception {
+        /*
+          Otherwise an admin spends their time reading drafts whose authors came back a minute later
+          and completed the form - and the queue becomes noise nobody reads.
+        */
+        insertCompany("Red Hat", "red-hat");
+        String auth  = insertUser("auth0|cr-draft", "CrDraft");
+        String token = UUID.randomUUID().toString();
+
+        await(service.captureDraft("red-hat", validBody(4.0).put("draftToken", token)));
+        assertEquals(1L, count("SELECT count(*) AS c FROM captured_drafts"));
+
+        await(service.submit(auth, "red-hat", validBody(4.0).put("draftToken", token)));
+
+        assertEquals(0L, count("SELECT count(*) AS c FROM captured_drafts"),
+            "the work is finished, so it is no longer waiting to be reviewed");
+        assertEquals(1L, count("SELECT count(*) AS c FROM company_reviews"));
+    }
+
+    @Test
+    void aDraftForACompanyWeDoNotHoldIsStillKept() throws Exception {
+        // The company is created by the write path, and a draft is not a write path. Discarding the
+        // capture because the employer is unknown would lose exactly the submissions worth reading.
+        await(service.captureDraft("somewhere-new", validBody(3.0)));
+
+        Row draft = await(pool.query("SELECT company_id, payload FROM captured_drafts")
+            .execute().map(rs -> rs.iterator().next()));
+        assertNull(draft.getLong("company_id"));
+        assertEquals("somewhere-new", draft.getJsonObject("payload").getString("companySlug"));
+    }
+
+    private long count(String sql) throws Exception {
+        return await(pool.query(sql).execute().map(rs -> rs.iterator().next().getLong("c")));
+    }
+
+
+    // ── Where the work happened ───────────────────────────────────────────────
+
+    /*
+      company_reviews has carried the declared ladder since V68 and nothing wrote to it, so a
+      workplace rating could only ever be filed against the company as a whole - while a review of
+      a manager at that same company, or an interview with it, could name the branch it happened
+      at. Ten Walmarts in one city can be ten different places to work, which is the entire reason
+      the ladder exists.
+    */
+
+    @Test
+    void aRatingRecordsWhereTheWorkHappened() throws Exception {
+        insertCompany("Red Hat", "red-hat");
+        String auth = insertUser("auth0|cr-loc-1", "CrLoc1");
+
+        await(service.submit(auth, "red-hat", validBody(4.0)
+            .put("declaredCountry", "Canada")
+            .put("declaredState",   "Ontario")
+            .put("declaredCity",    "Kitchener")
+            .put("declaredPrecision", DeclaredLocation.CITY)));
+
+        Row stored = storedRating();
+        assertEquals("Canada",    stored.getString("declared_country"));
+        assertEquals("Ontario",   stored.getString("declared_state"));
+        assertEquals("Kitchener", stored.getString("declared_city"));
+        assertEquals("city",      stored.getString("declared_precision"),
+            "precision is stated, not inferred from which columns happen to be filled");
+    }
+
+    @Test
+    void aCoarseAnswerIsAWholeAnswer() throws Exception {
+        // Nobody is made to find a street address to rate a workplace. A province on its own is a
+        // real rung, and refusing it would cost the rating rather than improving the location.
+        insertCompany("Red Hat", "red-hat");
+        String auth = insertUser("auth0|cr-loc-2", "CrLoc2");
+
+        await(service.submit(auth, "red-hat", validBody(4.0)
+            .put("declaredCountry", "Canada")
+            .put("declaredState",   "Ontario")
+            .put("declaredPrecision", DeclaredLocation.STATE)));
+
+        Row stored = storedRating();
+        assertEquals("state", stored.getString("declared_precision"));
+        assertNull(stored.getString("declared_city"));
+    }
+
+    @Test
+    void anExactPickTakesItsCoarseValuesFromTheLocationRow() throws Exception {
+        /*
+          The building already knows where it is. Trusting the form's coarse values instead would
+          let one that had drifted out of sync publish a city the selected address is not in.
+        */
+        insertCompany("Red Hat", "red-hat");
+        String auth = insertUser("auth0|cr-loc-3", "CrLoc3");
+        long location = insertLocation(companyId("red-hat"),
+            "175 Bloor St E", "Toronto", "Ontario", "Canada");
+
+        await(service.submit(auth, "red-hat", validBody(4.0)
+            .put("companyLocationId", location)
+            .put("declaredCity", "Waterloo")            // stale form - the building is in Toronto
+            .put("declaredPrecision", DeclaredLocation.EXACT)));
+
+        Row stored = storedRating();
+        assertEquals(location,  stored.getLong("company_location_id"));
+        assertEquals("exact",   stored.getString("declared_precision"));
+        assertEquals("Toronto", stored.getString("declared_city"),
+            "the selected building decides the city, not whatever the form last held");
+        assertEquals("Ontario", stored.getString("declared_state"));
+    }
+
+    @Test
+    void aWorkplaceBelongingToAnotherCompanyIsRefused() throws Exception {
+        /*
+          Accepting this would file a rating of Red Hat against a Canonical address, and Canonical's
+          page would then show a branch nobody there has rated. There is no honest request that
+          does this - only a stale form or a crafted one.
+        */
+        insertCompany("Red Hat", "red-hat");
+        insertCompany("Canonical", "canonical");
+        String auth = insertUser("auth0|cr-loc-4", "CrLoc4");
+        long theirs = insertLocation(companyId("canonical"),
+            "1 Circle Rd", "London", "England", "United Kingdom");
+
+        JsonObject body = validBody(4.0)
+            .put("companyLocationId", theirs)
+            .put("declaredPrecision", DeclaredLocation.EXACT);
+
+        assertThrows(Exception.class, () -> await(service.submit(auth, "red-hat", body)));
+        assertEquals(0L, count("SELECT COUNT(*) AS c FROM company_reviews"),
+            "the whole rating is refused, not stored with the location quietly dropped");
+    }
+
+    @Test
+    void theRatingIsHandedBackWithItsLocationSoTheFormCanOpenOnIt() throws Exception {
+        /*
+          Revisiting the form means changing an answer, not starting again - so it opens on the
+          location the rating was filed against. A field that came back empty over a stored answer
+          reads as the answer having been thrown away, and re-deriving it from wherever the person
+          happens to be today would quietly migrate an old rating to a place it did not come from.
+        */
+        insertCompany("Red Hat", "red-hat");
+        String auth = insertUser("auth0|cr-loc-5", "CrLoc5");
+        await(service.submit(auth, "red-hat", validBody(4.0)
+            .put("declaredCountry", "Canada")
+            .put("declaredState",   "Ontario")
+            .put("declaredCity",    "Kitchener")
+            .put("declaredPrecision", DeclaredLocation.CITY)));
+
+        JsonObject mine = await(service.findMine(auth, "red-hat")).getJsonObject("review");
+
+        assertEquals("Kitchener", mine.getString("declaredCity"));
+        assertEquals("Ontario",   mine.getString("declaredState"));
+        assertEquals("Canada",    mine.getString("declaredCountry"));
+        assertEquals("city",      mine.getString("declaredPrecision"));
+    }
+
+    @Test
+    void anEditCanMoveTheRatingToWhereItActuallyHappened() throws Exception {
+        // One rating per person per company, so an edit is an upsert. Correcting the location has
+        // to reach the stored row, or the correction is accepted and discarded.
+        insertCompany("Red Hat", "red-hat");
+        String auth = insertUser("auth0|cr-loc-6", "CrLoc6");
+        await(service.submit(auth, "red-hat", validBody(4.0)
+            .put("declaredCountry", "Canada")
+            .put("declaredPrecision", DeclaredLocation.COUNTRY)));
+
+        await(service.submit(auth, "red-hat", validBody(4.0)
+            .put("declaredCountry", "Canada")
+            .put("declaredState",   "Ontario")
+            .put("declaredCity",    "Kitchener")
+            .put("declaredPrecision", DeclaredLocation.CITY)));
+
+        Row stored = storedRating();
+        assertEquals("Kitchener", stored.getString("declared_city"));
+        assertEquals("city",      stored.getString("declared_precision"));
+        assertEquals(1L, count("SELECT COUNT(*) AS c FROM company_reviews"),
+            "still one rating - an edit replaces, it does not add");
+    }
+
+    @Test
+    void coarseningAnExactPickLetsGoOfTheBuilding() throws Exception {
+        /*
+          Somebody who picked the wrong branch and falls back to the city must not leave a row
+          claiming 'city' while still pointing at a building. That is why the five columns move
+          together rather than being kept individually: a per-column COALESCE would hold the old id
+          against the new precision forever.
+        */
+        insertCompany("Red Hat", "red-hat");
+        String auth = insertUser("auth0|cr-loc-7", "CrLoc7");
+        long location = insertLocation(companyId("red-hat"),
+            "175 Bloor St E", "Toronto", "Ontario", "Canada");
+        await(service.submit(auth, "red-hat", validBody(4.0)
+            .put("companyLocationId", location)
+            .put("declaredPrecision", DeclaredLocation.EXACT)));
+
+        await(service.submit(auth, "red-hat", validBody(4.0)
+            .put("declaredCountry", "Canada")
+            .put("declaredState",   "Ontario")
+            .put("declaredCity",    "Kitchener")
+            .put("declaredPrecision", DeclaredLocation.CITY)));
+
+        Row stored = storedRating();
+        assertEquals("city", stored.getString("declared_precision"));
+        assertNull(stored.getLong("company_location_id"),
+            "the building went with the precision that required it");
+    }
+
+    @Test
+    void anEditThatDeclaresNothingKeepsTheStoredLocation() throws Exception {
+        /*
+          A client that does not know about the location field - an older tab, another consumer of
+          the API - sends a rating with no ladder at all. Treating that as "clear it" would let one
+          silently erase an answer it never knew to send, so a submission that declares nothing
+          leaves what is stored alone. It is the same rule the author handle already follows.
+        */
+        insertCompany("Red Hat", "red-hat");
+        String auth = insertUser("auth0|cr-loc-8", "CrLoc8");
+        await(service.submit(auth, "red-hat", validBody(4.0)
+            .put("declaredCountry", "Canada")
+            .put("declaredState",   "Ontario")
+            .put("declaredCity",    "Kitchener")
+            .put("declaredPrecision", DeclaredLocation.CITY)));
+
+        await(service.submit(auth, "red-hat", validBody(2.0)));
+
+        Row stored = storedRating();
+        assertEquals(2.0, stored.getBigDecimal("overall_rating").doubleValue(),
+            "the rating it did send was taken");
+        assertEquals("Kitchener", stored.getString("declared_city"),
+            "and the location it said nothing about was left alone");
+        assertEquals("city", stored.getString("declared_precision"));
+    }
+
+    /** The single rating in the database, for asserting on what was actually stored. */
+    private static Row storedRating() throws Exception {
+        return await(pool.query("""
+                SELECT overall_rating, declared_country, declared_state, declared_city,
+                       declared_precision, company_location_id
+                FROM company_reviews
+                """).execute().map(rs -> rs.iterator().next()));
+    }
+
+    private static long insertLocation(long companyId, String street, String city,
+                                       String state, String country) throws Exception {
+        return await(pool.preparedQuery("""
+                INSERT INTO company_locations
+                    (company_id, source, source_place_id, display_name, street, city, state, country)
+                VALUES ($1, 'manual', $2, $3, $4, $5, $6, $7)
+                RETURNING id
+                """)
+            .execute(Tuple.of(companyId, street, "Office", street, city, state, country))
+            .map(rs -> rs.iterator().next().getLong("id")));
     }
 
     private String insertCompany(String name, String slug) throws Exception {

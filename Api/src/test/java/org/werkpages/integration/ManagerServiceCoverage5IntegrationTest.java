@@ -85,6 +85,153 @@ public class ManagerServiceCoverage5IntegrationTest {
         }
     }
 
+
+    // ── Landing on your own submission ────────────────────────────────────────
+
+    /*
+      Reported from the running site: adding a manager showed the "submitted for review" toast and
+      then dropped the reader on "Manager Not Found".
+
+      The add form files a manager as pending_approval and sends the submitter to its profile. A
+      pending row is invisible to everybody else - that is the rule the tile invariant rests on -
+      but the person who just submitted it must be able to see the thing they submitted. Otherwise
+      the product tells them it worked and then denies the manager exists.
+    */
+
+    @Test
+    void theSubmitterCanOpenTheirOwnPendingManagerById() throws Exception {
+        String auth0Id = insertUser("auth0|pending-own-id");
+        JsonObject body = buildValidCreateBody("Pending Own Byid", "PendingCo", "Director");
+
+        Row created = await(service.createManager(auth0Id, body, null));
+        long managerId = created.getLong("id");
+        assertEquals("pending_approval", approvalStatusOf(managerId),
+            "the add form files for review rather than publishing");
+
+        Row profile = await(service.getManagerById(managerId, auth0Id));
+        assertEquals("Pending Own Byid", profile.getString("name"),
+            "the submitter lands on the manager they just submitted, not on Not Found");
+    }
+
+    @Test
+    void theSubmitterCanOpenTheirOwnPendingManagerBySlug() throws Exception {
+        /*
+          The id URL is not where they stay. The profile redirects to the canonical
+          /companies/<c>/managers/<m> once the slug loads, so the slug route has to serve the
+          submitter too - otherwise the page resolves, redirects, and *then* says Not Found.
+        */
+        String auth0Id = insertUser("auth0|pending-own-slug");
+        JsonObject body = buildValidCreateBody("Pending Own Byslug", "PendingSlugCo", "Director");
+
+        Row created = await(service.createManager(auth0Id, body, null));
+        String slug = slugOf(created.getLong("id"));
+        assertNotNull(slug, "a pending manager still gets a slug, which is what the redirect uses");
+
+        Row profile = await(service.getManagerBySlug(slug, auth0Id));
+        assertEquals("Pending Own Byslug", profile.getString("name"));
+    }
+
+    @Test
+    void nobodyElseCanOpenSomebodyElsesPendingManager() throws Exception {
+        // The other half of the rule, and the reason the first two are not simply "serve pending".
+        String owner    = insertUser("auth0|pending-owner");
+        String stranger = insertUser("auth0|pending-stranger");
+        Row created = await(service.createManager(owner,
+            buildValidCreateBody("Pending Not Yours", "PrivateCo", "Director"), null));
+        long managerId = created.getLong("id");
+
+        assertThrows(Exception.class, () -> await(service.getManagerById(managerId, stranger)),
+            "another signed-in reader must not see a pending submission");
+        assertThrows(Exception.class, () -> await(service.getManagerById(managerId, null)),
+            "and neither must an anonymous one");
+    }
+
+    @Test
+    void theAddFormsOwnCaptureIsAdoptedSoTheSubmitterCanSeeIt() throws Exception {
+        /*
+          The full add-form sequence, which is what the reader actually performs.
+
+          Step one of the form posts an early CAPTURE as soon as the name and company are valid -
+          a pending row with NO submitter, because nobody has submitted anything yet. The real
+          submission then follows and is supposed to ADOPT that capture rather than file a second
+          person.
+
+          If adoption misses, the reader is sent to a row whose submitted_by is null, and
+          enforceSubmitterAccess refuses it to everybody - including the person who just filled
+          in the form. That is the "Manager Not Found" they land on.
+        */
+        String auth0Id = insertUser("auth0|capture-adopt");
+
+        // The capture: the form's first step, before the company box is finished.
+        JsonObject captured = await(service.createGhostManager(new JsonObject()
+            .put("name", "Captured Then Submitted")
+            .put("company", "AdoptCo")
+            .put("title", "Director")
+            .put("country", "Canada"), null));
+        long capturedId = captured.getLong("id");
+        assertEquals("pending_approval", approvalStatusOf(capturedId));
+
+        // The submission that follows, same person, same company.
+        Row created = await(service.createManager(auth0Id,
+            buildValidCreateBody("Captured Then Submitted", "AdoptCo", "Director"), null));
+
+        // Whatever row the form is sent to, the submitter must be able to open it.
+        Row profile = await(service.getManagerById(created.getLong("id"), auth0Id));
+        assertEquals("Captured Then Submitted", profile.getString("name"),
+            "the reader lands on the manager they submitted, not on Not Found");
+    }
+
+    @Test
+    void aCaptureTooOldToAdoptStillBelongsToWhoeverSubmittedIt() throws Exception {
+        /*
+          The reported failure, and the one the adoption test above does NOT reach.
+
+          Adoption only claims a capture created within the hour. Past that window the submission
+          falls through to ordinary duplicate detection, finds the stale capture at the same
+          company, and ATTACHES to it - and that branch, "approved or pending_approval", never
+          stamps submitted_by. Only the ghost branch does.
+
+          So the reader is returned a pending row that belongs to nobody, and
+          enforceSubmitterAccess refuses a row with a null submitter to everybody. The product
+          says "submitted for review" and then tells them the manager does not exist.
+        */
+        String auth0Id = insertUser("auth0|stale-capture");
+
+        JsonObject captured = await(service.createGhostManager(new JsonObject()
+            .put("name", "Stale Capture Person")
+            .put("company", "StaleCo")
+            .put("title", "Director")
+            .put("country", "Canada"), null));
+        long capturedId = captured.getLong("id");
+        assertNull(submitterOf(capturedId), "a capture starts with no submitter - nobody submitted yet");
+
+        // Older than the one-hour adoption window.
+        await(pool.preparedQuery("UPDATE managers SET created_at = now() - INTERVAL '3 hours' WHERE id = $1")
+            .execute(Tuple.of(capturedId)).mapEmpty());
+
+        Row created = await(service.createManager(auth0Id,
+            buildValidCreateBody("Stale Capture Person", "StaleCo", "Director"), null));
+
+        Row profile = await(service.getManagerById(created.getLong("id"), auth0Id));
+        assertEquals("Stale Capture Person", profile.getString("name"),
+            "the submitter can open what they submitted, however old the capture behind it was");
+    }
+
+    private UUID submitterOf(long managerId) throws Exception {
+        return await(pool.preparedQuery("SELECT submitted_by FROM managers WHERE id = $1")
+            .execute(Tuple.of(managerId)).map(rs -> rs.iterator().next().getUUID("submitted_by")));
+    }
+
+    private String approvalStatusOf(long managerId) throws Exception {
+        return await(pool.preparedQuery("SELECT approval_status FROM managers WHERE id = $1")
+            .execute(Tuple.of(managerId)).map(rs -> rs.iterator().next().getString("approval_status")));
+    }
+
+    private String slugOf(long managerId) throws Exception {
+        return await(pool.preparedQuery("SELECT slug FROM managers WHERE id = $1")
+            .execute(Tuple.of(managerId)).map(rs -> rs.iterator().next().getString("slug")));
+    }
+
     private String insertUser(String auth0Id) throws Exception {
         pool.preparedQuery("INSERT INTO users(auth0_id, email, username, first_name, last_name, role) VALUES ($1,$2,$3,$4,$5,'user')")
                 .execute(Tuple.of(auth0Id, auth0Id + "@test.com", "u_" + auth0Id.replace("|", ""), "Test", "User"))
@@ -349,7 +496,21 @@ public class ManagerServiceCoverage5IntegrationTest {
             await(service.updateReview(auth0Id, managerId, reviewId, body));
             fail("expected bad request");
         } catch (Exception e) {
-            assertTrue(e.getMessage().toLowerCase().contains("missing") || e.getMessage().toLowerCase().contains("required"));
+            /*
+              The refusal has to name the field that is absent, not merely say something is.
+
+              This asserted the words "missing" or "required", which passed for
+              "Missing required fields" - a sentence that names nothing and points nowhere. A
+              person filled in every question they could see, got that back, and there was no way
+              to act on it or to report it usefully; pinning the cause took a round trip through
+              the server logs. The message now says which answer it wants, and this asserts that
+              rather than the old phrasing.
+            */
+            String message = e.getMessage().toLowerCase();
+            assertTrue(message.contains("needs"),
+                "the error should name the missing answer, got: " + e.getMessage());
+            assertTrue(message.contains("rating") || message.contains("company") || message.contains("title"),
+                "and say which one, got: " + e.getMessage());
         }
     }
 
@@ -521,7 +682,13 @@ public class ManagerServiceCoverage5IntegrationTest {
             await(service.replaceReview(auth0Id, managerId, reviewId, body, null));
             fail("expected bad request");
         } catch (Exception e) {
-            assertTrue(e.getMessage().toLowerCase().contains("missing") || e.getMessage().toLowerCase().contains("required"));
+            // As above: the refusal names the answer it is waiting for. Here that is the ratings,
+            // which is what this body leaves out.
+            String message = e.getMessage().toLowerCase();
+            assertTrue(message.contains("needs"),
+                "the error should name the missing answer, got: " + e.getMessage());
+            assertTrue(message.contains("rating"),
+                "and it is the ratings that are absent, got: " + e.getMessage());
         }
     }
 

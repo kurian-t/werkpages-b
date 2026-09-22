@@ -88,7 +88,7 @@ class InterviewReviewIntegrationTest {
     void cleanDb() throws Exception {
         // interview_review_rounds references interview_reviews, so it has to go in the same
         // statement — TRUNCATE refuses to leave a referencing table behind.
-        await(pool.query("TRUNCATE interview_review_rounds, interview_review_deletions, interview_reviews, company_interview_stats").execute());
+        await(pool.query("TRUNCATE captured_drafts, interview_review_rounds, interview_review_deletions, interview_reviews, company_interview_stats").execute());
         await(pool.query("TRUNCATE managers, users, companies CASCADE").execute());
     }
 
@@ -1058,6 +1058,77 @@ class InterviewReviewIntegrationTest {
     // Helpers
     // ══════════════════════════════════════════════════════════════════════════
 
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // Unfinished forms
+    // ══════════════════════════════════════════════════════════════════════════
+
+    /**
+     * What a logged-out person had when the account was finally asked for.
+     *
+     * <p>This form used to render a sign-in wall in place of its fields, so somebody without an
+     * account never saw a single question — alone among the contribution forms, and impossible to
+     * capture from, because a form that never rendered has no answers to keep. It renders for
+     * everybody now and asks at submit, which is the moment these tests are about.
+     */
+    @Nested
+    class UnfinishedForms {
+
+        @Test
+        void anUnfinishedExperienceIsKeptForAnAdmin() throws Exception {
+            insertCompany("Draft Co", "draft-co");
+
+            await(service.captureDraft("draft-co", fullBody().put("author", "QuietOtter77")));
+
+            Row draft = await(pool.query("SELECT kind, company_id, payload FROM captured_drafts")
+                .execute().map(rs -> rs.iterator().next()));
+            assertEquals("interview", draft.getString("kind"));
+            assertNotNull(draft.getLong("company_id"));
+            assertEquals("QuietOtter77", draft.getJsonObject("payload").getString("author"),
+                "the answers are kept verbatim, because every form carries different fields");
+        }
+
+        @Test
+        void anUnfinishedExperienceIsNotAPublishedOne() throws Exception {
+            insertCompany("Draft Co", "draft-co");
+
+            await(service.captureDraft("draft-co", fullBody()));
+
+            assertEquals(0, rowCount("SELECT COUNT(*) AS c FROM interview_reviews"),
+                "a draft is one person's unfinished answer - it must not reach the table the "
+                + "public averages are computed from");
+        }
+
+        @Test
+        void finishingTheFormRemovesTheDraftItCameFrom() throws Exception {
+            // Otherwise an admin reads drafts whose authors came back and completed them, and the
+            // queue becomes noise nobody opens.
+            String auth0Id = insertUser("finisher");
+            insertCompany("Draft Co", "draft-co");
+            String token = UUID.randomUUID().toString();
+
+            await(service.captureDraft("draft-co", fullBody().put("draftToken", token)));
+            assertEquals(1, rowCount("SELECT COUNT(*) AS c FROM captured_drafts"));
+
+            await(service.createReview(auth0Id, "draft-co", fullBody().put("draftToken", token)));
+
+            assertEquals(0, rowCount("SELECT COUNT(*) AS c FROM captured_drafts"),
+                "the work is finished, so it is no longer waiting to be reviewed");
+        }
+
+        @Test
+        void aDraftForACompanyWeDoNotHoldIsStillKept() throws Exception {
+            // A draft is not a write path, and the write path is what creates companies. Discarding
+            // the capture because the employer is unknown would lose the submissions worth reading.
+            await(service.captureDraft("somewhere-new", fullBody()));
+
+            Row draft = await(pool.query("SELECT company_id, payload FROM captured_drafts")
+                .execute().map(rs -> rs.iterator().next()));
+            assertNull(draft.getLong("company_id"));
+            assertEquals("somewhere-new", draft.getJsonObject("payload").getString("companySlug"));
+        }
+    }
+
     private static List<String> roundTypesOf(String reviewId) throws Exception {
         return await(interviewRepo.findRounds(UUID.fromString(reviewId)).map(rows -> {
             List<String> types = new java.util.ArrayList<>();
@@ -1407,5 +1478,115 @@ class InterviewReviewIntegrationTest {
                 .map(rs -> rs.iterator().next().getUUID("id")));
         }
 
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // The individual experiences behind the averages
+    // ══════════════════════════════════════════════════════════════════════════
+
+    /**
+     * REGRESSION. {@code listForCompany} reads {@code job_relevance} out of every row, but
+     * {@code findByCompany} names its columns and never selected it — so the read threw, the
+     * endpoint returned 500, and the tab's whole experience section disappeared for exactly the
+     * people who had earned it. A signed-out reader saw the gated empty list and never hit the
+     * broken path, which is why it survived a manual look at the page.
+     *
+     * <p>Nothing covered this method at all. That is the actual reason it shipped.
+     */
+    @Nested
+    class ListForCompany {
+
+        @Test
+        void contributorGetsTheExperiences_includingEveryCategoryTheCardShows() throws Exception {
+            String auth0Id = insertUser("lister");
+            insertCompany("List Co", "list-co");
+            await(service.createReview(auth0Id, "list-co", fullBody().put("jobRelevance", 3.5)));
+
+            JsonObject out = await(service.listForCompany(auth0Id, "list-co", 20, 0));
+
+            assertFalse(out.getBoolean("gated"));
+            JsonArray data = out.getJsonArray("data");
+            assertEquals(1, data.size());
+
+            JsonObject row = data.getJsonObject(0);
+            assertEquals(4.5, row.getDouble("overallRating"));
+            assertEquals("offer", row.getString("outcome"));
+
+            // Every part the card can open, read off the same row. jobRelevance is the one that
+            // was missing from the query, so it is the one that has to be asserted.
+            JsonObject categories = row.getJsonObject("categories");
+            assertEquals(4.0, categories.getDouble("communication"));
+            assertEquals(3.5, categories.getDouble("respectForTime"));
+            assertEquals(5.0, categories.getDouble("roleClarity"));
+            assertEquals(4.0, categories.getDouble("processFairness"));
+            assertEquals(2.5, categories.getDouble("nextStepTransparency"));
+            assertEquals(3.5, categories.getDouble("jobRelevance"));
+        }
+
+        @Test
+        void nonContributorGetsTheGatedEmptyList_notAnError() throws Exception {
+            String author = insertUser("author");
+            insertCompany("Gate Co", "gate-co");
+            await(service.createReview(author, "gate-co", base()));
+
+            // Signed in, but has never filed an interview experience. Rating a manager or a
+            // company does not open this tab - it is its own contribution.
+            String reader = insertUser("reader");
+            JsonObject out = await(service.listForCompany(reader, "gate-co", 20, 0));
+
+            /*
+              The rows travel; their scores do not.
+
+              This used to assert an empty array, which was the behaviour then: a gated reader
+              got nothing, and the tab rendered as though nobody had ever interviewed here. It
+              now returns the real experiences with every number stripped server-side, so the
+              page can draw the cards with the ratings blurred out.
+
+              Asserting the scores are absent is the stronger check, and the one that matters:
+              a blur is a visual effect, so a withheld number must never leave the server. An
+              empty array only ever proved the array was empty.
+            */
+            assertTrue(out.getBoolean("gated"));
+            assertEquals(1, out.getJsonArray("data").size(), "the experience itself still travels");
+            JsonObject row = out.getJsonArray("data").getJsonObject(0);
+            assertNull(row.getValue("overallRating"), "the score is withheld, not blurred client-side");
+            assertNull(row.getValue("difficulty"),    "difficulty is a score too");
+            assertTrue(row.getJsonObject("categories").isEmpty(), "no per-category scores either");
+        }
+
+        @Test
+        void signedOutIsGated_ratherThanRejected() throws Exception {
+            insertCompany("Anon Co", "anon-co");
+
+            JsonObject out = await(service.listForCompany(null, "anon-co", 20, 0));
+
+            assertTrue(out.getBoolean("gated"),
+                "the page is public; only the experiences behind it are earned");
+            assertEquals(0, out.getJsonArray("data").size());
+        }
+
+        @Test
+        void newestFirst_andDeletedExperiencesAreGone() throws Exception {
+            String auth0Id = insertUser("historian");
+            insertCompany("Order Co", "order-co");
+            await(service.createReview(auth0Id, "order-co", base().put("interviewYear", YEAR - 1)));
+
+            String other = insertUser("second-historian");
+            String newerId = await(service.createReview(other, "order-co", base()))
+                .getString("id");
+
+            JsonArray data = await(service.listForCompany(auth0Id, "order-co", 20, 0))
+                .getJsonArray("data");
+            assertEquals(2, data.size());
+            assertEquals(newerId, data.getJsonObject(0).getString("id"), "newest first");
+
+            await(pool.preparedQuery("UPDATE interview_reviews SET deleted_at = now() WHERE id = $1")
+                .execute(Tuple.of(UUID.fromString(newerId))));
+
+            JsonArray after = await(service.listForCompany(auth0Id, "order-co", 20, 0))
+                .getJsonArray("data");
+            assertEquals(1, after.size(), "a deleted experience must not come back through the list");
+            assertNotEquals(newerId, after.getJsonObject(0).getString("id"));
+        }
     }
 }

@@ -64,7 +64,10 @@ public class ManagerService {
     private final ProofOfWorkService         proofOfWork;
     private final GeoObservationRepository   geoObservations;
     private final DeclaredLocationResolver   declaredLocations;
+    private final ReviewDisposition          reviewDisposition;
     private final LocationStatsProjector     locationStats;
+    private final org.werkpages.repository.LocationCorpusRepository locationCorpus;
+    private final org.werkpages.repository.AnonymousGhostSlotRepository ghostSlots;
 
     public ManagerService(ManagerRepository managerRepo, ReviewRepository reviewRepo,
                           UserRepository userRepo, EditRepository editRepo,
@@ -102,6 +105,15 @@ public class ManagerService {
         this.declaredLocations = new DeclaredLocationResolver(
             new org.werkpages.repository.CompanyLocationRepository(db));
         this.locationStats = new LocationStatsProjector();
+        this.reviewDisposition = new ReviewDisposition();
+        // Holds a DuckDB connection to the S3 corpus, opened lazily on first use. Constructing it
+        // is free and cannot fail: an unreachable bucket or an unpublished release disables
+        // suggestions rather than breaking anything that constructs a ManagerService, which
+        // includes every unit test.
+        this.locationCorpus = new org.werkpages.repository.LocationCorpusRepository();
+        // Same construction as the others here: stateless beyond its client, and threading it
+        // through every constructor overload would touch every test.
+        this.ghostSlots = new org.werkpages.repository.AnonymousGhostSlotRepository(db);
     }
 
     // ── GET managers list ─────────────────────────────────────────────────────
@@ -246,7 +258,19 @@ public class ManagerService {
                         .put("industrySlug", IndustryTaxonomy.slug(cardIndustry))
                         .put("managerCount", row.getLong("manager_count"))
                         .put("totalReviews", row.getLong("total_reviews"))
-                        .put("avgRating",    row.getBigDecimal("avg_rating"));
+                        .put("avgRating",    row.getBigDecimal("avg_rating"))
+                        /*
+                          All three datasets, named for what they are.
+
+                          One bare "avgRating" on a tile reads as a verdict on the company; it is
+                          the mean of its managers' ratings and says nothing about working there
+                          or interviewing there, both of which are separately rated. The tile can
+                          only say so if it is sent all three.
+                        */
+                        .put("workplaceCount",  row.getLong("workplace_count"))
+                        .put("workplaceRating", row.getBigDecimal("workplace_avg_rating"))
+                        .put("interviewCount",  row.getLong("interview_count"))
+                        .put("interviewRating", row.getBigDecimal("interview_avg_rating"));
                     if (logoUrl != null && !logoUrl.isBlank()) co.put("logoUrl", logoUrl);
                     companies.add(co);
                 }
@@ -681,6 +705,198 @@ public class ManagerService {
      * `industry` rides along because the picker needs it to tell two similarly-named companies
      * apart before the user commits to one.
      */
+    /**
+     * Places to offer for one company: its buildings, and geography anybody has already confirmed
+     * for it.
+     *
+     * <p>Both kinds come back in one list because both are valid answers. Somebody who knows the
+     * branch picks the building; somebody who only knows the province picks the province and is
+     * done. Requiring a street address to file a rating would lose the rating.
+     */
+    public Future<JsonArray> suggestCompanyLocations(Long companyId, String companyName, String query,
+                                                     String country, String state) {
+        if (query == null || query.trim().length() < 2) return Future.succeededFuture(new JsonArray());
+        return new org.werkpages.repository.CompanyLocationRepository(db)
+            .suggest(companyId, companyName, query, country, state)
+            .map(rows -> {
+                JsonArray out = new JsonArray();
+                for (Row row : rows) {
+                    // (mapping below unchanged)
+                    boolean isPlace = "place".equals(row.getString("kind"));
+                    JsonObject item = new JsonObject()
+                        .put("kind", row.getString("kind"))
+                        .put("label", row.getString("label"))
+                        .put("country", row.getString("country"));
+                    if (row.getString("state") != null) item.put("state", row.getString("state"));
+                    if (row.getString("city")  != null) item.put("city",  row.getString("city"));
+                    if (isPlace) {
+                        item.put("detail", row.getString("detail"))
+                            .put("precision", DeclaredLocation.EXACT)
+                            .put("companyLocationId", row.getLong("company_location_id"));
+                    } else {
+                        // How specific this geography is, from how much of it there is.
+                        String precision = row.getString("city")  != null ? DeclaredLocation.CITY
+                                         : row.getString("state") != null ? DeclaredLocation.STATE
+                                         : DeclaredLocation.COUNTRY;
+                        item.put("precision", precision);
+                    }
+                    out.add(item);
+                }
+                return out;
+            })
+            .compose(confirmed -> appendCorpusSuggestions(confirmed, companyName, query, country, state));
+    }
+
+    /** How many suggestions the picker shows in total, across every tier. */
+    private static final int SUGGESTION_LIMIT = 8;
+
+    /**
+     * How many coarse places lead the list, before any building.
+     *
+     * <p>Geography went last and was merely reserved a seat, which put "Toronto, Ontario, Canada"
+     * at the bottom of eight street addresses — visible, but below every answer somebody had not
+     * asked for. The coarse answer is the one most people can actually give, so it goes first.
+     *
+     * <p>Capped rather than unlimited, and the rest of the list is buildings: somebody who knows
+     * the branch still finds it without scrolling past every suburb of the city they typed.
+     */
+    private static final int GEOGRAPHY_FIRST = 3;
+
+    /**
+     * Adds corpus candidates beneath what is already confirmed.
+     *
+     * <p><b>Order is the point.</b> Everything from Postgres — buildings already selected, geography
+     * already confirmed for this company — comes first, because those are facts about this company
+     * that somebody stood behind. Corpus rows are candidates from a map: useful, plentiful, and
+     * never allowed to push a real answer off the list.
+     *
+     * <p>Once the confirmed tiers fill the list, the corpus is not queried at all. A company whose
+     * locations are already known should not pay an S3 round trip per keystroke to be told about
+     * places nobody there has worked.
+     *
+     * <p>Failure is silent, by construction: the corpus repository returns an empty array rather
+     * than failing, so an unreachable bucket costs suggestions and nothing else.
+     */
+    private Future<JsonArray> appendCorpusSuggestions(JsonArray confirmed, String companyName,
+                                                      String query, String country, String state) {
+        if (confirmed.size() >= SUGGESTION_LIMIT) return Future.succeededFuture(confirmed);
+
+        java.util.Set<String> seen = new java.util.HashSet<>();
+        for (Object entry : confirmed) {
+            String label = ((JsonObject) entry).getString("label");
+            if (label != null) seen.add(label.toLowerCase());
+        }
+
+        /*
+          Both at once. They are independent reads of different files, and running them one after
+          the other doubled the wait on every keystroke for no reason.
+        */
+        Future<JsonArray> placesF    = locationCorpus.suggestPlaces(companyName, query, country);
+        Future<JsonArray> geographyF = locationCorpus.suggestGeography(query, country, null);
+
+        return Future.all(placesF, geographyF).map(cf -> {
+            JsonArray places    = cf.resultAt(0);
+            JsonArray geography = cf.resultAt(1);
+            JsonArray merged = confirmed.copy();
+
+            /*
+              Geography gets its own seats, and buildings cannot take them.
+
+              Buildings are listed first because somebody typing a company or a street wants the
+              branch. But there are thousands of them and only a handful of matching places, so
+              filling the list with buildings meant "Toronto, Ontario, Canada" never appeared at
+              all - somebody who only knows the city was shown eight street addresses and no way to
+              say what they actually knew. A coarse answer is a complete answer, and it has to be
+              reachable.
+            */
+            /*
+              Coarse first, then buildings, then any geography that did not fit at the top.
+
+              A city or a province is the answer most people have, and it was being printed
+              underneath eight street addresses nobody had asked about. Leading with it costs the
+              person who knows the exact branch three rows of scrolling; burying it cost everybody
+              else the ability to answer at all.
+            */
+            int geoSeats = Math.min(GEOGRAPHY_FIRST, geography.size());
+            addCorpusGeography(merged, geography, seen, country,
+                               Math.min(merged.size() + geoSeats, SUGGESTION_LIMIT));
+            addCorpusPlaces(merged, places, seen, country, SUGGESTION_LIMIT);
+            addCorpusGeography(merged, geography, seen, country, SUGGESTION_LIMIT);
+            return merged;
+        });
+    }
+
+    private void addCorpusPlaces(JsonArray out, JsonArray places,
+                                 java.util.Set<String> seen, String country, int limit) {
+        for (Object entry : places) {
+            if (out.size() >= limit) return;
+            JsonObject place = (JsonObject) entry;
+            String label = place.getString("name");
+            if (label == null || !seen.add(label.toLowerCase() + "|" + place.getString("street"))) continue;
+
+            String detail = java.util.stream.Stream
+                .of(place.getString("street"),
+                    join(", ", place.getString("city"), place.getString("stateCode")))
+                .filter(part -> part != null && !part.isBlank())
+                .collect(java.util.stream.Collectors.joining(" · "));
+
+            out.add(new JsonObject()
+                .put("kind", "place")
+                .put("label", label)
+                .put("detail", detail)
+                .put("country", country)
+                .put("city", place.getString("city"))
+                .put("precision", DeclaredLocation.EXACT)
+                // No companyLocationId: this building is not in the database yet. The client sends
+                // corpusPlace back on submit and it is promoted then - see CorpusPlace.
+                .put("corpusPlace", place.copy().put("countryCode",
+                        org.werkpages.repository.LocationCorpusRepository.iso(country))));
+        }
+    }
+
+    private void addCorpusGeography(JsonArray out, JsonArray geography,
+                                    java.util.Set<String> seen, String country, int limit) {
+        for (Object entry : geography) {
+            if (out.size() >= limit) return;
+            JsonObject geo = (JsonObject) entry;
+            String name  = geo.getString("name");
+            String kind  = geo.getString("geoKind");
+            if (name == null) continue;
+
+            String stateName = geo.getString("stateName");
+            String label = "country".equals(kind) ? name
+                         : "region".equals(kind)  ? join(", ", name, country)
+                         : join(", ", name, stateName, country);
+            if (!seen.add(label.toLowerCase())) continue;
+
+            JsonObject item = new JsonObject()
+                .put("kind", "geo")
+                .put("label", label)
+                .put("country", country);
+
+            switch (kind == null ? "" : kind) {
+                case "country" -> item.put("precision", DeclaredLocation.COUNTRY);
+                case "region"  -> item.put("state", name).put("precision", DeclaredLocation.STATE);
+                default        -> {
+                    item.put("city", name).put("precision", DeclaredLocation.CITY);
+                    if (stateName != null) item.put("state", stateName);
+                    // A city with no region cannot be stored at city precision, which requires
+                    // country + state + city. Hong Kong and Monaco are genuinely like this, so it
+                    // is offered as the province-level answer rather than dropped.
+                    if (stateName == null) item.put("precision", DeclaredLocation.COUNTRY);
+                }
+            }
+            out.add(item);
+        }
+    }
+
+    /** Joins the non-blank parts with a separator. */
+    private static String join(String separator, String... parts) {
+        return java.util.Arrays.stream(parts)
+            .filter(part -> part != null && !part.isBlank())
+            .collect(java.util.stream.Collectors.joining(separator));
+    }
+
     public Future<JsonArray> suggestCompanies(String query) {
         if (query == null || query.isBlank()) return Future.succeededFuture(new JsonArray());
         return companyRepo.searchForPicker(query.trim())
@@ -789,19 +1005,64 @@ public class ManagerService {
         return createManager(auth0Id, body, resolvedLogoUrl, SubmissionContext.NONE);
     }
 
+
+
+    /** The two values a manager's status may take, or null for anything else - including absence. */
+    private static String statusOrNull(String raw) {
+        if (raw == null) return null;
+        String value = raw.trim().toLowerCase();
+        return ("active".equals(value) || "retired".equals(value)) ? value : null;
+    }
+
+    /**
+     * Which required review field is absent, phrased for a reader, or null when none is.
+     *
+     * <p>Shared by the three paths that accept a review - submitted with a new manager, added to
+     * an existing one, and replacing an earlier one - so the same omission reads the same way
+     * wherever it happens.
+     *
+     * <p>The company and title are the manager's, as the reviewer knew them: they live on the
+     * review rather than being read from the manager row because a manager moves, and an opinion
+     * records the job it was about rather than the job they hold now.
+     */
+    private static String reviewFieldMissing(Double overallRating, JsonObject ratings,
+                                             String managerCompany, String managerTitle) {
+        if (overallRating == null)   return "Your review needs an overall rating.";
+        if (ratings == null)         return "Your review needs its category ratings.";
+        if (isBlank(managerCompany)) return "Your review needs the company you worked with this manager at.";
+        if (isBlank(managerTitle))   return "Your review needs the job title this manager held.";
+        return null;
+    }
+
     /** All validation and business logic for POST /api/managers. Returns the created manager row. */
     public Future<Row> createManager(String auth0Id, JsonObject body, String resolvedLogoUrl,
                                      SubmissionContext submission) {
         if (body == null) return Future.failedFuture(ServiceException.badRequest("Missing request body"));
         final GeoObservation observed = submission.observed();
         final DeclaredLocation declared = submission.declared();
+        // Null unless the form named a building that is not in the database yet. Promoted inside
+        // the transaction below, so a location is only ever created alongside the manager it
+        // belongs to.
+        final CorpusPlace corpusPlace = submission.corpusPlace();
 
         String name    = toProperNameCase(body.getString("name"));
         String company = body.getString("company") != null ? body.getString("company").trim() : null;
         String title   = body.getString("title")   != null ? body.getString("title").trim()   : null;
         String image   = body.getString("image");
-        if (isBlank(name) || isBlank(company) || isBlank(title) || isBlank(image)) {
-            return Future.failedFuture(ServiceException.badRequest("Missing required fields"));
+        /*
+          Name the field, rather than saying "something".
+
+          "Missing required fields" is what a person saw after filling in a form where every
+          visible question was answered - it names nothing, points nowhere, and cannot be acted on
+          or usefully reported. Each of these four is a distinct question somebody can go answer.
+        */
+        String missing = isBlank(name)    ? "a name"
+                       : isBlank(company) ? "a company"
+                       : isBlank(title)   ? "a job title"
+                       : isBlank(image)   ? "an avatar initial"
+                       : null;
+        if (missing != null) {
+            return Future.failedFuture(ServiceException.badRequest("This manager needs " + missing + "."));
         }
         if (name.length() > 100)    return Future.failedFuture(ServiceException.badRequest("Manager name must be at most 100 characters"));
         if (company.length() < 2)   return Future.failedFuture(ServiceException.badRequest("Company name must be at least 2 characters"));
@@ -866,8 +1127,9 @@ public class ManagerService {
         LocalDate workedFrom  = parseYearMonth(reviewBody.getString("workedFrom"));
         LocalDate workedUntil = parseYearMonth(reviewBody.getString("workedUntil"));
 
-        if (overallRating == null || ratings == null || isBlank(managerCompany) || isBlank(managerTitle)) {
-            return Future.failedFuture(ServiceException.badRequest("Review is missing required fields"));
+        String missingReview = reviewFieldMissing(overallRating, ratings, managerCompany, managerTitle);
+        if (missingReview != null) {
+            return Future.failedFuture(ServiceException.badRequest(missingReview));
         }
         if (workedFrom == null) return Future.failedFuture(ServiceException.badRequest("Your start date working with this manager is required"));
         if (workedFrom.isAfter(today)) return Future.failedFuture(ServiceException.badRequest("The 'from' date cannot be in the future"));
@@ -974,9 +1236,10 @@ public class ManagerService {
                                     .compose(slug ->
                                 ((Pool) db).withTransaction(conn ->
                                     // Resolved inside the transaction: at exact precision this reads
-                                    // the chosen location row, and it must be the same row the
-                                    // insert below points at.
-                                    declaredLocations.resolve(conn, declared, companyId)
+                                    // the chosen location row - or creates it, when the place came
+                                    // from the corpus - and it must be the same row the insert
+                                    // below points at.
+                                    declaredLocations.resolve(conn, declared, corpusPlace, companyId)
                                     .compose(loc ->
                                     conn.preparedQuery("""
                                         INSERT INTO managers
@@ -1054,6 +1317,39 @@ public class ManagerService {
             });
     }
 
+
+    /**
+     * Whether two names are close enough that the second is worth showing for the first.
+     *
+     * <p>Not "the same person" - a suggestion. The reader decides, so this is tuned to avoid
+     * hiding a real match rather than to avoid showing a near miss.
+     *
+     * <p>The rule: the first names must match exactly, and the typed surname must be a plausible
+     * fragment of the stored one. "Daniel Pa" for "Daniel Perovic" is the case this exists for -
+     * two letters that are not even a prefix - so a short fragment is accepted only when it shares
+     * the first letter, which keeps "Daniel Ko" from dragging in every Daniel at the company.
+     *
+     * <p>A typed surname of one character is rejected outright: at that length everything is
+     * plausible, and a list of everyone called Daniel is not an answer.
+     */
+    private static boolean isPlausibleSameName(String typed, String stored) {
+        String[] t = typed.trim().split("\\s+", 2);
+        String[] c = stored.trim().split("\\s+", 2);
+        if (t.length < 2 || c.length < 2) return false;
+        if (!t[0].equalsIgnoreCase(c[0])) return false;
+
+        String typedLast  = t[1].trim();
+        String storedLast = c[1].trim();
+        if (typedLast.length() < 2) return false;
+        if (storedLast.toLowerCase().startsWith(typedLast.toLowerCase())) return true;
+        // Same initial and a short fragment: "Pa" against "Perovic". Long fragments have to be
+        // near-misses rather than merely alphabetical neighbours.
+        if (typedLast.length() <= 3) {
+            return Character.toLowerCase(typedLast.charAt(0)) == Character.toLowerCase(storedLast.charAt(0));
+        }
+        return LevenshteinUtil.distance(typedLast.toLowerCase(), storedLast.toLowerCase()) <= 2;
+    }
+
     private static Row findFuzzyNameMatch(RowSet<Row> candidates, String targetName) {
         for (Row row : candidates) {
             String candidateName = row.getString("name");
@@ -1125,8 +1421,18 @@ public class ManagerService {
                         });
                 });
         } else {
-            // approved or pending_approval — delete any legacy seed, then attach review
-            return managerRepo.findByIdFlat(existingId)
+            /*
+              approved or pending_approval — delete any legacy seed, then attach review.
+
+              The submitter is stamped on the way through. A capture this submission attached to
+              rather than adopted carries no submitted_by, and enforceSubmitterAccess refuses an
+              ownerless pending row to everybody - so without this the person who just submitted
+              is shown "Manager Not Found" straight after being told it went for review.
+
+              COALESCE inside the update, so a manager somebody else submitted keeps its original
+              submitter; this only fills a gap.
+            */
+            return managerRepo.claimSubmitterIfUnowned(existingId, userId)
                 .compose(opt -> {
                     if (opt.isEmpty()) return Future.failedFuture(ServiceException.notFound("Manager not found"));
                     Row existingRow = opt.get();
@@ -1365,6 +1671,16 @@ public class ManagerService {
         LocalDate workedUntil     = parseYearMonth(body.getString("workedUntil"));
         LocalDate managerRoleStart = parseYearMonth(body.getString("managerRoleStart"));
         LocalDate managerRoleEnd   = parseYearMonth(body.getString("managerRoleEnd")); // null = still in role
+        /*
+          Whether the manager was still in the role, as this reviewer knew it - the one field the
+          add-manager form asked for and this one could not. Optional: a body that omits it leaves
+          the manager's own status alone rather than asserting one on their behalf.
+        */
+        final String managerStatus = statusOrNull(body.getString("managerStatus"));
+        if (body.getString("managerStatus") != null && managerStatus == null) {
+            return Future.failedFuture(ServiceException.badRequest(
+                "Manager status must be either active or retired."));
+        }
         LocalDate today = LocalDate.now();
 
         // ── Manager role date validation (optional — not all reviewers know manager tenure) ─
@@ -1457,7 +1773,8 @@ public class ManagerService {
                 if (managerRoleStart == null) {
                     return insertReviewTransactionally(managerId, userId, author, overallRating,
                             ratings, managerCompany, managerTitle, text,
-                            workedFrom, workedUntil, null, null, resolvedLogoUrl, draftToken, submission);
+                            workedFrom, workedUntil, null, null, resolvedLogoUrl, draftToken, submission,
+                            managerStatus);
                 }
                 return reviewRepo.findRolePeriodsForManager(managerId)
                     .compose(allRoleRows -> {
@@ -1478,7 +1795,8 @@ public class ManagerService {
 
                         return insertReviewTransactionally(managerId, userId, author, overallRating,
                                 ratings, managerCompany, managerTitle, text,
-                                workedFrom, workedUntil, managerRoleStart, managerRoleEnd, resolvedLogoUrl, draftToken, submission);
+                                workedFrom, workedUntil, managerRoleStart, managerRoleEnd, resolvedLogoUrl, draftToken, submission,
+                                managerStatus);
                     });  // closes allRoleRows compose
             })  // closes existingRows compose
         );  // closes deleteDraftFirst compose
@@ -1519,16 +1837,48 @@ public class ManagerService {
             });
     }
 
-    private Future<DeclaredLocation> resolveDeclaredForManager(SqlClient conn, DeclaredLocation declared, long managerId) {
-        if (declared == null || declared.isEmpty() || !DeclaredLocation.EXACT.equals(declared.precision())) {
-            return declaredLocations.resolve(conn, declared, null);
-        }
+    /**
+     * Moves an edited opinion from what it contributed to what it now contributes.
+     *
+     * <p>Subtract-then-add rather than a computed difference, because an edit that changes the
+     * location does not merely change a number - it moves the contribution to a different set of
+     * scope rows entirely, and a difference has nowhere to go in that case.
+     *
+     * <p>Ratings were editable long before location was, and this path did not maintain the
+     * projection at all: re-rating a manager from 5 to 1 left the location figures still counting
+     * the 5. Putting location on the edit form is what made that visible, so it is fixed here
+     * rather than left for the next person to find.
+     */
+    private Future<Void> reprojectEditedReview(SqlClient conn, long managerId, Row before, Row after) {
+        if (before == null) return Future.succeededFuture();
         return conn.preparedQuery("SELECT company_id FROM managers WHERE id = $1")
             .execute(Tuple.of(managerId))
             .compose(rs -> {
                 var it = rs.iterator();
                 Long companyId = it.hasNext() ? it.next().getLong("company_id") : null;
-                return declaredLocations.resolve(conn, declared, companyId);
+                // No company means nothing was ever projected for this review, so there is nothing
+                // to move. A rebuild picks it up if a company is attached later.
+                if (companyId == null) return Future.succeededFuture();
+                return locationStats.applyChange(conn,
+                    LocationStatsProjector.ManagerReviewFacts.from(before, companyId),
+                    LocationStatsProjector.ManagerReviewFacts.from(after,  companyId));
+            });
+    }
+
+    private Future<DeclaredLocation> resolveDeclaredForManager(SqlClient conn, DeclaredLocation declared,
+                                                               CorpusPlace corpusPlace, long managerId) {
+        if (declared == null || declared.isEmpty() || !DeclaredLocation.EXACT.equals(declared.precision())) {
+            return declaredLocations.resolve(conn, declared, null, null);
+        }
+        // The company comes from the manager rather than the request: a review is about a manager,
+        // and the building has to belong to that manager's company. Taking it from the body would
+        // let a stale or crafted form file a Walmart address under a review of somebody at Loblaws.
+        return conn.preparedQuery("SELECT company_id FROM managers WHERE id = $1")
+            .execute(Tuple.of(managerId))
+            .compose(rs -> {
+                var it = rs.iterator();
+                Long companyId = it.hasNext() ? it.next().getLong("company_id") : null;
+                return declaredLocations.resolve(conn, declared, corpusPlace, companyId);
             });
     }
 
@@ -1537,7 +1887,8 @@ public class ManagerService {
             JsonObject ratings, String managerCompany, String managerTitle, String text,
             LocalDate workedFrom, LocalDate workedUntil,
             LocalDate managerRoleStart, LocalDate managerRoleEnd,
-            String resolvedLogoUrl, UUID draftToken, SubmissionContext submission) {
+            String resolvedLogoUrl, UUID draftToken, SubmissionContext submission,
+            String managerStatus) {
 
         return ((Pool) db).withTransaction(conn -> {
             // Authenticated submit with a token: delete the matching anonymous drop-off draft first.
@@ -1551,7 +1902,8 @@ public class ManagerService {
             UUID tokenToStore = (userId == null) ? draftToken : null;
 
             return deleteDraft
-                .compose(v -> resolveDeclaredForManager(conn, submission.declared(), managerId))
+                .compose(v -> resolveDeclaredForManager(conn, submission.declared(),
+                                                        submission.corpusPlace(), managerId))
                 .compose(resolvedDeclared ->
                 conn.preparedQuery("""
                         INSERT INTO reviews (
@@ -1562,10 +1914,11 @@ public class ManagerService {
                             overall_working_experience, manager_company, manager_title, text,
                             worked_from, worked_until, manager_role_start, manager_role_end,
                             draft_token, verified, helpful_count, created_at, updated_at,
-                            declared_country, declared_state, declared_city, declared_precision, company_location_id
+                            declared_country, declared_state, declared_city, declared_precision, company_location_id,
+                            manager_status
                         )
                         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,true,0,now(),now(),
-                                $23,$24,$25,$26,$27)
+                                $23,$24,$25,$26,$27,$28)
                         RETURNING *
                         """)
                     .execute(Tuple.of(
@@ -1576,7 +1929,8 @@ public class ManagerService {
                         getRating(ratings, 9), managerCompany, managerTitle, text,
                         workedFrom, workedUntil, managerRoleStart, managerRoleEnd, tokenToStore,
                         resolvedDeclared.country(), resolvedDeclared.state(), resolvedDeclared.city(),
-                        resolvedDeclared.precision(), resolvedDeclared.companyLocationId()
+                        resolvedDeclared.precision(), resolvedDeclared.companyLocationId(),
+                        managerStatus
                     ))
                 .compose(reviewResult -> {
                     Row reviewRow = reviewResult.iterator().next();
@@ -1595,7 +1949,8 @@ public class ManagerService {
                         .compose(ignoredObs -> projectNewReview(conn, managerId, reviewRow))
                         .compose(ignoredProj -> applyProofOfWork(conn, managerId, userId, newId))
                         .compose(afterDecision -> conn.preparedQuery("""
-                            SELECT id, manager_company, manager_title, worked_from, worked_until,
+                            SELECT id, manager_company, manager_title, manager_status,
+                                   worked_from, worked_until,
                                    declared_country, declared_state, declared_city,
                                    declared_precision, company_location_id
                             -- Same reason as ReviewRepository.findMostCurrentReviewForManager:
@@ -1626,6 +1981,15 @@ public class ManagerService {
                             String currentLogo = newId.equals(mostCurrent.getUUID("id"))
                                 ? resolvedLogoUrl
                                 : logoResolver.apply(currentCompany);
+                            /*
+                              Whether they are still in the role, decided the same way as their
+                              company and title: by the most current opinion rather than by
+                              whoever submitted last. A review that said nothing leaves the
+                              manager's status alone - silence is not a claim that they retired.
+                            */
+                            String currentStatus = newId.equals(mostCurrent.getUUID("id"))
+                                ? managerStatus
+                                : mostCurrent.getString("manager_status");
                             /*
                               Where the manager works now, decided the same way as their company and
                               title: by whichever opinion is the most current one, not by whichever
@@ -1672,10 +2036,16 @@ public class ManagerService {
                                 })
                                 .compose(cmpResult -> {
                                     long cmpId = cmpResult.iterator().next().getLong("id");
+                                    /*
+                                      COALESCE on the status, not an assignment: a review that
+                                      said nothing about it must leave the manager's own alone.
+                                      Passing NULL here would retire somebody because the person
+                                      rating them did not answer a question.
+                                    */
                                     if (currentLocation.isEmpty()) {
                                         return conn.preparedQuery(
-                                                "UPDATE managers SET updated_at = now(), company = $1, title = $2, company_logo_url = $3, company_id = $4 WHERE id = $5")
-                                            .execute(Tuple.of(currentCompany, currentTitle, currentLogo, cmpId, managerId));
+                                                "UPDATE managers SET updated_at = now(), company = $1, title = $2, company_logo_url = $3, company_id = $4, status = COALESCE($6, status) WHERE id = $5")
+                                            .execute(Tuple.of(currentCompany, currentTitle, currentLogo, cmpId, managerId, currentStatus));
                                     }
                                     return conn.preparedQuery("""
                                             UPDATE managers
@@ -1683,13 +2053,14 @@ public class ManagerService {
                                                    company_logo_url = $3, company_id = $4,
                                                    declared_country = $6, declared_state = $7,
                                                    declared_city = $8, declared_precision = $9,
-                                                   company_location_id = $10
+                                                   company_location_id = $10,
+                                                   status = COALESCE($11, status)
                                              WHERE id = $5
                                             """)
                                         .execute(Tuple.of(currentCompany, currentTitle, currentLogo, cmpId, managerId,
                                                           currentLocation.country(), currentLocation.state(),
                                                           currentLocation.city(), currentLocation.precision(),
-                                                          currentLocation.companyLocationId()));
+                                                          currentLocation.companyLocationId(), currentStatus));
                                 })
                                 // The post-decision row when the rating was held, so the response
                                 // says what the server actually did rather than what the INSERT
@@ -1869,7 +2240,8 @@ public class ManagerService {
             if (managerRoleEnd != null && workedUntil != null && workedUntil.isAfter(managerRoleEnd)) return Future.failedFuture(ServiceException.badRequest("Your end date cannot be after the manager left this role (" + formatYM(managerRoleEnd) + ")"));
         }
 
-        if (overallRating == null || ratings == null || isBlank(managerCompany) || isBlank(managerTitle)) return Future.failedFuture(ServiceException.badRequest("Missing required fields"));
+        String missingReviewField = reviewFieldMissing(overallRating, ratings, managerCompany, managerTitle);
+        if (missingReviewField != null) return Future.failedFuture(ServiceException.badRequest(missingReviewField));
         if (!isValidRating(overallRating)) return Future.failedFuture(ServiceException.badRequest("Overall rating must be between 1 and 5"));
         if (managerCompany.length() > 100) return Future.failedFuture(ServiceException.badRequest("Manager company must be at most 100 characters"));
         if (managerTitle.length()   > 100) return Future.failedFuture(ServiceException.badRequest("Manager title must be at most 100 characters"));
@@ -1937,18 +2309,44 @@ public class ManagerService {
                             }
                         }
 
-                        return reviewRepo.update(reviewId, managerId, callerId, author, overallRating,
+                        /*
+                          Where the opinion happened is only revisited when the form actually
+                          asked again. A body with no declaredPrecision is an edit to something
+                          else, and re-deriving a location there would migrate a 2019 opinion to
+                          wherever the manager works today - the same failure the manager-transfer
+                          case exists to prevent, arriving through the edit form instead.
+                        */
+                        DeclaredLocation declared = DeclaredLocation.fromBody(body);
+                        boolean restatesLocation = !declared.isEmpty();
+                        CorpusPlace corpusPlace  = CorpusPlace.fromBody(body.getJsonObject("corpusPlace"));
+
+                        return ((Pool) db).withTransaction(conn ->
+                            reviewRepo.findForProjection(conn, reviewId).compose(beforeOpt ->
+                            (restatesLocation
+                                ? resolveDeclaredForManager(conn, declared, corpusPlace, managerId)
+                                : Future.<DeclaredLocation>succeededFuture(null))
+                            .compose(resolved -> reviewRepo.update(conn,
+                                reviewId, managerId, callerId, author, overallRating,
                                 ratings.getDouble("Communication Style"), ratings.getDouble("Perceived Approachability"),
                                 ratings.getDouble("Perceived Clarity of Expectations"), ratings.getDouble("Feedback Style"),
                                 ratings.getDouble("Perceived Supportiveness"), ratings.getDouble("Decision Making Style"),
                                 ratings.getDouble("Organization and Planning Style"), ratings.getDouble("Delegation Style"),
                                 ratings.getDouble("Perceived Professional Demeanor"), ratings.getDouble("Overall Working Experience"),
                                 managerCompany, managerTitle, text, workedFrom, workedUntil,
-                                managerRoleStart, managerRoleEnd)
+                                managerRoleStart, managerRoleEnd, resolved))
                             .compose(rowOpt -> {
                                 if (rowOpt.isEmpty()) return Future.failedFuture(ServiceException.notFound("Review not found"));
+                                // The read model is maintained in the same transaction as the write
+                                // it describes, per the incrementally-maintained-read-table rules:
+                                // a projection updated afterwards is a projection that drifts the
+                                // first time the second statement fails.
+                                return reprojectEditedReview(conn, managerId,
+                                        beforeOpt.orElse(null), rowOpt.get())
+                                    .map(v -> rowOpt.get());
+                            })))
+                            .map(row -> {
                                 managerRepo.recalculateInBackground(managerId);
-                                return Future.succeededFuture(rowOpt.get());
+                                return row;
                             });
                     });
             });
@@ -1967,7 +2365,16 @@ public class ManagerService {
                     .compose(ownerOpt -> {
                         if (ownerOpt.isEmpty()) return Future.failedFuture(ServiceException.notFound("Review not found"));
                         if (!ownerOpt.get().equals(userId)) return Future.failedFuture(ServiceException.forbidden("Forbidden"));
-                        return reviewRepo.delete(reviewId, managerId)
+                        /*
+                          The hide and the projection move together, or the figures keep counting
+                          a rating the page no longer shows. Soft-deleting is a boundary crossing
+                          like any other, so it goes through the projector rather than being
+                          remembered here.
+                        */
+                        return ((Pool) db).withTransaction(conn ->
+                                locationStats.contributionOf(conn, reviewId)
+                                    .compose(before -> reviewRepo.delete(conn, reviewId, managerId)
+                                        .compose(v -> locationStats.resyncManagerReview(conn, reviewId, before))))
                             .compose(v -> {
                                 // Recalculate immediately after soft-delete, before recordDeletion,
                                 // so stale stats are never left behind if recordDeletion fails.
@@ -1977,6 +2384,56 @@ public class ManagerService {
                             .map(v -> new JsonObject().put("success", true).put("message", "Review deleted"));
                     });
             });
+    }
+
+
+    // ── Crossing the projection boundary ──────────────────────────────────────
+
+    /**
+     * Brings back ratings whose three-day delete window has expired, as anonymous.
+     *
+     * <p>A delete here hides a rating rather than destroying it, and after three days it
+     * resurfaces. That makes restoring a boundary crossing in the other direction, and the
+     * projection has to follow: subtracting on delete without adding back on restore would leave
+     * every restored rating permanently uncounted, silently and forever.
+     *
+     * <p>The ids are read first, because once {@code deleted_at} is cleared there is nothing left
+     * to identify which rows this run touched.
+     *
+     * @return how many were restored
+     */
+    public Future<Integer> restoreExpiredReviewDeletions() {
+        return ((Pool) db).withTransaction(conn ->
+            conn.preparedQuery("""
+                    SELECT id FROM reviews
+                     WHERE deleted_at IS NOT NULL AND deleted_at < now() - INTERVAL '3 days'
+                    """)
+                .execute()
+                .compose(rs -> {
+                    List<UUID> ids = new ArrayList<>();
+                    for (Row r : rs) ids.add(r.getUUID("id"));
+                    if (ids.isEmpty()) return Future.succeededFuture(0);
+                    return conn.preparedQuery("""
+                            UPDATE reviews SET deleted_at = NULL
+                             WHERE deleted_at IS NOT NULL AND deleted_at < now() - INTERVAL '3 days'
+                            """)
+                        .execute()
+                        .compose(updated -> {
+                            // They were out of the projection while hidden, so each starts from
+                            // "contributing nothing" and is added back at whatever it now is.
+                            Future<Void> chain = Future.succeededFuture();
+                            for (UUID id : ids) {
+                                chain = chain.compose(v ->
+                                    locationStats.resyncManagerReview(conn, id, Optional.empty()));
+                            }
+                            return chain.map(ids.size());
+                        });
+                }));
+    }
+
+    /** Holds, releases or rejects a rating. See {@link ReviewDisposition}. */
+    public Future<Void> setReviewDisposition(UUID reviewId, String disposition) {
+        return ((Pool) db).withTransaction(conn -> reviewDisposition.set(conn, reviewId, disposition));
     }
 
     // ── REPLACE review (delete old + create new, no cooldown recorded) ────────
@@ -2050,7 +2507,8 @@ public class ManagerService {
             if (managerRoleEnd != null && workedFrom.isAfter(managerRoleEnd)) return ServiceException.badRequest("Your start date cannot be after the manager left this role (" + formatYM(managerRoleEnd) + ")");
             if (managerRoleEnd != null && workedUntil != null && workedUntil.isAfter(managerRoleEnd)) return ServiceException.badRequest("Your end date cannot be after the manager left this role (" + formatYM(managerRoleEnd) + ")");
         }
-        if (overallRating == null || ratings == null || isBlank(managerCompany) || isBlank(managerTitle)) return ServiceException.badRequest("Missing required fields");
+        String missingSync = reviewFieldMissing(overallRating, ratings, managerCompany, managerTitle);
+        if (missingSync != null) return ServiceException.badRequest(missingSync);
         if (managerCompany.length() > 100) return ServiceException.badRequest("Manager company must be at most 100 characters");
         if (managerTitle.length()   > 100) return ServiceException.badRequest("Manager title must be at most 100 characters");
         if (text != null && text.length() > 2000) return ServiceException.badRequest("Review text must be at most 2000 characters");
@@ -2222,6 +2680,16 @@ public class ManagerService {
             .put("helpfulCount",  row.getInteger("helpful_count"))
             .put("createdAt",     row.getOffsetDateTime("created_at").toString())
             .put("updatedAt",     row.getOffsetDateTime("updated_at").toString())
+            /*
+              Where the opinion says the work happened. Exposed because the edit form has to open
+              with what is already stored - without these, reopening a review showed an empty
+              location field, and saving it would have looked like the person had cleared it.
+            */
+            .put("declaredCountry",   row.getString("declared_country"))
+            .put("declaredState",     row.getString("declared_state"))
+            .put("declaredCity",      row.getString("declared_city"))
+            .put("declaredPrecision", row.getString("declared_precision"))
+            .put("companyLocationId", row.getLong("company_location_id"))
             .put("workedFrom",    row.getLocalDate("worked_from")  != null ? row.getLocalDate("worked_from").toString()  : null)
             .put("workedUntil",   row.getLocalDate("worked_until") != null ? row.getLocalDate("worked_until").toString() : null)
             /*
@@ -2485,16 +2953,67 @@ public class ManagerService {
                     return Future.failedFuture(ServiceException.unauthorized("User not found"));
                 UUID userId = opt.get();
 
+                /*
+                  The company half, by identity when we have one.
+
+                  The client resolves which company was chosen and sends its id; this used to
+                  match on the text it happened to be stored under instead, so "Revvity" and
+                  "Revvity Chemagen Technologie" looked like two unrelated employers and a search
+                  for one could not see the managers of the other.
+
+                  Scope is the selected company plus its DESCENDANTS - downward only. Selecting a
+                  parent considers its subsidiaries, because somebody looking for a colleague
+                  should not have to know which legal entity payroll uses. Selecting a child does
+                  NOT pull in its parent or its siblings: those people do not work at the company
+                  that was chosen.
+
+                  Text remains the fallback for a search that resolved no company at all.
+                */
+                Future<RowSet<Row>> searchFuture = companyId == null
+                    ? managerRepo.search(5, 0, "%" + fullName + "%", "%" + company.trim() + "%", "featured", userId)
+                    /*
+                      Note what is matched here: the FIRST name, not the whole typed string.
+
+                      The company scope has already done the narrowing - this is one employer and
+                      its subsidiaries, not the directory - so the SQL's job is to hand the name
+                      rule a small, relevant set to judge. Matching the full string here instead
+                      put the decision back in an ILIKE: "Daniel Pa" excluded Daniel Perovic
+                      before anything had a chance to notice they might be the same person, which
+                      is the bug this whole change exists to fix.
+
+                      Company resolution narrows; name resolution decides.
+                    */
+                    : companyRepo.findDescendantIds(companyId).compose(scope ->
+                          managerRepo.searchInCompanies(20, 0, "%" + firstName.trim() + "%", scope, "featured", userId));
+
                 return Future.all(
                     userRepo.hasContributed(userId),
-                    managerRepo.search(5, 0, "%" + fullName + "%", "%" + company.trim() + "%", "featured", userId)
+                    searchFuture
                 ).compose(cf -> {
                     boolean     contributed = cf.resultAt(0);
                     RowSet<Row> rows        = cf.resultAt(1);
 
+                    /*
+                      An exact name is a match. A plausible partial is a CANDIDATE.
+
+                      This gate used to accept only equalsIgnoreCase on the whole name, which made
+                      the search above decorative: whatever it returned was discarded unless the
+                      reader had typed the manager's name character for character. Somebody
+                      searching "Daniel Pa" for Daniel Perovic therefore found nothing - and then
+                      the create branch below minted a second Daniel at the same employer.
+
+                      A candidate is surfaced and suppresses creation. It is deliberately NOT
+                      treated as "this is definitely them": the reader decides, and the cost of
+                      showing a near miss is a glance, where the cost of hiding it is a duplicate
+                      human in the directory for good.
+                    */
                     List<Row> matched = new ArrayList<>();
+                    List<Row> candidates = new ArrayList<>();
                     for (Row row : rows) {
-                        if (row.getString("name").equalsIgnoreCase(fullName.trim())) matched.add(row);
+                        String candidateName = row.getString("name");
+                        if (candidateName == null) continue;
+                        if (candidateName.equalsIgnoreCase(fullName.trim())) matched.add(row);
+                        else if (isPlausibleSameName(fullName.trim(), candidateName)) candidates.add(row);
                     }
 
                     // Pending managers are never returned to users — they are invisible until
@@ -2510,6 +3029,28 @@ public class ManagerService {
                             new JsonObject()
                                 .put("data", data)
                                 .put("created", false)
+                                .put("hasContributed", contributed));
+                    }
+
+                    /*
+                      No exact match, but somebody close enough to be worth showing.
+
+                      Returned as data so the reader sees them, and - the point of this branch -
+                      nothing is created. Every row here is already approved or ghost, so each one
+                      has a profile that will actually render: the tile invariant in section 41
+                      holds.
+                    */
+                    List<Row> visibleCandidates = candidates.stream()
+                        .filter(r -> !"pending_approval".equals(r.getString("approval_status")))
+                        .collect(Collectors.toList());
+                    if (!visibleCandidates.isEmpty()) {
+                        JsonArray data = new JsonArray();
+                        for (Row row : visibleCandidates) data.add(rowToManagerJson(row));
+                        return Future.succeededFuture(
+                            new JsonObject()
+                                .put("data", data)
+                                .put("created", false)
+                                .put("candidates", true)
                                 .put("hasContributed", contributed));
                     }
 
@@ -2533,8 +3074,12 @@ public class ManagerService {
                     // Before creating anything, check for a Levenshtein-close name at the same
                     // company (same guard used in createManager). A typo like "John Smyth" must
                     // not spawn a new ghost/pending alongside the real "John Smith" at Starbucks.
-                    return managerRepo.findByCompanyExact(company.trim()).compose(candidates -> {
-                        Row fuzzyMatch = findFuzzyNameMatch(candidates, fullName.trim());
+                    Future<RowSet<Row>> fuzzyPool = companyId == null
+                        ? managerRepo.findByCompanyExact(company.trim())
+                        : companyRepo.findDescendantIds(companyId)
+                              .compose(scope -> managerRepo.findInCompanies(scope));
+                    return fuzzyPool.compose(fuzzyCandidates -> {
+                        Row fuzzyMatch = findFuzzyNameMatch(fuzzyCandidates, fullName.trim());
                         if (fuzzyMatch != null && !"pending_approval".equals(fuzzyMatch.getString("approval_status"))) {
                             JsonArray data = new JsonArray().add(rowToManagerJson(fuzzyMatch));
                             return Future.succeededFuture(
@@ -2679,6 +3224,14 @@ public class ManagerService {
                                                  SubmissionContext submission) {
         final GeoObservation observed = submission.observed();
         if (body == null) return Future.failedFuture(ServiceException.badRequest("Missing request body"));
+        // The address behind this request, already extracted by the same proxy-aware helper the
+        // rate limiter uses. Null when we cannot identify one, which the quota treats as "no free
+        // ghost" rather than as an unlimited supply.
+        final String clientIp = submission.clientIp();
+        // Carries the publish decision out of the async chain to the response below. The decision
+        // is made before the insert; the response is built after it.
+        final java.util.concurrent.atomic.AtomicBoolean publishedRef =
+            new java.util.concurrent.atomic.AtomicBoolean(false);
         String name    = toProperNameCase(body.getString("name"));
         String company = body.getString("company") != null ? body.getString("company").trim() : null;
         String title   = body.getString("title")   != null ? body.getString("title").trim()   : null;
@@ -2723,8 +3276,62 @@ public class ManagerService {
                             .put("created", false)
                     );
                 }
-                return companyRepo.resolve(body.getLong("companyId"), company, null, resolvedLogoUrl)
-                    .compose(companyRow -> managerRepo.createCapturedDraft(name, company, title, country, fState, fCity, resolvedLogoUrl, companyRow.getLong("id")))
+                /*
+                  Two callers, two different meanings, and conflating them is what broke the
+                  find flow in production.
+
+                  `fromSearch` is a DELIBERATE SEARCH that found nobody. Per the product rule it
+                  auto-adds the manager as 'ghost': live, publicly visible, and shown straight back
+                  to the searcher as a clickable locked tile. Once per visitor - the client holds
+                  that slot, the /find path holds it in users.has_auto_created_manager.
+
+                  Without it, this is the ADD-FORM DROP-OFF capture: somebody started typing into
+                  /add and may never submit. That lands in the admin queue as 'pending_approval'
+                  and is never published - typing a name must not put a manager on the site.
+
+                  Both used to create a captured draft. The search then rendered a tile linking to
+                  a profile the server refused to serve, and every one of those clicks landed on
+                  "Manager not found".
+                */
+                boolean fromSearch = Boolean.TRUE.equals(body.getBoolean("fromSearch"));
+
+                /*
+                  Whether this search may publish, decided BEFORE anything is written.
+
+                  Two gates, and they are checked in this order on purpose:
+
+                    1. the site-wide ceiling - if automatic creation is paused, nobody gets a
+                       public manager, and no per-address quota is consumed while the site is
+                       already under pressure;
+                    2. this address's own quota - one auto-created manager per window, the
+                       server-side backstop for the localStorage key a visitor can clear.
+
+                  Failing either is NOT an error. The search still records a pending row for an
+                  admin; it simply does not publish. The caller is told via `published` so it knows
+                  not to render a tile - a tile for an unpublished row links to a profile the
+                  server refuses to serve, which is the "Manager not found" outage.
+                */
+                Future<Boolean> mayPublish = !fromSearch
+                    ? Future.succeededFuture(false)
+                    : ghostSlots.withinSiteWideCeiling()
+                        .compose(withinCeiling -> withinCeiling
+                            ? ghostSlots.claim(clientIp)
+                            : Future.succeededFuture(false));
+
+                return mayPublish.compose(publish ->
+                    companyRepo.resolve(body.getLong("companyId"), company, null, resolvedLogoUrl)
+                    .compose(companyRow -> publish
+                        ? managerRepo.createAutoApproved(name, company, title, country, fState, fCity,
+                                                         null, resolvedLogoUrl, companyRow.getLong("id"))
+                        : managerRepo.createCapturedDraft(name, company, title, country, fState, fCity,
+                                                          resolvedLogoUrl, companyRow.getLong("id")))
+                    .recover(err -> {
+                        // The quota was spent before the insert was attempted, so a failure here
+                        // would otherwise cost this address its window for nothing.
+                        if (!publish) return Future.failedFuture(err);
+                        return ghostSlots.release(clientIp).compose(released -> Future.failedFuture(err));
+                    })
+                    .map(row -> { publishedRef.set(publish); return row; }))
                     .compose(row -> {
                         long newId = row.getLong("id");
                         // Composed rather than transactional, for the same reason as the /find
@@ -2745,10 +3352,21 @@ public class ManagerService {
                                     .compose(statsDone -> Future.succeededFuture(row));
                             });
                     })
-                    .map(row -> new JsonObject()
-                        .put("id", row.getLong("id"))
-                        .put("name", row.getString("name"))
-                        .put("created", true));
+                    .compose(row -> {
+                        long newId = row.getLong("id");
+                        JsonObject result = new JsonObject()
+                            .put("id", newId)
+                            .put("name", row.getString("name"))
+                            .put("created", true)
+                            // Whether a PUBLIC manager exists, not merely that a row was written.
+                            // The client renders a tile and spends its one-per-browser slot only
+                            // on true - a tile for an unpublished row points at a profile the
+                            // server refuses to serve.
+                            .put("published", publishedRef.get());
+                        return publishedRef.get()
+                            ? ghostSlots.recordManager(clientIp, newId).map(done -> result)
+                            : Future.succeededFuture(result);
+                    });
             });
     }
 

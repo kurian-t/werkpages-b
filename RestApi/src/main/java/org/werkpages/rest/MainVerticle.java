@@ -154,7 +154,9 @@ public class MainVerticle extends AbstractVerticle {
                         // ── Soft-delete restore job (runs daily) ──────────────────────────────
                         final CompanyRepository companyRepoForWeights = companyRepo;
                         vertx.setPeriodic(86_400_000L, timerId -> {
-                            reviewRepo.restoreExpiredDeletions()
+                            // Through the service, which brings the restored ratings back into the
+                            // location figures as well as back onto the page.
+                            managerService.restoreExpiredReviewDeletions()
                                 .onSuccess(n -> { if (n > 0) System.out.println("✓ Restored " + n + " anonymised review(s)"); })
                                 .onFailure(err -> System.err.println("⚠ Review restore job failed: " + err.getMessage()));
                             interviewRepo.restoreExpiredDeletions()
@@ -240,6 +242,19 @@ public class MainVerticle extends AbstractVerticle {
                         // database object that has not existed for thirty migrations.
                         final CompanyRepository companyRepoForScheduler = companyRepo;
                         final AtomicBoolean statsRefreshRunning = new AtomicBoolean(false);
+                        // ── Ghost quota retention ──────────────────────────────────────────────
+                        //
+                        // The quota table holds a salted hash of a visitor's address. It is
+                        // pseudonymised personal data, not anonymous - IPv4 is small enough to
+                        // brute-force with the salt - so it is not kept past its usefulness. The
+                        // migration documents a 30-day retention; this is what enforces it.
+                        final org.werkpages.repository.AnonymousGhostSlotRepository ghostSlotsForSweep =
+                            new org.werkpages.repository.AnonymousGhostSlotRepository(Database.getClient());
+                        vertx.setPeriodic(24 * 3_600_000L, timerId ->
+                            ghostSlotsForSweep.sweepExpired()
+                                .onFailure(err -> System.err.println(
+                                    "⚠ anonymous_ghost_quota sweep failed: " + err.getMessage())));
+
                         vertx.setPeriodic(6 * 3_600_000L, timerId -> {
                             if (statsRefreshRunning.compareAndSet(false, true)) {
                                 companyRepoForScheduler.refreshCompanyStats()
@@ -300,6 +315,7 @@ public class MainVerticle extends AbstractVerticle {
                         routerFactory.addHandlerByOperationId("getIndustryProfile",     industriesHandler::handleGetIndustryProfile);
                         routerFactory.addHandlerByOperationId("getCompanyInterviews",   interviewsHandler::handleGetCompanyInterviews);
                         routerFactory.addHandlerByOperationId("listCompanyInterviews",  interviewsHandler::handleListCompanyInterviews);
+                        routerFactory.addHandlerByOperationId("captureInterviewDraft",  interviewsHandler::handleCaptureInterviewDraft);
                         routerFactory.addHandlerByOperationId("createInterviewReview",  interviewsHandler::handleCreateInterviewReview);
                         routerFactory.addHandlerByOperationId("deleteInterviewReview",  interviewsHandler::handleDeleteInterviewReview);
                         routerFactory.addHandlerByOperationId("updateInterviewReview",  interviewsHandler::handleUpdateInterviewReview);
@@ -309,6 +325,7 @@ public class MainVerticle extends AbstractVerticle {
                         // Company ratings. Every operationId in the spec must be routed or the
                         // router factory refuses to boot, which is why these three go in together.
                         routerFactory.addHandlerByOperationId("submitCompanyRating", companyRatingsHandler::handleSubmit);
+                        routerFactory.addHandlerByOperationId("captureCompanyRatingDraft", companyRatingsHandler::handleCaptureDraft);
                         routerFactory.addHandlerByOperationId("getMyCompanyRating",  companyRatingsHandler::handleGetMine);
                         routerFactory.addHandlerByOperationId("listCompanyRatings",   companyRatingsHandler::handleList);
 
@@ -320,12 +337,14 @@ public class MainVerticle extends AbstractVerticle {
                         routerFactory.addHandlerByOperationId("adminGetProofChallenges",      proofChallengesHandler::handleAdminList);
                         routerFactory.addHandlerByOperationId("adminResolveProofChallenge",   proofChallengesHandler::handleAdminResolve);
                         routerFactory.addHandlerByOperationId("adminListHighProfileFigures",  proofChallengesHandler::handleListFigures);
+                        routerFactory.addHandlerByOperationId("adminGhostCreationStatus", adminHandler::handleGhostCreationStatus);
                         routerFactory.addHandlerByOperationId("adminAddHighProfileFigure",    proofChallengesHandler::handleAddFigure);
                         routerFactory.addHandlerByOperationId("adminRemoveHighProfileFigure", proofChallengesHandler::handleRemoveFigure);
                         routerFactory.addHandlerByOperationId("deleteCompanyRating", companyRatingsHandler::handleDelete);
                         routerFactory.addHandlerByOperationId("getManagerBySlug",       managersHandler::handleGetManagerBySlug);
                         routerFactory.addHandlerByOperationId("getCompanies",           managersHandler::handleGetCompanies);
                         routerFactory.addHandlerByOperationId("createCompany",           managersHandler::handleCreateCompany);
+                        routerFactory.addHandlerByOperationId("suggestCompanyLocations", managersHandler::handleSuggestCompanyLocations);
                         routerFactory.addHandlerByOperationId("suggestCompanies",       managersHandler::handleSuggestCompanies);
                         routerFactory.addHandlerByOperationId("getGeo",                 managersHandler::handleGetGeo);
                         routerFactory.addHandlerByOperationId("getSimilarManagers",     managersHandler::handleGetSimilarManagers);
@@ -343,6 +362,8 @@ public class MainVerticle extends AbstractVerticle {
                         routerFactory.addHandlerByOperationId("getAdminBannedUsers",      adminHandler::handleGetBannedUsers);
                         routerFactory.addHandlerByOperationId("banUser",                  adminHandler::handleBanUser);
                         routerFactory.addHandlerByOperationId("unbanUser",                adminHandler::handleUnbanUser);
+                        routerFactory.addHandlerByOperationId("getAdminCapturedDrafts",    adminHandler::handleGetCapturedDrafts);
+                        routerFactory.addHandlerByOperationId("markCapturedDraftReviewed", adminHandler::handleMarkDraftReviewed);
                         routerFactory.addHandlerByOperationId("getAdminGhostManagers",    adminHandler::handleGetGhostManagers);
                         routerFactory.addHandlerByOperationId("markGhostManagerReviewed", adminHandler::handleMarkGhostReviewed);
                         routerFactory.addHandlerByOperationId("getAdminPendingManagers",  adminHandler::handleGetPendingManagers);

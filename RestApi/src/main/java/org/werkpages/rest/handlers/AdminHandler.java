@@ -42,7 +42,48 @@ public class AdminHandler {
         this.roleService      = roleService;
     }
 
+    // ── GET /api/admin/captured-drafts ───────────────────────────────────────
+
+    public void handleGetCapturedDrafts(RoutingContext ctx) {
+        String auth0Id = ctx.get("auth0Id");
+        int limit  = parseIntParam(ctx.request().getParam("limit"),  50, 1, 200);
+        int offset = parseIntParam(ctx.request().getParam("offset"), 0,  0, Integer.MAX_VALUE);
+        service.getCapturedDrafts(auth0Id, limit, offset)
+            .onSuccess(json -> ok(ctx, json))
+            .onFailure(err -> ManagersHandler.handleError(ctx, err));
+    }
+
+    // ── POST /api/admin/captured-drafts/:draftId/reviewed ────────────────────
+
+    public void handleMarkDraftReviewed(RoutingContext ctx) {
+        String auth0Id = ctx.get("auth0Id");
+        long draftId;
+        try {
+            draftId = Long.parseLong(ctx.pathParam("draftId"));
+        } catch (NumberFormatException e) {
+            ctx.response().setStatusCode(400).putHeader("Content-Type", "application/json")
+               .end(new JsonObject().put("error", "Invalid draft id").encode());
+            return;
+        }
+        service.markDraftReviewed(auth0Id, draftId)
+            .onSuccess(json -> ok(ctx, json))
+            .onFailure(err -> ManagersHandler.handleError(ctx, err));
+    }
+
     // ── GET /api/admin/ghost-managers ────────────────────────────────────────
+
+    /**
+     * Whether automatic manager creation is paused, and the numbers behind it.
+     *
+     * <p>A circuit breaker nobody can see is indistinguishable from the feature quietly not
+     * working: when it holds, searches fall back to the pending queue and no user is shown
+     * anything unusual. This is where that becomes visible.
+     */
+    public void handleGhostCreationStatus(RoutingContext ctx) {
+        service.ghostCreationStatus(ctx.get("auth0Id"))
+            .onSuccess(json -> ctx.response().putHeader("Content-Type", "application/json").end(json.encode()))
+            .onFailure(err -> ManagersHandler.handleError(ctx, err));
+    }
 
     public void handleGetGhostManagers(RoutingContext ctx) {
         String auth0Id = ctx.get("auth0Id");

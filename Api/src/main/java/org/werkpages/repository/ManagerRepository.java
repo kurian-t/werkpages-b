@@ -146,6 +146,37 @@ public class ManagerRepository {
                 : Future.succeededFuture(Optional.empty()));
     }
 
+    /**
+     * Managers whose company is one of {@code companyIds}, matched on name.
+     *
+     * <p>The company half of a search by <em>identity</em> rather than by text. The client already
+     * resolves which company was chosen and sends its id; matching on the name it happens to be
+     * stored under instead is what let "Revvity" and "Revvity Chemagen Technologie" look like two
+     * unrelated employers, and what makes a search for one miss the managers of the other.
+     *
+     * <p>The caller decides the scope. For a selected company that is a parent, it is the parent
+     * plus its descendants - see {@link CompanyRepository#findDescendantIds}.
+     *
+     * <p>Falls back to nothing when the list is empty: an empty scope is not "every company".
+     */
+    public Future<RowSet<Row>> searchInCompanies(int limit, int offset, String searchPattern,
+                                                 java.util.List<Long> companyIds, String sortBy,
+                                                 UUID userId) {
+        if (companyIds == null || companyIds.isEmpty()) {
+            return db.preparedQuery("SELECT 1 WHERE false").execute();
+        }
+        String orderBy = buildOrderBy(sortBy);
+        return db.preparedQuery(SELECT_BODY + """
+                WHERE (m.name ILIKE $3 OR m.title ILIKE $3)
+                  AND m.company_id = ANY($4)
+                  AND (m.approval_status IN ('approved','ghost')
+                       OR (m.approval_status = 'pending_approval' AND m.search_created_by_user_id = $5))
+                GROUP BY m.id, c.slug, c.industry
+                """ + orderBy + " LIMIT $1 OFFSET $2")
+            .execute(Tuple.of(limit, offset, searchPattern,
+                              companyIds.toArray(new Long[0]), userId));
+    }
+
     public Future<RowSet<Row>> search(int limit, int offset, String searchPattern, String companyPattern, String sortBy) {
         return search(limit, offset, searchPattern, companyPattern, sortBy, null);
     }
@@ -279,7 +310,7 @@ public class ManagerRepository {
 
     public Future<RowSet<Row>> findPendingByUser(UUID userId) {
         return db.preparedQuery("""
-                SELECT id, name, company, title, image, overall_rating, reviews_count,
+                SELECT id, name, company, company_id, title, image, overall_rating, reviews_count,
                        bio, status, approval_status, linkedin_url, company_logo_url, country, created_at
                 FROM managers
                 WHERE submitted_by = $1 AND approval_status IN ('pending_approval', 'rejected')
@@ -1092,6 +1123,28 @@ public class ManagerRepository {
     // ── Find-or-attach helpers ────────────────────────────────────────────────
 
     /** Returns all non-rejected managers for an exact company name (case-insensitive). */
+    /**
+     * The fuzzy path's candidate pool, scoped by company identity rather than by company text.
+     *
+     * <p>Same shape as {@link #findByCompanyExact}, taking the id scope a search resolved - the
+     * selected company plus its descendants - so a near-miss name is checked against the whole
+     * group rather than against whichever spelling of the employer the row happens to carry.
+     */
+    public Future<RowSet<Row>> findInCompanies(java.util.List<Long> companyIds) {
+        if (companyIds == null || companyIds.isEmpty()) {
+            return db.preparedQuery("SELECT 1 WHERE false").execute();
+        }
+        return db.preparedQuery("""
+                SELECT id, name, approval_status
+                FROM managers
+                WHERE company_id = ANY($1)
+                  AND approval_status NOT IN ('rejected')
+                ORDER BY reviews_count DESC NULLS LAST
+                LIMIT 50
+                """)
+            .execute(Tuple.of((Object) companyIds.toArray(new Long[0])));
+    }
+
     public Future<RowSet<Row>> findByCompanyExact(String company) {
         return db.preparedQuery("""
                 SELECT id, name, approval_status
@@ -1102,6 +1155,29 @@ public class ManagerRepository {
                 LIMIT 50
                 """)
             .execute(Tuple.of(company));
+    }
+
+    /**
+     * Stamps the submitter on a row that has none, and returns the row either way.
+     *
+     * <p>For the attach path. A capture carries no {@code submitted_by} - nobody had submitted
+     * anything when it was written - and if a submission attaches to one instead of adopting it,
+     * the row stays ownerless. {@code enforceSubmitterAccess} refuses an ownerless pending row to
+     * everybody, so the person who just filled in the form is told the manager does not exist.
+     *
+     * <p>COALESCE, never an overwrite: a manager somebody else submitted keeps its original
+     * submitter. This only fills a gap.
+     */
+    public Future<Optional<Row>> claimSubmitterIfUnowned(long managerId, UUID userId) {
+        if (userId == null) return findByIdFlat(managerId);
+        return db.preparedQuery("""
+                UPDATE managers
+                   SET submitted_by = COALESCE(submitted_by, $1), updated_at = now()
+                 WHERE id = $2
+                RETURNING *
+                """)
+            .execute(Tuple.of(userId, managerId))
+            .map(rs -> rs.iterator().hasNext() ? Optional.of(rs.iterator().next()) : Optional.empty());
     }
 
     /** Updates a ghost manager with richer data from the add-manager form. */
