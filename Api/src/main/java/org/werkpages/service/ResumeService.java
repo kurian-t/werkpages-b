@@ -110,12 +110,33 @@ public class ResumeService {
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
+    /**
+     * Resolves the caller to a user id, and refuses anyone who is not an admin.
+     *
+     * <p>Every public method on this service starts here, which is why the check lives here rather
+     * than in {@code ResumesHandler}: one choke point covers the three endpoints and anything
+     * added later, and it cannot be bypassed by reaching the service another way.
+     *
+     * <p>The resume builder is unreleased. The client gates it in three places — both header links
+     * and an {@code <AdminOnly>} wrapper on the route — but a route guard in a single-page app is
+     * not access control: the endpoints previously answered any signed-in caller, so anybody who
+     * found {@code /api/resumes/mine} could read and write their own row and put real data in the
+     * production table. Backend authorization is the authoritative one.
+     *
+     * <p>Same shape as {@code AdminService.requireAdmin}: 401 when there is no caller or no such
+     * user, 403 when there is one and they are not an admin.
+     */
     private Future<UUID> resolveUserId(String auth0Id) {
-        return userRepo.findIdByAuth0Id(auth0Id)
-            .compose(opt -> opt.isPresent()
-                ? Future.succeededFuture(opt.get())
-                : Future.failedFuture(ServiceException.unauthorized("User not found"))
-            );
+        if (auth0Id == null) return Future.failedFuture(ServiceException.unauthorized("Unauthorized"));
+        return userRepo.findByAuth0IdWithBan(auth0Id)
+            .compose(opt -> {
+                if (opt.isEmpty()) return Future.failedFuture(ServiceException.unauthorized("User not found"));
+                Row row = opt.get();
+                if (!"admin".equals(row.getString("role"))) {
+                    return Future.failedFuture(ServiceException.forbidden("Forbidden"));
+                }
+                return Future.succeededFuture(row.getUUID("id"));
+            });
     }
 
     private JsonObject rowToJson(Row row) {

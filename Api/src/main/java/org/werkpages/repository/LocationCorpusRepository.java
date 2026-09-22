@@ -463,7 +463,22 @@ public class LocationCorpusRepository {
                       Bounded by memory_limit, so it evicts rather than growing without limit -
                       which is why that limit is set deliberately above.
                     */
-                    "SET enable_external_file_cache=true" }) {
+                    "SET enable_external_file_cache=true",
+                    /*
+                      How long a broken corpus takes to admit it.
+
+                      DuckDB defaults to http_retries=3 with a 30s http_timeout, so a bucket that
+                      never answers costs about ninety seconds before the first suggestion gives
+                      up - on the request of whoever happened to type first. The guarantee this
+                      class makes is that a corpus it cannot reach degrades to no suggestions;
+                      ninety seconds of nothing is not degrading gracefully, it is hanging.
+
+                      Ten seconds is far above any healthy round trip to the bucket, which sits in
+                      the same region, so this bounds the failure path without touching the
+                      working one.
+                    */
+                    "SET http_retries=1",
+                    "SET http_timeout=10000" }) {
                 try (Statement statement = conn.createStatement()) {
                     statement.execute(tuning);
                 } catch (SQLException unsupported) {

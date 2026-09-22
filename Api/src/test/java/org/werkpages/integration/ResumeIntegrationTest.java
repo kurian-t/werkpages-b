@@ -20,6 +20,7 @@ import org.werkpages.repository.CompanyRepository;
 import org.werkpages.repository.ResumeRepository;
 import org.werkpages.repository.UserRepository;
 import org.werkpages.service.ResumeService;
+import org.werkpages.service.ServiceException;
 
 import java.time.LocalDate;
 import java.util.UUID;
@@ -73,18 +74,69 @@ class ResumeIntegrationTest {
         pool.close().toCompletionStage().toCompletableFuture().get(5, TimeUnit.SECONDS);
     }
 
+    // ── Who the resume builder is for ────────────────────────────────────────
+
+    /*
+      Admin only, enforced here rather than in the client.
+
+      The resume builder is unreleased and is not to be reachable by anyone else. The client gates
+      it in three places - both header links and an <AdminOnly> wrapper on the route - but those
+      are conveniences: the endpoints answered any signed-in caller, so anybody who found
+      /api/resumes/mine could read and write their own resume row and put real data in the
+      production table.
+
+      A route guard in a single-page app is not access control. These three cover every public
+      method on the service, which is the layer both handlers and any future caller pass through.
+    */
+
+    @Test
+    void getResume_nonAdmin_isRefused() throws Exception {
+        String auth0Id = insertUser();
+        ServiceException ex = assertServiceException(service.getResume(auth0Id));
+        assertEquals(403, ex.getStatusCode(), "a signed-in non-admin must not read a resume");
+    }
+
+    @Test
+    void saveResume_nonAdmin_isRefused() throws Exception {
+        String auth0Id = insertUser();
+        JsonObject body = buildResumeBody("Nice try.", skills("Java"), new JsonArray(), new JsonArray(), new JsonArray());
+        ServiceException ex = assertServiceException(service.saveResume(auth0Id, body));
+        assertEquals(403, ex.getStatusCode(), "a signed-in non-admin must not write a resume");
+
+        Long count = await(pool.query("SELECT COUNT(*) AS cnt FROM user_resumes").execute()
+            .map(rows -> rows.iterator().next().getLong("cnt")));
+        assertEquals(0L, count, "the refused save must not have reached the table");
+    }
+
+    @Test
+    void getPrefill_nonAdmin_isRefused() throws Exception {
+        String auth0Id = insertUser();
+        ServiceException ex = assertServiceException(service.getPrefill(auth0Id));
+        assertEquals(403, ex.getStatusCode(), "prefill reads the caller's history - admins only");
+    }
+
+    @Test
+    void anAdminIsStillServed() throws Exception {
+        // The gate refuses the wrong role, not everybody.
+        String auth0Id = insertAdmin();
+        assertNull(await(service.getResume(auth0Id)));
+        JsonObject saved = await(service.saveResume(auth0Id,
+            buildResumeBody("Admin.", skills("Java"), new JsonArray(), new JsonArray(), new JsonArray())));
+        assertEquals("Admin.", saved.getString("summary"));
+    }
+
     // ── getResume ────────────────────────────────────────────────────────────
 
     @Test
     void getResume_returnsNullWhenNoResumeSaved() throws Exception {
-        String auth0Id = insertUser();
+        String auth0Id = insertAdmin();
         JsonObject result = await(service.getResume(auth0Id));
         assertNull(result, "getResume must return null when no resume exists yet");
     }
 
     @Test
     void getResume_returnsDataAfterSave() throws Exception {
-        String auth0Id = insertUser();
+        String auth0Id = insertAdmin();
         JsonObject body = buildResumeBody("I build things.", skills("Java", "React"), new JsonArray(), new JsonArray(), new JsonArray());
         await(service.saveResume(auth0Id, body));
 
@@ -99,7 +151,7 @@ class ResumeIntegrationTest {
 
     @Test
     void saveResume_createsNewRow() throws Exception {
-        String auth0Id = insertUser();
+        String auth0Id = insertAdmin();
         JsonObject body = buildResumeBody("Engineer.", skills("Go"), new JsonArray(), new JsonArray(), new JsonArray());
         JsonObject result = await(service.saveResume(auth0Id, body));
 
@@ -109,7 +161,7 @@ class ResumeIntegrationTest {
 
     @Test
     void saveResume_updatesExistingRow() throws Exception {
-        String auth0Id = insertUser();
+        String auth0Id = insertAdmin();
         await(service.saveResume(auth0Id, buildResumeBody("First.", skills("Java"), new JsonArray(), new JsonArray(), new JsonArray())));
         JsonObject updated = await(service.saveResume(auth0Id, buildResumeBody("Updated.", skills("Python", "Go"), new JsonArray(), new JsonArray(), new JsonArray())));
 
@@ -124,7 +176,7 @@ class ResumeIntegrationTest {
 
     @Test
     void saveResume_roundTripsWorkEntries() throws Exception {
-        String auth0Id = insertUser();
+        String auth0Id = insertAdmin();
         JsonArray workEntries = new JsonArray().add(new JsonObject()
             .put("company", "Acme Corp")
             .put("title", "Engineer")
@@ -145,7 +197,7 @@ class ResumeIntegrationTest {
 
     @Test
     void saveResume_roundTripsDesign() throws Exception {
-        String auth0Id = insertUser();
+        String auth0Id = insertAdmin();
         JsonObject design = new JsonObject()
             .put("pageSize", "A4")
             .put("layout", "sidebar-left")
@@ -165,7 +217,7 @@ class ResumeIntegrationTest {
 
     @Test
     void saveResume_noDesign_returnsNullDesign() throws Exception {
-        String auth0Id = insertUser();
+        String auth0Id = insertAdmin();
         await(service.saveResume(auth0Id, buildResumeBody("No design.", new JsonArray(), new JsonArray(), new JsonArray(), new JsonArray())));
 
         JsonObject result = await(service.getResume(auth0Id));
@@ -175,7 +227,7 @@ class ResumeIntegrationTest {
 
     @Test
     void getResume_enrichesWorkEntriesWithCompanyLogoFromDirectory() throws Exception {
-        String auth0Id = insertUser();
+        String auth0Id = insertAdmin();
         // Save a work entry with no logoUrl
         JsonArray workEntries = new JsonArray().add(new JsonObject()
             .put("company", "LogoCo")
@@ -198,7 +250,7 @@ class ResumeIntegrationTest {
 
     @Test
     void getResume_preservesManualLogoUrlOverDirectoryLogo() throws Exception {
-        String auth0Id = insertUser();
+        String auth0Id = insertAdmin();
         // Save a work entry that already has a logoUrl set by the user
         JsonArray workEntries = new JsonArray().add(new JsonObject()
             .put("company", "Acme Corp")
@@ -222,7 +274,7 @@ class ResumeIntegrationTest {
 
     @Test
     void saveResume_ensuresCompanyInDirectory() throws Exception {
-        String auth0Id = insertUser();
+        String auth0Id = insertAdmin();
         JsonArray workEntries = new JsonArray().add(new JsonObject()
             .put("company", "NewCo Inc")
             .put("title", "Dev")
@@ -242,14 +294,14 @@ class ResumeIntegrationTest {
 
     @Test
     void getPrefill_returnsEmptyWhenNoReviews() throws Exception {
-        String auth0Id = insertUser();
+        String auth0Id = insertAdmin();
         JsonObject result = await(service.getPrefill(auth0Id));
         assertEquals(0, result.getJsonArray("data").size());
     }
 
     @Test
     void getPrefill_returnsWorkEntriesFromReviews() throws Exception {
-        String auth0Id = insertUser();
+        String auth0Id = insertAdmin();
         UUID userId = resolveUserId(auth0Id);
         Long managerId = insertManager("Alice A", "TechCorp", "Director", "approved");
         insertReview(managerId, userId, "TechCorp", "Senior Engineer", "2020-01-01", "2022-06-01");
@@ -268,7 +320,7 @@ class ResumeIntegrationTest {
 
     @Test
     void getPrefill_currentJobWhenWorkedUntilIsNull() throws Exception {
-        String auth0Id = insertUser();
+        String auth0Id = insertAdmin();
         UUID userId = resolveUserId(auth0Id);
         Long managerId = insertManager("Bob B", "FinCo", "Manager", "approved");
         insertReview(managerId, userId, "FinCo", "Analyst", "2021-03-01", null);
@@ -282,7 +334,7 @@ class ResumeIntegrationTest {
 
     @Test
     void getPrefill_excludesDeletedReviews() throws Exception {
-        String auth0Id = insertUser();
+        String auth0Id = insertAdmin();
         UUID userId = resolveUserId(auth0Id);
         Long managerId = insertManager("Carol C", "OldCo", "VP", "approved");
         insertReview(managerId, userId, "OldCo", "Lead", "2019-01-01", "2020-01-01");
@@ -295,7 +347,7 @@ class ResumeIntegrationTest {
 
     @Test
     void getPrefill_includesLogoUrlWhenCompanyHasLogo() throws Exception {
-        String auth0Id = insertUser();
+        String auth0Id = insertAdmin();
         UUID userId = resolveUserId(auth0Id);
         Long managerId = insertManager("Eve E", "LoggedCo", "Director", "approved");
         // Give the company a logo
@@ -311,7 +363,7 @@ class ResumeIntegrationTest {
 
     @Test
     void getPrefill_excludesPendingManagers() throws Exception {
-        String auth0Id = insertUser();
+        String auth0Id = insertAdmin();
         UUID userId = resolveUserId(auth0Id);
         Long managerId = insertManager("Dave D", "PendingCo", "Lead", "pending_approval");
         insertReview(managerId, userId, "PendingCo", "Dev", "2021-01-01", null);
@@ -343,11 +395,20 @@ class ResumeIntegrationTest {
 
     // ── helpers ───────────────────────────────────────────────────────────────
 
+    /** An admin, which is the only role the resume builder serves. */
+    private String insertAdmin() throws Exception {
+        return insertUserWithRole("admin");
+    }
+
     private String insertUser() throws Exception {
+        return insertUserWithRole("user");
+    }
+
+    private String insertUserWithRole(String role) throws Exception {
         String auth0Id = "auth0|" + UUID.randomUUID();
         await(pool.preparedQuery(
-                "INSERT INTO users(id, auth0_id, username, role, has_auto_created_manager) VALUES (gen_random_uuid(), $1, $2, 'user', false)")
-            .execute(Tuple.of(auth0Id, "user_" + UUID.randomUUID().toString().replace("-", "").substring(0, 8))));
+                "INSERT INTO users(id, auth0_id, username, role, has_auto_created_manager) VALUES (gen_random_uuid(), $1, $2, $3, false)")
+            .execute(Tuple.of(auth0Id, "user_" + UUID.randomUUID().toString().replace("-", "").substring(0, 8), role)));
         return auth0Id;
     }
 
@@ -395,6 +456,21 @@ class ResumeIntegrationTest {
         JsonArray arr = new JsonArray();
         for (String item : items) arr.add(item);
         return arr;
+    }
+
+    private static ServiceException assertServiceException(Future<?> future) {
+        try {
+            future.toCompletionStage().toCompletableFuture().get(10, TimeUnit.SECONDS);
+            fail("Expected future to fail");
+            return null;
+        } catch (java.util.concurrent.ExecutionException e) {
+            if (e.getCause() instanceof ServiceException se) return se;
+            fail("Expected ServiceException but got: " + e.getCause());
+            return null;
+        } catch (Exception e) {
+            fail("Unexpected exception: " + e);
+            return null;
+        }
     }
 
     private static <T> T await(Future<T> future) throws Exception {

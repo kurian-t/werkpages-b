@@ -61,12 +61,27 @@ class LocationCorpusRepositoryTest {
     @Test
     @DisplayName("an unreachable corpus returns no suggestions instead of failing")
     void unreachableCorpusIsSilent() throws Exception {
+        /*
+          The budget is generous on purpose, and it is not the assertion.
+
+          What this test checks is the OUTCOME - empty results, no exception. Getting there costs
+          a one-off `INSTALL httpfs`, which downloads the extension on any machine that has not
+          cached it in ~/.duckdb. That is free on a developer box and real work on a clean CI
+          runner: the same class runs in 0.3s here with the extension cached and 11s without it,
+          and this test failed in CI at sixty seconds because the download plus DuckDB's default
+          three S3 retries did not fit.
+
+          Raising the number is right because the wait is a cold engine install, not the behaviour
+          under test. The failure path itself is now bounded in LocationCorpusRepository - see the
+          http_retries and http_timeout settings there - so this should complete in seconds once
+          the engine is up.
+        */
         LocationCorpusRepository repo = unreachable();
 
         JsonArray geo = repo.suggestGeography("kitchener", "CA", null)
-            .toCompletionStage().toCompletableFuture().get(60, TimeUnit.SECONDS);
+            .toCompletionStage().toCompletableFuture().get(180, TimeUnit.SECONDS);
         JsonArray places = repo.suggestPlaces("Walmart", "walmart", "CA")
-            .toCompletionStage().toCompletableFuture().get(60, TimeUnit.SECONDS);
+            .toCompletionStage().toCompletableFuture().get(180, TimeUnit.SECONDS);
 
         // The whole point: a location field that cannot load suggestions must still let somebody
         // type a city and submit. No corpus is a degraded form, never a broken one.
