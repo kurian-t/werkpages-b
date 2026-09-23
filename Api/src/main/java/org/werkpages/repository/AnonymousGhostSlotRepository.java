@@ -151,18 +151,28 @@ public class AnonymousGhostSlotRepository {
      * never trip it.
      *
      * <p>{@code approval_status = 'ghost'} is precisely "created automatically": the deliberate
-     * paths write 'approved' or 'pending_approval'. The existing index on approval_status carries
-     * this; if ghost volume ever makes that scan matter, the next step is a partial index on
-     * created_at, and that migration belongs in the Werkpages stream.
+     * paths write 'approved' or 'pending_approval'.
+     *
+     * <p><b>The 24-hour bound is in the WHERE clause, not only in the FILTERs, and that is the
+     * point.</b> Ghost rows accumulate forever - every ghost ever created stays one - so counting
+     * across the whole set would mean a per-request scan that grows without limit. A FILTER inside
+     * an aggregate cannot use an index, because every row still has to be read in order to be
+     * filtered; only a WHERE predicate can range scan. With the bound here and the partial index
+     * from Werkpages V81 ({@code idx_managers_ghost_created_at}), this reads the last day rather
+     * than the entire history, and stays the same cost however large the table gets.
+     *
+     * <p>{@code last_day} is then simply {@code count(*)}: the WHERE has already restricted the
+     * rows to that window.
      */
     public Future<SiteWideRate> siteWideRates() {
         // Rolling windows, not calendar buckets. Fixed buckets have a boundary hole: the cap can be
         // spent at 10:59 and again at 11:01, for double the intended rate in two minutes.
         return db.preparedQuery("""
-                SELECT count(*) FILTER (WHERE created_at > now() - interval '1 hour')  AS last_hour,
-                       count(*) FILTER (WHERE created_at > now() - interval '24 hours') AS last_day
+                SELECT count(*) FILTER (WHERE created_at > now() - interval '1 hour') AS last_hour,
+                       count(*) AS last_day
                 FROM managers
                 WHERE approval_status = 'ghost'
+                  AND created_at > now() - interval '24 hours'
                 """)
             .execute()
             .map(rows -> {
