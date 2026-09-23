@@ -88,6 +88,18 @@ class SitemapServiceIntegrationTest {
             .toCompletionStage().toCompletableFuture().get(5, TimeUnit.SECONDS);
     }
 
+    /** A manager with no job title - the page would be a bare name, so it is not indexable. */
+    private void insertRolelessManager(String name, String slug, long companyId, String company) throws Exception {
+        pool.preparedQuery("""
+                INSERT INTO managers
+                    (name, slug, company, title, status, approval_status, company_id,
+                     overall_rating, reviews_count, category_averages, created_at, updated_at)
+                VALUES ($1, $2, $3, '  ', 'active', 'approved', $4, 0, 0, '{}', now(), now())
+                """)
+            .execute(Tuple.of(name, slug, company, companyId))
+            .toCompletionStage().toCompletableFuture().get(5, TimeUnit.SECONDS);
+    }
+
     // ── Tests ─────────────────────────────────────────────────────────────────
 
     @Test
@@ -136,28 +148,48 @@ class SitemapServiceIntegrationTest {
         assertTrue(xml.contains("https://werkpages.com/industries/other/companies/ghost-inc"));
     }
 
+    /**
+     * A company whose managers have no reviews yet is still submitted.
+     *
+     * <p>This asserted the opposite until the indexability rule changed. Requiring a review meant
+     * a company nobody had rated was invisible to search - including to somebody googling that
+     * employer by name, who is exactly the visitor most likely to leave the first review.
+     *
+     * <p>See INDEXABLE_MANAGER in SitemapService for the full reasoning.
+     */
     @Test
-    void generate_companyWithOnlyReviewlessManagers_excluded() throws Exception {
-        long id = insertCompany("Empty Ghost Co", "empty-ghost-co", "ghost");
-        insertManager("No Reviews", "no-reviews", "ghost", id, "Empty Ghost Co", 0);
+    void generate_companyWithReviewlessButCompleteManagers_included() throws Exception {
+        long id = insertCompany("Fresh Co", "fresh-co", "ghost");
+        insertManager("No Reviews Yet", "no-reviews-yet", "ghost", id, "Fresh Co", 0);
 
         String xml = sitemapService.generate()
             .toCompletionStage().toCompletableFuture().get(10, TimeUnit.SECONDS);
 
-        assertFalse(xml.contains("empty-ghost-co"), "a company whose managers have no reviews is thin and must be excluded");
+        assertTrue(xml.contains("fresh-co"),
+            "a company with a complete manager profile is worth indexing before anyone rates them");
     }
 
+    /**
+     * A review-less manager is submitted; a manager with no job title is not.
+     *
+     * <p>The line moved from "has been rated" to "has something on the page". A profile carrying
+     * a real name, role and employer is unique content whether or not anybody has reviewed it.
+     * A profile with a blank role is a bare name, and there is nothing a search result could
+     * honestly promise about it.
+     */
     @Test
-    void generate_managerWithNoReviews_excluded() throws Exception {
+    void generate_reviewlessManagerIncluded_rolelessManagerExcluded() throws Exception {
         long id = insertCompany("Acme Corp", "acme-corp", "approved");
-        insertManager("Reviewed One", "reviewed-one", "approved", id, "Acme Corp", 2);
-        insertManager("Thin One",     "thin-one",     "approved", id, "Acme Corp", 0);
+        insertManager("Complete Profile", "complete-profile", "approved", id, "Acme Corp", 0);
+        insertRolelessManager("Bare Name", "bare-name", id, "Acme Corp");
 
         String xml = sitemapService.generate()
             .toCompletionStage().toCompletableFuture().get(10, TimeUnit.SECONDS);
 
-        assertTrue(xml.contains("companies/acme-corp/managers/reviewed-one"), "reviewed manager stays in the sitemap");
-        assertFalse(xml.contains("thin-one"), "review-less manager must be excluded from the sitemap");
+        assertTrue(xml.contains("complete-profile"),
+            "no reviews yet is not the same as nothing on the page");
+        assertFalse(xml.contains("bare-name"),
+            "a profile with no role has nothing a search result could promise");
     }
 
     @Test

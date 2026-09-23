@@ -183,6 +183,165 @@ class GhostSeedDeletionIntegrationTest {
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
+    /**
+     * The countdown starts on the first real review and is never restarted by later ones.
+     *
+     * <p>The UPDATE behind this had no {@code weight_expires_on IS NULL} guard, so every
+     * subsequent real review pushed the expiry out another fortnight. A manager receiving a
+     * review even occasionally therefore kept its placeholder <b>forever</b> - the clock restarted
+     * before it could finish, and no amount of waiting would ever have cleared it.
+     *
+     * <p>Asserted as "the date did not move", not merely "a date is set", because the bug set a
+     * date perfectly well. It set it again, and again.
+     */
+    @Test
+    void seedExpiry_startsOnFirstRealReview_andLaterReviewsDoNotRestartIt() throws Exception {
+        long managerId = insertManagerWithSeed("ClockCo", "Clock Manager", "NULL");
+
+        await(reviewRepo.scheduleSeedExpiry(managerId));
+        assertNotNull(readSeedExpiry(managerId), "the first real review must start the countdown");
+
+        // Move the clock to a known nearer date, as though it had been running for a while.
+        await(pool.preparedQuery(
+                "UPDATE reviews SET weight_expires_on = CURRENT_DATE + 2 WHERE manager_id = $1 AND weight = TRUE")
+            .execute(Tuple.of(managerId)).mapEmpty());
+        java.time.LocalDate beforeSecondReview = readSeedExpiry(managerId);
+
+        // A second real review arrives.
+        await(reviewRepo.scheduleSeedExpiry(managerId));
+
+        /*
+            Compared against the value read back from the database, not against LocalDate.now().
+
+            The first version of this assertion computed the expected date in the JVM and failed
+            for the wrong reason: the Postgres container runs UTC and the JVM ran UTC-4, so late
+            in the evening CURRENT_DATE was already tomorrow and the two disagreed by a day. The
+            claim being tested is "this date did not move", which needs no clock of its own.
+        */
+        assertEquals(beforeSecondReview, readSeedExpiry(managerId),
+            "a later review must not push the expiry out again - the clock runs down once");
+    }
+
+    /**
+     * An expired placeholder is removed from the table, not merely ignored.
+     *
+     * <p>"Expired" used to mean hidden from the list and excluded from the rating while the row
+     * stayed put indefinitely. Nothing ever deleted it. This is the sweep that does, and it must
+     * take only the expired placeholders: a placeholder still counting down, and any real review,
+     * have to survive it untouched.
+     */
+    @Test
+    void deleteExpiredSeedReviews_removesOnlyPlaceholdersPastTheirDate() throws Exception {
+        long expired  = insertManagerWithExpiredSeed("SweepCo", "Swept Manager");
+        long counting = insertManagerWithSeed("KeepCo", "Kept Manager", "CURRENT_DATE + 5");
+
+        // A real review on the same manager as the expired placeholder - it must not be collateral.
+        await(pool.preparedQuery(
+                "INSERT INTO reviews(manager_id, author, overall_rating, manager_company, manager_title, "
+              + "worked_from, weight, created_at) "
+              + "VALUES ($1,'Real Person',5.0,'SweepCo','VP',CURRENT_DATE - 10, FALSE, now())")
+            .execute(Tuple.of(expired)).mapEmpty());
+
+        /*
+            A row that should not exist: weight TRUE with a real author attached. Every write path
+            makes placeholders authorless, so this cannot arise normally - it is here because the
+            statement deletes in bulk and unattended, and the cost of the invariant being broken by
+            some future migration is somebody's real review vanishing irrecoverably. It must
+            survive.
+        */
+        long guarded = insertManagerWithSeed("GuardCo", "Guarded Manager", "CURRENT_DATE - 1");
+        String ownerAuth0 = insertUser("auth0|seedguard", "seedguarduser");
+        await(pool.preparedQuery(
+                "UPDATE reviews SET user_id = (SELECT id FROM users WHERE auth0_id = $2) "
+              + "WHERE manager_id = $1 AND weight = TRUE")
+            .execute(Tuple.of(guarded, ownerAuth0)).mapEmpty());
+
+        int deleted = await(reviewRepo.deleteExpiredSeedReviews());
+        assertEquals(1, deleted, "exactly the one authorless placeholder past its date");
+        assertEquals(1L, countReviews(guarded, true),
+            "a weighted row with a real author is never swept, whatever its expiry says");
+
+        assertEquals(0L, countReviews(expired, true),  "the expired placeholder is gone");
+        assertEquals(1L, countReviews(expired, false), "the real review on that manager survives");
+        assertEquals(1L, countReviews(counting, true), "a placeholder still counting down survives");
+    }
+
+    /** The placeholder's expiry date as the database holds it. */
+    private java.time.LocalDate readSeedExpiry(long managerId) throws Exception {
+        return await(pool
+            .preparedQuery("SELECT weight_expires_on FROM reviews WHERE manager_id = $1 AND weight = TRUE")
+            .execute(Tuple.of(managerId))
+            .map(rs -> rs.iterator().next().getLocalDate("weight_expires_on")));
+    }
+
+    /** Reviews on a manager, split by whether they are placeholders. */
+    private long countReviews(long managerId, boolean placeholders) throws Exception {
+        return await(pool
+            .preparedQuery("SELECT COUNT(*) AS c FROM reviews WHERE manager_id = $1 AND weight = $2")
+            .execute(Tuple.of(managerId, placeholders))
+            .map(rs -> rs.iterator().next().getLong("c")));
+    }
+
+    /**
+     * Rating a ghost from its own profile page retires the placeholder.
+     *
+     * <p>Found in live data: 304 placeholders, every one with {@code weight_expires_on} NULL, and
+     * fourteen managers whose displayed rating was the mean of a real review and a fabricated one.
+     *
+     * <p>Only two callers ever touched a seed - the find-or-create flow and the drop-off draft.
+     * {@code createReview}, which is what runs when somebody opens a ghost's profile and presses
+     * "Write a Review", did neither: it inserted the genuine review and left the placeholder in
+     * place, counting forever. Most people rate from the profile page, which is why the clock had
+     * never started on a single one of the 304.
+     *
+     * <p>Retirement is a 14-day countdown, never an immediate delete, so no manager's displayed
+     * rating jumps the instant somebody submits. What this asserts is that the clock <em>starts</em> -
+     * a placeholder still sitting at NULL after a real review is the defect, and it is what the
+     * 304 untouched placeholders in production all looked like.
+     */
+    @Test
+    void createReview_fromProfilePage_removesThePlaceholder() throws Exception {
+        long managerId = insertManagerWithSeed("ProfileCo", "Profile Rated", "NULL");
+        assertEquals(1L, countSeeds(managerId), "precondition: the ghost carries a placeholder");
+
+        String auth0Id = insertUser("auth0|profilerater", "profilerater");
+        await(service.createReview(auth0Id, managerId,
+            reviewBodyFor("ProfileCo", "VP"), null));
+
+        assertEquals(1L, countSeeds(managerId), "the placeholder goes on a timer, it is not deleted now");
+        assertNotNull(readSeedExpiry(managerId),
+            "a real review must start the placeholder's countdown - left NULL it counts toward the "
+          + "manager's average forever, which is the mean of a genuine review and a fabricated one");
+    }
+
+    /** A complete, valid review payload - the same shape ReviewIntegrationTest uses. */
+    private static JsonObject reviewBodyFor(String company, String title) {
+        JsonObject ratings = new JsonObject();
+        for (String key : new String[]{
+                "Communication Style", "Perceived Approachability",
+                "Perceived Clarity of Expectations", "Feedback Style",
+                "Perceived Supportiveness", "Decision Making Style",
+                "Organization and Planning Style", "Delegation Style",
+                "Perceived Professional Demeanor", "Overall Working Experience"}) {
+            ratings.put(key, 4.0);
+        }
+        return new JsonObject()
+            .put("overallRating",  4.0)
+            .put("ratings",        ratings)
+            .put("managerCompany", company)
+            .put("managerTitle",   title)
+            .put("workedFrom",     "2022-01")
+            .put("author",         "AnonTester99")
+            .put("authorType",     "anonymous");
+    }
+
+    private long countSeeds(long managerId) throws Exception {
+        return await(pool
+            .preparedQuery("SELECT COUNT(*) AS c FROM reviews WHERE manager_id = $1 AND weight = TRUE")
+            .execute(Tuple.of(managerId))
+            .map(rs -> rs.iterator().next().getLong("c")));
+    }
+
     private String insertUser(String auth0Id, String username) throws Exception {
         await(pool.preparedQuery(
             "INSERT INTO users(auth0_id,email,username,first_name,last_name) VALUES ($1,$2,$3,$4,$5)")

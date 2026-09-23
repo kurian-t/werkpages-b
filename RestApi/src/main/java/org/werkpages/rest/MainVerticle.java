@@ -46,6 +46,7 @@ import org.werkpages.service.SitemapService;
 import org.werkpages.repository.MergeSuggestionsRepository;
 import org.werkpages.repository.ResumeRepository;
 
+import org.werkpages.service.MaintenanceSweep;
 import io.vertx.core.AbstractVerticle;
 import io.vertx.core.Vertx;
 import io.vertx.core.http.HttpMethod;
@@ -151,87 +152,22 @@ public class MainVerticle extends AbstractVerticle {
                         // ── Sitemap ───────────────────────────────────────────────────────────
                         SitemapService sitemapService = new SitemapService(Database.getClient());
 
-                        // ── Soft-delete restore job (runs daily) ──────────────────────────────
-                        final CompanyRepository companyRepoForWeights = companyRepo;
-                        vertx.setPeriodic(86_400_000L, timerId -> {
-                            // Through the service, which brings the restored ratings back into the
-                            // location figures as well as back onto the page.
-                            managerService.restoreExpiredReviewDeletions()
-                                .onSuccess(n -> { if (n > 0) System.out.println("✓ Restored " + n + " anonymised review(s)"); })
-                                .onFailure(err -> System.err.println("⚠ Review restore job failed: " + err.getMessage()));
-                            interviewRepo.restoreExpiredDeletions()
-                                .onSuccess(n -> { if (n > 0) System.out.println("✓ Restored " + n + " anonymised interview review(s)"); })
-                                .onFailure(err -> System.err.println("⚠ Interview restore job failed: " + err.getMessage()));
+                        /*
+                            The daily housekeeping, extracted to MaintenanceSweep.
 
-                            // ── Proof challenges nobody answered ──────────────────────────
-                            //
-                            // Abandoning is not a way out, so an untouched challenge ages into
-                            // 'abandoned' — which still flags its author and still sits in the
-                            // admin queue, because a flag nobody can lift is a lock with no key.
-                            //
-                            // Re-running this cannot double-charge anyone: the debit is keyed on
-                            // the challenge id in user_confidence_events, and that uniqueness is a
-                            // constraint rather than this loop being careful.
-                            proofChallengeRepo.markAbandoned()
-                                .onSuccess(rows -> {
-                                    for (io.vertx.sqlclient.Row r : rows) {
-                                        confidenceRepo.apply(r.getUUID("user_id"),
-                                                ConfidenceRepository.CHALLENGE_ABANDONED, -15,
-                                                "challenge", r.getUUID("id").toString())
-                                            .onFailure(err -> System.err.println(
-                                                "⚠ Abandonment debit failed: " + err.getMessage()));
-                                    }
-                                    if (rows.rowCount() > 0)
-                                        System.out.println("✓ Aged out " + rows.rowCount() + " unanswered challenge(s)");
-                                })
-                                .onFailure(err -> System.err.println("⚠ Challenge sweep failed: " + err.getMessage()));
+                            It lived here as an anonymous lambda, which meant the only way to
+                            observe it was to boot the verticle and wait a day - so when it turned
+                            out to have been dead in production, nothing had ever been able to say
+                            so. It is now a callable object with its own tests; this line only
+                            decides when it runs.
 
-                            // ── Standing credit ───────────────────────────────────────────
-                            //
-                            // Thirty days continuously live, not thirty days since it was written:
-                            // a rating held for twenty-nine days and approved yesterday has stood
-                            // for a day. The query reads live_since, which resets whenever a
-                            // rating re-enters the live state.
-                            confidenceRepo.findReviewsDueStandingCredit(500)
-                                .onSuccess(rows -> {
-                                    for (io.vertx.sqlclient.Row r : rows) {
-                                        confidenceRepo.apply(r.getUUID("user_id"),
-                                                ConfidenceRepository.REVIEW_STOOD_30D, 2,
-                                                "review", r.getUUID("id").toString())
-                                            .onFailure(err -> System.err.println(
-                                                "⚠ Standing credit failed: " + err.getMessage()));
-                                    }
-                                })
-                                .onFailure(err -> System.err.println("⚠ Standing credit sweep failed: " + err.getMessage()));
-
-                            // ── Expired placeholder weights ───────────────────────────────
-                            //
-                            // A placeholder review stops counting 14 days after it is written, but
-                            // that happens because a date passes, not because anything writes. No
-                            // request fires, so nothing recalculated the manager, and the cached
-                            // rating and review count stayed at yesterday's numbers indefinitely
-                            // while the reviews list had already stopped showing those reviews.
-                            //
-                            // This closes that gap once a day. The query returns only managers
-                            // whose cached count actually disagrees with reality, so on a normal
-                            // day it finds nothing and does nothing.
-                            managerRepo.findManagersWithExpiredWeights()
-                                .compose(rows -> {
-                                    io.vertx.core.Future<Void> chain = io.vertx.core.Future.succeededFuture();
-                                    int stale = 0;
-                                    for (io.vertx.sqlclient.Row row : rows) {
-                                        long managerId = row.getLong("id");
-                                        stale++;
-                                        chain = chain
-                                            .compose(v -> managerRepo.recalculate(managerId))
-                                            .compose(v -> companyRepoForWeights.syncStatsForManager(managerId));
-                                    }
-                                    final int total = stale;
-                                    return chain.map(v -> total);
-                                })
-                                .onSuccess(n -> { if (n > 0) System.out.println("✓ Recalculated " + n + " manager(s) whose placeholder reviews expired"); })
-                                .onFailure(err -> System.err.println("⚠ Expired-weight recalculation failed: " + err.getMessage()));
-                        });
+                            schedule() uses the THREE-argument setPeriodic. The two-argument form
+                            defers the first run by a full period, and since every deploy restarts
+                            this process, a daily sweep scheduled that way never ran at all.
+                        */
+                        new MaintenanceSweep(reviewRepo, managerRepo, companyRepo,
+                                             proofChallengeRepo, confidenceRepo)
+                            .schedule(vertx);
 
                         // ── company_stats_live reconciliation (safety net — primary updates go
                         //    through updateCompanyStatsForManager/Company on each mutation) ──────
@@ -250,12 +186,14 @@ public class MainVerticle extends AbstractVerticle {
                         // migration documents a 30-day retention; this is what enforces it.
                         final org.werkpages.repository.AnonymousGhostSlotRepository ghostSlotsForSweep =
                             new org.werkpages.repository.AnonymousGhostSlotRepository(Database.getClient());
-                        vertx.setPeriodic(24 * 3_600_000L, timerId ->
+                        // Same initial-delay fix as the sweep above.
+                        vertx.setPeriodic(180_000L, 24 * 3_600_000L, timerId ->
                             ghostSlotsForSweep.sweepExpired()
                                 .onFailure(err -> System.err.println(
                                     "⚠ anonymous_ghost_quota sweep failed: " + err.getMessage())));
 
-                        vertx.setPeriodic(6 * 3_600_000L, timerId -> {
+                        // Same initial-delay fix; staggered so the two sweeps do not start together.
+                        vertx.setPeriodic(120_000L, 6 * 3_600_000L, timerId -> {
                             if (statsRefreshRunning.compareAndSet(false, true)) {
                                 companyRepoForScheduler.refreshCompanyStats()
                                     .onSuccess(v -> System.out.println("✓ company_stats_live reconciled from source"))

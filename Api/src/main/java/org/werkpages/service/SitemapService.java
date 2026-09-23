@@ -23,6 +23,25 @@ public class SitemapService {
         "/terms",
     };
 
+    /**
+     * The SQL half of the indexability rule; {@code client/lib/indexability.ts} is the other.
+     *
+     * <p>This used to be {@code reviews_count > 0}: a profile earned a sitemap entry only once
+     * somebody had rated it. The reasoning was that a mass of review-less profiles reads to Google
+     * as near-duplicate filler, which is a real way to damage a domain - but "has no reviews yet"
+     * and "has nothing on it" are different conditions, and only the second is thin.
+     *
+     * <p>A review-less profile still carries a name, a role, an employer and a location, and
+     * auto-created ones are limited to one per account and filtered for public figures, so they
+     * are not generated in bulk. Excluding them hid exactly the pages somebody searching a
+     * manager by name was trying to reach - the search that leads to the first review.
+     *
+     * <p>What stays out is a profile with no employer or no role, which really is just a name.
+     */
+    private static final String INDEXABLE_MANAGER =
+        "  AND m.title IS NOT NULL AND btrim(m.title) <> ''\n"
+      + "  AND m.company IS NOT NULL AND btrim(m.company) <> ''\n";
+
     private final SqlClient db;
 
     public SitemapService(SqlClient db) {
@@ -30,10 +49,10 @@ public class SitemapService {
     }
 
     public Future<String> generate() {
-        // Only pages with real content are indexable. Empty ghost/auto-created pages (0 reviews)
-        // are thin, near-duplicate templates — submitting them floods Google's crawl budget and
-        // produces "Discovered - currently not indexed" and "Duplicate" reports. A company/manager
-        // earns a sitemap entry only once it has at least one real review (reviews_count > 0).
+        // Which profiles are submitted: the SQL mirror of client/lib/indexability.ts, and the two
+        // have to keep saying the same thing. A URL submitted here while the page serves noindex
+        // spends crawl budget to be refused; a page that is indexable but never submitted has to
+        // be discovered some other way. See INDEXABLE_MANAGER.
         Future<RowSet<Row>> companiesFuture = db.query("""
                 SELECT DISTINCT c.slug, c.industry
                 FROM companies c
@@ -41,7 +60,7 @@ public class SitemapService {
                 WHERE c.status IN ('approved', 'ghost')
                   AND c.slug IS NOT NULL
                   AND m.approval_status IN ('approved', 'ghost')
-                  AND m.reviews_count > 0
+                """ + INDEXABLE_MANAGER + """
                 ORDER BY c.slug
                 """).execute();
 
@@ -52,7 +71,7 @@ public class SitemapService {
                 WHERE m.approval_status IN ('approved', 'ghost')
                   AND m.slug IS NOT NULL
                   AND c.slug IS NOT NULL
-                  AND m.reviews_count > 0
+                """ + INDEXABLE_MANAGER + """
                 ORDER BY c.slug, m.slug
                 """).execute();
 

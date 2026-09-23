@@ -395,6 +395,144 @@ class ReviewIntegrationTest {
         return body;
     }
 
+    /**
+     * When createReview returns, the numbers it changed are already correct.
+     *
+     * <p>There is no sleep and no polling here, deliberately: the whole assertion is that the
+     * call does not come back until the recalculation it triggered has landed. Anything that
+     * waits would pass against the bug.
+     *
+     * <p><b>The race is forced, not hoped for.</b> An earlier version of this test just called the
+     * service and asserted - and it PASSED against the un-awaited code, because locally, with a
+     * warm pool and one row, the background recalculation happened to win. A test that has only
+     * ever been seen passing proves nothing, so the timing is now controlled: the repository is
+     * subclassed to delay {@code recalculate} by {@link #RECALC_DELAY_MS}, which is far longer
+     * than the sync it used to run alongside.
+     *
+     * <p>Un-awaited, the sync therefore reads the manager row before the recalculation lands and
+     * records nothing; awaited, it cannot. Verified to fail without the fix.
+     *
+     * <p>Two writes were racing. {@code recalculate} writes managers.reviews_count and
+     * managers.overall_rating; {@code syncStatsForManager} then computes company_stats_live
+     * <em>from those two columns</em>. The sync was awaited and the recalculation was not, so the
+     * company's figures could be derived from the pre-review numbers and stay wrong until the
+     * next review happened to land - and the client, which refetches the manager as soon as this
+     * returns, could read the old average back.
+     *
+     * <p>total_reviews is the sharpest assertion: company_stats_live only counts a manager whose
+     * reviews_count is above zero, so a sync that ran first records nothing at all.
+     */
+    @Test
+    void createReview_whenItReturns_managerAndCompanyFiguresAreAlreadyUpdated() throws Exception {
+        String auth0Id = insertUser("auth0|raceuser", "raceuser");
+        long companyId = insertCompanyForRaceTest("Race Corp Ltd");
+        long managerId = insertManagerInCompany("Race Manager", "Race Corp Ltd", "Manager", companyId);
+
+        await(slowRecalcService().createReview(auth0Id, managerId,
+            validBody("Race Corp Ltd", "Manager", "2022-01", null), null));
+
+        Row manager = await(pool
+            .preparedQuery("SELECT reviews_count, overall_rating FROM managers WHERE id = $1")
+            .execute(Tuple.of(managerId))
+            .map(rs -> rs.iterator().next()));
+        assertEquals(1, manager.getInteger("reviews_count"),
+            "the manager's cached count must be written before the call returns");
+        assertNotNull(manager.getBigDecimal("overall_rating"));
+        assertTrue(manager.getBigDecimal("overall_rating").doubleValue() > 0,
+            "the cached rating must reflect the review that was just submitted");
+
+        Row stats = await(pool
+            .preparedQuery("SELECT total_reviews, avg_rating FROM company_stats_live WHERE company_id = $1")
+            .execute(Tuple.of(companyId))
+            .map(rs -> rs.iterator().hasNext() ? rs.iterator().next() : null));
+        assertNotNull(stats, "the company's live stats row must exist once one of its managers is rated");
+        assertEquals(1L, stats.getLong("total_reviews"),
+            "company stats are derived from the manager's counts, so they must be synced after the recalculation");
+        assertNotNull(stats.getBigDecimal("avg_rating"),
+            "a company whose only manager is rated has an average; null means the sync read the pre-review row");
+    }
+
+    /**
+     * Deleting a review updates the company's figures too.
+     *
+     * <p>This path recalculated the manager and then stopped. company_stats_live is derived from
+     * managers.reviews_count and managers.overall_rating, and nothing here ever told it to
+     * re-read them - so a company kept counting a review that had been removed, indefinitely,
+     * until some unrelated mutation on that company happened to trigger a sync.
+     *
+     * <p>Deliberately asserts the company row rather than the manager row: the manager side was
+     * already being recalculated, and asserting it would pass against the bug.
+     */
+    @Test
+    void deleteReview_alsoUpdatesTheCompanyFigures() throws Exception {
+        String auth0Id = insertUser("auth0|delstats", "delstatsuser");
+        long companyId = insertCompanyForRaceTest("Race Corp Ltd");
+        long managerId = insertManagerInCompany("Deleting Manager", "Race Corp Ltd", "Manager", companyId);
+
+        Row created = await(service.createReview(auth0Id, managerId,
+            validBody("Race Corp Ltd", "Manager", "2022-01", null), null));
+        assertEquals(1L, companyTotalReviews(companyId), "precondition: the company counts the new review");
+
+        await(service.deleteReview(auth0Id, managerId, created.getUUID("id")));
+
+        assertEquals(0L, companyTotalReviews(companyId),
+            "the company's live stats must stop counting a review that has been deleted");
+    }
+
+    /** total_reviews on the company's live stats row, or 0 when no row exists yet. */
+    private long companyTotalReviews(long companyId) throws Exception {
+        return await(pool
+            .preparedQuery("SELECT total_reviews FROM company_stats_live WHERE company_id = $1")
+            .execute(Tuple.of(companyId))
+            .map(rs -> rs.iterator().hasNext() ? rs.iterator().next().getLong("total_reviews") : 0L));
+    }
+
+    /** Long enough that an un-awaited recalculation cannot possibly land before the sync. */
+    private static final long RECALC_DELAY_MS = 400;
+
+    /**
+     * The service, wired to a repository whose recalculation is deliberately slow.
+     *
+     * <p>Subclassed rather than mocked, so every other query still hits the real database and the
+     * only thing changed is when this one write completes. No production seam is needed: the
+     * method is public and the class is not final.
+     */
+    private ManagerService slowRecalcService() {
+        ManagerRepository slow = new ManagerRepository(pool) {
+            @Override
+            public Future<Void> recalculate(long managerId) {
+                return Future.<Void>fromCompletionStage(
+                        java.util.concurrent.CompletableFuture.runAsync(() -> {
+                            try { Thread.sleep(RECALC_DELAY_MS); }
+                            catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+                        }))
+                    .compose(v -> super.recalculate(managerId));
+            }
+        };
+        // editRepo/reportRepo are locals in setUpAll, not fields; fresh ones are equivalent here.
+        return new ManagerService(slow, reviewRepo, userRepo,
+            new EditRepository(pool), new ReportRepository(pool), pool);
+    }
+
+    /** A company row this test owns outright, so a leftover from a previous run cannot skew it. */
+    private long insertCompanyForRaceTest(String name) throws Exception {
+        await(pool.preparedQuery("DELETE FROM companies WHERE name = $1").execute(Tuple.of(name)));
+        return await(pool
+            .preparedQuery("INSERT INTO companies(name, slug, status, created_at, updated_at) "
+                         + "VALUES ($1, $2, 'approved', now(), now()) RETURNING id")
+            .execute(Tuple.of(name, "race-corp-ltd"))
+            .map(rs -> rs.iterator().next().getLong("id")));
+    }
+
+    /** insertManager, but linked to a company - company_stats_live keys off company_id. */
+    private long insertManagerInCompany(String name, String company, String title, long companyId) throws Exception {
+        return await(pool
+            .preparedQuery("INSERT INTO managers(name,company,title,image,status,overall_rating,reviews_count,category_averages,company_id) "
+                         + "VALUES ($1,$2,$3,'img','active',0,0,'{}',$4) RETURNING id")
+            .execute(Tuple.of(name, company, title, companyId))
+            .map(rs -> rs.iterator().next().getLong("id")));
+    }
+
     private long insertManager(String name, String company, String title) throws Exception {
         return await(pool
             .preparedQuery("INSERT INTO managers(name,company,title,image,status,overall_rating,reviews_count,category_averages) " +

@@ -527,11 +527,52 @@ public class ReviewRepository {
             .map(rows -> rows.iterator().next());
     }
 
+    /**
+     * Starts the placeholder's 14-day countdown, once.
+     *
+     * <p>{@code AND weight_expires_on IS NULL} is the whole point of this clause. Without it every
+     * subsequent real review re-ran this UPDATE and pushed the expiry out another fortnight, so a
+     * manager receiving a review even occasionally kept its placeholder <em>forever</em> - the
+     * countdown restarted before it could ever finish. The clock is meant to start when the first
+     * real review arrives and then run down regardless of what else happens.
+     */
     public Future<Void> scheduleSeedExpiry(long managerId) {
         return db.preparedQuery(
-                "UPDATE reviews SET weight_expires_on = now() + INTERVAL '14 days' WHERE manager_id = $1 AND weight = TRUE")
+                "UPDATE reviews SET weight_expires_on = now() + INTERVAL '14 days' "
+              + "WHERE manager_id = $1 AND weight = TRUE AND weight_expires_on IS NULL")
             .execute(Tuple.of(managerId))
             .mapEmpty();
+    }
+
+    /**
+     * Deletes placeholder reviews whose countdown has run out.
+     *
+     * <p>Expiry already removed them from the reviews list and from the cached rating, so this
+     * changes no number anybody sees - it removes the row itself. Until now nothing ever did:
+     * "expired" meant ignored-everywhere-but-still-present, and the placeholders accumulated in
+     * the table indefinitely.
+     *
+     * <p><b>{@code user_id IS NULL} is a deliberate second lock on the door.</b> A placeholder is
+     * defined by {@code weight = TRUE}, and that alone is sufficient: the column is
+     * {@code NOT NULL DEFAULT FALSE}, the real review INSERT never names it, no UPDATE anywhere
+     * sets it, and both the generator and the V33 backfill write {@code user_id = NULL}. So a
+     * real review cannot carry it. But this statement deletes rows in bulk and unattended, and if
+     * that invariant were ever broken by a migration or a manual fix, the cost would be somebody's
+     * real review disappearing with nothing to recover it from. The guard makes such a row survive
+     * instead. V36 states the same pair as the definition of a seed, and the other seed deletes in
+     * this codebase already pair them.
+     *
+     * <p>Must run <em>after</em> the expired-weight recalculation in the same sweep. That query
+     * finds managers by {@code EXISTS (expired placeholder)}, so deleting first would hide every
+     * manager whose cached count had not yet caught up, and their figures would stay wrong with
+     * nothing left to point at the problem.
+     */
+    public Future<Integer> deleteExpiredSeedReviews() {
+        return db.preparedQuery(
+                "DELETE FROM reviews WHERE weight = TRUE AND user_id IS NULL "
+              + "AND weight_expires_on IS NOT NULL AND weight_expires_on <= CURRENT_DATE")
+            .execute()
+            .map(RowSet::rowCount);
     }
 
     public Future<Void> deleteSeedReview(long managerId) {

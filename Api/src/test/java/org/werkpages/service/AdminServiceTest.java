@@ -60,6 +60,9 @@ class AdminServiceTest {
         // to answer with a real future instead of Mockito's default null.
         when(companyRepo.syncStatsForManager(anyLong())).thenReturn(Future.succeededFuture());
         when(companyRepo.updateCompanyStatsForCompany(anyLong())).thenReturn(Future.succeededFuture());
+        // recalculate() is awaited by the service now rather than fired and forgotten, so the
+        // mock must return a Future; unstubbed, Mockito hands back null and the compose NPEs.
+        when(managerRepo.recalculate(anyLong())).thenReturn(Future.succeededFuture());
         when(managerRepo.findSlugs(anyLong())).thenReturn(Future.succeededFuture(Optional.empty()));
         when(managerRepo.findCurrentRoleStart(anyLong())).thenReturn(Future.succeededFuture(Optional.empty()));
         service     = new AdminService(userRepo, managerRepo, reviewRepo, editRepo, notifRepo, companyRepo);

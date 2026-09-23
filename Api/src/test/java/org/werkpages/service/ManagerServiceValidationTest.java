@@ -89,8 +89,18 @@ class ManagerServiceValidationTest {
             .thenReturn(Future.succeededFuture(Optional.empty()));
         when(reviewRepo.findByUserForValidation(eq(USER_ID), anyString()))
             .thenReturn(Future.succeededFuture(emptyRs));
+        /*
+            recalculate() is now awaited by the service rather than fired and forgotten, so the
+            mock has to honour its signature and hand back a Future. Unstubbed, Mockito returned
+            null and every path that composes on it died with an NPE - which is what a null-
+            returning double for a Future-typed method will always do.
+        */
+        when(managerRepo.recalculate(anyLong())).thenReturn(Future.succeededFuture());
         doNothing().when(managerRepo).recalculateInBackground(anyLong());
         when(reviewRepo.deleteSeedReview(anyLong())).thenReturn(Future.succeededFuture());
+        // createReview now starts the placeholder's countdown after a successful insert, so the
+        // mock must return a Future here too; unstubbed it hands back null and the compose NPEs.
+        when(reviewRepo.scheduleSeedExpiry(anyLong())).thenReturn(Future.succeededFuture());
     }
 
     // ── User / auth checks ────────────────────────────────────────────────────
@@ -363,7 +373,7 @@ class ManagerServiceValidationTest {
         Row result = await(service.createReview(AUTH0_ID, MANAGER_ID, validBody(), "https://logo.test"));
 
         assertNotNull(result);
-        verify(managerRepo).recalculateInBackground(MANAGER_ID);
+        verify(managerRepo).recalculate(MANAGER_ID);   // awaited now, same assertion
     }
 
     @Test
@@ -1019,7 +1029,7 @@ class ManagerServiceValidationTest {
 
         Row result = await(service.updateReview(AUTH0_ID, MANAGER_ID, reviewId, validBody()));
         assertNotNull(result);
-        verify(managerRepo).recalculateInBackground(MANAGER_ID);
+        verify(managerRepo).recalculate(MANAGER_ID);   // awaited now, same assertion
     }
 
 
@@ -1113,7 +1123,7 @@ class ManagerServiceValidationTest {
 
         assertTrue(result.getBoolean("success"));
         verify(reviewRepo).recordDeletion(USER_ID, MANAGER_ID);
-        verify(managerRepo).recalculateInBackground(MANAGER_ID);
+        verify(managerRepo).recalculate(MANAGER_ID);   // awaited now, same assertion
     }
 
     // ══════════════════════════════════════════════════════════════════════════

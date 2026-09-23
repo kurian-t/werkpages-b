@@ -136,14 +136,33 @@ public class AnonymousGhostSlotRepository {
         return siteWideRates().map(rate -> rate.withinCeiling());
     }
 
-    /** What the ceilings currently see. Also what the admin banner reports. */
+    /**
+     * What the ceilings currently see. Also what the admin banner reports.
+     *
+     * <p><b>Counted from the managers actually created, not from this table.</b> It used to count
+     * rows in {@code anonymous_ghost_quota}, which records only the logged-OUT path. A logged-in
+     * first search goes through {@code users.has_auto_created_manager} instead and never touches
+     * that table, so every profile auto-created by a signed-in visitor was invisible here.
+     *
+     * <p>Two things were wrong with that. The admin banner reported a number that was not the
+     * number of automatic manager creations, which is how this was noticed - creating one while
+     * signed in moved nothing. And {@link #withinSiteWideCeiling()} is named and documented as a
+     * site-wide breaker while seeing only half the traffic, so the half it could not see could
+     * never trip it.
+     *
+     * <p>{@code approval_status = 'ghost'} is precisely "created automatically": the deliberate
+     * paths write 'approved' or 'pending_approval'. The existing index on approval_status carries
+     * this; if ghost volume ever makes that scan matter, the next step is a partial index on
+     * created_at, and that migration belongs in the Werkpages stream.
+     */
     public Future<SiteWideRate> siteWideRates() {
         // Rolling windows, not calendar buckets. Fixed buckets have a boundary hole: the cap can be
         // spent at 10:59 and again at 11:01, for double the intended rate in two minutes.
         return db.preparedQuery("""
-                SELECT count(*) FILTER (WHERE claimed_at > now() - interval '1 hour')  AS last_hour,
-                       count(*) FILTER (WHERE claimed_at > now() - interval '24 hours') AS last_day
-                FROM anonymous_ghost_quota
+                SELECT count(*) FILTER (WHERE created_at > now() - interval '1 hour')  AS last_hour,
+                       count(*) FILTER (WHERE created_at > now() - interval '24 hours') AS last_day
+                FROM managers
+                WHERE approval_status = 'ghost'
                 """)
             .execute()
             .map(rows -> {
@@ -155,8 +174,8 @@ public class AnonymousGhostSlotRepository {
     /**
      * Automatic public creation as it currently stands, site-wide.
      *
-     * @param lastHour claims in the last rolling hour
-     * @param lastDay  claims in the last rolling 24 hours
+     * @param lastHour managers auto-created in the last rolling hour, by any path
+     * @param lastDay  managers auto-created in the last rolling 24 hours, by any path
      */
     public record SiteWideRate(long lastHour, long lastDay) {
         public boolean withinCeiling() {

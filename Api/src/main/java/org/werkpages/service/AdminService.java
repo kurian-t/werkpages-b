@@ -188,16 +188,24 @@ public class AdminService {
                         managerId);
                 }
                 // Compute the real rating from submitted reviews now that the manager is live.
-                managerRepo.recalculateInBackground(managerId);
+                // Awaited below, before the company sync: see the ordering note there.
+                Future<Void> recalculated = managerRepo.recalculate(managerId);
                 JsonObject ok = new JsonObject()
                     .put("success", true)
                     .put("message", "Manager approved")
                     .put("_managerId", managerId)
                     .put("_needsLogo", existingLogo == null)
                     .put("_company", company);
-                if (companyRepo == null) return Future.succeededFuture(ok);
-                // Awaited: the stats write must not outlive the request that triggered it.
-                return companyRepo.syncStatsForManager(managerId).map(statsDone -> ok);
+                if (companyRepo == null) return recalculated.map(recalcDone -> ok);
+                /*
+                    Both awaited, and in this order. company_stats_live is derived from
+                    managers.reviews_count and managers.overall_rating, so syncing before the
+                    recalculation lands writes the company's figures from the pre-approval
+                    numbers. The sync was already awaited; the recalculation it depends on was not.
+                */
+                return recalculated
+                    .compose(v -> companyRepo.syncStatsForManager(managerId))
+                    .map(statsDone -> ok);
             });
     }
 
@@ -338,8 +346,12 @@ public class AdminService {
                                   + (reason != null && !reason.isBlank() ? " Reason: " + reason.trim() : ""),
                             c.getLong("manager_id"));
                         // Recalculate only on approval: a rejected rating never entered the cache.
-                        if (approve) managerRepo.recalculateInBackground(c.getLong("manager_id"));
-                        return Future.succeededFuture(new JsonObject()
+                        // Awaited, so the admin's next screen reads the figure this decision
+                        // produced rather than the one it replaced.
+                        Future<Void> recalculated = approve
+                            ? managerRepo.recalculate(c.getLong("manager_id"))
+                            : Future.succeededFuture();
+                        return recalculated.map(recalcDone -> new JsonObject()
                             .put("success", true)
                             .put("status", approve ? "approved" : "rejected"));
                     });

@@ -19,6 +19,7 @@ import org.werkpages.repository.ManagerRepository;
 import org.werkpages.repository.ReportRepository;
 import org.werkpages.repository.ReviewRepository;
 import org.werkpages.repository.UserRepository;
+import org.werkpages.repository.AnonymousGhostSlotRepository;
 import org.werkpages.service.ManagerService;
 import org.testcontainers.containers.PostgreSQLContainer;
 import org.testcontainers.junit.jupiter.Container;
@@ -80,6 +81,78 @@ class FindOrCreateIntegrationTest {
     }
 
     // ── First search, long names → ghost ─────────────────────────────────────
+
+    /**
+     * The manager handed back from a first search already carries its seeded rating.
+     *
+     * <p>Reported in production on the sister product: a user searched, the profile was
+     * auto-created, and the tile came back with an empty space where the rating goes. The seed
+     * review was in the database the whole time - reloading showed the rating - which made it
+     * look random.
+     *
+     * <p>The cause is in this response, not in the tile. {@code createAutoApproved} returns its
+     * own RETURNING row, captured before the seed review exists, so reviews_count is 0 and
+     * overall_rating null on it. {@code createSeedReview} only writes to {@code reviews}; the
+     * counts reach the manager via {@code recalculate}, which ran fire-and-forget while the stale
+     * row was serialised and returned regardless.
+     *
+     * <p>This asserts on the response object specifically. Querying the database afterwards would
+     * pass either way - the row does get fixed a moment later - and would miss the bug entirely.
+     * Verified to fail against the un-awaited version.
+     */
+    @Test
+    void findOrCreate_firstSearch_returnedManagerCarriesItsSeededRating() throws Exception {
+        String auth0Id = insertUser("auth0|seeded", "seededuser");
+
+        JsonObject result = await(service.findOrCreate(
+            auth0Id, "Rated", "Person", "Engineer", "Acme Corp", "US", null, null, null));
+
+        JsonObject manager = result.getJsonArray("data").getJsonObject(0);
+
+        assertEquals("ghost", manager.getString("approvalStatus"));
+        assertNotNull(manager.getValue("overallRating"),
+            "the tile renders whatever this response says; a null rating draws nothing");
+        assertTrue(manager.getDouble("overallRating") > 0,
+            "the seed review gives the profile a real rating, so the response must show it");
+        // "reviews", not "reviewsCount" - rowToManagerJson emits that key, and it is the one
+        // ManagerCard reads as boss.reviews when it decides whether to draw the rating at all.
+        assertNotNull(manager.getInteger("reviews"),
+            "the count the tile reads must be present on the returned manager");
+        assertTrue(manager.getInteger("reviews") >= 1,
+            "the seeded review must be counted on the manager that is returned");
+    }
+
+    /**
+     * A manager auto-created by a signed-in visitor counts toward the site-wide rate.
+     *
+     * <p>Reported from the admin panel: "Automatic manager creation is active - 0 in the last
+     * hour" while a profile had just been auto-created by a logged-in search. The number was not
+     * wrong about its own query; it was counting the wrong thing. It read
+     * {@code anonymous_ghost_quota}, which only the logged-OUT path writes to. A logged-in first
+     * search claims {@code users.has_auto_created_manager} instead and never touches that table,
+     * so signed-in creations were invisible.
+     *
+     * <p>That is worse than a wrong label. {@code withinSiteWideCeiling()} is the breaker meant to
+     * stop runaway automatic creation, and traffic it cannot see can never trip it - so half the
+     * creation paths had no ceiling at all.
+     *
+     * <p>Asserted through the rate the breaker itself reads, not through the managers table, so
+     * the test fails if the breaker ever goes back to looking somewhere narrower.
+     */
+    @Test
+    void findOrCreate_loggedInGhost_countsTowardTheSiteWideRate() throws Exception {
+        AnonymousGhostSlotRepository ghostSlots = new AnonymousGhostSlotRepository(pool);
+        long before = await(ghostSlots.siteWideRates()).lastHour();
+
+        String auth0Id = insertUser("auth0|ratecount", "ratecountuser");
+        await(service.findOrCreate(
+            auth0Id, "Counted", "Creation", "Engineer", "Acme Corp", "US", null, null, null));
+
+        assertEquals(before + 1, await(ghostSlots.siteWideRates()).lastHour(),
+            "a signed-in auto-creation is still an automatic creation - the breaker must see it");
+        assertEquals(before + 1, await(ghostSlots.siteWideRates()).lastDay(),
+            "and it must appear in the 24-hour window the admin banner reports");
+    }
 
     @Test
     void findOrCreate_firstSearch_longNames_createsGhost() throws Exception {

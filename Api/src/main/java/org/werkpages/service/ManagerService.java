@@ -1606,7 +1606,24 @@ public class ManagerService {
                         if (draftTokenStr != null && !draftTokenStr.isBlank()) {
                             try { draftToken = UUID.fromString(draftTokenStr); } catch (IllegalArgumentException ignored) {}
                         }
-                        return validateAndInsertReview(body, managerId, userId, author, resolvedLogoUrl, draftToken, submission);
+                        /*
+                            Start the placeholder's countdown once the real review is in.
+
+                            This path - opening a ghost's profile and pressing "Write a Review" -
+                            retired the placeholder neither way, so the seeded review kept counting
+                            toward the average forever alongside the genuine one.
+
+                            AFTER the insert, not before. Retiring it first means a submission that
+                            then fails validation has already timed out the placeholder, leaving
+                            the manager with a retired seed and no review to replace it.
+
+                            Always the 14-day countdown, never an immediate delete: no manager's
+                            displayed rating changes the instant somebody submits.
+                        */
+                        return validateAndInsertReview(body, managerId, userId, author,
+                                resolvedLogoUrl, draftToken, submission)
+                            .compose(reviewRow -> reviewRepo.scheduleSeedExpiry(managerId)
+                                .map(seedScheduled -> reviewRow));
                     });
             });
     }
@@ -2069,10 +2086,20 @@ public class ManagerService {
                         }));
                 }));
         }).compose(row -> {
-            managerRepo.recalculateInBackground(managerId);
-            // .compose rather than .onSuccess: a void success handler cannot await, which is how
-            // this write used to outlive the request that started it.
-            return companyRepo.syncStatsForManager(managerId).map(statsDone -> row);
+            /*
+                The recalculation comes first, and is awaited.
+
+                company_stats_live is computed FROM managers.reviews_count and
+                managers.overall_rating. Syncing it while the recalculation that writes those two
+                columns is still in flight derives the company's figures from the previous
+                numbers, and nothing corrects them until the next review lands.
+
+                The sync was already awaited, and a comment here said so. The thing it depends on
+                was not, which made the guarantee half a guarantee.
+            */
+            return managerRepo.recalculate(managerId)
+                .compose(recalced -> companyRepo.syncStatsForManager(managerId))
+                .map(statsDone -> row);
         });
     }
 
@@ -2344,10 +2371,11 @@ public class ManagerService {
                                         beforeOpt.orElse(null), rowOpt.get())
                                     .map(v -> rowOpt.get());
                             })))
-                            .map(row -> {
-                                managerRepo.recalculateInBackground(managerId);
-                                return row;
-                            });
+                            // Awaited: the client refetches the manager the moment this
+                            // returns, and an un-awaited recalculation loses that race - the
+                            // edit appears to have had no effect until the next reload.
+                            .compose(row -> managerRepo.recalculate(managerId)
+                                .map(recalced -> row));
                     });
             });
     }
@@ -2375,12 +2403,32 @@ public class ManagerService {
                                 locationStats.contributionOf(conn, reviewId)
                                     .compose(before -> reviewRepo.delete(conn, reviewId, managerId)
                                         .compose(v -> locationStats.resyncManagerReview(conn, reviewId, before))))
-                            .compose(v -> {
-                                // Recalculate immediately after soft-delete, before recordDeletion,
-                                // so stale stats are never left behind if recordDeletion fails.
-                                managerRepo.recalculateInBackground(managerId);
-                                return reviewRepo.recordDeletion(userId, managerId);
-                            })
+                            .compose(v ->
+                                /*
+                                    Recalculate immediately after the soft-delete and before
+                                    recordDeletion, so stale stats are never left behind if
+                                    recordDeletion fails.
+
+                                    That was the stated intent and it was only ever a comment:
+                                    un-awaited, the recalculation could still be in flight when
+                                    recordDeletion ran, or fail silently after the response had
+                                    gone - leaving a deleted review still counted in the average.
+                                */
+                                managerRepo.recalculate(managerId)
+                                    /*
+                                        And sync the company, which this path never did at all.
+
+                                        Deleting a review changed the manager's cached count and
+                                        rating, but company_stats_live is derived from those two
+                                        columns and nothing here told it to re-read them. The
+                                        company's average therefore kept counting a review that
+                                        had been removed - indefinitely, since the only other
+                                        writer is the next mutation on that company.
+
+                                        Separate defect from the ordering above; both live here.
+                                    */
+                                    .compose(recalced -> companyRepo.syncStatsForManager(managerId))
+                                    .compose(synced -> reviewRepo.recordDeletion(userId, managerId)))
                             .map(v -> new JsonObject().put("success", true).put("message", "Review deleted"));
                     });
             });
@@ -3179,11 +3227,23 @@ public class ManagerService {
                                         GeoObservationRepository.SUBJECT_MANAGER, String.valueOf(newId),
                                         GeoObservationRepository.ACTION_SEARCH, observed)
                                     .compose(obsDone -> reviewRepo.createSeedReview(newId, company, title))
-                                    .compose(ignored -> {
-                                        managerRepo.recalculateInBackground(newId);
-                                        return companyRepo.syncStatsForManager(newId)
-                                            .compose(statsDone -> Future.succeededFuture(row));
-                                    })
+                                    /*
+                                        The response must describe the manager AFTER the seed review, not before it.
+
+                                        `row` is the insert's own RETURNING row, captured before the seed review existed -
+                                        reviews_count 0, overall_rating null. createSeedReview only writes to `reviews`; the
+                                        counts on the manager are written by recalculate(), which used to run fire-and-forget
+                                        while the caller was handed the stale `row` regardless. The tile for a just-created
+                                        profile therefore rendered with no rating even though the seed review was already in
+                                        the database, and reloading fixed it - which is what made it look intermittent.
+
+                                        syncStatsForManager is deliberately left as it was: it touches company_stats, not this
+                                        row, and nothing here needs to wait for it.
+                                    */
+                                    .compose(ignored -> managerRepo.recalculate(newId))
+                                    .compose(recalced -> managerRepo.findById(newId))
+                                    .compose(fresh -> companyRepo.syncStatsForManager(newId)
+                                        .map(statsDone -> fresh.orElse(row)))
                                     .recover(err -> {
                                         System.err.println("Seed review creation failed for auto-approved manager " + newId + ": " + err.getMessage());
                                         err.printStackTrace(System.err);
@@ -3341,11 +3401,23 @@ public class ManagerService {
                                 GeoObservationRepository.SUBJECT_MANAGER, String.valueOf(newId),
                                 GeoObservationRepository.ACTION_CREATE, observed)
                             .compose(obsDone -> reviewRepo.createSeedReview(newId, company, title))
-                            .compose(ignored -> {
-                                managerRepo.recalculateInBackground(newId);
-                                return companyRepo.syncStatsForManager(newId)
-                                    .compose(statsDone -> Future.succeededFuture(row));
-                            })
+                            /*
+                                The response must describe the manager AFTER the seed review, not before it.
+
+                                `row` is the insert's own RETURNING row, captured before the seed review existed -
+                                reviews_count 0, overall_rating null. createSeedReview only writes to `reviews`; the
+                                counts on the manager are written by recalculate(), which used to run fire-and-forget
+                                while the caller was handed the stale `row` regardless. The tile for a just-created
+                                profile therefore rendered with no rating even though the seed review was already in
+                                the database, and reloading fixed it - which is what made it look intermittent.
+
+                                syncStatsForManager is deliberately left as it was: it touches company_stats, not this
+                                row, and nothing here needs to wait for it.
+                            */
+                            .compose(ignored -> managerRepo.recalculate(newId))
+                            .compose(recalced -> managerRepo.findById(newId))
+                            .compose(fresh -> companyRepo.syncStatsForManager(newId)
+                                .map(statsDone -> fresh.orElse(row)))
                             .recover(err -> {
                                 System.err.println("Seed review creation failed for ghost manager " + newId + ": " + err.getMessage());
                                 return companyRepo.syncStatsForManager(newId)
