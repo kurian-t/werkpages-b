@@ -30,6 +30,8 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 
 import static org.junit.jupiter.api.Assertions.*;
+import org.werkpages.service.SubmissionContext;
+import org.werkpages.repository.GeoObservation;
 
 @Testcontainers
 class DropOffDraftIntegrationTest {
@@ -110,31 +112,72 @@ class DropOffDraftIntegrationTest {
     }
 
     /**
-     * A search that matches an existing captured draft must not claim to have published anything.
+     * A search never links to a half-typed draft. It publishes its own manager instead.
      *
-     * <p>This is the "Manager Not Found" outage, reported three times from production and seen by
-     * signed-out visitors on their first search.
+     * <p>Production ids 8717 and 8718, thirteen seconds apart:
      *
-     * <p>{@code findCapturedByNameAndCompany} deliberately matches 'pending_approval' as well as
-     * 'approved' and 'ghost' - that is its job, so a later visitor adopts an existing draft rather
-     * than creating a duplicate. But the branch that returned it sent only {@code id}, {@code name}
-     * and {@code created}, with no {@code published} field at all.
+     * <pre>
+     *   8717  Sourabh Setia | Lum       | sourabh-setia           | pending, from the add form
+     *   8718  Sourabh Setia | Lumenwerx | sourabh-setia-lumenwerx | the search's own row
+     * </pre>
      *
-     * <p>The client guards with {@code if (ghostRow?.published === false) return []}. Undefined is
-     * not false, so the guard never fired and a clickable locked tile was built pointing at a
-     * pending row. Clicking it reaches {@code enforceSubmitterAccess}, and a captured draft carries
-     * no {@code submitted_by}, so the server refuses it to everybody.
+     * <p>The search endpoint used to look in the same bucket the add form does, which includes
+     * 'pending_approval'. A pending draft is not live, not ghost, and {@code getManagerById}
+     * refuses it to everybody - so matching one could only ever yield a tile that 404s, and
+     * failing to match one yielded a duplicate with a company-suffixed slug. Both faces of the
+     * same mistake: the search consulting rows it cannot link to.
      *
-     * <p>It looked intermittent because it only happens when the searched name matches something an
-     * earlier visitor had half-typed into the add form.
-     *
-     * <p>Asserted here rather than in Playwright on purpose: the frontend test mocks this endpoint,
-     * so it would assert whatever shape the mock was given and could never have caught a field the
-     * real server omits.
+     * <p>It now looks only at 'approved' and 'ghost'. A draft that duplicates what the search
+     * publishes stays in the admin queue to be reviewed or merged - which is what that queue and
+     * those tools are for.
      */
     @Test
-    void createGhostManager_matchingACapturedDraft_reportsItIsNotPublished() throws Exception {
-        // An earlier visitor half-filled the add form: a captured draft, pending, no submitter.
+    void createGhostManager_fromSearch_ignoresAPendingDraftAndPublishesItsOwn() throws Exception {
+        // Somebody half-filled the add form earlier. This must never be linked to from a search.
+        JsonObject draft = new JsonObject()
+            .put("name",    "Sourabh Setia")
+            .put("company", "Lumenwerx")
+            .put("title",   "Engineering Manager")
+            .put("country", "Canada");
+        long draftId = await(service.createGhostManager(draft, null)).getLong("id");
+
+        var draftStatus = await(pool.preparedQuery("SELECT approval_status FROM managers WHERE id = $1")
+            .execute(Tuple.of(draftId)));
+        assertEquals("pending_approval", draftStatus.iterator().next().getString("approval_status"),
+            "precondition: the add-form capture is pending and therefore unservable");
+
+        // Now a real search for the same person.
+        JsonObject search = draft.copy().put("fromSearch", true);
+        // A client address is required: the publish gate treats "no address" as "no free ghost",
+        // so without one this would create a draft and prove nothing about the search path.
+        JsonObject result = await(service.createGhostManager(search, null,
+            SubmissionContext.of(GeoObservation.NONE, search, "203.0.113.7")));
+
+        assertNotEquals(draftId, result.getLong("id"),
+            "a search must not hand back a draft the profile page refuses to serve");
+
+        var served = await(pool.preparedQuery("SELECT approval_status FROM managers WHERE id = $1")
+            .execute(Tuple.of(result.getLong("id"))));
+        assertEquals("ghost", served.iterator().next().getString("approval_status"),
+            "the search publishes its own row, which is what the tile links to");
+        assertTrue(result.getBoolean("published"),
+            "and says so, so the client knows the tile is safe to render");
+    }
+
+    /**
+     * The add form still adopts its own earlier draft, and still says it is not published.
+     *
+     * <p>Only the add form sees pending drafts now; the search was cut off from them because a
+     * draft is unservable and a tile pointing at one 404s. This keeps the add form's behaviour
+     * honest: reuse the draft rather than filling the admin queue with copies of it, and report
+     * {@code published: false} so no tile is ever built from the response.
+     *
+     * <p>The {@code published} field itself is the other half of the outage. This branch used to
+     * omit it, and the client guarded with {@code published === false} - undefined is not false,
+     * so the guard never fired.
+     */
+    @Test
+    void createGhostManager_addForm_adoptsItsDraftAndReportsItIsNotPublished() throws Exception {
         JsonObject captureBody = new JsonObject()
             .put("name",    "Sourabh Setia")
             .put("company", "Lumenwerx")
@@ -146,16 +189,14 @@ class DropOffDraftIntegrationTest {
         var status = await(pool.preparedQuery("SELECT approval_status, submitted_by FROM managers WHERE id = $1")
             .execute(Tuple.of(capturedId)));
         var capturedRow = status.iterator().next();
-        assertEquals("pending_approval", capturedRow.getString("approval_status"),
-            "precondition: the draft is pending");
+        assertEquals("pending_approval", capturedRow.getString("approval_status"));
         assertNull(capturedRow.getUUID("submitted_by"),
-            "precondition: a captured draft has no submitter, so enforceSubmitterAccess refuses it to all");
+            "a captured draft has no submitter, so enforceSubmitterAccess refuses it to everybody");
 
-        // Now somebody searches that exact name and company. Same endpoint, fromSearch = true.
-        JsonObject searchBody = captureBody.copy().put("fromSearch", true);
-        JsonObject result = await(service.createGhostManager(searchBody, null));
+        // The add form posting again - no fromSearch flag.
+        JsonObject result = await(service.createGhostManager(captureBody.copy(), null));
 
-        assertEquals(capturedId, result.getLong("id"), "it adopts the existing draft, as intended");
+        assertEquals(capturedId, result.getLong("id"), "it reuses the draft rather than duplicating");
         assertNotNull(result.getValue("published"),
             "the response MUST carry `published` - its absence is what let a tile be built");
         assertFalse(result.getBoolean("published"),

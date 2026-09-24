@@ -3325,7 +3325,33 @@ public class ManagerService {
         final String fState = state;
         final String fCity  = city;
 
-        return managerRepo.findCapturedByNameAndCompany(name, company)
+        /*
+            Which rows this endpoint may even see depends on who is calling.
+
+            It serves two callers. The ADD FORM wants pending drafts: if somebody half-typed this
+            manager before, reuse that draft rather than filling the admin queue with copies. The
+            SEARCH must never see them. A pending draft is not live and not ghost, and the profile
+            page refuses to serve it - so a search that matches one can only ever produce a tile
+            leading to "Manager Not Found".
+
+            That is the whole bug, and it had three faces: adopting a draft (404), failing to match
+            a draft captured mid-typing (a duplicate with a company-suffixed slug), and racing the
+            capture this same search had just written. All three are the search consulting a bucket
+            it has no business linking to.
+
+            So the search looks only at rows the profile page will actually serve, and creates its
+            own when there are none. The invariant in CLAUDE.md section 41 - a tile is only ever
+            rendered for a row the profile page will serve - then holds by construction, instead of
+            being re-established by guarding each leak as it is found.
+
+            A draft that turns out to duplicate a manager the search publishes is not this
+            endpoint's problem to solve. It sits in the admin queue for review, and the merge tools
+            exist for exactly that.
+        */
+        boolean callerIsSearch = Boolean.TRUE.equals(body.getBoolean("fromSearch"));
+        return (callerIsSearch
+                    ? managerRepo.findByNameAndCompany(name, company)
+                    : managerRepo.findCapturedByNameAndCompany(name, company))
             .compose(rows -> {
                 if (rows.iterator().hasNext()) {
                     Row row = rows.iterator().next();
@@ -3355,13 +3381,31 @@ public class ManagerService {
                     */
                     String existingStatus = row.getString("approval_status");
                     boolean servable = "approved".equals(existingStatus) || "ghost".equals(existingStatus);
-                    return Future.succeededFuture(
-                        new JsonObject()
-                            .put("id", row.getLong("id"))
+                    long existingId = row.getLong("id");
+                    /*
+                        The row may have been captured mid-typing, under a fragment of the company
+                        name - "Lum" for "Lumenwerx". Now that the finished name is known, complete
+                        it, so the manager is not left listed under half a word.
+
+                        Resolving the company first gives the row the real company_id too; the
+                        fragment had its own, pointing at a company that only exists because
+                        somebody paused while typing.
+                    */
+                    return companyRepo.resolve(body.getLong("companyId"), company, null, resolvedLogoUrl)
+                        .compose(companyRow -> managerRepo.refineCapturedCompany(
+                            existingId, company, companyRow.getLong("id")))
+                        .recover(err -> {
+                            // Cosmetic. A manager listed under a fragment is worse than one listed
+                            // correctly, but neither is worth failing the search over.
+                            System.err.println("Company refinement failed for manager " + existingId
+                                               + ": " + err.getMessage());
+                            return Future.succeededFuture();
+                        })
+                        .map(ignored -> new JsonObject()
+                            .put("id", existingId)
                             .put("name", row.getString("name"))
                             .put("created", false)
-                            .put("published", servable)
-                    );
+                            .put("published", servable));
                 }
                 /*
                   Two callers, two different meanings, and conflating them is what broke the
@@ -3380,7 +3424,7 @@ public class ManagerService {
                   a profile the server refused to serve, and every one of those clicks landed on
                   "Manager not found".
                 */
-                boolean fromSearch = Boolean.TRUE.equals(body.getBoolean("fromSearch"));
+                boolean fromSearch = callerIsSearch;
 
                 /*
                   Whether this search may publish, decided BEFORE anything is written.

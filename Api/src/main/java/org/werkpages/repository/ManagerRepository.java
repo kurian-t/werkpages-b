@@ -997,16 +997,70 @@ public class ManagerRepository {
                 : Optional.empty());
     }
 
+    /**
+     * The same person, whether or not the company name was finished being typed.
+     *
+     * <p>The company test used to run one way only: {@code m.company ILIKE '%typed%'}, which asks
+     * whether the STORED name contains what was just typed. That catches a stored "Lumenwerx Inc"
+     * when somebody types "Lumenwerx". It cannot catch the opposite, and the opposite is what
+     * actually happens.
+     *
+     * <p>The partial-search capture fires on a pause in typing, so it stores whatever was in the
+     * box at that moment - "Lum". When the finished search arrives with "Lumenwerx", the old test
+     * asked whether "Lum" contains "Lumenwerx", got no, and treated a manager it already had as a
+     * new one. Production produced exactly that: id 8717 "Sourabh Setia" at "Lum" holding the
+     * clean slug {@code sourabh-setia}, and id 8718 "Sourabh Setia" at "Lumenwerx" thirteen
+     * seconds later, pushed onto {@code sourabh-setia-lumenwerx} because the base was taken.
+     *
+     * <p>So the containment is tested in both directions. The new direction uses {@code position}
+     * rather than a built LIKE pattern, so a company name containing % or _ cannot act as a
+     * wildcard, and it requires at least three stored characters - one or two letters would match
+     * most employers on the site. An exact-side match still sorts first, so a fully typed company
+     * is never beaten by a fragment.
+     */
     public Future<RowSet<Row>> findCapturedByNameAndCompany(String fullName, String company) {
+        String typed = company.trim();
         return db.preparedQuery(SELECT_BODY + """
                 WHERE m.name ILIKE $1
-                  AND m.company ILIKE $2
+                  AND (
+                        m.company ILIKE $2
+                     OR (
+                          length(btrim(m.company)) >= 3
+                          AND position(lower(btrim(m.company)) in lower($3)) > 0
+                        )
+                      )
                   AND m.approval_status IN ('approved', 'ghost', 'pending_approval')
                 GROUP BY m.id, c.slug, c.industry
-                ORDER BY m.reviews_count DESC, m.id ASC
+                ORDER BY (m.company ILIKE $2) DESC, m.reviews_count DESC, m.id ASC
                 LIMIT 5
                 """)
-            .execute(Tuple.of(fullName, "%" + company.trim() + "%"));
+            .execute(Tuple.of(fullName, "%" + typed + "%", typed));
+    }
+
+    /**
+     * Completes a company name that was captured before the person finished typing it.
+     *
+     * <p>The partial-search capture stores whatever was in the box at the pause - "Lum" for
+     * "Lumenwerx" - and that fragment is what the manager is then listed under. Once the finished
+     * search arrives and matches that row, the full name is known and the row should carry it.
+     *
+     * <p>Only ever lengthens, and only when the stored value is genuinely a fragment of the new
+     * one: a manager legitimately listed at a shorter company is left alone. Pending rows only,
+     * so nothing published is renamed underneath anybody.
+     */
+    public Future<Void> refineCapturedCompany(long managerId, String fullCompany, Long companyId) {
+        return db.preparedQuery("""
+                UPDATE managers
+                   SET company = $2,
+                       company_id = COALESCE($3, company_id),
+                       updated_at = now()
+                 WHERE id = $1
+                   AND approval_status = 'pending_approval'
+                   AND length(btrim(company)) < length(btrim($2))
+                   AND position(lower(btrim(company)) in lower($2)) > 0
+                """)
+            .execute(Tuple.of(managerId, fullCompany.trim(), companyId))
+            .mapEmpty();
     }
 
     public Future<RowSet<Row>> findByNameAndCompany(String fullName, String company) {
