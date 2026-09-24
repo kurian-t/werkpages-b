@@ -3329,11 +3329,38 @@ public class ManagerService {
             .compose(rows -> {
                 if (rows.iterator().hasNext()) {
                     Row row = rows.iterator().next();
+                    /*
+                        `published` belongs here too, and its absence was the "Manager Not Found"
+                        outage.
+
+                        findCapturedByNameAndCompany deliberately matches 'pending_approval' as
+                        well as 'approved' and 'ghost' - that is the point of it, so a second
+                        visitor adopts an existing captured draft instead of creating a duplicate.
+                        But this branch returned only {id, name, created}, with no `published`
+                        field at all.
+
+                        The client guards with `if (ghostRow?.published === false) return []`.
+                        Undefined is not false, so the guard did not fire, and a clickable locked
+                        tile was built pointing at a pending row. Clicking it reaches
+                        getManagerById -> enforceSubmitterAccess, and a captured draft carries no
+                        submitted_by, so the server refuses it to everybody: "Manager Not Found".
+
+                        Reported three times from production. It only happens when somebody
+                        searches a name that an earlier visitor had already half-typed into the add
+                        form, which is why it looked intermittent.
+
+                        The invariant is the one the corpus states: a tile is only ever rendered
+                        for a row the profile page will actually serve. So this reports publishable
+                        exactly when the row is one the profile page serves.
+                    */
+                    String existingStatus = row.getString("approval_status");
+                    boolean servable = "approved".equals(existingStatus) || "ghost".equals(existingStatus);
                     return Future.succeededFuture(
                         new JsonObject()
                             .put("id", row.getLong("id"))
                             .put("name", row.getString("name"))
                             .put("created", false)
+                            .put("published", servable)
                     );
                 }
                 /*

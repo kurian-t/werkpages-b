@@ -109,6 +109,59 @@ class DropOffDraftIntegrationTest {
         assertEquals(1L, reviewRows.iterator().next().getLong(0));
     }
 
+    /**
+     * A search that matches an existing captured draft must not claim to have published anything.
+     *
+     * <p>This is the "Manager Not Found" outage, reported three times from production and seen by
+     * signed-out visitors on their first search.
+     *
+     * <p>{@code findCapturedByNameAndCompany} deliberately matches 'pending_approval' as well as
+     * 'approved' and 'ghost' - that is its job, so a later visitor adopts an existing draft rather
+     * than creating a duplicate. But the branch that returned it sent only {@code id}, {@code name}
+     * and {@code created}, with no {@code published} field at all.
+     *
+     * <p>The client guards with {@code if (ghostRow?.published === false) return []}. Undefined is
+     * not false, so the guard never fired and a clickable locked tile was built pointing at a
+     * pending row. Clicking it reaches {@code enforceSubmitterAccess}, and a captured draft carries
+     * no {@code submitted_by}, so the server refuses it to everybody.
+     *
+     * <p>It looked intermittent because it only happens when the searched name matches something an
+     * earlier visitor had half-typed into the add form.
+     *
+     * <p>Asserted here rather than in Playwright on purpose: the frontend test mocks this endpoint,
+     * so it would assert whatever shape the mock was given and could never have caught a field the
+     * real server omits.
+     */
+    @Test
+    void createGhostManager_matchingACapturedDraft_reportsItIsNotPublished() throws Exception {
+        // An earlier visitor half-filled the add form: a captured draft, pending, no submitter.
+        JsonObject captureBody = new JsonObject()
+            .put("name",    "Sourabh Setia")
+            .put("company", "Lumenwerx")
+            .put("title",   "Engineering Manager")
+            .put("country", "Canada");
+        JsonObject captured = await(service.createGhostManager(captureBody, null));
+        long capturedId = captured.getLong("id");
+
+        var status = await(pool.preparedQuery("SELECT approval_status, submitted_by FROM managers WHERE id = $1")
+            .execute(Tuple.of(capturedId)));
+        var capturedRow = status.iterator().next();
+        assertEquals("pending_approval", capturedRow.getString("approval_status"),
+            "precondition: the draft is pending");
+        assertNull(capturedRow.getUUID("submitted_by"),
+            "precondition: a captured draft has no submitter, so enforceSubmitterAccess refuses it to all");
+
+        // Now somebody searches that exact name and company. Same endpoint, fromSearch = true.
+        JsonObject searchBody = captureBody.copy().put("fromSearch", true);
+        JsonObject result = await(service.createGhostManager(searchBody, null));
+
+        assertEquals(capturedId, result.getLong("id"), "it adopts the existing draft, as intended");
+        assertNotNull(result.getValue("published"),
+            "the response MUST carry `published` - its absence is what let a tile be built");
+        assertFalse(result.getBoolean("published"),
+            "a pending row is not publicly servable, so no tile may be rendered for it");
+    }
+
     @Test
     void createDropOffDraft_capturedManagerKeepsItsStatusAndGainsTheReview() throws Exception {
         // What this protects is unchanged: attaching a drop-off draft must not move a manager's
