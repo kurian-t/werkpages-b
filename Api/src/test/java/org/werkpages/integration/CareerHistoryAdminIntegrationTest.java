@@ -410,6 +410,58 @@ class CareerHistoryAdminIntegrationTest {
             "so the logo they chose is the one that sticks");
     }
 
+    /**
+     * Picking a company in the career editor writes the logo the admin chose.
+     *
+     * <p>Reported repeatedly: pick the right company, save, and the logo does not change. The id
+     * WAS stored - but the logo rode along only on the branch taken when nothing was picked, and
+     * neither {@code resolve} (a SELECT) nor {@code findOrCreate} (writes logo_url on INSERT only)
+     * can change an existing row. So no admin action could correct a company's logo, and every
+     * re-edit was a no-op.
+     */
+    @Test
+    void pickingACompanyInTheCareerEditor_persistsTheChosenLogo() throws Exception {
+        long companyId = await(pool.preparedQuery(
+                "INSERT INTO companies(name, logo_url, status, created_at, updated_at) "
+              + "VALUES ('Stale Logo Co', 'https://logo.test/WRONG-old.png', 'approved', now(), now()) "
+              + "RETURNING id")
+            .execute().map(rs -> rs.iterator().next().getLong("id")));
+
+        long managerId  = insertManager("Logo Persist Mgr", "Stale Logo Co", "Director");
+        String adminAuth = insertUser("auth0|ch-logo01", "ChLogo01", "admin");
+
+        await(service.adminCreateCareerEntry(adminAuth, managerId, "Stale Logo Co",
+                "Director", "2024-01", null, companyId, "https://logo.test/CHOSEN-new.png"));
+
+        String stored = await(pool.preparedQuery("SELECT logo_url FROM companies WHERE id = $1")
+            .execute(Tuple.of(companyId))
+            .map(rs -> rs.iterator().next().getString("logo_url")));
+        assertEquals("https://logo.test/CHOSEN-new.png", stored,
+            "the logo the admin picked must reach the company row - nothing else can correct it");
+    }
+
+    /** A save that carries no logo must not wipe the one the company already has. */
+    @Test
+    void savingWithoutALogo_leavesTheCompanysLogoAlone() throws Exception {
+        long companyId = await(pool.preparedQuery(
+                "INSERT INTO companies(name, logo_url, status, created_at, updated_at) "
+              + "VALUES ('Keep Logo Co', 'https://logo.test/keep-me.png', 'approved', now(), now()) "
+              + "RETURNING id")
+            .execute().map(rs -> rs.iterator().next().getLong("id")));
+
+        long managerId  = insertManager("Logo Keep Mgr", "Keep Logo Co", "Director");
+        String adminAuth = insertUser("auth0|ch-logo02", "ChLogo02", "admin");
+
+        await(service.adminCreateCareerEntry(adminAuth, managerId, "Keep Logo Co",
+                "Director", "2024-01", null, companyId, null));
+
+        String stored = await(pool.preparedQuery("SELECT logo_url FROM companies WHERE id = $1")
+            .execute(Tuple.of(companyId))
+            .map(rs -> rs.iterator().next().getString("logo_url")));
+        assertEquals("https://logo.test/keep-me.png", stored,
+            "a caller with no logo to offer must not clear the company's");
+    }
+
     private long countCompanies() throws Exception {
         return await(pool.preparedQuery("SELECT count(*) AS c FROM companies").execute()
             .map(rs -> rs.iterator().next().getLong("c")));

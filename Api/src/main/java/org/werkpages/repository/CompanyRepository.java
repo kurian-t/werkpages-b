@@ -166,6 +166,31 @@ public class CompanyRepository {
     }
 
     /**
+     * Writes a logo onto an existing company row.
+     *
+     * <p>Nothing else in this class does. {@link #findOrCreate} writes {@code logo_url} on INSERT
+     * only, and {@link #resolve} with a known id merely SELECTs - so once a company row held a
+     * wrong logo, no admin action could change it. An admin picking a company in an editor saw
+     * the right mark in the dropdown, saved, and every surface went on showing the old one,
+     * because the pick was never persisted anywhere.
+     *
+     * <p>Only ever sets a non-blank value, and never clears one: a caller that has no logo to
+     * offer must not wipe the logo the company already has.
+     *
+     * <p>The company row is the single source of truth for a company's logo, so this updates it
+     * for every manager at that company - which is the point. It is a company's logo, not one
+     * manager's.
+     */
+    public Future<Void> updateLogoUrl(long companyId, String logoUrl) {
+        if (logoUrl == null || logoUrl.isBlank()) return Future.succeededFuture();
+        return db.preparedQuery(
+                "UPDATE companies SET logo_url = $1, updated_at = now() "
+              + "WHERE id = $2 AND (logo_url IS DISTINCT FROM $1)")
+            .execute(Tuple.of(logoUrl.trim(), companyId))
+            .mapEmpty();
+    }
+
+    /**
      * Returns an existing company matching {@code name} (case-insensitive) or creates
      * a ghost entry. The logo_url and domain are only written on INSERT; an existing
      * row is touched only to update updated_at so the RETURNING clause is always valid.

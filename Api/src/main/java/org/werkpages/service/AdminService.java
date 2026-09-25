@@ -1146,13 +1146,8 @@ public class AdminService {
                     rides with the request and the name is only display text - the same rule the
                     manager editor and the edit-request flow already follow.
                 */
-                Future<Long> companyIdFuture = pickedCompanyId != null
-                    ? Future.succeededFuture(pickedCompanyId)
-                    : (companyRepo != null
-                        ? companyRepo.resolve(null, company.trim(), null, pickedLogoUrl)
-                            .map(row -> row.getLong("id"))
-                            .otherwise((Long) null)
-                        : Future.succeededFuture(null));
+                Future<Long> companyIdFuture = resolveCompanyForCareerEntry(
+                    pickedCompanyId, company, pickedLogoUrl);
                 return companyIdFuture.compose(companyId ->
                     managerRepo.insertCareerEntry(managerId, company.trim(), title.trim(),
                                                   finalStart, finalEnd, companyId)
@@ -1179,6 +1174,41 @@ public class AdminService {
             String company, String title, String startDateStr, String endDateStr) {
         return adminCreateCareerEntry(auth0Id, managerId, company, title,
                                       startDateStr, endDateStr, null, null);
+    }
+
+    /**
+     * The company a career entry belongs to, and the logo the admin chose for it.
+     *
+     * <p>Identity comes from the picked id - re-resolving by name is what created a second
+     * company and left the manager on the wrong logo, since two companies can share a name and a
+     * name typed slightly differently makes a new one.
+     *
+     * <p><b>The picked LOGO used to be dropped on exactly that branch.</b> It was passed only to
+     * {@code resolve}, which is reached only when nothing was picked - and {@code resolve} with a
+     * known id merely SELECTs, while {@code findOrCreate} writes {@code logo_url} on INSERT only.
+     * So no path in the system could ever change an existing company's logo: the admin picked the
+     * right mark, saved, and every surface went on showing the old one. Re-editing did nothing,
+     * because the pick had nowhere to land.
+     *
+     * <p>The company row is the single source of truth for a company's logo, so this writes it
+     * there rather than copying it onto the career entry. It is a company's logo, not one
+     * manager's, and a second copy would be a second thing to disagree.
+     *
+     * <p>Both career-entry paths use this, so create and update cannot drift apart again.
+     */
+    private Future<Long> resolveCompanyForCareerEntry(Long pickedCompanyId, String company,
+                                                      String pickedLogoUrl) {
+        if (pickedCompanyId != null) {
+            if (companyRepo == null) return Future.succeededFuture(pickedCompanyId);
+            return companyRepo.updateLogoUrl(pickedCompanyId, pickedLogoUrl)
+                .map(v -> pickedCompanyId)
+                // A logo is cosmetic; the entry still belongs on the company that was picked.
+                .otherwise(pickedCompanyId);
+        }
+        if (companyRepo == null) return Future.succeededFuture(null);
+        return companyRepo.resolve(null, company.trim(), null, pickedLogoUrl)
+            .map(row -> row.getLong("id"))
+            .otherwise((Long) null);
     }
 
     /**
@@ -1323,13 +1353,8 @@ public class AdminService {
                     rides with the request and the name is only display text - the same rule the
                     manager editor and the edit-request flow already follow.
                 */
-                Future<Long> companyIdFuture = pickedCompanyId != null
-                    ? Future.succeededFuture(pickedCompanyId)
-                    : (companyRepo != null
-                        ? companyRepo.resolve(null, company.trim(), null, pickedLogoUrl)
-                            .map(row -> row.getLong("id"))
-                            .otherwise((Long) null)
-                        : Future.succeededFuture(null));
+                Future<Long> companyIdFuture = resolveCompanyForCareerEntry(
+                    pickedCompanyId, company, pickedLogoUrl);
                 return companyIdFuture.compose(companyId ->
                     managerRepo.updateCareerEntry(entryId, managerId, company.trim(), title.trim(),
                                                   finalStart, finalEnd, companyId)
