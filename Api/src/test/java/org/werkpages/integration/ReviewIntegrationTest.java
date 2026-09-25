@@ -865,6 +865,43 @@ class ReviewIntegrationTest {
         assertEquals(2L, (long) result.getLong("total"));
     }
 
+    /**
+     * The capped end date is sent ALONGSIDE the reviewer's own, never instead of it.
+     *
+     * <p>Reported from production: a card read "Jan 2021 - Present" for a manager who had
+     * already left the role, because {@code worked_until} belongs to the REVIEWER - who is
+     * still at the company. Display needs the capped date.
+     *
+     * <p>But the edit form opens from this same payload, so replacing {@code workedUntil} with
+     * the cap would have silently rewritten the reviewer's own answer the next time they saved.
+     * Both fields must be present, and on this fixture they must differ.
+     */
+    @Test
+    void getMyReviews_sendsTheCappedEndDate_withoutLosingTheReviewersOwn() throws Exception {
+        long mgr     = insertManager("Capped Period Mgr", "CappedCorp", "CappedTitle");
+        String auth0 = insertUser("auth0|capped-period", "CappedUser01");
+
+        // The reviewer never closed their own period - they are still at the company.
+        await(service.createReview(auth0, mgr, validBody("CappedCorp", "CappedTitle", "2021-01", null), null));
+        // The manager, however, left that role in June 2022.
+        await(pool.preparedQuery(
+                "INSERT INTO career_history(manager_id, company, title, start_date, end_date) "
+              + "VALUES ($1, 'CappedCorp', 'CappedTitle', $2, $3)")
+            .execute(Tuple.of(mgr,
+                java.time.OffsetDateTime.parse("2021-01-01T00:00:00Z"),
+                java.time.OffsetDateTime.parse("2022-06-01T00:00:00Z")))
+            .mapEmpty());
+
+        io.vertx.core.json.JsonObject result =
+            (io.vertx.core.json.JsonObject) await(service.getMyReviews(auth0, 50, 0));
+        io.vertx.core.json.JsonObject review = result.getJsonArray("data").getJsonObject(0);
+
+        assertNull(review.getString("workedUntil"),
+            "the reviewer left their end date open - saving must not close it on their behalf");
+        assertEquals("2022-06-01", review.getString("effectiveWorkedUntil"),
+            "but the card cannot say Present for a manager who has gone");
+    }
+
     @Test
     void getMyReviews_unknownUser_returns404() {
         ServiceException ex = assertServiceException(service.getMyReviews("auth0|no-such-user", 50, 0));

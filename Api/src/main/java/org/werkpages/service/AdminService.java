@@ -1115,7 +1115,8 @@ public class AdminService {
      * amount of editing could change it. This is the missing half of the pair.
      */
     public Future<JsonObject> adminCreateCareerEntry(String auth0Id, long managerId,
-            String company, String title, String startDateStr, String endDateStr) {
+            String company, String title, String startDateStr, String endDateStr,
+            Long pickedCompanyId, String pickedLogoUrl) {
         return requireAdmin(auth0Id)
             .compose(adminId -> {
                 if (company == null || company.isBlank()) return Future.failedFuture(ServiceException.badRequest("company required"));
@@ -1136,10 +1137,22 @@ public class AdminService {
                 OffsetDateTime finalStart = start, finalEnd = end;
                 // Resolve the company so the entry carries an id, not just text - the same reason
                 // the update path does it.
-                Future<Long> companyIdFuture = companyRepo != null
-                    ? companyRepo.resolve(null, company.trim(), null, null).map(row -> row.getLong("id"))
-                        .otherwise((Long) null)
-                    : Future.succeededFuture(null);
+                /*
+                    The company the admin PICKED, not a name re-resolved from text.
+
+                    Re-resolving by name is what created a second company and left the manager on
+                    the wrong logo: two companies can share a name, and a name typed slightly
+                    differently makes a new one. The picker already established identity, so the id
+                    rides with the request and the name is only display text - the same rule the
+                    manager editor and the edit-request flow already follow.
+                */
+                Future<Long> companyIdFuture = pickedCompanyId != null
+                    ? Future.succeededFuture(pickedCompanyId)
+                    : (companyRepo != null
+                        ? companyRepo.resolve(null, company.trim(), null, pickedLogoUrl)
+                            .map(row -> row.getLong("id"))
+                            .otherwise((Long) null)
+                        : Future.succeededFuture(null));
                 return companyIdFuture.compose(companyId ->
                     managerRepo.insertCareerEntry(managerId, company.trim(), title.trim(),
                                                   finalStart, finalEnd, companyId)
@@ -1147,6 +1160,25 @@ public class AdminService {
                         .compose(v -> managerRepo.syncHeadlineFromCareerHistory(managerId)));
             })
             .map(v -> new JsonObject().put("success", true).put("created", 1));
+    }
+
+    /**
+     * Without a picked company, as callers that have only text still use.
+     *
+     * <p>Kept so the identity-carrying form is an addition rather than a migration: a caller with
+     * nothing to pass sends nothing, and the name is resolved as before.
+     */
+    public Future<JsonObject> adminUpdateCareerEntry(String auth0Id, long managerId, long entryId,
+            String company, String title, String startDateStr, String endDateStr) {
+        return adminUpdateCareerEntry(auth0Id, managerId, entryId, company, title,
+                                      startDateStr, endDateStr, null, null);
+    }
+
+    /** Without a picked company - see the update overload above. */
+    public Future<JsonObject> adminCreateCareerEntry(String auth0Id, long managerId,
+            String company, String title, String startDateStr, String endDateStr) {
+        return adminCreateCareerEntry(auth0Id, managerId, company, title,
+                                      startDateStr, endDateStr, null, null);
     }
 
     /**
@@ -1257,7 +1289,8 @@ public class AdminService {
     // ── Career history admin ──────────────────────────────────────────────────
 
     public Future<JsonObject> adminUpdateCareerEntry(String auth0Id, long managerId, long entryId,
-            String company, String title, String startDateStr, String endDateStr) {
+            String company, String title, String startDateStr, String endDateStr,
+            Long pickedCompanyId, String pickedLogoUrl) {
         return requireAdmin(auth0Id)
             .compose(adminId -> {
                 if (company == null || company.isBlank()) return Future.failedFuture(ServiceException.badRequest("company required"));
@@ -1281,10 +1314,22 @@ public class AdminService {
                 // an admin correcting the company on a career entry changes only the text, and the
                 // manager keeps appearing under the old company - which is decided by the id.
                 OffsetDateTime finalStart = start, finalEnd = end;
-                Future<Long> companyIdFuture = companyRepo != null
-                    ? companyRepo.resolve(null, company.trim(), null, null).map(row -> row.getLong("id"))
-                        .otherwise((Long) null)
-                    : Future.succeededFuture(null);
+                /*
+                    The company the admin PICKED, not a name re-resolved from text.
+
+                    Re-resolving by name is what created a second company and left the manager on
+                    the wrong logo: two companies can share a name, and a name typed slightly
+                    differently makes a new one. The picker already established identity, so the id
+                    rides with the request and the name is only display text - the same rule the
+                    manager editor and the edit-request flow already follow.
+                */
+                Future<Long> companyIdFuture = pickedCompanyId != null
+                    ? Future.succeededFuture(pickedCompanyId)
+                    : (companyRepo != null
+                        ? companyRepo.resolve(null, company.trim(), null, pickedLogoUrl)
+                            .map(row -> row.getLong("id"))
+                            .otherwise((Long) null)
+                        : Future.succeededFuture(null));
                 return companyIdFuture.compose(companyId ->
                     managerRepo.updateCareerEntry(entryId, managerId, company.trim(), title.trim(),
                                                   finalStart, finalEnd, companyId)

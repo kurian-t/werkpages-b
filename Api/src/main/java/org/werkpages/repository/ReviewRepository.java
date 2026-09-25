@@ -34,6 +34,44 @@ public class ReviewRepository {
     }
 
     /**
+     * When the reviewer stopped working with this manager, bounded by the manager's own role.
+     *
+     * <p>A review card said "Jan 2024 - Present" for a manager who had left the company, because
+     * {@code worked_until} is the REVIEWER's date: they are still there, so it is null. But the
+     * manager is not, and nobody can still be working with someone who left.
+     *
+     * <p>{@code LEAST} ignores nulls in Postgres, which gives exactly the rule wanted:
+     *
+     * <ul>
+     *   <li>both null - still current, and rightly so;
+     *   <li>reviewer still there, manager's role ended - capped at the role's end;
+     *   <li>reviewer left, role still open - the reviewer's own date, unchanged;
+     *   <li>both set - whichever came first.
+     * </ul>
+     *
+     * <p>Matched on the company and title the review itself records, so a manager holding two
+     * roles at two companies at once caps each review against the right one - and neither, while
+     * both remain open.
+     */
+    private static final String EFFECTIVE_WORKED_UNTIL = """
+            LEAST(
+                r.worked_until,
+                (SELECT MAX(ch.end_date)::date
+                   FROM career_history ch
+                  WHERE ch.manager_id = r.manager_id
+                    AND LOWER(TRIM(ch.company)) = LOWER(TRIM(r.manager_company))
+                    AND LOWER(TRIM(ch.title))   = LOWER(TRIM(r.manager_title))
+                    AND NOT EXISTS (
+                          SELECT 1 FROM career_history o
+                           WHERE o.manager_id = ch.manager_id
+                             AND LOWER(TRIM(o.company)) = LOWER(TRIM(ch.company))
+                             AND LOWER(TRIM(o.title))   = LOWER(TRIM(ch.title))
+                             AND o.end_date IS NULL
+                        ))
+            ) AS effective_worked_until
+            """;
+
+    /**
      * The manager's ratings, as this particular caller is entitled to see them.
      *
      * <p>A held rating is withheld from the public, and from nobody else. Its author has to see it
@@ -62,16 +100,21 @@ public class ReviewRepository {
         // User-filtered queries naturally exclude placeholders (user_id IS NULL) via the user_id condition.
         // Soft-deleted reviews (deleted_at IS NOT NULL) are always excluded.
         if (userIdFilter != null) {
-            String sql = String.format("SELECT * FROM reviews WHERE manager_id = $1 AND user_id = $4 AND deleted_at IS NULL ORDER BY %s LIMIT $2 OFFSET $3", orderBy);
+            String sql = String.format("SELECT r.*, " + EFFECTIVE_WORKED_UNTIL
+                + " FROM reviews r WHERE r.manager_id = $1 AND r.user_id = $4 AND r.deleted_at IS NULL"
+                + " ORDER BY %s LIMIT $2 OFFSET $3", orderBy.replace("created_at", "r.created_at")
+                    .replace("helpful_count", "r.helpful_count").replace("overall_rating", "r.overall_rating"));
             return db.preparedQuery(sql).execute(Tuple.of(managerId, limit, offset, userIdFilter));
         } else {
             // Not the view here, because the view answers only "is it published" and this query
             // also has to answer "is it yours" and "do you moderate".
             String sql = String.format(
-                "SELECT * FROM reviews WHERE manager_id = $1 AND deleted_at IS NULL "
-                + "AND (weight = FALSE OR weight_expires_on IS NULL OR weight_expires_on > CURRENT_DATE) "
-                + "AND (disposition = 'live' OR $4 = TRUE OR ($5::uuid IS NOT NULL AND user_id = $5)) "
-                + "ORDER BY %s LIMIT $2 OFFSET $3", orderBy);
+                "SELECT r.*, " + EFFECTIVE_WORKED_UNTIL
+                + " FROM reviews r WHERE r.manager_id = $1 AND r.deleted_at IS NULL "
+                + "AND (r.weight = FALSE OR r.weight_expires_on IS NULL OR r.weight_expires_on > CURRENT_DATE) "
+                + "AND (r.disposition = 'live' OR $4 = TRUE OR ($5::uuid IS NOT NULL AND r.user_id = $5)) "
+                + "ORDER BY %s LIMIT $2 OFFSET $3", orderBy.replace("created_at", "r.created_at")
+                    .replace("helpful_count", "r.helpful_count").replace("overall_rating", "r.overall_rating"));
             return db.preparedQuery(sql).execute(Tuple.of(managerId, limit, offset, isAdmin, viewerId));
         }
     }
@@ -224,7 +267,11 @@ public class ReviewRepository {
                     r.manager_company, r.manager_title, r.text, r.verified, r.helpful_count,
                     r.created_at, r.updated_at, r.worked_from, r.worked_until,
                     r.manager_role_start, r.manager_role_end,
-                    m.name AS manager_name, m.image AS manager_image, m.status AS manager_status
+                """
+                // Same cap as the manager's own rating list, from the same fragment: "My Reviews"
+                // went on saying "to present" for a role the career history had already closed.
+                + EFFECTIVE_WORKED_UNTIL + """
+                    , m.name AS manager_name, m.image AS manager_image, m.status AS manager_status
                 FROM reviews r
                 JOIN managers m ON m.id = r.manager_id
                 WHERE r.user_id = $1 AND r.deleted_at IS NULL

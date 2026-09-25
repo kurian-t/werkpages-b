@@ -1616,6 +1616,9 @@ paths:
                       type: string
                     workedUntil:
                       type: string
+                    effectiveWorkedUntil:
+                      type: string
+                      nullable: true
                     managerCompany:
                       type: string
                     managerTitle:
@@ -4418,6 +4421,13 @@ components:
           type: string
           nullable: true
           description: "YYYY-MM date the reviewer stopped working with this manager (null = current)"
+        effectiveWorkedUntil:
+          type: string
+          nullable: true
+          description: >-
+            workedUntil capped at the date the MANAGER left this role, per career history.
+            Display reads this; the edit form and overlap checks read workedUntil, which is
+            the reviewer's own answer and must never be overwritten with the capped value.
         managerRoleStart:
           type: string
           nullable: true

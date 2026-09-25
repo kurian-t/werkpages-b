@@ -2744,8 +2744,9 @@ public class ManagerService {
             .put("declaredCity",      row.getString("declared_city"))
             .put("declaredPrecision", row.getString("declared_precision"))
             .put("companyLocationId", row.getLong("company_location_id"))
-            .put("workedFrom",    row.getLocalDate("worked_from")  != null ? row.getLocalDate("worked_from").toString()  : null)
-            .put("workedUntil",   row.getLocalDate("worked_until") != null ? row.getLocalDate("worked_until").toString() : null)
+            .put("workedFrom",    dateOrNull(row, "worked_from"))
+            .put("workedUntil",   dateOrNull(row, "worked_until"))
+            .put("effectiveWorkedUntil", effectiveWorkedUntil(row))
             /*
               Whether this rating is on the site.
 
@@ -2769,6 +2770,29 @@ public class ManagerService {
         } catch (Exception e) {
             return "live";
         }
+    }
+
+    /** A date column as "YYYY-MM-DD", or null. Repeated in every rating mapper before this. */
+    private static String dateOrNull(Row row, String column) {
+        java.time.LocalDate d = row.getLocalDate(column);
+        return d != null ? d.toString() : null;
+    }
+
+    /**
+     * When the rating's subject actually left this role, as opposed to when the reviewer did.
+     *
+     * <p>{@code worked_until} belongs to the REVIEWER, who may still be at a company the manager
+     * has since left - which is why a card read "Jan 2024 - Present" for somebody who had moved
+     * on. The bounded value is computed by EFFECTIVE_WORKED_UNTIL in ReviewRepository.
+     *
+     * <p>Sent ALONGSIDE the raw date, never instead of it: the edit form opens with what the
+     * reviewer stored, and saving the bounded value back would silently rewrite their answer.
+     * Display reads this; forms and overlap checks read {@code workedUntil}.
+     */
+    private static String effectiveWorkedUntil(Row row) {
+        return row.getColumnIndex("effective_worked_until") < 0
+            ? dateOrNull(row, "worked_until")
+            : dateOrNull(row, "effective_worked_until");
     }
 
     private JsonObject buildMyReviewJson(Row row) {
@@ -2799,8 +2823,9 @@ public class ManagerService {
             .put("helpfulCount",  row.getInteger("helpful_count"))
             .put("createdAt",     row.getOffsetDateTime("created_at").toString())
             .put("updatedAt",     row.getOffsetDateTime("updated_at").toString())
-            .put("workedFrom",         row.getLocalDate("worked_from")        != null ? row.getLocalDate("worked_from").toString()        : null)
-            .put("workedUntil",        row.getLocalDate("worked_until")       != null ? row.getLocalDate("worked_until").toString()       : null)
+            .put("workedFrom",         dateOrNull(row, "worked_from"))
+            .put("workedUntil",        dateOrNull(row, "worked_until"))
+            .put("effectiveWorkedUntil", effectiveWorkedUntil(row))
             .put("managerRoleStart",   row.getLocalDate("manager_role_start") != null ? row.getLocalDate("manager_role_start").toString() : null)
             .put("managerRoleEnd",     row.getLocalDate("manager_role_end")   != null ? row.getLocalDate("manager_role_end").toString()   : null);
     }

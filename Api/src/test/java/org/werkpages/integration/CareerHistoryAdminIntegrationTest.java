@@ -372,6 +372,100 @@ class CareerHistoryAdminIntegrationTest {
             "and the headline follows, because career history owns it");
     }
 
+    /**
+     * The company an admin picked is the company that is stored - by id, not by re-resolving text.
+     *
+     * <p>The editor sent only the company's name, so the server resolved it again. Company names
+     * are unique case-insensitively, so the danger is not two rows sharing a name - it is that a
+     * name typed even slightly differently is a <em>new</em> company. Picking "Lime" from the list
+     * and having the text read anything else minted a second row and moved the manager onto its
+     * logo, with no way to correct it from the panel that caused it.
+     */
+    @Test
+    void careerEntry_storesThePickedCompanyId_ratherThanResolvingTheNameAgain() throws Exception {
+        String adminAuth = insertUser("auth0|ch-pick01", "ChPick01", "admin");
+        long managerId   = insertManager("Ketti Ciarniello", "Lime", "Assistant Treasurer");
+
+        long realLime = await(pool.preparedQuery(
+                "INSERT INTO companies(name, slug, status, logo_url, created_at, updated_at) "
+              + "VALUES ('Lime','lime-real','approved','https://logo.test/lime.png',now(),now()) RETURNING id")
+            .execute().map(rs -> rs.iterator().next().getLong("id")));
+        long companiesBefore = countCompanies();
+
+        // Picked Lime from the list, but the text differs - which is exactly when re-resolving
+        // by name would invent a second company.
+        await(service.adminCreateCareerEntry(adminAuth, managerId,
+            "Lime Micromobility", "Assistant Treasurer", "2024", null,
+            realLime, "https://logo.test/lime.png"));
+
+        Long stored = await(pool
+            .preparedQuery("SELECT company_id FROM career_history WHERE manager_id = $1 ORDER BY id DESC LIMIT 1")
+            .execute(Tuple.of(managerId))
+            .map(rs -> rs.iterator().next().getLong("company_id")));
+        assertEquals(realLime, stored,
+            "the id the admin picked must be stored, whatever the display text says");
+        assertEquals(companiesBefore, countCompanies(),
+            "and no second company is invented behind their back");
+        assertEquals("https://logo.test/lime.png", managerRowLogo(managerId),
+            "so the logo they chose is the one that sticks");
+    }
+
+    private long countCompanies() throws Exception {
+        return await(pool.preparedQuery("SELECT count(*) AS c FROM companies").execute()
+            .map(rs -> rs.iterator().next().getLong("c")));
+    }
+
+    /**
+     * A review's period is bounded by the manager's role, not just the reviewer's own dates.
+     *
+     * <p>A card read "Jan 2024 - Present" for a manager who had left, because
+     * {@code worked_until} belongs to the REVIEWER - who is still at the company. Nobody can
+     * still be working with someone who has gone.
+     */
+    @Test
+    void reviewPeriod_isCappedAtTheManagersRoleEnd() throws Exception {
+        long managerId = insertManager("Ketti Ciarniello", "Lime", "Assistant Treasurer");
+        long entryId   = insertCareerEntry(managerId, "Lime", "Assistant Treasurer", "2024");
+        await(pool.preparedQuery("UPDATE career_history SET end_date = '2026-01-01T00:00:00Z' WHERE id = $1")
+            .execute(Tuple.of(entryId)).mapEmpty());
+        await(pool.preparedQuery(
+                "INSERT INTO reviews(manager_id, author, overall_rating, manager_company, manager_title, "
+              + "worked_from, worked_until, created_at, updated_at) "
+              + "VALUES ($1,'LoyalPanda80',4.3,'Lime','Assistant Treasurer','2024-01-01',NULL,now(),now())")
+            .execute(Tuple.of(managerId)).mapEmpty());
+
+        Row review = await(new org.werkpages.repository.ReviewRepository(pool)
+            .findByManager(managerId, 10, 0, "recent", null, null, true)
+            .map(rs -> rs.iterator().next()));
+        assertNotNull(review.getLocalDate("effective_worked_until"),
+            "the reviewer is still there, but the manager is not - the card cannot say Present");
+        assertEquals("2026-01-01", review.getLocalDate("effective_worked_until").toString());
+    }
+
+    /** Two roles held at once, both open: neither review is capped. */
+    @Test
+    void reviewPeriod_isNotCapped_whileTheRoleIsStillOpen() throws Exception {
+        long managerId = insertManager("Ketti Ciarniello", "Lime", "Assistant Treasurer");
+        insertCareerEntry(managerId, "Lime", "Assistant Treasurer", "2024");
+        await(pool.preparedQuery(
+                "INSERT INTO reviews(manager_id, author, overall_rating, manager_company, manager_title, "
+              + "worked_from, worked_until, created_at, updated_at) "
+              + "VALUES ($1,'Someone',4.0,'Lime','Assistant Treasurer','2024-01-01',NULL,now(),now())")
+            .execute(Tuple.of(managerId)).mapEmpty());
+
+        Row review = await(new org.werkpages.repository.ReviewRepository(pool)
+            .findByManager(managerId, 10, 0, "recent", null, null, true)
+            .map(rs -> rs.iterator().next()));
+        assertNull(review.getLocalDate("effective_worked_until"),
+            "an open role stays Present - a manager may hold two roles at two companies at once");
+    }
+
+    private String managerRowLogo(long managerId) throws Exception {
+        return await(pool.preparedQuery("SELECT company_logo_url FROM managers WHERE id = $1")
+            .execute(Tuple.of(managerId))
+            .map(rs -> rs.iterator().next().getString("company_logo_url")));
+    }
+
     private Row segmentFor(long managerId, String company) throws Exception {
         var rows = await(new org.werkpages.repository.ReviewRepository(pool)
             .findCareerSegmentsByManager(managerId, 50, 0));

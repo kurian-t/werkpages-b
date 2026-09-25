@@ -674,7 +674,8 @@ public class AdminHandler {
         if (body == null) { bad(ctx, "Missing request body"); return; }
         service.adminCreateCareerEntry(auth0Id, managerId,
                 body.getString("company"), body.getString("title"),
-                body.getString("startDate"), body.getString("endDate"))
+                body.getString("startDate"), body.getString("endDate"),
+                body.getLong("companyId"), body.getString("companyLogoUrl"))
             .onSuccess(json -> ctx.response().putHeader("Content-Type", "application/json").end(json.encode()))
             .onFailure(err -> ManagersHandler.handleError(ctx, err));
     }
@@ -690,7 +691,8 @@ public class AdminHandler {
         if (body == null) { bad(ctx, "Body required"); return; }
         service.adminUpdateCareerEntry(auth0Id, managerId, entryId,
                 body.getString("company"), body.getString("title"),
-                body.getString("startDate"), body.getString("endDate"))
+                body.getString("startDate"), body.getString("endDate"),
+                body.getLong("companyId"), body.getString("companyLogoUrl"))
             .onSuccess(json -> ok(ctx, json))
             .onFailure(err -> ManagersHandler.handleError(ctx, err));
     }
