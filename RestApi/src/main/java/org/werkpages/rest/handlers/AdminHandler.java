@@ -122,6 +122,27 @@ public class AdminHandler {
 
     // ── POST /api/admin/pending-managers/:managerId/approve ──────────────────
 
+    /**
+     * What approving this manager would do to its slug - asked before approving, not after.
+     *
+     * <p>Pending rows sit in the {@code -pending} namespace so they cannot squat on the name a
+     * reader expects. Approval moves them onto it, unless somebody published is already there, in
+     * which case it is a decision for an admin rather than something to resolve by appending a
+     * company. This is what the panel reads to offer merge-or-rename.
+     */
+    public void handlePreviewApprovalSlug(RoutingContext ctx) {
+        String auth0Id = ctx.get("auth0Id");
+        long managerId;
+        try {
+            managerId = Long.parseLong(ctx.pathParam("managerId"));
+        } catch (Exception e) {
+            bad(ctx, "Invalid manager ID"); return;
+        }
+        service.previewApprovalSlug(auth0Id, managerId)
+            .onSuccess(json -> ctx.response().putHeader("Content-Type", "application/json").end(json.encode()))
+            .onFailure(err -> ManagersHandler.handleError(ctx, err));
+    }
+
     public void handleApprovePendingManager(RoutingContext ctx) {
         String auth0Id = ctx.get("auth0Id");
         long managerId;
@@ -130,7 +151,11 @@ public class AdminHandler {
         } catch (Exception e) {
             bad(ctx, "Invalid manager ID"); return;
         }
-        service.approvePendingManager(auth0Id, managerId, null)
+        // An admin who resolved a slug conflict says which name to publish under; absent, the
+        // service takes the clean one when it is free and otherwise leaves the row alone.
+        JsonObject approvalBody = ctx.body() != null ? ctx.body().asJsonObject() : null;
+        String requestedSlug = approvalBody != null ? approvalBody.getString("slug") : null;
+        service.approvePendingManager(auth0Id, managerId, null, requestedSlug)
             .onSuccess(result -> {
                 // Backfill logo if needed (resolved here since CompanyLogoUtils is in RestApi)
                 if (result.getBoolean("_needsLogo", false)) {

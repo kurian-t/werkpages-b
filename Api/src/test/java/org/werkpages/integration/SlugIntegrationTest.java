@@ -229,6 +229,85 @@ class SlugIntegrationTest {
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
+    /**
+     * A pending row never occupies the name a published manager would use.
+     *
+     * <p>Slug allocation asks {@code SELECT 1 FROM managers WHERE slug = $1} - every row blocks a
+     * name, including rows no visitor can open. Production showed the cost: a half-typed draft
+     * took {@code sourabh-setia}, and the manager published thirteen seconds later was pushed onto
+     * {@code sourabh-setia-lumenwerx}. That mangled slug was not a naming decision, it was a
+     * collision with something invisible.
+     */
+    @Test
+    void pendingRows_liveInTheirOwnNamespace_soTheCleanNameStaysFree() throws Exception {
+        long companyId = await(companyRepo.findOrCreate("Lumenwerx", null, null)).getLong("id");
+
+        long draftId = await(managerRepo.createCapturedDraft(
+            "Sourabh Setia", "Lumenwerx", "Engineering Manager",
+            "Canada", null, null, null, companyId)).getLong("id");
+
+        String draftSlug = await(slugOf(draftId));
+        assertEquals("sourabh-setia-pending", draftSlug,
+            "a row the public cannot reach belongs in the pending namespace");
+
+        // The real one, published moments later, gets the name a reader would expect.
+        long liveId = await(managerRepo.createAutoApproved(
+            "Sourabh Setia", "Lumenwerx", "Engineering Manager",
+            "Canada", null, null, null, null, companyId)).getLong("id");
+
+        assertEquals("sourabh-setia", await(slugOf(liveId)),
+            "the clean slug must still be free - nothing pending may hold it");
+    }
+
+    /** Two drafts for one person still need distinct slugs. */
+    @Test
+    void secondPendingRowForTheSamePerson_getsItsOwnPendingSlug() throws Exception {
+        long companyId = await(companyRepo.findOrCreate("Lumenwerx", null, null)).getLong("id");
+        long first  = await(managerRepo.createCapturedDraft("Sourabh Setia", "Lumenwerx", "EM",
+            "Canada", null, null, null, companyId)).getLong("id");
+        long second = await(managerRepo.createCapturedDraft("Sourabh Setia", "Lumenwerx", "EM",
+            "Canada", null, null, null, companyId)).getLong("id");
+
+        assertEquals("sourabh-setia-pending", await(slugOf(first)));
+        assertNotEquals(await(slugOf(first)), await(slugOf(second)),
+            "a second draft cannot reuse the first draft's slug");
+        assertTrue(await(slugOf(second)).startsWith("sourabh-setia-pending"),
+            "and it stays inside the pending namespace");
+    }
+
+    /**
+     * The conflict an admin is asked to resolve, reported before anything is approved.
+     *
+     * <p>Free name: approval simply takes it. Taken by somebody published: that is a judgement -
+     * the same person entered twice, or two people who share a name - so the holder is reported
+     * along with an alternative, rather than the database appending a company on its own.
+     */
+    @Test
+    void approvalPreview_reportsWhetherTheCleanNameIsFree_andWhoHoldsIt() throws Exception {
+        long companyId = await(companyRepo.findOrCreate("Lumenwerx", null, null)).getLong("id");
+
+        long draftId = await(managerRepo.createCapturedDraft("Sourabh Setia", "Lumenwerx", "EM",
+            "Canada", null, null, null, companyId)).getLong("id");
+        assertEquals("sourabh-setia", managerRepo.cleanSlugFor("Sourabh Setia"));
+        assertTrue(await(managerRepo.findLiveHolderOfSlug("sourabh-setia")).isEmpty(),
+            "nothing published holds it yet");
+
+        // Somebody published takes the name.
+        await(managerRepo.createAutoApproved("Sourabh Setia", "Other Co", "EM",
+            "Canada", null, null, null, null, companyId));
+
+        var holder = await(managerRepo.findLiveHolderOfSlug("sourabh-setia"));
+        assertTrue(holder.isPresent(), "now it is held, and approving the draft is a decision");
+        assertEquals("Other Co", holder.get().getString("company"));
+        assertNotEquals(draftId, holder.get().getLong("id"));
+    }
+
+    private Future<String> slugOf(long managerId) {
+        return pool.preparedQuery("SELECT slug FROM managers WHERE id = $1")
+            .execute(io.vertx.sqlclient.Tuple.of(managerId))
+            .map(rs -> rs.iterator().next().getString("slug"));
+    }
+
     private static <T> T await(Future<T> future) throws Exception {
         return future.toCompletionStage().toCompletableFuture().get(10, TimeUnit.SECONDS);
     }

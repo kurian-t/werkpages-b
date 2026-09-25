@@ -63,6 +63,21 @@ class AdminServiceTest {
         // recalculate() is awaited by the service now rather than fired and forgotten, so the
         // mock must return a Future; unstubbed, Mockito hands back null and the compose NPEs.
         when(managerRepo.recalculate(anyLong())).thenReturn(Future.succeededFuture());
+        // Rejection now frees the name the row was holding, so the mock must return a Future here
+        // too; unstubbed it hands back null and the compose chain NPEs.
+        when(managerRepo.parkSlugAsRejected(anyLong())).thenReturn(Future.succeededFuture());
+        /*
+            Approval now moves the row out of the "-pending" slug namespace onto the clean name,
+            which means three more repository calls on this path. Unstubbed, Mockito returns null
+            for each and the compose chain NPEs - the same failure mode as recalculate above.
+
+            findLiveHolderOfSlug returns empty, i.e. "the clean name is free", which is the
+            ordinary case these tests are about. The conflict case has its own integration test.
+        */
+        when(managerRepo.cleanSlugFor(anyString())).thenReturn("clean-slug");
+        when(managerRepo.findLiveHolderOfSlug(anyString()))
+            .thenReturn(Future.succeededFuture(Optional.empty()));
+        when(managerRepo.reslug(anyLong(), anyString())).thenReturn(Future.succeededFuture());
         when(managerRepo.findSlugs(anyLong())).thenReturn(Future.succeededFuture(Optional.empty()));
         when(managerRepo.findCurrentRoleStart(anyLong())).thenReturn(Future.succeededFuture(Optional.empty()));
         service     = new AdminService(userRepo, managerRepo, reviewRepo, editRepo, notifRepo, companyRepo);

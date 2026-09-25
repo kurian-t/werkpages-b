@@ -1152,6 +1152,29 @@ public class CompanyRepository {
                             FROM managers m WHERE m.company_id = $3
                             """)
                         .execute(Tuple.of(mergeUuid, keepId, mergeId))
+                        /*
+                          Record every moving manager's OLD url before the move.
+
+                          A manager URL is /companies/<company-slug>/managers/<manager-slug>, so
+                          changing company_id changes the URL of every manager on the source
+                          company - all of them, at once. Nothing recorded that, which meant a
+                          company merge silently 404'd every nested manager link that had ever
+                          been shared or indexed.
+
+                          Before the UPDATE, deliberately: afterwards the old company slug is no
+                          longer reachable from the row.
+                        */
+                        .compose(v -> conn.preparedQuery("""
+                                INSERT INTO manager_url_history (manager_id, company_slug, manager_slug)
+                                SELECT m.id, c.slug, m.slug
+                                  FROM managers m
+                                  JOIN companies c ON c.id = m.company_id
+                                 WHERE m.company_id = $1
+                                   AND m.slug IS NOT NULL
+                                   AND c.slug IS NOT NULL
+                                ON CONFLICT DO NOTHING
+                                """)
+                            .execute(Tuple.of(mergeId)))
                         .compose(v -> conn.preparedQuery("UPDATE managers SET company_id = $1, company = $2 WHERE company_id = $3")
                             .execute(Tuple.of(keepId, keepName, mergeId)))
 

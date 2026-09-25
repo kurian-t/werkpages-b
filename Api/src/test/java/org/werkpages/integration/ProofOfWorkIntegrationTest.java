@@ -681,13 +681,36 @@ class ProofOfWorkIntegrationTest {
         assertEquals(mgr, r.getLong("manager_id"), "and still attached to its manager");
     }
 
+    /**
+     * Deleting a manager nobody reviewed retires the row and frees the name.
+     *
+     * <p>This asserted the opposite - that an unreviewed row was destroyed outright, on the
+     * reasoning that "delete still means delete for the empty rows this is mostly used on". The
+     * reasoning held for the row and not for its URL. Destroying it left
+     * {@code manager_url_history} with nothing to point at, so every inbound link became a hard
+     * 404, and the freed slug could later be handed to a <em>different</em> person - an old link
+     * then resolving to the wrong human, which is the worst outcome available here.
+     *
+     * <p>Retiring costs one row and keeps both properties. The slug is parked in the rejected
+     * namespace, so the NAME is still freed for whoever should have it - which was the only real
+     * argument for deleting. A genuine hard delete remains for spam and PII as a separate,
+     * explicit action.
+     */
     @Test
-    void deletingAManagerNobodyReviewedRemovesItOutright() throws Exception {
-        // "Delete" still means delete for the empty rows this is mostly used on.
+    void deletingAManagerNobodyReviewedRetiresItAndFreesTheName() throws Exception {
         long mgr = insertManager("Unrated Person", insertCompany("Kestrel Freight"));
-        assertTrue(await(managers.deleteOrRetire(mgr)));
-        assertEquals(0, await(pool.preparedQuery("SELECT id FROM managers WHERE id = $1")
-            .execute(Tuple.of(mgr))).size());
+        String before = await(pool.preparedQuery("SELECT slug FROM managers WHERE id = $1")
+            .execute(Tuple.of(mgr)).map(rows -> rows.iterator().next().getString("slug")));
+
+        assertFalse(await(managers.deleteOrRetire(mgr)),
+            "nothing is destroyed now, so the retire path is the only path");
+
+        Row row = await(pool.preparedQuery("SELECT approval_status, slug FROM managers WHERE id = $1")
+            .execute(Tuple.of(mgr)).map(rows -> rows.iterator().hasNext() ? rows.iterator().next() : null));
+        assertNotNull(row, "the row survives, so links that point at it still resolve");
+        assertEquals("rejected", row.getString("approval_status"));
+        assertNotEquals(before, row.getString("slug"),
+            "and the name it was holding is freed for whoever should have it");
     }
 
     @Test

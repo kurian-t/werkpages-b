@@ -165,7 +165,88 @@ public class AdminService {
             });
     }
 
+    /**
+     * What approving this pending manager would do to its slug, before anything is approved.
+     *
+     * <p>A pending row lives in the {@code -pending} namespace precisely so it cannot squat on the
+     * name a reader would expect. Approval moves it onto that name - unless somebody published is
+     * already there, which is a judgement rather than a collision: the same person entered twice,
+     * or two people who share a name. Only an admin can tell which, so the panel is shown the
+     * holder and offered both ways out instead of the database quietly appending a company.
+     */
+    public Future<JsonObject> previewApprovalSlug(String auth0Id, long managerId) {
+        return requireAdmin(auth0Id)
+            .compose(adminId -> managerRepo.findById(managerId))
+            .compose(opt -> {
+                if (opt.isEmpty()) return Future.failedFuture(ServiceException.notFound("Manager not found"));
+                Row row = opt.get();
+                String cleanSlug = managerRepo.cleanSlugFor(row.getString("name"));
+                /*
+                    Two different questions, and only asking the first one missed the common case.
+
+                    "Does something hold this slug?" catches a duplicate whose name matches
+                    exactly. It structurally cannot catch "Emma D" against a live "Emma Davis",
+                    because those slugs do not collide - and a truncated name is precisely what a
+                    half-finished form produces. Approving one silently forks the person in two.
+
+                    So the likely-same-person question is asked as well, using the very matcher the
+                    add form already shows people while they type: name containment, company as a
+                    ranking signal rather than a filter, live rows only. Reused rather than
+                    reimplemented - one definition of "looks like the same person" in the codebase.
+
+                    Warned, never blocked. Two people really can share a name, and an admin who
+                    cannot publish the second one has a worse problem than a duplicate.
+                */
+                String nameLike = "%" + row.getString("name").trim() + "%";
+                String companyLike = row.getString("company") != null && !row.getString("company").isBlank()
+                    ? "%" + row.getString("company").trim() + "%" : "%";
+                return managerRepo.findSimilar(nameLike, companyLike).compose(similar ->
+                       managerRepo.findLiveHolderOfSlug(cleanSlug).map(holder -> {
+                    JsonObject out = new JsonObject()
+                        .put("managerId",   managerId)
+                        .put("currentSlug", row.getString("slug"))
+                        .put("cleanSlug",   cleanSlug)
+                        .put("available",   holder.isEmpty());
+                    if (holder.isPresent()) {
+                        Row h = holder.get();
+                        out.put("heldBy", new JsonObject()
+                            .put("id",             h.getLong("id"))
+                            .put("name",           h.getString("name"))
+                            .put("company",        h.getString("company"))
+                            .put("slug",           h.getString("slug"))
+                            .put("approvalStatus", h.getString("approval_status"))
+                            .put("reviewsCount",   h.getInteger("reviews_count")));
+                        // The alternative offered alongside "merge into that one".
+                        out.put("suggestedSlug", managerRepo.cleanSlugFor(
+                            row.getString("name") + " " + row.getString("company")));
+                    }
+                    JsonArray looksLike = new JsonArray();
+                    for (Row cand : similar) {
+                        if (cand.getLong("id") == managerId) continue;
+                        looksLike.add(new JsonObject()
+                            .put("id",      cand.getLong("id"))
+                            .put("name",    cand.getString("name"))
+                            .put("company", cand.getString("company"))
+                            .put("title",   cand.getString("title")));
+                    }
+                    // Present even when the slug is free: that is the case the slug check misses.
+                    out.put("looksLike", looksLike);
+                    return out;
+                }));
+            });
+    }
+
     public Future<JsonObject> approvePendingManager(String auth0Id, long managerId, String resolveLogoFn) {
+        return approvePendingManager(auth0Id, managerId, resolveLogoFn, null);
+    }
+
+    /**
+     * @param requestedSlug the slug an admin explicitly chose when the clean one was taken, or
+     *                      null to take the clean slug if it is free and otherwise leave the row
+     *                      where it is rather than inventing a name nobody asked for
+     */
+    public Future<JsonObject> approvePendingManager(String auth0Id, long managerId, String resolveLogoFn,
+                                                    String requestedSlug) {
         return requireAdmin(auth0Id)
             .compose(adminId -> managerRepo.approve(managerId))
             .compose(opt -> {
@@ -187,9 +268,26 @@ public class AdminService {
                         " has been approved and is now live on the platform.",
                         managerId);
                 }
+                /*
+                    Leave the pending namespace.
+
+                    The row has been approved, so it is now something a reader can open, and it
+                    should be on the name they would expect rather than on scaffolding. An
+                    explicitly requested slug wins - that is the admin having resolved a conflict.
+                    Otherwise take the clean name if it is free, and if it is not, leave the row
+                    where it is: a published manager already holds that name, and quietly
+                    appending a company is how this went wrong in the first place.
+                */
+                String cleanSlug = managerRepo.cleanSlugFor(managerName);
+                Future<Void> reslugged = requestedSlug != null && !requestedSlug.isBlank()
+                    ? managerRepo.reslug(managerId, requestedSlug.trim())
+                    : managerRepo.findLiveHolderOfSlug(cleanSlug).compose(holder -> holder.isEmpty()
+                        ? managerRepo.reslug(managerId, cleanSlug)
+                        : Future.succeededFuture());
+
                 // Compute the real rating from submitted reviews now that the manager is live.
                 // Awaited below, before the company sync: see the ordering note there.
-                Future<Void> recalculated = managerRepo.recalculate(managerId);
+                Future<Void> recalculated = reslugged.compose(v -> managerRepo.recalculate(managerId));
                 JsonObject ok = new JsonObject()
                     .put("success", true)
                     .put("message", "Manager approved")
@@ -215,6 +313,15 @@ public class AdminService {
             // statement, so a person cannot be rejected here and still appear under a half-typed
             // company name somewhere else.
             .compose(adminId -> managerRepo.reject(managerId))
+            /*
+              Free the name. A rejected manager is invisible everywhere, but it went on holding
+              its slug for ever - so a name an admin had explicitly taken down could never be used
+              by the real person it belonged to. Same defect as a pending row squatting on a clean
+              name, one status along.
+            */
+            .compose(opt -> opt.isEmpty()
+                ? io.vertx.core.Future.succeededFuture(opt)
+                : managerRepo.parkSlugAsRejected(managerId).map(v -> opt))
             .compose(opt -> {
                 if (opt.isEmpty()) return Future.failedFuture(ServiceException.notFound("Pending manager not found"));
                 Row row = opt.get();

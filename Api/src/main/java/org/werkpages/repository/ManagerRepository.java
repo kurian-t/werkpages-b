@@ -581,10 +581,26 @@ public class ManagerRepository {
                         "SELECT COUNT(*) AS c FROM reviews WHERE manager_id = $1")
                     .execute(Tuple.of(managerId)))
                 .compose(rows -> {
-                    if (rows.iterator().next().getLong("c") == 0) {
-                        return conn.preparedQuery("DELETE FROM managers WHERE id = $1")
-                            .execute(Tuple.of(managerId)).map(true);
-                    }
+                    /*
+                        One path, and it never destroys the row.
+
+                        A review-less manager used to be hard-DELETEd. Three things followed from
+                        that, and all three are worse than keeping the row:
+
+                          - the row vanished, so manager_url_history had nothing to point at and
+                            every inbound link became a hard 404, including anything indexed;
+                          - the slug was silently freed and could later be handed to a DIFFERENT
+                            person, so an old link resolved to the wrong human - the worst outcome
+                            available here;
+                          - no trace was left of a destructive admin action.
+
+                        Retiring costs a row and keeps all three properties. The slug is parked in
+                        the rejected namespace so the NAME is still freed for whoever should have
+                        it, which was the only real argument for deleting.
+
+                        A genuine hard delete still exists for spam and PII - see delete() - but it
+                        is a separate, explicit action rather than a side effect of "remove".
+                    */
                     return conn.preparedQuery(
                             "UPDATE reviews SET deleted_at = now() "
                             + "WHERE manager_id = $1 AND deleted_at IS NULL")
@@ -593,6 +609,19 @@ public class ManagerRepository {
                                 "UPDATE managers SET approval_status = 'rejected', updated_at = now() "
                                 + "WHERE id = $1")
                             .execute(Tuple.of(managerId)))
+                        .compose(v -> conn.preparedQuery("""
+                                UPDATE managers
+                                   SET slug = CASE
+                                                WHEN EXISTS (SELECT 1 FROM managers x
+                                                              WHERE x.slug = managers.slug || $2
+                                                                AND x.id <> managers.id)
+                                                THEN managers.slug || $2 || '-' || managers.id
+                                                ELSE managers.slug || $2
+                                              END,
+                                       updated_at = now()
+                                 WHERE id = $1 AND slug IS NOT NULL AND position($2 in slug) = 0
+                                """)
+                            .execute(Tuple.of(managerId, REJECTED_SLUG_SUFFIX)))
                         .map(false);
                 }));
     }
@@ -1078,7 +1107,7 @@ public class ManagerRepository {
     public Future<Row> createSearchPending(String name, String company, String title,
                                            String country, String state, String city,
                                            String logoUrl, Long companyId, UUID searchCreatedByUserId) {
-        return generateUniqueSlug(name, company).compose(slug ->
+        return generatePendingSlug(name).compose(slug ->
             db.preparedQuery("""
                     INSERT INTO managers
                     (name, company, title, status, approval_status, country, state, city,
@@ -1133,7 +1162,7 @@ public class ManagerRepository {
      */
     public Future<Row> createCapturedDraft(String name, String company, String title,
                                    String country, String state, String city, String logoUrl, Long companyId) {
-        return generateUniqueSlug(name, company).compose(slug ->
+        return generatePendingSlug(name).compose(slug ->
             db.preparedQuery("""
                     INSERT INTO managers
                     (name, company, title, status, approval_status, country, state, city,
@@ -1152,7 +1181,7 @@ public class ManagerRepository {
     public Future<Row> createPending(String name, String company, String title,
                                       String status, String country, String state,
                                       String logoUrl, Long companyId) {
-        return generateUniqueSlug(name, company).compose(slug ->
+        return generatePendingSlug(name).compose(slug ->
             db.preparedQuery("""
                     INSERT INTO managers
                     (name, company, title, status, approval_status, country, state,
@@ -1318,9 +1347,174 @@ public class ManagerRepository {
      * Strategy: name → name-company → name-company-2 → name-company-3 …
      * Numbers only appear when two managers share both name and company.
      */
+    /**
+     * The live manager already holding the clean slug this pending row wants, if there is one.
+     *
+     * <p>Approving a pending row moves it out of the {@code -pending} namespace and onto the name
+     * a reader would expect. Usually that name is free. When it is not, somebody published is
+     * already on it, and that is a decision rather than a collision: the same person entered
+     * twice, or two different people who share a name. Only an admin can tell which, so this
+     * reports the conflict instead of quietly appending something.
+     */
+    public Future<Optional<Row>> findLiveHolderOfSlug(String slug) {
+        return db.preparedQuery("""
+                SELECT m.id, m.name, m.company, m.slug, m.approval_status,
+                       m.reviews_count, m.overall_rating
+                  FROM managers m
+                 WHERE m.slug = $1
+                   AND m.approval_status IN ('approved', 'ghost')
+                 LIMIT 1
+                """)
+            .execute(Tuple.of(slug))
+            .map(rows -> rows.iterator().hasNext()
+                ? Optional.of(rows.iterator().next())
+                : Optional.empty());
+    }
+
+    /**
+     * The slug a name resolves to, before anything is asked about availability.
+     *
+     * <p>The single definition of that. It was written out three times - here, in
+     * {@link #generateUniqueSlug} and in {@link #generatePendingSlug} - each repeating
+     * {@code toBaseSlug} plus the same "manager" fallback for a name that slugifies to nothing.
+     * Three copies of one rule is three places for it to drift.
+     *
+     * <p>Note that {@code V82__pending_slug_namespace.sql} reimplements this in SQL, because a
+     * migration cannot call Java. That copy is unavoidable and is commented there; it is the only
+     * one that should exist.
+     */
+    public String cleanSlugFor(String name) {
+        String raw = toBaseSlug(name == null ? "" : name.trim());
+        return raw.isEmpty() ? "manager" : raw;
+    }
+
+    /**
+     * Moves a manager onto a new slug, recording where it used to live.
+     *
+     * <p>Used at approval, when a row leaves the pending namespace. The old URL was never public -
+     * only the submitter could open it - but the history row costs nothing and means a bookmark
+     * somebody kept still resolves.
+     */
+    public Future<Void> reslug(long managerId, String newSlug) {
+        return findSlugs(managerId).compose(before -> {
+            /*
+                History only when there is a URL to remember.
+
+                manager_url_history.company_slug is NOT NULL, and a pending manager may have no
+                company attached yet - company_id is nullable precisely for rows in this state.
+                Recording nothing is right anyway: with no company slug there was never a nested
+                URL for anyone to have bookmarked.
+            */
+            String oldCompanySlug = before.map(r -> r.getString("company_slug")).orElse(null);
+            String oldManagerSlug = before.map(r -> r.getString("slug")).orElse(null);
+            Future<Void> history = (oldCompanySlug != null && oldManagerSlug != null)
+                ? recordUrlHistory(managerId, oldCompanySlug, oldManagerSlug)
+                : Future.succeededFuture();
+            return history.compose(v -> db.preparedQuery(
+                    "UPDATE managers SET slug = $2, updated_at = now() WHERE id = $1")
+                .execute(Tuple.of(managerId, newSlug))
+                .mapEmpty());
+        });
+    }
+
+    /**
+     * Brings a manager's slug back in step with its name.
+     *
+     * <p>{@code updateForAttach} is the one path that rewrites a name - the add form supplying
+     * richer detail for a row the search created - and it never touched the slug. So correcting
+     * "Emma D" to "Emma Davis" renamed the person and left them on {@code emma-d}, and the row
+     * then approved under a name derived from a truncation somebody had typed.
+     *
+     * <p>Composed from the pieces that already exist rather than repeating them: the target slug
+     * is whatever that row's status is entitled to, and {@link #reslug} records the outgoing URL.
+     * Declines when the name resolves to a slug something else holds - that is a merge decision,
+     * and quietly appending to dodge it is what produced the mangled slugs in the first place.
+     */
+    public Future<Boolean> syncSlugToName(long managerId) {
+        return db.preparedQuery("SELECT name, slug, approval_status FROM managers WHERE id = $1")
+            .execute(Tuple.of(managerId))
+            .compose(rows -> {
+                if (!rows.iterator().hasNext()) return Future.succeededFuture(false);
+                Row row = rows.iterator().next();
+                String name    = row.getString("name");
+                String current = row.getString("slug");
+                String status  = row.getString("approval_status");
+                if (name == null || current == null) return Future.succeededFuture(false);
+
+                boolean hidden = "pending_approval".equals(status);
+                Future<String> target = hidden
+                    ? generatePendingSlug(name)
+                    : Future.succeededFuture(cleanSlugFor(name));
+
+                return target.compose(want -> {
+                    if (want.equals(current)) return Future.succeededFuture(false);
+                    return slugAvailable(want).compose(free -> free
+                        ? reslug(managerId, want).map(v -> true)
+                        : Future.succeededFuture(false));
+                });
+            });
+    }
+
+    /** The namespace hidden rows live in, once an admin has taken them out of circulation. */
+    public static final String REJECTED_SLUG_SUFFIX = "-rejected";
+
+    /**
+     * Moves a hidden row's slug out of the public namespace, freeing the name.
+     *
+     * <p>A rejected or removed manager is invisible on every public surface, but it went on
+     * holding its slug for ever - so a name an admin had explicitly taken down could never be used
+     * by the real person it belonged to. Same defect as pending rows squatting on clean names,
+     * one status along.
+     *
+     * <p>Idempotent, and guarded on the current slug so a row already parked is left alone. The id
+     * breaks ties: two rejected managers of the same name cannot collide.
+     */
+    public Future<Void> parkSlugAsRejected(long managerId) {
+        return db.preparedQuery("""
+                UPDATE managers
+                   SET slug = CASE
+                                WHEN EXISTS (SELECT 1 FROM managers x
+                                              WHERE x.slug = managers.slug || $2 AND x.id <> managers.id)
+                                THEN managers.slug || $2 || '-' || managers.id
+                                ELSE managers.slug || $2
+                              END,
+                       updated_at = now()
+                 WHERE id = $1
+                   AND slug IS NOT NULL
+                   AND position($2 in slug) = 0
+                """)
+            .execute(Tuple.of(managerId, REJECTED_SLUG_SUFFIX))
+            .mapEmpty();
+    }
+
+    /** The namespace pending rows live in. Lowercase, because every slug on the site is. */
+    public static final String PENDING_SLUG_SUFFIX = "-pending";
+
+    /**
+     * A slug for a row the public cannot reach.
+     *
+     * <p>Slug allocation asks {@code SELECT 1 FROM managers WHERE slug = $1} - every row blocks a
+     * name, including rows no visitor can ever open. So a half-typed draft took
+     * {@code sourabh-setia} and the real manager, published seconds later, was pushed onto
+     * {@code sourabh-setia-lumenwerx}. The mangled slug was not a naming decision; it was a
+     * collision with something invisible.
+     *
+     * <p>Putting pending rows in their own namespace removes the collision rather than handling
+     * it. {@code sourabh-setia} stays free for whoever is actually published, with no special case
+     * in the allocator: nothing pending can hold it any more.
+     *
+     * <p>The company is not used here. A pending slug is scaffolding - it is replaced with the
+     * real one at approval - so there is nothing to gain from making it descriptive, and plenty
+     * to lose from baking in a company name captured halfway through being typed.
+     */
+    public Future<String> generatePendingSlug(String name) {
+        String base = cleanSlugFor(name) + PENDING_SLUG_SUFFIX;
+        return slugAvailable(base).compose(free ->
+            free ? Future.succeededFuture(base) : trySlug(base, 2));
+    }
+
     public Future<String> generateUniqueSlug(String name, String company) {
-        String raw = toBaseSlug(name.trim());
-        final String base = raw.isEmpty() ? "manager" : raw;
+        final String base = cleanSlugFor(name);
         return slugAvailable(base).compose(free -> {
             if (free) return Future.succeededFuture(base);
             String companyPart = toBaseSlug(company == null ? "" : company.trim());

@@ -1261,6 +1261,85 @@ class AdminServiceIntegrationTest {
             .map(rs -> rs.iterator().next().getString("slug")));
     }
 
+    /**
+     * Removing a manager never destroys the row, and frees the name.
+     *
+     * <p>A review-less manager used to be hard-DELETEd. The row vanished, so
+     * {@code manager_url_history} had nothing to point at and every inbound link became a hard
+     * 404 - and worse, the freed slug could later be handed to a <em>different</em> person, so an
+     * old link resolved to the wrong human.
+     *
+     * <p>Retiring keeps the row and parks the slug, which frees the NAME without losing the
+     * address. A genuine hard delete still exists for spam and PII, as a separate explicit action.
+     */
+    @Test
+    void deleteManager_withNoReviews_retiresItInsteadOfDestroyingTheRow() throws Exception {
+        String adminAuth0 = insertUser("auth0|admin-del", "AdminDel", "admin");
+        long companyId = insertCompanyRow("Delete Corp", "delete-corp");
+        long managerId = insertApprovedManagerAtCompany("Gone Person", "Delete Corp", companyId);
+        await(pool.preparedQuery("UPDATE managers SET slug = 'gone-person' WHERE id = $1")
+            .execute(Tuple.of(managerId)).mapEmpty());
+
+        await(service.deleteManager(adminAuth0, managerId));
+
+        var row = await(pool.preparedQuery("SELECT approval_status, slug FROM managers WHERE id = $1")
+            .execute(Tuple.of(managerId)));
+        assertTrue(row.iterator().hasNext(),
+            "the row must survive - deleting it strands every link that points at it");
+        var r = row.iterator().next();
+        assertEquals("rejected", r.getString("approval_status"));
+        assertNotEquals("gone-person", r.getString("slug"),
+            "and the name is freed, which was the only real argument for deleting the row");
+    }
+
+    /**
+     * Rejecting a pending manager frees the name it was holding.
+     *
+     * <p>Rejected rows are invisible on every public surface but went on owning their slug, so a
+     * name an admin had explicitly taken down could never be used by the person it belonged to.
+     */
+    @Test
+    void rejectPendingManager_freesTheNameItWasHolding() throws Exception {
+        String adminAuth0 = insertUser("auth0|admin-rej", "AdminRej", "admin");
+        long companyId = insertCompanyRow("Reject Corp", "reject-corp");
+        long managerId = await(pool.preparedQuery(
+                "INSERT INTO managers(name,company,company_id,title,image,status,approval_status,"
+              + "overall_rating,reviews_count,category_averages,slug) "
+              + "VALUES ('Nope Person','Reject Corp',$1,'EM','img','active','pending_approval',0,0,'{}','nope-person') "
+              + "RETURNING id")
+            .execute(Tuple.of(companyId))
+            .map(rs -> rs.iterator().next().getLong("id")));
+
+        await(service.rejectPendingManager(adminAuth0, managerId, "not a real manager"));
+
+        assertNotEquals("nope-person", slugOfManager(managerId),
+            "a rejected manager must stop holding a name nobody else can then use");
+    }
+
+    private long insertCompanyRow(String name, String slug) throws Exception {
+        await(pool.preparedQuery("DELETE FROM companies WHERE slug = $1").execute(Tuple.of(slug)));
+        return await(pool.preparedQuery(
+                "INSERT INTO companies(name, slug, status, created_at, updated_at) "
+              + "VALUES ($1, $2, 'approved', now(), now()) RETURNING id")
+            .execute(Tuple.of(name, slug))
+            .map(rs -> rs.iterator().next().getLong("id")));
+    }
+
+    private long insertApprovedManagerAtCompany(String name, String company, long companyId) throws Exception {
+        return await(pool.preparedQuery(
+                "INSERT INTO managers(name,company,company_id,title,image,status,approval_status,"
+              + "overall_rating,reviews_count,category_averages) "
+              + "VALUES ($1,$2,$3,'Engineering Manager','img','active','approved',0,0,'{}') RETURNING id")
+            .execute(Tuple.of(name, company, companyId))
+            .map(rs -> rs.iterator().next().getLong("id")));
+    }
+
+    private String slugOfManager(long managerId) throws Exception {
+        return await(pool.preparedQuery("SELECT slug FROM managers WHERE id = $1")
+            .execute(Tuple.of(managerId))
+            .map(rs -> rs.iterator().next().getString("slug")));
+    }
+
     private long insertApprovedManager(String name, String company, String title) throws Exception {
         return await(pool.preparedQuery(
             "INSERT INTO managers(name,company,title,image,status,approval_status,overall_rating,reviews_count,category_averages) " +

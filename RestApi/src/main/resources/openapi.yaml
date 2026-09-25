@@ -2522,6 +2522,55 @@ paths:
         '403':
           description: Forbidden
 
+  /api/admin/pending-managers/{managerId}/slug-preview:
+    get:
+      operationId: previewApprovalSlug
+      summary: What approving this manager would do to its slug (admin only)
+      description: >
+        Pending managers hold a slug in the reserved "-pending" namespace so they cannot occupy
+        the name a published manager would use. Approval moves them onto the clean name.
+
+
+        This reports, before anything is approved, whether that name is free - and when it is not,
+        which live manager holds it, so the panel can offer merging into that manager or publishing
+        under a suggested alternative instead of the database silently appending a company.
+      tags:
+        - Admin
+      parameters:
+        - in: path
+          name: managerId
+          required: true
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: The slug this approval would take, and any conflict
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  managerId:
+                    type: integer
+                    format: int64
+                  currentSlug:
+                    type: string
+                  cleanSlug:
+                    type: string
+                  available:
+                    type: boolean
+                    description: False when a published manager already holds the clean slug.
+                  suggestedSlug:
+                    type: string
+                    description: Present only when the clean slug is taken.
+                  heldBy:
+                    type: object
+                    description: The published manager occupying the clean slug.
+        '403':
+          description: Forbidden
+        '404':
+          description: Manager not found
+
   /api/admin/pending-managers/{managerId}/approve:
     post:
       operationId: approvePendingManager
@@ -2534,6 +2583,18 @@ paths:
           required: true
           schema:
             type: integer
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                slug:
+                  type: string
+                  description: >
+                    The name to publish under, when an admin resolved a conflict. Omitted, the
+                    clean slug is taken if free and the row is otherwise left where it is.
       responses:
         '200':
           description: Manager approved

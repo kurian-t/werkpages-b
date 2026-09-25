@@ -1391,6 +1391,12 @@ public class ManagerService {
             // Enrich the ghost record with the more complete form data, add career history,
             // then attach the review.
             return managerRepo.updateForAttach(existingId, name, title, status, country, linkedinUrl, logoUrl, userId)
+                /*
+                  The name may have just changed - this is the path that supplies a fuller one for
+                  a row the search created from whatever was typed. The slug has to follow, or the
+                  person is renamed and left on an address derived from a truncation.
+                */
+                .compose(updated -> managerRepo.syncSlugToName(existingId).map(moved -> updated))
                 .compose(updatedOpt -> {
                     if (updatedOpt.isEmpty()) return Future.failedFuture(ServiceException.notFound("Manager not found"));
                     Row updatedRow = updatedOpt.get();
