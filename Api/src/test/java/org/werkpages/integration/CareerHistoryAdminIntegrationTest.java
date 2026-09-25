@@ -272,6 +272,81 @@ class CareerHistoryAdminIntegrationTest {
         assertEquals("Founder", m.getString("title"));
     }
 
+    /**
+     * The trajectory's dates come from career history, not from whoever reviewed the role.
+     *
+     * <p>Reported from production: a manager shown as "2024 – Present" at a company they had left,
+     * because the reviewer who rated them was still employed there. {@code is_current} was
+     * {@code BOOL_OR(worked_until IS NULL)} over <em>reviews</em> - the reviewer's own employment
+     * dates - so no amount of editing the manager's career history could change it.
+     */
+    @Test
+    void trajectoryDates_comeFromCareerHistory_notFromTheReviewersDates() throws Exception {
+        long managerId = insertManager("Ketti Ciarniello", "Lime", "Assistant Treasurer");
+        long entryId   = insertCareerEntry(managerId, "Lime", "Assistant Treasurer", "2024");
+        await(pool.preparedQuery("UPDATE career_history SET end_date = '2026-01-01T00:00:00Z' WHERE id = $1")
+            .execute(Tuple.of(entryId)).mapEmpty());
+
+        // A reviewer who is still at Lime: worked_until IS NULL. The manager has still left.
+        await(pool.preparedQuery(
+                "INSERT INTO reviews(manager_id, author, overall_rating, manager_company, manager_title, "
+              + "worked_from, worked_until, created_at, updated_at) "
+              + "VALUES ($1,'Someone',4.3,'Lime','Assistant Treasurer','2024-01-01',NULL,now(),now())")
+            .execute(Tuple.of(managerId)).mapEmpty());
+
+        Row seg = segmentFor(managerId, "Lime");
+        assertFalse(seg.getBoolean("is_current"),
+            "the manager's role ended, whatever their reviewer's own dates say");
+        assertNotNull(seg.getLocalDate("end_date"),
+            "and the end date is the one recorded against the role");
+    }
+
+    /**
+     * A role with no reviews still appears, and can be the current one.
+     *
+     * <p>The panel was built by grouping reviews, so a role nobody had rated did not exist to it -
+     * and could never be shown as current, however it was recorded.
+     */
+    @Test
+    void aRoleWithNoReviews_stillAppearsAndCanBeCurrent() throws Exception {
+        long managerId = insertManager("Ketti Ciarniello", "ICAT Logistics", "Director of Treasury");
+        insertCareerEntry(managerId, "ICAT Logistics", "Director of Treasury", "2026");
+
+        Row seg = segmentFor(managerId, "ICAT Logistics");
+        assertTrue(seg.getBoolean("is_current"),
+            "an open role is current even with nothing rated against it");
+        assertEquals(0L, seg.getLong("review_count"));
+    }
+
+    /**
+     * Reviews naming a role that was never recorded are not dropped.
+     *
+     * <p>Career history owns the dates, but it must not become a filter: a review referring to a
+     * company and title nobody entered as a role is still somebody's rating of this manager.
+     */
+    @Test
+    void reviewsForAnUnrecordedRole_stillAppear() throws Exception {
+        long managerId = insertManager("Ketti Ciarniello", "Lime", "Assistant Treasurer");
+        insertCareerEntry(managerId, "Lime", "Assistant Treasurer", "2024");
+        await(pool.preparedQuery(
+                "INSERT INTO reviews(manager_id, author, overall_rating, manager_company, manager_title, "
+              + "worked_from, created_at, updated_at) "
+              + "VALUES ($1,'Someone',5.0,'Ghost Employer','Some Role','2019-01-01',now(),now())")
+            .execute(Tuple.of(managerId)).mapEmpty());
+
+        assertNotNull(segmentFor(managerId, "Ghost Employer"),
+            "a rated role nobody recorded must not vanish from the trajectory");
+    }
+
+    private Row segmentFor(long managerId, String company) throws Exception {
+        var rows = await(new org.werkpages.repository.ReviewRepository(pool)
+            .findCareerSegmentsByManager(managerId, 50, 0));
+        for (Row r : rows) {
+            if (company.equalsIgnoreCase(r.getString("company"))) return r;
+        }
+        return null;
+    }
+
     private Row managerRow(long managerId) throws Exception {
         return await(pool
             .preparedQuery("SELECT company, title, status, company_id FROM managers WHERE id = $1")

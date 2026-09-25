@@ -80,54 +80,116 @@ public class ReviewRepository {
         return findCareerSegmentsByManager(managerId, limit, offset, null, false);
     }
 
+    /**
+     * The career trajectory: when each role ran, and how it was rated.
+     *
+     * <p><b>Dates come from career_history; ratings come from reviews.</b> They used to both come
+     * from reviews, which meant a role's start, end and "Present" were really the dates of
+     * whoever happened to review it. A manager who had left showed "Present" because their
+     * reviewer was still at the company, and a role nobody had reviewed could never show as
+     * current no matter how it was recorded. Editing the manager's own career history changed
+     * none of it, because the panel was not reading that table at all.
+     *
+     * <p>A FULL OUTER JOIN rather than a plain one, so neither side loses rows: a role recorded
+     * with no reviews yet still appears (rated "NO REVIEWS YET"), and reviews naming a
+     * company/title that was never recorded as a role still appear rather than vanishing from the
+     * page. Career history wins on dates wherever it has an entry.
+     *
+     * <p>Same visibility rule as the review list: public sees live, an author and an admin see
+     * theirs.
+     */
     public Future<RowSet<Row>> findCareerSegmentsByManager(long managerId, int limit, int offset,
                                                            UUID viewerId, boolean isAdmin) {
-        return db.preparedQuery("""
-                SELECT
-                  MIN(manager_company)                        AS company,
-                  MIN(manager_title)                          AS role,
-                  MIN(worked_from)                            AS start_date,
-                  MAX(worked_until)                           AS end_date,
-                  BOOL_OR(worked_until IS NULL)               AS is_current,
-                  AVG(overall_rating)                         AS avg_rating,
-                  COUNT(*)                                    AS review_count,
-                  AVG(communication_style)                    AS communication_style,
-                  AVG(perceived_approachability)              AS perceived_approachability,
-                  AVG(perceived_clarity_of_expectations)      AS perceived_clarity_of_expectations,
-                  AVG(feedback_style)                         AS feedback_style,
-                  AVG(perceived_supportiveness)               AS perceived_supportiveness,
-                  AVG(decision_making_style)                  AS decision_making_style,
-                  AVG(organization_and_planning_style)        AS organization_and_planning_style,
-                  AVG(delegation_style)                       AS delegation_style,
-                  AVG(perceived_professional_demeanor)        AS perceived_professional_demeanor,
-                  AVG(overall_working_experience)             AS overall_working_experience,
-                  MIN(manager_role_start)                     AS manager_role_start,
-                  MAX(manager_role_end)                       AS manager_role_end
-                FROM reviews
-                WHERE manager_id = $1
-                  AND deleted_at IS NULL
-                  -- Same rule as the review list: withheld from the public, shown to its author
-                  -- and to an admin. Filtering this to published only had a second effect nobody
-                  -- would guess - the admin controls for editing career history hang off these
-                  -- rows, so a manager whose ratings were all held lost its timeline and its edit
-                  -- buttons at the same time.
-                  AND (disposition = 'live' OR $4 = TRUE OR ($5::uuid IS NOT NULL AND user_id = $5))
-                GROUP BY LOWER(TRIM(manager_company)), LOWER(TRIM(manager_title))
-                ORDER BY MIN(worked_from) ASC NULLS LAST
+        return db.preparedQuery(SEGMENTS_SQL + """
+                ORDER BY start_date ASC NULLS LAST
                 LIMIT $2 OFFSET $3
                 """)
             .execute(Tuple.of(managerId, limit, offset, isAdmin, viewerId));
     }
 
+    /**
+     * Roles from career history and rated groups from reviews, reconciled.
+     *
+     * <p>Shared by the listing and its count so the number above the panel can never disagree with
+     * what the panel shows - they were separate queries with separate grouping, which is its own
+     * way to be wrong.
+     */
+    private static final String SEGMENTS_SQL = """
+            WITH ch AS (
+                SELECT LOWER(TRIM(company)) AS ck,
+                       LOWER(TRIM(title))   AS tk,
+                       MIN(company)         AS company,
+                       MIN(title)           AS title,
+                       MIN(start_date)::date AS start_date,
+                       MAX(end_date)::date   AS end_date,
+                       BOOL_OR(end_date IS NULL) AS is_current
+                  FROM career_history
+                 WHERE manager_id = $1
+                 GROUP BY 1, 2
+            ),
+            rv AS (
+                SELECT LOWER(TRIM(manager_company)) AS ck,
+                       LOWER(TRIM(manager_title))   AS tk,
+                       MIN(manager_company)         AS company,
+                       MIN(manager_title)           AS title,
+                       MIN(worked_from)             AS start_date,
+                       MAX(worked_until)            AS end_date,
+                       BOOL_OR(worked_until IS NULL) AS is_current,
+                       AVG(overall_rating)                    AS avg_rating,
+                       COUNT(*)                               AS review_count,
+                       AVG(communication_style)               AS communication_style,
+                       AVG(perceived_approachability)         AS perceived_approachability,
+                       AVG(perceived_clarity_of_expectations) AS perceived_clarity_of_expectations,
+                       AVG(feedback_style)                    AS feedback_style,
+                       AVG(perceived_supportiveness)          AS perceived_supportiveness,
+                       AVG(decision_making_style)             AS decision_making_style,
+                       AVG(organization_and_planning_style)   AS organization_and_planning_style,
+                       AVG(delegation_style)                  AS delegation_style,
+                       AVG(perceived_professional_demeanor)   AS perceived_professional_demeanor,
+                       AVG(overall_working_experience)        AS overall_working_experience,
+                       MIN(manager_role_start)                AS manager_role_start,
+                       MAX(manager_role_end)                  AS manager_role_end
+                  FROM reviews
+                 WHERE manager_id = $1 AND deleted_at IS NULL
+                   AND (disposition = 'live' OR $4 = TRUE OR ($5::uuid IS NOT NULL AND user_id = $5))
+                 GROUP BY 1, 2
+            )
+            SELECT
+                COALESCE(ch.company, rv.company) AS company,
+                COALESCE(ch.title,   rv.title)   AS role,
+                COALESCE(ch.start_date, rv.start_date) AS start_date,
+                CASE WHEN ch.ck IS NOT NULL THEN ch.end_date   ELSE rv.end_date   END AS end_date,
+                CASE WHEN ch.ck IS NOT NULL THEN ch.is_current ELSE COALESCE(rv.is_current, FALSE) END AS is_current,
+                rv.avg_rating,
+                COALESCE(rv.review_count, 0) AS review_count,
+                rv.communication_style,
+                rv.perceived_approachability,
+                rv.perceived_clarity_of_expectations,
+                rv.feedback_style,
+                rv.perceived_supportiveness,
+                rv.decision_making_style,
+                rv.organization_and_planning_style,
+                rv.delegation_style,
+                rv.perceived_professional_demeanor,
+                rv.overall_working_experience,
+                rv.manager_role_start,
+                rv.manager_role_end
+              FROM ch FULL OUTER JOIN rv ON ch.ck = rv.ck AND ch.tk = rv.tk
+            """;
+
+    /**
+     * How many segments the panel will show - counted from the same reconciliation it renders.
+     *
+     * <p>This counted review groups only, so a manager with roles recorded but not yet reviewed
+     * was told there were fewer segments than the page then displayed.
+     */
     public Future<Long> countCareerSegmentsByManager(long managerId) {
-        return db.preparedQuery("""
-                SELECT COUNT(*) FROM (
-                  SELECT 1 FROM reviews
-                  WHERE manager_id = $1 AND deleted_at IS NULL
-                  GROUP BY LOWER(TRIM(manager_company)), LOWER(TRIM(manager_title))
-                ) sub
-                """)
-            .execute(Tuple.of(managerId))
+        return countCareerSegmentsByManager(managerId, null, false);
+    }
+
+    public Future<Long> countCareerSegmentsByManager(long managerId, UUID viewerId, boolean isAdmin) {
+        return db.preparedQuery("SELECT COUNT(*) FROM (" + SEGMENTS_SQL + ") seg")
+            .execute(Tuple.of(managerId, 0, 0, isAdmin, viewerId))
             .map(rows -> rows.iterator().next().getLong(0));
     }
 
