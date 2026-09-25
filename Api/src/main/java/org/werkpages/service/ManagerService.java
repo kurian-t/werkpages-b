@@ -2222,7 +2222,8 @@ public class ManagerService {
                     .put("reviewCount",       row.getLong("review_count").intValue())
                     .put("categoryAverages",  categoryAverages)
                     .put("managerRoleStart",  mrStart != null ? mrStart.toString() : null)
-                    .put("managerRoleEnd",    mrEnd   != null ? mrEnd.toString()   : null));
+                    .put("managerRoleEnd",    mrEnd   != null ? mrEnd.toString()   : null)
+                    .put("logoUrl",           row.getString("logo_url")));
             }
             return new JsonObject()
                 .put("data",   segments)

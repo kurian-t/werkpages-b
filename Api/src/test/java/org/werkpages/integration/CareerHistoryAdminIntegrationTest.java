@@ -466,6 +466,40 @@ class CareerHistoryAdminIntegrationTest {
             .map(rs -> rs.iterator().next().getString("company_logo_url")));
     }
 
+    /**
+     * The trajectory tile shows the logo of the company the role was AT - including past ones.
+     *
+     * <p>Reported three times from production. The admin opened the trajectory card's editor,
+     * picked the right company from the dropdown, saved - and the tile went on showing an
+     * unrelated brand's mark. The pick WAS stored: {@code career_history.company_id} held the
+     * right row all along. The segments query simply returned no logo column at all, so the
+     * frontend fell through to guessing a domain from the company NAME and rendered whatever
+     * came back.
+     *
+     * <p>Past companies were the whole of the bug: the only logo that ever appeared was the
+     * manager's CURRENT one, which the page patched in by name-matching after the fetch.
+     */
+    @Test
+    void careerSegment_carriesTheLogoOfThePickedCompany_evenForAPastRole() throws Exception {
+        long lime = await(pool.preparedQuery(
+                "INSERT INTO companies(name, logo_url, status, created_at, updated_at) "
+              + "VALUES ('Lime Logo Co', 'https://logo.test/lime-picked.png', 'approved', now(), now()) "
+              + "RETURNING id")
+            .execute().map(rs -> rs.iterator().next().getLong("id")));
+
+        // The manager is at a DIFFERENT company now - the old one is strictly in the past.
+        long managerId = insertManager("Trajectory Logo Mgr", "ICAT Logo Co", "Director");
+        long entryId   = insertCareerEntry(managerId, "Lime Logo Co", "Assistant Treasurer", "2024");
+        await(pool.preparedQuery(
+                "UPDATE career_history SET company_id = $1, end_date = '2026-01-01T00:00:00Z' WHERE id = $2")
+            .execute(Tuple.of(lime, entryId)).mapEmpty());
+
+        Row segment = segmentFor(managerId, "Lime Logo Co");
+        assertNotNull(segment, "the past role must still appear on the trajectory");
+        assertEquals("https://logo.test/lime-picked.png", segment.getString("logo_url"),
+            "the logo the admin picked must reach the tile - a past company is not an exception");
+    }
+
     private Row segmentFor(long managerId, String company) throws Exception {
         var rows = await(new org.werkpages.repository.ReviewRepository(pool)
             .findCareerSegmentsByManager(managerId, 50, 0));

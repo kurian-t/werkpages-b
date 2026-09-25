@@ -165,7 +165,8 @@ public class ReviewRepository {
                        MIN(title)           AS title,
                        MIN(start_date)::date AS start_date,
                        MAX(end_date)::date   AS end_date,
-                       BOOL_OR(end_date IS NULL) AS is_current
+                       BOOL_OR(end_date IS NULL) AS is_current,
+                       MIN(company_id)      AS company_id
                   FROM career_history
                  WHERE manager_id = $1
                  GROUP BY 1, 2
@@ -216,8 +217,23 @@ public class ReviewRepository {
                 rv.perceived_professional_demeanor,
                 rv.overall_working_experience,
                 rv.manager_role_start,
-                rv.manager_role_end
+                rv.manager_role_end,
+                /*
+                  The logo of the company this role was actually AT.
+
+                  The panel returned no logo at all, so every past company fell through to the
+                  frontend's guess-the-domain fallback and rendered a stranger's mark. Picking
+                  the right company in the admin editor stored its id and changed nothing on
+                  screen, because nothing read it back.
+
+                  Preference is the company the admin PICKED (career_history.company_id), then
+                  the one the name resolves to - unique per companies_name_ci, so neither join
+                  can multiply rows and the count above the panel stays honest.
+                */
+                COALESCE(picked_co.logo_url, named_co.logo_url) AS logo_url
               FROM ch FULL OUTER JOIN rv ON ch.ck = rv.ck AND ch.tk = rv.tk
+              LEFT JOIN companies picked_co ON picked_co.id = ch.company_id
+              LEFT JOIN companies named_co  ON LOWER(TRIM(named_co.name)) = COALESCE(ch.ck, rv.ck)
             """;
 
     /**
