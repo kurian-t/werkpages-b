@@ -1316,41 +1316,6 @@ class AdminServiceIntegrationTest {
             "a rejected manager must stop holding a name nobody else can then use");
     }
 
-    /**
-     * A merge suggestion says which URL each manager is on, and which one the merge produces.
-     *
-     * <p>The merge reclaims the plain name slug for the survivor and parks the retired duplicate's,
-     * so the resulting address is settled before an admin clicks anything - and the payload carried
-     * neither slug. The one visible consequence of a merge, the profile's URL changing, was
-     * invisible at the moment of deciding.
-     */
-    @Test
-    void mergeSuggestions_reportTheSlugsAndTheResultingUrl() throws Exception {
-        String adminAuth0 = insertUser("auth0|admin-slugview", "AdminSlugView", "admin");
-        long companyId = insertCompanyRow("Slugview Corp", "slugview-corp");
-        long lowId  = insertApprovedManagerAtCompany("Emma Davis", "Slugview Corp", companyId);
-        long highId = insertApprovedManagerAtCompany("Emma Davis", "Slugview Corp", companyId);
-        await(pool.preparedQuery("UPDATE managers SET slug = 'emma-davis-slugview-corp' WHERE id = $1")
-            .execute(Tuple.of(lowId)).mapEmpty());
-        await(pool.preparedQuery("UPDATE managers SET slug = 'emma-davis' WHERE id = $1")
-            .execute(Tuple.of(highId)).mapEmpty());
-
-        // manager_id_a < manager_id_b is a table constraint.
-        await(pool.preparedQuery(
-                "INSERT INTO merge_suggestions(manager_id_a, manager_id_b, confidence, reason, status) "
-              + "VALUES ($1, $2, 'high', 'same person', 'pending')")
-            .execute(Tuple.of(Math.min(lowId, highId), Math.max(lowId, highId))).mapEmpty());
-
-        JsonObject out = await(service.getMergeSuggestions(adminAuth0, 20, 0));
-        JsonObject first = out.getJsonArray("data").getJsonObject(0);
-
-        assertNotNull(first.getJsonObject("managerA").getString("slug"),
-            "each side must show the URL it is on today");
-        assertNotNull(first.getJsonObject("managerB").getString("slug"));
-        assertEquals("emma-davis", first.getString("resultingSlug"),
-            "and the payload must say where the survivor ends up, since the merge decides it");
-    }
-
     private long insertCompanyRow(String name, String slug) throws Exception {
         await(pool.preparedQuery("DELETE FROM companies WHERE slug = $1").execute(Tuple.of(slug)));
         return await(pool.preparedQuery(

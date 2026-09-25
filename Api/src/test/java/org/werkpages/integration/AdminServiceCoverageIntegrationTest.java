@@ -546,6 +546,42 @@ class AdminServiceCoverageIntegrationTest {
     // Helpers
     // ══════════════════════════════════════════════════════════════════════════
 
+    /**
+     * A merge suggestion says which URL each manager is on, and which one the merge produces.
+     *
+     * <p>The merge reclaims the plain name slug for the survivor and parks the retired duplicate's,
+     * so the resulting address is settled before an admin clicks anything - and the payload carried
+     * neither slug. The one visible consequence of a merge, the profile's URL changing, was
+     * invisible at the moment of deciding.
+     *
+     * <p>Lives here rather than in AdminServiceIntegrationTest because this is the class that
+     * wires a real MergeSuggestionsRepository; the other builds the service without one.
+     */
+    @Test
+    void mergeSuggestions_reportTheSlugsAndTheResultingUrl() throws Exception {
+        String adminAuth = insertUser("auth0|admin-slugview", "AdminSlugView", "admin");
+        long first  = insertApprovedManager("Emma Davis", "Slugview Corp", "Engineering Manager");
+        long second = insertApprovedManager("Emma Davis", "Other Corp", "Engineering Manager");
+        long low = Math.min(first, second), high = Math.max(first, second);
+        await(pool.preparedQuery("UPDATE managers SET slug = 'emma-davis-slugview-corp' WHERE id = $1")
+            .execute(Tuple.of(low)).mapEmpty());
+        await(pool.preparedQuery("UPDATE managers SET slug = 'emma-davis' WHERE id = $1")
+            .execute(Tuple.of(high)).mapEmpty());
+        await(pool.preparedQuery(
+                "INSERT INTO merge_suggestions(manager_id_a, manager_id_b, confidence, reason, status) "
+              + "VALUES ($1, $2, 'SAME', 'same person', 'pending')")
+            .execute(Tuple.of(low, high)).mapEmpty());
+
+        JsonObject out = await(service.getMergeSuggestions(adminAuth, 20, 0));
+        JsonObject suggestion = out.getJsonArray("data").getJsonObject(0);
+
+        assertNotNull(suggestion.getJsonObject("managerA").getString("slug"),
+            "each side must show the URL it is on today");
+        assertNotNull(suggestion.getJsonObject("managerB").getString("slug"));
+        assertEquals("emma-davis", suggestion.getString("resultingSlug"),
+            "and the payload must say where the survivor ends up, since the merge decides it");
+    }
+
     private String insertUser(String auth0Id, String username, String role) throws Exception {
         await(pool.preparedQuery(
             "INSERT INTO users(auth0_id, email, username, first_name, last_name, role) " +
