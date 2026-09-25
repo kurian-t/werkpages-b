@@ -166,6 +166,52 @@ public class AdminService {
     }
 
     /**
+     * Live managers stuck on a company-suffixed slug whose plain name is now free.
+     *
+     * <p>Their slug was decided at INSERT against whatever held the name at that instant, and what
+     * held it was usually invisible - a draft captured mid-typing, or a manager later rejected.
+     * Freeing those namespaces makes the plain name available again, but nothing goes back to
+     * check, so the real person stays on the suffixed URL for ever.
+     *
+     * <p>Listed rather than repaired automatically: moving a live slug changes a public, possibly
+     * indexed URL, and that is a decision about timing rather than correctness.
+     */
+    public Future<JsonObject> listSlugReclaimCandidates(String auth0Id, int limit) {
+        return requireAdmin(auth0Id)
+            .compose(adminId -> managerRepo.findSlugReclaimCandidates(limit))
+            .map(rows -> {
+                JsonArray data = new JsonArray();
+                for (Row row : rows) {
+                    data.add(new JsonObject()
+                        .put("id",           row.getLong("id"))
+                        .put("name",         row.getString("name"))
+                        .put("company",      row.getString("company"))
+                        .put("currentSlug",  row.getString("slug"))
+                        .put("cleanSlug",    row.getString("clean_slug"))
+                        .put("reviewsCount", row.getInteger("reviews_count")));
+                }
+                return new JsonObject().put("data", data);
+            });
+    }
+
+    /**
+     * Moves one manager onto the plain name, recording the URL it is leaving.
+     *
+     * <p>The same operation a merge performs, reused rather than rewritten - it is conservative,
+     * declines when the name is genuinely held, and writes manager_url_history first so links
+     * already shared keep resolving.
+     */
+    public Future<JsonObject> reclaimManagerSlug(String auth0Id, long managerId) {
+        return requireAdmin(auth0Id)
+            .compose(adminId -> managerRepo.reclaimBaseSlug(managerId))
+            .compose(moved -> managerRepo.findSlugs(managerId)
+                .map(slugs -> new JsonObject()
+                    .put("success", true)
+                    .put("moved", moved)
+                    .put("slug", slugs.map(r -> r.getString("slug")).orElse(null))));
+    }
+
+    /**
      * What approving this pending manager would do to its slug, before anything is approved.
      *
      * <p>A pending row lives in the {@code -pending} namespace precisely so it cannot squat on the
@@ -642,10 +688,43 @@ public class AdminService {
                     return slugsFuture.compose(slugsOpt ->
                         newCompanyIdFuture.compose(newCompanyId -> {
                             if (newEndDate != null) {
-                                // User is adding a PAST role (has an end date) — insert the segment
-                                // without closing the current open career entry or changing manager.company.
-                                return managerRepo.insertCareerEntry(managerId, effectiveCo, effectiveTit, careerStart, newEndDate, newCompanyId)
-                                    .compose(v -> applyEditAndApprove(managerId, editId, null, null, null, newStatus, newCountry, newLinkedinUrl, effectiveCo, effectiveTit, adminId, now, proposedBy, managerName, null));
+                                /*
+                                    An end date means the role has finished. Which role, though,
+                                    decides whether this is a correction or a new past position -
+                                    and it always did the same thing, which was the bug.
+
+                                    This branch INSERTED unconditionally. So editing the dates on
+                                    the role a manager is already in added a second copy of it
+                                    rather than amending the first: the original entry stayed open
+                                    and kept driving the page, and every re-attempt added another
+                                    row. That is why repeated edits appeared to do nothing.
+
+                                    It also passed null for company, title and logo, and
+                                    managerRepo.update builds its SET clause from non-null
+                                    arguments - so the headline was never written even when the
+                                    company had changed. The header stayed on the old employer
+                                    however many times the edit was approved.
+
+                                    Now: the same company and title as the open role means the
+                                    admin is correcting that role, so it is updated in place.
+                                    Anything else is a genuinely different position and is
+                                    inserted. Either way the headline is rebuilt from the career
+                                    history afterwards rather than passed along by hand.
+                                */
+                                return managerRepo.findOpenCareerEntry(managerId).compose(openOpt -> {
+                                    boolean correctingCurrentRole = openOpt.isPresent()
+                                        && effectiveCo.equalsIgnoreCase(openOpt.get().getString("company"))
+                                        && effectiveTit.equalsIgnoreCase(openOpt.get().getString("title"));
+                                    Future<?> entry = correctingCurrentRole
+                                        ? managerRepo.updateCareerEntry(openOpt.get().getLong("id"), managerId,
+                                              effectiveCo, effectiveTit, careerStart, newEndDate, newCompanyId)
+                                        : managerRepo.insertCareerEntry(managerId, effectiveCo, effectiveTit,
+                                              careerStart, newEndDate, newCompanyId);
+                                    return entry.compose(v -> applyEditAndApprove(managerId, editId,
+                                        newCompany, newCompanyLogoUrl, newTitle, newStatus, newCountry,
+                                        newLinkedinUrl, effectiveCo, effectiveTit, adminId, now,
+                                        proposedBy, managerName, newCompanyId));
+                                });
                             }
                             // No end date. Only treat this as a genuine *current* role change when the
                             // new role starts on/after the manager's existing current role. An older
@@ -710,7 +789,17 @@ public class AdminService {
                                                      UUID adminId, OffsetDateTime reviewedAt,
                                                      UUID proposedBy, String managerName, Long newCompanyId) {
         return managerRepo.update(managerId, newCompany, newTitle, null, null, newStatus, newCountry, newLinkedinUrl, null, newCompanyId)
-            .compose(opt -> editRepo.approve(editId, adminId, reviewedAt))
+            /*
+              Career history has the last word on the headline.
+
+              The fields above are the ones the form owns outright - country, LinkedIn, and the
+              status the admin chose. Company, title and logo are derived, because they are also
+              written by the career entries and two writers of one fact is how this page kept
+              drifting: approving an edit could leave the header on a company the manager had
+              already left.
+            */
+            .compose(opt -> managerRepo.syncHeadlineFromCareerHistory(managerId))
+            .compose(v -> editRepo.approve(editId, adminId, reviewedAt))
             .compose(v -> {
                 if (proposedBy != null) {
                     notifRepo.sendAsync(proposedBy, "review_accepted",
@@ -1083,6 +1172,7 @@ public class AdminService {
                             .put("company", row.getString("company_a"))
                             .put("title",   row.getString("title_a"))
                             .put("country", row.getString("country_a"))
+                            .put("slug",    row.getString("slug_a"))
                             .put("reviews", row.getInteger("reviews_a")))
                         .put("managerB", new JsonObject()
                             .put("id",      row.getLong("id_b"))
@@ -1090,7 +1180,21 @@ public class AdminService {
                             .put("company", row.getString("company_b"))
                             .put("title",   row.getString("title_b"))
                             .put("country", row.getString("country_b"))
+                            .put("slug",    row.getString("slug_b"))
                             .put("reviews", row.getInteger("reviews_b")))
+                        /*
+                            What the surviving manager's URL will be after the merge.
+
+                            The merge reclaims the plain name slug for whoever survives - the
+                            retired duplicate is parked out of the way first - so the outcome is
+                            decided before an admin clicks, and it was decided invisibly. Showing
+                            it is the difference between choosing a merge and discovering one.
+
+                            Both rows are the same person by definition here, so the clean slug is
+                            the same whichever direction the merge runs; only the row that ends up
+                            on it differs.
+                        */
+                        .put("resultingSlug", managerRepo.cleanSlugFor(row.getString("name_a")))
                     );
                 }
                 return new JsonObject().put("data", data).put("total", total);
@@ -1136,7 +1240,15 @@ public class AdminService {
                     : Future.succeededFuture(null);
                 return companyIdFuture.compose(companyId ->
                     managerRepo.updateCareerEntry(entryId, managerId, company.trim(), title.trim(),
-                                                  finalStart, finalEnd, companyId));
+                                                  finalStart, finalEnd, companyId)
+                        /*
+                          The headline follows the roles. This wrote career_history and stopped, so
+                          the Edit button on the career trajectory could move a manager's current
+                          role while the header above it went on naming the old company, logo and
+                          title - visibly wrong, and no amount of re-editing fixed it.
+                        */
+                        .compose(count -> managerRepo.syncHeadlineFromCareerHistory(managerId)
+                            .map(v -> count)));
             })
             .map(count -> new JsonObject().put("success", true).put("updated", count));
     }
@@ -1144,6 +1256,9 @@ public class AdminService {
     public Future<JsonObject> adminDeleteCareerEntry(String auth0Id, long managerId, long entryId) {
         return requireAdmin(auth0Id)
             .compose(adminId -> managerRepo.deleteCareerEntry(entryId, managerId))
+            // Same reason as the update above: removing the current role must not leave the header
+            // advertising it.
+            .compose(count -> managerRepo.syncHeadlineFromCareerHistory(managerId).map(v -> count))
             .map(count -> new JsonObject().put("success", true).put("deleted", count));
     }
 

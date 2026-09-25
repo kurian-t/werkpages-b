@@ -66,6 +66,9 @@ class AdminServiceTest {
         // Rejection now frees the name the row was holding, so the mock must return a Future here
         // too; unstubbed it hands back null and the compose chain NPEs.
         when(managerRepo.parkSlugAsRejected(anyLong())).thenReturn(Future.succeededFuture());
+        // Career history now owns the headline, so every path that touches a career entry ends by
+        // rebuilding it. The mock must return a Future here too.
+        when(managerRepo.syncHeadlineFromCareerHistory(anyLong())).thenReturn(Future.succeededFuture());
         /*
             Approval now moves the row out of the "-pending" slug namespace onto the clean name,
             which means three more repository calls on this path. Unstubbed, Mockito returns null

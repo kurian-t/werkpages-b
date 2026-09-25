@@ -2522,6 +2522,51 @@ paths:
         '403':
           description: Forbidden
 
+  /api/admin/slug-reclaim-candidates:
+    get:
+      operationId: listSlugReclaimCandidates
+      summary: Live managers whose plain name slug has become free (admin only)
+      description: >
+        A slug is chosen at INSERT against whatever held the name then - often a row no visitor
+        could reach, such as a draft captured mid-typing or a manager later rejected. Those rows
+        now live in their own namespaces, which frees the plain names, but nothing goes back to
+        move the real manager onto them.
+
+
+        Listed rather than repaired automatically, because moving a live slug changes a public and
+        possibly indexed URL. The old address keeps resolving through manager_url_history.
+      tags:
+        - Admin
+      parameters:
+        - in: query
+          name: limit
+          required: false
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: Candidates
+        '403':
+          description: Forbidden
+
+  /api/admin/managers/{managerId}/reclaim-slug:
+    post:
+      operationId: reclaimManagerSlug
+      summary: Move a manager onto its plain name slug (admin only)
+      tags:
+        - Admin
+      parameters:
+        - in: path
+          name: managerId
+          required: true
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: Whether the slug moved, and what it is now
+        '403':
+          description: Forbidden
+
   /api/admin/pending-managers/{managerId}/slug-preview:
     get:
       operationId: previewApprovalSlug

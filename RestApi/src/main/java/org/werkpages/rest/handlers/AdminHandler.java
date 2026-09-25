@@ -122,6 +122,31 @@ public class AdminHandler {
 
     // ── POST /api/admin/pending-managers/:managerId/approve ──────────────────
 
+    /** Live managers on a suffixed slug whose plain name has since become free. */
+    public void handleListSlugReclaimCandidates(RoutingContext ctx) {
+        String auth0Id = ctx.get("auth0Id");
+        int limit = ctx.queryParam("limit").stream().findFirst()
+            .map(v -> { try { return Integer.parseInt(v); } catch (Exception e) { return 50; } })
+            .orElse(50);
+        service.listSlugReclaimCandidates(auth0Id, Math.min(Math.max(limit, 1), 200))
+            .onSuccess(json -> ctx.response().putHeader("Content-Type", "application/json").end(json.encode()))
+            .onFailure(err -> ManagersHandler.handleError(ctx, err));
+    }
+
+    /** Moves one manager onto the plain name, recording the URL it leaves behind. */
+    public void handleReclaimManagerSlug(RoutingContext ctx) {
+        String auth0Id = ctx.get("auth0Id");
+        long managerId;
+        try {
+            managerId = Long.parseLong(ctx.pathParam("managerId"));
+        } catch (Exception e) {
+            bad(ctx, "Invalid manager ID"); return;
+        }
+        service.reclaimManagerSlug(auth0Id, managerId)
+            .onSuccess(json -> ctx.response().putHeader("Content-Type", "application/json").end(json.encode()))
+            .onFailure(err -> ManagersHandler.handleError(ctx, err));
+    }
+
     /**
      * What approving this manager would do to its slug - asked before approving, not after.
      *

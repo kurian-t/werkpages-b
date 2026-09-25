@@ -29,9 +29,11 @@ public class MergeSuggestionsRepository {
                     a.id AS id_a, a.name AS name_a, a.company AS company_a,
                     a.title AS title_a, a.country AS country_a, a.state AS state_a,
                     a.city AS city_a, COALESCE(a.reviews_count, 0) AS reviews_a,
+                    a.slug AS slug_a,
                     b.id AS id_b, b.name AS name_b, b.company AS company_b,
                     b.title AS title_b, b.country AS country_b, b.state AS state_b,
                     b.city AS city_b, COALESCE(b.reviews_count, 0) AS reviews_b,
+                    b.slug AS slug_b,
                     ms.id AS suggestion_id,
                     ms.reviews_a_at_eval, ms.reviews_b_at_eval
                 FROM managers a

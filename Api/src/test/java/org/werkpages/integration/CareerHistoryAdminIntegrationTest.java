@@ -158,6 +158,128 @@ class CareerHistoryAdminIntegrationTest {
     }
 
     // ══════════════════════════════════════════════════════════════════════════
+    // The headline follows the roles
+    //
+    // This page has been repaired repeatedly and kept coming back, because three tables each owned
+    // part of one truth: the header from the `managers` row, the role cards from career_history,
+    // the trajectory's dates from reviews. Editing one surface left the others behind. These pin
+    // the rule that career history owns the headline, so the drift cannot return unnoticed.
+    // ══════════════════════════════════════════════════════════════════════════
+
+    /**
+     * Moving a manager to a newer role moves the header with them.
+     *
+     * <p>Reported from production: a manager given a newer role at a different company went on
+     * showing the old company's name, logo and title at the top of their profile, with a Retired
+     * badge, no matter how many times the change was approved. Nothing derived the header from the
+     * roles beneath it.
+     */
+    @Test
+    void editingTheCurrentRole_movesTheHeaderCompanyTitleAndStatus() throws Exception {
+        String adminAuth = insertUser("auth0|ch-headline01", "ChHeadline01", "admin");
+        long managerId   = insertManager("Ketti Ciarniello", "Lime", "Assistant Treasurer");
+        long entryId     = insertCareerEntry(managerId, "Lime", "Assistant Treasurer", "2024");
+
+        await(service.adminUpdateCareerEntry(
+            adminAuth, managerId, entryId, "ICAT Logistics", "Director of Treasury", "2026", null));
+
+        Row m = managerRow(managerId);
+        assertEquals("ICAT Logistics", m.getString("company"),
+            "the header must name the company the manager is actually at");
+        assertEquals("Director of Treasury", m.getString("title"));
+        assertEquals("active", m.getString("status"),
+            "an open role means they are active - the Retired badge was left over from the old row");
+    }
+
+    /**
+     * Closing the only role retires the manager.
+     *
+     * <p>Nobody is "actively leading" a role that has an end date, so status is derived rather
+     * than left to whatever was set last.
+     */
+    @Test
+    void closingTheOnlyRole_marksTheManagerRetired() throws Exception {
+        String adminAuth = insertUser("auth0|ch-headline02", "ChHeadline02", "admin");
+        long managerId   = insertManager("Ketti Ciarniello", "Lime", "Assistant Treasurer");
+        long entryId     = insertCareerEntry(managerId, "Lime", "Assistant Treasurer", "2024");
+
+        await(service.adminUpdateCareerEntry(
+            adminAuth, managerId, entryId, "Lime", "Assistant Treasurer", "2024", "2026"));
+
+        assertEquals("retired", managerRow(managerId).getString("status"),
+            "every role has ended, so the manager cannot still be active");
+    }
+
+    /**
+     * With several roles, the open one decides the header - not the newest row written.
+     *
+     * <p>The trajectory shows roles in both directions, and an admin correcting an old one must
+     * not drag the header backwards onto a company the manager left years ago.
+     */
+    @Test
+    void withSeveralRoles_theOpenOneDecidesTheHeader() throws Exception {
+        String adminAuth = insertUser("auth0|ch-headline03", "ChHeadline03", "admin");
+        long managerId   = insertManager("Ketti Ciarniello", "ICAT Logistics", "Director of Treasury");
+        long oldEntry    = insertCareerEntry(managerId, "Lime", "Assistant Treasurer", "2024");
+        await(pool.preparedQuery("UPDATE career_history SET end_date = '2026-01-01T00:00:00Z' WHERE id = $1")
+            .execute(Tuple.of(oldEntry)).mapEmpty());
+        insertCareerEntry(managerId, "ICAT Logistics", "Director of Treasury", "2026");
+
+        // Correcting the OLD, closed role.
+        await(service.adminUpdateCareerEntry(
+            adminAuth, managerId, oldEntry, "Lime", "Assistant Treasurer", "2023", "2026-01"));
+
+        Row m = managerRow(managerId);
+        assertEquals("ICAT Logistics", m.getString("company"),
+            "the current role still decides the header, whichever row was edited");
+        assertEquals("active", m.getString("status"));
+    }
+
+    /**
+     * Deleting the current role falls back to the most recent remaining one.
+     *
+     * <p>The Delete button on the trajectory wrote career_history and stopped, leaving the header
+     * advertising a role that no longer existed anywhere.
+     */
+    @Test
+    void deletingTheCurrentRole_fallsBackToTheMostRecentRemainingOne() throws Exception {
+        String adminAuth = insertUser("auth0|ch-headline04", "ChHeadline04", "admin");
+        long managerId   = insertManager("Ketti Ciarniello", "ICAT Logistics", "Director of Treasury");
+        long oldEntry    = insertCareerEntry(managerId, "Lime", "Assistant Treasurer", "2024");
+        await(pool.preparedQuery("UPDATE career_history SET end_date = '2026-01-01T00:00:00Z' WHERE id = $1")
+            .execute(Tuple.of(oldEntry)).mapEmpty());
+        long currentEntry = insertCareerEntry(managerId, "ICAT Logistics", "Director of Treasury", "2026");
+
+        await(service.adminDeleteCareerEntry(adminAuth, managerId, currentEntry));
+
+        Row m = managerRow(managerId);
+        assertEquals("Lime", m.getString("company"),
+            "with the current role gone the header falls back to the last one that remains");
+        assertEquals("retired", m.getString("status"),
+            "and that role has ended, so the manager is retired");
+    }
+
+    /** A manager with no career history is left exactly as they are. */
+    @Test
+    void aManagerWithNoCareerHistory_keepsTheHeadlineTheyHave() throws Exception {
+        long managerId = insertManager("No History", "Solo Corp", "Founder");
+
+        await(managerRepo.syncHeadlineFromCareerHistory(managerId));
+
+        Row m = managerRow(managerId);
+        assertEquals("Solo Corp", m.getString("company"),
+            "there is nothing to derive from, and inventing a headline is worse than keeping it");
+        assertEquals("Founder", m.getString("title"));
+    }
+
+    private Row managerRow(long managerId) throws Exception {
+        return await(pool
+            .preparedQuery("SELECT company, title, status, company_id FROM managers WHERE id = $1")
+            .execute(Tuple.of(managerId))
+            .map(rs -> rs.iterator().next()));
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
     // adminUpdateCareerEntry — success paths
     // ══════════════════════════════════════════════════════════════════════════
 

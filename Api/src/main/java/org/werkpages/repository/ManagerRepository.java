@@ -667,6 +667,72 @@ public class ManagerRepository {
     }
 
     /**
+     * The career entry a manager is currently in, if any.
+     *
+     * <p>"Current" is the open entry - {@code end_date IS NULL} - and the most recently started
+     * one when several are open. Defined once here so every caller agrees; it was previously
+     * re-expressed in each query that needed it.
+     */
+    public Future<Optional<Row>> findOpenCareerEntry(long managerId) {
+        return db.preparedQuery("""
+                SELECT id, company, company_id, title, start_date, end_date
+                  FROM career_history
+                 WHERE manager_id = $1 AND end_date IS NULL
+                 ORDER BY start_date DESC NULLS LAST
+                 LIMIT 1
+                """)
+            .execute(Tuple.of(managerId))
+            .map(rows -> rows.iterator().hasNext()
+                ? Optional.of(rows.iterator().next())
+                : Optional.empty());
+    }
+
+    /**
+     * Rebuilds the manager's headline from their career history.
+     *
+     * <p><b>This exists because three tables each owned part of the same truth and nothing
+     * reconciled them.</b> The header came from the {@code managers} row, the role cards from
+     * {@code career_history}, and the trajectory's dates from {@code reviews} - so a manager could
+     * be shown at Lime, listed at ICAT, and dated from whenever their reviewer happened to work
+     * there. Editing one surface silently left the others behind, which is why this page has been
+     * repaired repeatedly and kept coming back.
+     *
+     * <p>Career history is now the owner of company, company_id, title, logo and retirement.
+     * Every path that changes a career entry ends here, so the headline cannot drift from the
+     * roles beneath it rather than being re-synchronised by hand at each call site.
+     *
+     * <p>The current role wins; with none open the most recent closed one does, and the manager is
+     * retired by definition - nobody is "actively leading" a role that has an end date. A manager
+     * with no career history at all is left completely alone: there is nothing to derive from, and
+     * inventing a headline would be worse than keeping the one they have.
+     */
+    public Future<Void> syncHeadlineFromCareerHistory(long managerId) {
+        return db.preparedQuery("""
+                UPDATE managers m
+                   SET company        = ch.company,
+                       company_id     = COALESCE(ch.company_id, m.company_id),
+                       title          = ch.title,
+                       company_logo_url = COALESCE(c.logo_url, m.company_logo_url),
+                       status         = CASE WHEN ch.end_date IS NULL THEN 'active' ELSE 'retired' END,
+                       updated_at     = now()
+                  FROM (
+                        SELECT DISTINCT ON (manager_id)
+                               manager_id, company, company_id, title, end_date
+                          FROM career_history
+                         WHERE manager_id = $1
+                         ORDER BY manager_id,
+                                  (end_date IS NULL) DESC,
+                                  start_date DESC NULLS LAST,
+                                  id DESC
+                       ) ch
+                  LEFT JOIN companies c ON c.id = ch.company_id
+                 WHERE m.id = ch.manager_id
+                """)
+            .execute(Tuple.of(managerId))
+            .mapEmpty();
+    }
+
+    /**
      * Start date of the manager's genuinely-current role: the open (end_date IS NULL) career
      * entry with the latest start_date. Returns empty when the manager has no open career entry
      * (callers fall back to the manager's created_at as the implicit current-role start).
@@ -1453,6 +1519,42 @@ public class ManagerRepository {
                         : Future.succeededFuture(false));
                 });
             });
+    }
+
+    /**
+     * Live managers sitting on a company-suffixed slug whose plain name is now free.
+     *
+     * <p>A slug is decided once, at INSERT, against whatever held the name at that instant - and
+     * what held it was often a row no visitor could reach. A draft captured mid-typing, or a
+     * manager later rejected, took {@code silvea-chowdhury}, so the real person was pushed onto
+     * {@code silvea-chowdhury-acs-athletics} and stayed there. No merge was involved; the name was
+     * simply taken at the wrong moment by something invisible.
+     *
+     * <p>Once the pending and rejected namespaces free those names, the plain slug is available
+     * again - but nothing goes back to check. This finds exactly those rows.
+     *
+     * <p>Deliberately not a migration. Moving a live slug changes a public, possibly indexed URL,
+     * so it is offered to an admin to run when the timing suits rather than firing on deploy.
+     * Conservative: only rows whose plain name is genuinely unheld, so two different people who
+     * share a name are never offered.
+     */
+    public Future<RowSet<Row>> findSlugReclaimCandidates(int limit) {
+        return db.preparedQuery("""
+                SELECT m.id, m.name, m.company, m.slug, m.reviews_count,
+                       regexp_replace(lower(btrim(m.name)), '[^a-z0-9]+', '-', 'g') AS clean_slug
+                  FROM managers m
+                 WHERE m.approval_status IN ('approved', 'ghost')
+                   AND m.slug IS NOT NULL
+                   AND regexp_replace(lower(btrim(m.name)), '[^a-z0-9]+', '-', 'g') <> ''
+                   AND m.slug <> regexp_replace(lower(btrim(m.name)), '[^a-z0-9]+', '-', 'g')
+                   AND NOT EXISTS (
+                         SELECT 1 FROM managers h
+                          WHERE h.slug = regexp_replace(lower(btrim(m.name)), '[^a-z0-9]+', '-', 'g')
+                       )
+                 ORDER BY m.reviews_count DESC NULLS LAST, m.id
+                 LIMIT $1
+                """)
+            .execute(Tuple.of(limit));
     }
 
     /** The namespace hidden rows live in, once an admin has taken them out of circulation. */
