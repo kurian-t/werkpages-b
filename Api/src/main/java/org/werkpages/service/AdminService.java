@@ -1103,6 +1103,53 @@ public class AdminService {
         "SUBSIDIARY_OF", "BRAND_OF", "DIVISION_OF", "OWNED_BY", "FRANCHISE_OF", "JOINT_VENTURE_OF");
 
     /**
+     * Records a role that has no career_history row yet.
+     *
+     * <p>Only update and delete existed. A card on the trajectory can come from three places - a
+     * career_history row, reviews grouped into a segment, or the manager record itself - and only
+     * the first could be edited. Editing either of the others opened the manager panel, which has
+     * no date fields, so the role's dates could never be written <em>anywhere</em>.
+     *
+     * <p>That is why a manager who had plainly left still showed "Present": with no row to carry
+     * an end date, the trajectory fell back to the reviewer's own {@code worked_until}, and no
+     * amount of editing could change it. This is the missing half of the pair.
+     */
+    public Future<JsonObject> adminCreateCareerEntry(String auth0Id, long managerId,
+            String company, String title, String startDateStr, String endDateStr) {
+        return requireAdmin(auth0Id)
+            .compose(adminId -> {
+                if (company == null || company.isBlank()) return Future.failedFuture(ServiceException.badRequest("company required"));
+                if (title   == null || title.isBlank())   return Future.failedFuture(ServiceException.badRequest("title required"));
+                if (startDateStr == null || startDateStr.isBlank()) return Future.failedFuture(ServiceException.badRequest("startDate required"));
+                OffsetDateTime start;
+                OffsetDateTime end = null;
+                try {
+                    start = OffsetDateTime.parse(startDateStr.length() == 4
+                        ? startDateStr + "-01-01T00:00:00Z" : startDateStr + "-01T00:00:00Z");
+                    if (endDateStr != null && !endDateStr.isBlank()) {
+                        end = OffsetDateTime.parse(endDateStr.length() == 4
+                            ? endDateStr + "-01-01T00:00:00Z" : endDateStr + "-01T00:00:00Z");
+                    }
+                } catch (Exception e) {
+                    return Future.failedFuture(ServiceException.badRequest("Invalid date format"));
+                }
+                OffsetDateTime finalStart = start, finalEnd = end;
+                // Resolve the company so the entry carries an id, not just text - the same reason
+                // the update path does it.
+                Future<Long> companyIdFuture = companyRepo != null
+                    ? companyRepo.resolve(null, company.trim(), null, null).map(row -> row.getLong("id"))
+                        .otherwise((Long) null)
+                    : Future.succeededFuture(null);
+                return companyIdFuture.compose(companyId ->
+                    managerRepo.insertCareerEntry(managerId, company.trim(), title.trim(),
+                                                  finalStart, finalEnd, companyId)
+                        // Career history owns the headline; a new role may well be the current one.
+                        .compose(v -> managerRepo.syncHeadlineFromCareerHistory(managerId)));
+            })
+            .map(v -> new JsonObject().put("success", true).put("created", 1));
+    }
+
+    /**
      * Records that one company is part of another. Not a merge: both keep their pages, managers
      * and ratings, and the child stays independently searchable.
      */

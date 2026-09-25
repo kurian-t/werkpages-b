@@ -661,6 +661,24 @@ public class AdminHandler {
 
     // ── PUT /api/admin/managers/:managerId/career-history/:entryId ───────────
 
+    /** Records a role that has no career_history row yet - see adminCreateCareerEntry. */
+    public void handleCreateCareerEntry(RoutingContext ctx) {
+        String auth0Id = ctx.get("auth0Id");
+        long managerId;
+        try {
+            managerId = Long.parseLong(ctx.pathParam("managerId"));
+        } catch (Exception e) {
+            bad(ctx, "Invalid manager ID"); return;
+        }
+        JsonObject body = ctx.body() != null ? ctx.body().asJsonObject() : null;
+        if (body == null) { bad(ctx, "Missing request body"); return; }
+        service.adminCreateCareerEntry(auth0Id, managerId,
+                body.getString("company"), body.getString("title"),
+                body.getString("startDate"), body.getString("endDate"))
+            .onSuccess(json -> ctx.response().putHeader("Content-Type", "application/json").end(json.encode()))
+            .onFailure(err -> ManagersHandler.handleError(ctx, err));
+    }
+
     public void handleUpdateCareerEntry(RoutingContext ctx) {
         String auth0Id = ctx.get("auth0Id");
         long managerId, entryId;

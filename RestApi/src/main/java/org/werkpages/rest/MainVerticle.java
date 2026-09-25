@@ -330,6 +330,7 @@ public class MainVerticle extends AbstractVerticle {
                         routerFactory.addHandlerByOperationId("listRoleAliases",          adminHandler::handleListRoleAliases);
                         routerFactory.addHandlerByOperationId("classifyRoles",            adminHandler::handleClassifyRoles);
                         routerFactory.addHandlerByOperationId("setRoleAlias",             adminHandler::handleSetRoleAlias);
+                        routerFactory.addHandlerByOperationId("adminCreateCareerEntry",   adminHandler::handleCreateCareerEntry);
                         routerFactory.addHandlerByOperationId("adminUpdateCareerEntry",   adminHandler::handleUpdateCareerEntry);
                         routerFactory.addHandlerByOperationId("adminDeleteCareerEntry",   adminHandler::handleDeleteCareerEntry);
                         routerFactory.addHandlerByOperationId("getAdminCountryStats",     adminHandler::handleGetCountryStats);

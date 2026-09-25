@@ -338,6 +338,40 @@ class CareerHistoryAdminIntegrationTest {
             "a rated role nobody recorded must not vanish from the trajectory");
     }
 
+    /**
+     * A role with no career_history row can be recorded, and that is what ends "Present".
+     *
+     * <p>Only update and delete existed. A trajectory card can come from a career_history row,
+     * from reviews grouped into a segment, or from the manager record - and only the first had an
+     * id, so for the other two there was nowhere to write dates at all. The panel therefore kept
+     * falling back to the reviewer's own {@code worked_until}, and a manager who had plainly left
+     * read "Present" however many times an admin edited it.
+     */
+    @Test
+    void recordingARoleThatHadNoRow_endsThePresentFallback() throws Exception {
+        String adminAuth = insertUser("auth0|ch-create01", "ChCreate01", "admin");
+        long managerId   = insertManager("Ketti Ciarniello", "Lime", "Assistant Treasurer");
+
+        // Reviewed, but never recorded as a role - and the reviewer is still there.
+        await(pool.preparedQuery(
+                "INSERT INTO reviews(manager_id, author, overall_rating, manager_company, manager_title, "
+              + "worked_from, worked_until, created_at, updated_at) "
+              + "VALUES ($1,'Someone',4.3,'Lime','Assistant Treasurer','2024-01-01',NULL,now(),now())")
+            .execute(Tuple.of(managerId)).mapEmpty());
+        assertTrue(segmentFor(managerId, "Lime").getBoolean("is_current"),
+            "precondition: with no row recorded, the reviewer's dates are all there is");
+
+        await(service.adminCreateCareerEntry(
+            adminAuth, managerId, "Lime", "Assistant Treasurer", "2024", "2026"));
+
+        Row seg = segmentFor(managerId, "Lime");
+        assertFalse(seg.getBoolean("is_current"),
+            "once the role is recorded with an end date it is no longer current");
+        assertNotNull(seg.getLocalDate("end_date"), "and the panel shows that end date");
+        assertEquals("retired", managerRow(managerId).getString("status"),
+            "and the headline follows, because career history owns it");
+    }
+
     private Row segmentFor(long managerId, String company) throws Exception {
         var rows = await(new org.werkpages.repository.ReviewRepository(pool)
             .findCareerSegmentsByManager(managerId, 50, 0));

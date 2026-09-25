@@ -3223,6 +3223,44 @@ paths:
         '403':
           description: Forbidden
 
+  /api/admin/managers/{managerId}/career-history:
+    post:
+      operationId: adminCreateCareerEntry
+      summary: Record a role that has no career-history row yet (admin only)
+      description: >
+        Only update and delete existed. A trajectory card can come from a career_history row, from
+        reviews grouped into a segment, or from the manager record - and only the first could be
+        edited, so a role's dates could not be written at all for the other two. That is why a
+        manager who had left still showed "Present": with no row to hold an end date, the panel
+        fell back to the reviewer's own dates.
+      tags:
+        - Admin
+      parameters:
+        - in: path
+          name: managerId
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [company, title, startDate]
+              properties:
+                company:   { type: string }
+                title:     { type: string }
+                startDate: { type: string }
+                endDate:   { type: string, nullable: true }
+      responses:
+        '200':
+          description: Created
+        '400':
+          description: Invalid input
+        '403':
+          description: Forbidden
+
   /api/admin/managers/{managerId}/career-history/{entryId}:
     put:
       operationId: adminUpdateCareerEntry
