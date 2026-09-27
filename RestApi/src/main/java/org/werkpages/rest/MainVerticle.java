@@ -47,6 +47,8 @@ import org.werkpages.repository.MergeSuggestionsRepository;
 import org.werkpages.repository.ResumeRepository;
 
 import org.werkpages.service.MaintenanceSweep;
+import org.werkpages.service.BrandfetchClient;
+import org.werkpages.service.DomainResolver;
 import io.vertx.core.AbstractVerticle;
 import io.vertx.core.Vertx;
 import io.vertx.core.http.HttpMethod;
@@ -165,8 +167,19 @@ public class MainVerticle extends AbstractVerticle {
                             defers the first run by a full period, and since every deploy restarts
                             this process, a daily sweep scheduled that way never ran at all.
                         */
+                        /*
+                          Brandfetch resolves a company's logo server-side, once, and the sweep
+                          refreshes it before its signed URL lapses. The client id is
+                          publishable - the browser bundle carries the same value - so it comes
+                          from the environment rather than the secret store. Absent, the sweep
+                          simply skips that step and logos fall through to the letter tile.
+                        */
+                        String brandfetchClientId = System.getenv("BRANDFETCH_CLIENT_ID");
                         new MaintenanceSweep(reviewRepo, managerRepo, companyRepo,
-                                             proofChallengeRepo, confidenceRepo)
+                                             proofChallengeRepo, confidenceRepo,
+                                             new BrandfetchClient(vertx, brandfetchClientId))
+                            .withResolver(new DomainResolver(vertx,
+                                System.getenv("LOGODEV_SECRET_KEY"), brandfetchClientId))
                             .schedule(vertx);
 
                         // ── company_stats_live reconciliation (safety net — primary updates go
@@ -296,6 +309,8 @@ public class MainVerticle extends AbstractVerticle {
                         routerFactory.addHandlerByOperationId("getAdminPendingEdits",     adminHandler::handleGetPendingEdits);
                         routerFactory.addHandlerByOperationId("approveManagerEdit",       adminHandler::handleApproveEdit);
                         routerFactory.addHandlerByOperationId("rejectManagerEdit",        adminHandler::handleRejectEdit);
+                        routerFactory.addHandlerByOperationId("adminGetReviews",          adminHandler::handleGetReviews);
+                        routerFactory.addHandlerByOperationId("adminDeleteReview",        adminHandler::handleDeleteReview);
                         routerFactory.addHandlerByOperationId("getAdminUsers",            adminHandler::handleGetUsers);
                         routerFactory.addHandlerByOperationId("getAdminBannedUsers",      adminHandler::handleGetBannedUsers);
                         routerFactory.addHandlerByOperationId("banUser",                  adminHandler::handleBanUser);

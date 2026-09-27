@@ -29,6 +29,9 @@ public class ManagerRepository {
                 m.category_averages, m.linkedin_url, m.company_logo_url, m.country,
                 m.created_at, m.submitted_by, m.company_id, m.slug,
                 c.slug AS company_slug,
+                -- The company's RESOLVED identity, for the logo chain. Never a guessed domain.
+                c.domain AS company_domain,
+                c.brandfetch_icon_url AS company_brandfetch_icon_url,
                 c.industry AS industry,
                 COALESCE(ch.career_history, '[]') AS career_history,
                 COALESCE(r.reviews, '[]') AS reviews
@@ -76,6 +79,9 @@ public class ManagerRepository {
                 m.category_averages, m.linkedin_url, m.company_logo_url, m.country, m.created_at,
                 m.submitted_by, m.external_id, m.company_id, m.slug,
                 c.slug AS company_slug,
+                -- The company's RESOLVED identity, for the logo chain. Never a guessed domain.
+                c.domain AS company_domain,
+                c.brandfetch_icon_url AS company_brandfetch_icon_url,
                 c.industry AS industry,
                 COALESCE(
                     json_agg(json_build_object(
@@ -171,7 +177,7 @@ public class ManagerRepository {
                   AND m.company_id = ANY($4)
                   AND (m.approval_status IN ('approved','ghost')
                        OR (m.approval_status = 'pending_approval' AND m.search_created_by_user_id = $5))
-                GROUP BY m.id, c.slug, c.industry
+                GROUP BY m.id, c.slug, c.industry, c.domain, c.brandfetch_icon_url
                 """ + orderBy + " LIMIT $1 OFFSET $2")
             .execute(Tuple.of(limit, offset, searchPattern,
                               companyIds.toArray(new Long[0]), userId));
@@ -191,30 +197,30 @@ public class ManagerRepository {
 
         if (userId != null) {
             if (hasSearch && hasCompany) {
-                sql   = SELECT_BODY + "WHERE (m.name ILIKE $3 OR m.company ILIKE $3 OR m.title ILIKE $3) AND m.company ILIKE $4 AND (m.approval_status IN ('approved','ghost') OR (m.approval_status = 'pending_approval' AND m.search_created_by_user_id = $5)) GROUP BY m.id, c.slug, c.industry " + orderBy + " LIMIT $1 OFFSET $2";
+                sql   = SELECT_BODY + "WHERE (m.name ILIKE $3 OR m.company ILIKE $3 OR m.title ILIKE $3) AND m.company ILIKE $4 AND (m.approval_status IN ('approved','ghost') OR (m.approval_status = 'pending_approval' AND m.search_created_by_user_id = $5)) GROUP BY m.id, c.slug, c.industry, c.domain, c.brandfetch_icon_url " + orderBy + " LIMIT $1 OFFSET $2";
                 tuple = Tuple.of(limit, offset, searchPattern, companyPattern, userId);
             } else if (hasSearch) {
-                sql   = SELECT_BODY + "WHERE (m.name ILIKE $3 OR m.company ILIKE $3 OR m.title ILIKE $3) AND (m.approval_status IN ('approved','ghost') OR (m.approval_status = 'pending_approval' AND m.search_created_by_user_id = $4)) GROUP BY m.id, c.slug, c.industry " + orderBy + " LIMIT $1 OFFSET $2";
+                sql   = SELECT_BODY + "WHERE (m.name ILIKE $3 OR m.company ILIKE $3 OR m.title ILIKE $3) AND (m.approval_status IN ('approved','ghost') OR (m.approval_status = 'pending_approval' AND m.search_created_by_user_id = $4)) GROUP BY m.id, c.slug, c.industry, c.domain, c.brandfetch_icon_url " + orderBy + " LIMIT $1 OFFSET $2";
                 tuple = Tuple.of(limit, offset, searchPattern, userId);
             } else if (hasCompany) {
-                sql   = SELECT_BODY + "WHERE m.company ILIKE $3 AND (m.approval_status IN ('approved','ghost') OR (m.approval_status = 'pending_approval' AND m.search_created_by_user_id = $4)) GROUP BY m.id, c.slug, c.industry " + orderBy + " LIMIT $1 OFFSET $2";
+                sql   = SELECT_BODY + "WHERE m.company ILIKE $3 AND (m.approval_status IN ('approved','ghost') OR (m.approval_status = 'pending_approval' AND m.search_created_by_user_id = $4)) GROUP BY m.id, c.slug, c.industry, c.domain, c.brandfetch_icon_url " + orderBy + " LIMIT $1 OFFSET $2";
                 tuple = Tuple.of(limit, offset, companyPattern, userId);
             } else {
-                sql   = SELECT_BODY + "WHERE (m.approval_status IN ('approved','ghost') OR (m.approval_status = 'pending_approval' AND m.search_created_by_user_id = $3)) GROUP BY m.id, c.slug, c.industry " + orderBy + " LIMIT $1 OFFSET $2";
+                sql   = SELECT_BODY + "WHERE (m.approval_status IN ('approved','ghost') OR (m.approval_status = 'pending_approval' AND m.search_created_by_user_id = $3)) GROUP BY m.id, c.slug, c.industry, c.domain, c.brandfetch_icon_url " + orderBy + " LIMIT $1 OFFSET $2";
                 tuple = Tuple.of(limit, offset, userId);
             }
         } else {
             if (hasSearch && hasCompany) {
-                sql   = SELECT_BODY + "WHERE (m.name ILIKE $3 OR m.company ILIKE $3 OR m.title ILIKE $3) AND m.company ILIKE $4 AND m.approval_status IN ('approved','ghost') GROUP BY m.id, c.slug, c.industry " + orderBy + " LIMIT $1 OFFSET $2";
+                sql   = SELECT_BODY + "WHERE (m.name ILIKE $3 OR m.company ILIKE $3 OR m.title ILIKE $3) AND m.company ILIKE $4 AND m.approval_status IN ('approved','ghost') GROUP BY m.id, c.slug, c.industry, c.domain, c.brandfetch_icon_url " + orderBy + " LIMIT $1 OFFSET $2";
                 tuple = Tuple.of(limit, offset, searchPattern, companyPattern);
             } else if (hasSearch) {
-                sql   = SELECT_BODY + "WHERE (m.name ILIKE $3 OR m.company ILIKE $3 OR m.title ILIKE $3) AND m.approval_status IN ('approved','ghost') GROUP BY m.id, c.slug, c.industry " + orderBy + " LIMIT $1 OFFSET $2";
+                sql   = SELECT_BODY + "WHERE (m.name ILIKE $3 OR m.company ILIKE $3 OR m.title ILIKE $3) AND m.approval_status IN ('approved','ghost') GROUP BY m.id, c.slug, c.industry, c.domain, c.brandfetch_icon_url " + orderBy + " LIMIT $1 OFFSET $2";
                 tuple = Tuple.of(limit, offset, searchPattern);
             } else if (hasCompany) {
-                sql   = SELECT_BODY + "WHERE m.company ILIKE $3 AND m.approval_status IN ('approved','ghost') GROUP BY m.id, c.slug, c.industry " + orderBy + " LIMIT $1 OFFSET $2";
+                sql   = SELECT_BODY + "WHERE m.company ILIKE $3 AND m.approval_status IN ('approved','ghost') GROUP BY m.id, c.slug, c.industry, c.domain, c.brandfetch_icon_url " + orderBy + " LIMIT $1 OFFSET $2";
                 tuple = Tuple.of(limit, offset, companyPattern);
             } else {
-                sql   = SELECT_BODY + "WHERE m.approval_status IN ('approved','ghost') GROUP BY m.id, c.slug, c.industry " + orderBy + " LIMIT $1 OFFSET $2";
+                sql   = SELECT_BODY + "WHERE m.approval_status IN ('approved','ghost') GROUP BY m.id, c.slug, c.industry, c.domain, c.brandfetch_icon_url " + orderBy + " LIMIT $1 OFFSET $2";
                 tuple = Tuple.of(limit, offset);
             }
         }
@@ -310,12 +316,35 @@ public class ManagerRepository {
 
     public Future<RowSet<Row>> findPendingByUser(UUID userId) {
         return db.preparedQuery("""
-                SELECT id, name, company, company_id, title, image, overall_rating, reviews_count,
-                       bio, status, approval_status, linkedin_url, company_logo_url, country, created_at
-                FROM managers
-                WHERE submitted_by = $1 AND approval_status IN ('pending_approval', 'rejected')
-                  AND search_created_by_user_id IS NULL
-                ORDER BY created_at DESC LIMIT 200
+                SELECT m.id, m.name, m.company, m.company_id, m.title, m.image, m.overall_rating,
+                       m.reviews_count, m.bio, m.status, m.approval_status, m.linkedin_url,
+                       m.company_logo_url, m.country, m.created_at,
+                       /*
+                         The employer's resolved identity, so a pending card renders the same
+                         logo the directory does.
+
+                         Resolved by foreign key FIRST, then by exact name. A pending manager is
+                         often linked to a half-typed fragment - the add form commits a company
+                         while somebody is still typing, so a submission labelled "Discord" can
+                         point at a row called "Di". The label is right and the key is wrong, and
+                         the tile showed a letter beside identical tiles that rendered.
+
+                         The name match is exact and case-insensitive against our OWN resolved
+                         companies - not a guess about the outside world - and company names are
+                         unique case-insensitively, so it cannot pick the wrong row.
+                       */
+                       COALESCE(c.domain, byname.domain) AS company_domain,
+                       COALESCE(c.brandfetch_icon_url, byname.brandfetch_icon_url)
+                           AS company_brandfetch_icon_url
+                FROM managers m
+                LEFT JOIN companies c ON c.id = m.company_id
+                LEFT JOIN companies byname
+                       ON NULLIF(c.domain, '') IS NULL
+                      AND LOWER(TRIM(byname.name)) = LOWER(TRIM(m.company))
+                      AND NULLIF(byname.domain, '') IS NOT NULL
+                WHERE m.submitted_by = $1 AND m.approval_status IN ('pending_approval', 'rejected')
+                  AND m.search_created_by_user_id IS NULL
+                ORDER BY m.created_at DESC LIMIT 200
                 """)
             .execute(Tuple.of(userId));
     }
@@ -1125,7 +1154,7 @@ public class ManagerRepository {
                         )
                       )
                   AND m.approval_status IN ('approved', 'ghost', 'pending_approval')
-                GROUP BY m.id, c.slug, c.industry
+                GROUP BY m.id, c.slug, c.industry, c.domain, c.brandfetch_icon_url
                 ORDER BY (m.company ILIKE $2) DESC, m.reviews_count DESC, m.id ASC
                 LIMIT 5
                 """)
@@ -1163,7 +1192,7 @@ public class ManagerRepository {
                 WHERE m.name ILIKE $1
                   AND m.company ILIKE $2
                   AND m.approval_status IN ('approved', 'ghost')
-                GROUP BY m.id, c.slug, c.industry
+                GROUP BY m.id, c.slug, c.industry, c.domain, c.brandfetch_icon_url
                 ORDER BY m.reviews_count DESC, m.id ASC
                 LIMIT 5
                 """)

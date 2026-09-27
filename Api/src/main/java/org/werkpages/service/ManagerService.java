@@ -272,6 +272,16 @@ public class ManagerService {
                         .put("interviewCount",  row.getLong("interview_count"))
                         .put("interviewRating", row.getBigDecimal("interview_avg_rating"));
                     if (logoUrl != null && !logoUrl.isBlank()) co.put("logoUrl", logoUrl);
+                    /*
+                      The resolved identity, for the logo chain. A provider is only ever given a
+                      domain somebody established - never one derived from the name, because a
+                      guess that resolves renders another company's logo with full confidence.
+                      Absent until resolution has run, and absent means "show the letter".
+                    */
+                    String resolvedDomain = row.getString("domain");
+                    String bfIcon         = row.getString("brandfetch_icon_url");
+                    if (resolvedDomain != null && !resolvedDomain.isBlank()) co.put("domain", resolvedDomain);
+                    if (bfIcon != null && !bfIcon.isBlank()) co.put("brandfetchIconUrl", bfIcon);
                     companies.add(co);
                 }
                 return new JsonObject().put("data", companies);
@@ -349,6 +359,7 @@ public class ManagerService {
                                 .put("slug",           row.getString("slug"))
                                 .put("approvalStatus", row.getString("approval_status"));
                             if (mgrLogoUrl != null && !mgrLogoUrl.isBlank()) mgr.put("companyLogoUrl", mgrLogoUrl);
+                    putCompanyIdentity(mgr, row);
                             managers.add(mgr);
                         }
                         JsonObject categoryAverages = new JsonObject();
@@ -637,6 +648,7 @@ public class ManagerService {
                 .put("slug",           row.getString("slug"))
                 .put("approvalStatus", row.getString("approval_status"));
             if (mgrLogoUrl != null && !mgrLogoUrl.isBlank()) mgr.put("companyLogoUrl", mgrLogoUrl);
+                    putCompanyIdentity(mgr, row);
             managers.add(mgr);
         }
         JsonObject categoryAverages = new JsonObject();
@@ -656,6 +668,18 @@ public class ManagerService {
             .put("categoryAverages", categoryAverages)
             .put("managers",         managers);
         if (finalLogoUrl != null && !finalLogoUrl.isBlank()) result.put("logoUrl", finalLogoUrl);
+        /*
+          The company's own resolved identity, so its header renders the same logo its tile does.
+          Read from the company row rather than derived from the name - a guessed domain that
+          resolves shows a different company's mark with full confidence.
+        */
+        if (!managers.isEmpty()) {
+            JsonObject first = managers.getJsonObject(0);
+            String cDomain = first.getString("companyDomain");
+            String cIcon   = first.getString("companyBrandfetchIconUrl");
+            if (cDomain != null && !cDomain.isBlank()) result.put("domain", cDomain);
+            if (cIcon   != null && !cIcon.isBlank())   result.put("brandfetchIconUrl", cIcon);
+        }
         return result;
     }
 
@@ -954,6 +978,9 @@ public class ManagerService {
                         .put("title", row.getString("title"))
                         .put("overallRating", row.getBigDecimal("overall_rating"))
                         .put("companyLogoUrl", row.getString("company_logo_url"))
+            // The company's resolved identity, for the logo chain. Never a guessed domain.
+            .put("companyDomain", identityOrNull(row, "company_domain"))
+            .put("companyBrandfetchIconUrl", identityOrNull(row, "company_brandfetch_icon_url"))
                         .put("approvalStatus", row.getString("approval_status"))
                     );
                 }
@@ -3784,6 +3811,9 @@ public class ManagerService {
             .put("status",         row.getString("status"))
             .put("country",        row.getString("country"))
             .put("companyLogoUrl", row.getString("company_logo_url"))
+            // The company's resolved identity, for the logo chain. Never a guessed domain.
+            .put("companyDomain", identityOrNull(row, "company_domain"))
+            .put("companyBrandfetchIconUrl", identityOrNull(row, "company_brandfetch_icon_url"))
             .put("approvalStatus", row.getString("approval_status"))
             // Industry of the manager's company, for the third line on manager cards.
             // Null until the AI classifier has run for that company.
@@ -3802,5 +3832,55 @@ public class ManagerService {
     private static String optionalString(Row row, String column) {
         int index = row.getColumnIndex(column);
         return index < 0 ? null : row.getString(index);
+    }
+
+    /**
+     * Attaches the company's resolved domain and Brandfetch icon to a manager payload.
+     *
+     * <p>One helper rather than four copies: every surface that renders a company logo needs the
+     * same two fields, and the one time they were threaded through a single call site the other
+     * seven kept showing letters.
+     *
+     * <p>Both are omitted when absent, which the client reads as "no identity established" and
+     * renders its own letter tile.
+     */
+    private static void putCompanyIdentity(io.vertx.core.json.JsonObject target,
+                                           io.vertx.sqlclient.Row row) {
+        if (row.getColumnIndex("company_domain") >= 0) {
+            String d = row.getString("company_domain");
+            if (d != null && !d.isBlank()) target.put("companyDomain", d);
+        }
+        if (row.getColumnIndex("company_brandfetch_icon_url") >= 0) {
+            String i = row.getString("company_brandfetch_icon_url");
+            if (i != null && !i.isBlank()) target.put("companyBrandfetchIconUrl", i);
+        }
+    }
+
+    /** A company-identity column when the query selected it, else null. */
+    private static String identityOrNull(io.vertx.sqlclient.Row row, String column) {
+        if (row.getColumnIndex(column) < 0) return null;
+        String v = row.getString(column);
+        return v == null || v.isBlank() ? null : v;
+    }
+
+    /**
+     * Brandfetch icons we already hold, keyed by lowercase domain.
+     *
+     * <p>Used by the company picker so its suggestions can show a logo even while logo.dev's
+     * monthly quota is exhausted. Reads our own table only.
+     */
+    public io.vertx.core.Future<java.util.Map<String, String>> iconsByDomain(java.util.List<String> domains) {
+        if (companyRepo == null || domains == null || domains.isEmpty()) {
+            return io.vertx.core.Future.succeededFuture(java.util.Map.of());
+        }
+        return companyRepo.findIconsByDomains(domains).map(rows -> {
+            java.util.Map<String, String> out = new java.util.HashMap<>();
+            for (io.vertx.sqlclient.Row r : rows) {
+                String d = r.getString("domain");
+                String i = r.getString("brandfetch_icon_url");
+                if (d != null && i != null) out.put(d, i);
+            }
+            return out;
+        }).otherwise(java.util.Map.of());
     }
 }

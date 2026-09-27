@@ -106,6 +106,16 @@ public class IndustryService {
                         .put("interviewCount",  row.getLong("interview_count"))
                         .put("interviewRating", row.getBigDecimal("interview_avg_rating"));
                     if (logoUrl != null && !logoUrl.isBlank()) co.put("logoUrl", logoUrl);
+                    /*
+                      The resolved identity, for the logo chain. A provider is only ever given a
+                      domain somebody established - never one derived from the name, because a
+                      guess that resolves renders another company's logo with full confidence.
+                      Absent until resolution has run, and absent means "show the letter".
+                    */
+                    String resolvedDomain = row.getString("domain");
+                    String bfIcon         = row.getString("brandfetch_icon_url");
+                    if (resolvedDomain != null && !resolvedDomain.isBlank()) co.put("domain", resolvedDomain);
+                    if (bfIcon != null && !bfIcon.isBlank()) co.put("brandfetchIconUrl", bfIcon);
                     companies.add(co);
                 }
                 JsonObject result = new JsonObject()

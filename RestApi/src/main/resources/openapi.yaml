@@ -2288,6 +2288,97 @@ paths:
         '404':
           description: Edit not found
 
+  /api/admin/reviews:
+    get:
+      operationId: adminGetReviews
+      summary: Recent ratings for moderation (admin only)
+      description: >-
+        Newest first, excluding already-deleted rows but INCLUDING held ones, since a held rating
+        is exactly what a moderator has been asked to look at. Carries the author's standing and
+        how many ratings they have ever written, so a first-ever rating from a fresh account -
+        the drive-by unlock shape - is visible without opening anything.
+      tags:
+        - Admin
+      parameters:
+        - in: query
+          name: limit
+          schema: { type: integer, minimum: 1, maximum: 100, default: 50 }
+        - in: query
+          name: offset
+          schema: { type: integer, minimum: 0, default: 0 }
+      responses:
+        '200':
+          description: Ratings
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items:
+                      type: object
+                  total:  { type: integer }
+                  limit:  { type: integer }
+                  offset: { type: integer }
+        '403':
+          description: Forbidden
+
+  /api/admin/reviews/{reviewId}:
+    delete:
+      operationId: adminDeleteReview
+      summary: Delete a rating as a moderator (admin only)
+      description: >-
+        Soft delete. The reason is required and decides consequences: only "junk" debits the
+        author's confidence, because a duplicate or an administrative correction is not their
+        fault. Unlike an author's own withdrawal this is never auto-restored after three days,
+        and the manager's rating and company figures are recomputed before the call returns.
+      tags:
+        - Admin
+      parameters:
+        - in: path
+          name: reviewId
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [reason]
+              properties:
+                reason:
+                  type: string
+                  enum: [junk, duplicate, correction, other]
+                  description: >-
+                    junk = fake or garbage contribution (penalises the author);
+                    duplicate and correction carry no penalty; other is a deliberate choice.
+      responses:
+        '200':
+          description: Rating deleted
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  reason:
+                    type: string
+                  confidencePenalty:
+                    type: boolean
+                  alreadyDeleted:
+                    type: boolean
+        '400':
+          description: Missing or unrecognised reason
+        '403':
+          description: Forbidden
+        '404':
+          description: Rating not found
+
   /api/admin/pending-edits/{editId}/reject:
     post:
       operationId: rejectManagerEdit

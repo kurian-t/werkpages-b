@@ -1177,6 +1177,131 @@ public class AdminService {
     }
 
     /**
+     * The moderation queue behind the admin Ratings tab.
+     *
+     * <p>Exists because there was nowhere to act. Deleting a junk rating meant knowing which
+     * manager it was on and navigating to their profile - so the only ratings a moderator could
+     * find were the ones they already knew about, which is the wrong way round.
+     *
+     * <p>{@code firstEverRating} is computed here rather than left to the client: it is the single
+     * strongest signal for the abuse this was built for - an account whose first and only act is a
+     * rating that unlocks the site.
+     */
+    public Future<JsonObject> getRecentReviews(String auth0Id, int limit, int offset) {
+        int cappedLimit = Math.max(1, Math.min(limit, 100));
+        int safeOffset  = Math.max(0, offset);
+        return requireAdmin(auth0Id)
+            .compose(adminId -> io.vertx.core.Future.all(
+                reviewRepo.listRecentForModeration(cappedLimit, safeOffset),
+                reviewRepo.countForModeration()))
+            .map(cf -> {
+                io.vertx.sqlclient.RowSet<Row> rows = cf.resultAt(0);
+                long total = cf.resultAt(1);
+                JsonArray data = new JsonArray();
+                for (Row row : rows) {
+                    Long totalByAuthor = row.getLong("author_total_ratings");
+                    data.add(new JsonObject()
+                        .put("id",              row.getUUID("id").toString())
+                        .put("managerId",       row.getLong("manager_id"))
+                        .put("managerName",     row.getString("manager_name"))
+                        .put("managerSlug",     row.getString("manager_slug"))
+                        .put("companySlug",     row.getString("company_slug"))
+                        .put("managerCompany",  row.getString("manager_company"))
+                        .put("managerTitle",    row.getString("manager_title"))
+                        .put("author",          row.getString("author"))
+                        .put("overallRating",   row.getBigDecimal("overall_rating"))
+                        .put("createdAt",       row.getOffsetDateTime("created_at").toString())
+                        .put("disposition",     row.getString("disposition"))
+                        .put("gateEligible",    row.getBoolean("gate_eligible"))
+                        // Standing when it was written, and standing now - they diverge once a
+                        // moderator has acted, and the difference is the audit.
+                        .put("authorConfidenceAtSubmission", row.getInteger("author_confidence"))
+                        .put("authorConfidenceNow",          row.getInteger("author_confidence_now"))
+                        .put("authorTotalRatings",           totalByAuthor)
+                        .put("firstEverRating",              totalByAuthor != null && totalByAuthor <= 1));
+                }
+                return new JsonObject()
+                    .put("data",   data)
+                    .put("total",  total)
+                    .put("limit",  cappedLimit)
+                    .put("offset", safeOffset);
+            });
+    }
+
+    /** Why a moderator removed a rating. Only the first costs the author anything. */
+    public static final java.util.Set<String> REVIEW_DELETE_REASONS =
+        java.util.Set.of("junk", "duplicate", "correction", "other");
+
+    /**
+     * A moderator removes a rating, and says why.
+     *
+     * <p>The reason is required and not a free-text note, because it decides something: only
+     * {@code junk} debits the author's confidence. A duplicate, or an administrative correction,
+     * is not their fault and must cost them nothing. A bare "delete + penalise?" checkbox would
+     * have recorded the decision nowhere, and an unexplained debit six months on is indefensible
+     * to the person carrying it.
+     *
+     * <p>Soft delete, never destroy - the standing rule for this data. The rating stops counting
+     * immediately: the manager's cached rating and the company projection are both recomputed
+     * before this resolves, so the average corrects itself the moment the decision is made rather
+     * than at the next sweep.
+     *
+     * <p>The debit is keyed on the review id, so a double-clicked delete cannot charge twice -
+     * and the row-count guard means the second call finds nothing to delete and never reaches
+     * the debit at all.
+     */
+    public Future<JsonObject> adminDeleteReview(String auth0Id, UUID reviewId, String reason) {
+        String cleaned = reason == null ? "" : reason.trim().toLowerCase();
+        if (!REVIEW_DELETE_REASONS.contains(cleaned)) {
+            return Future.failedFuture(ServiceException.badRequest(
+                "A deletion reason is required: junk, duplicate, correction or other"));
+        }
+        return requireAdmin(auth0Id).compose(adminUserId ->
+            reviewRepo.findAuthorAndManager(reviewId).compose(found -> {
+                if (found.isEmpty()) {
+                    return Future.failedFuture(ServiceException.notFound("Rating not found"));
+                }
+                UUID authorId  = found.get().getUUID("user_id");
+                long managerId = found.get().getLong("manager_id");
+
+                return reviewRepo.adminDelete(reviewId, cleaned, adminUserId).compose(deleted -> {
+                    if (!deleted) {
+                        /*
+                          Two moderators clicking at once. Sequentially the second call never
+                          reaches here - the lookup above already filters deleted rows and 404s -
+                          so this is the concurrent race only, and emphatically not a second
+                          debit for one piece of junk.
+                        */
+                        return Future.succeededFuture(new JsonObject()
+                            .put("success", true).put("alreadyDeleted", true));
+                    }
+
+                    /*
+                      Junk only, and only when we know whose it was. An anonymous rating has
+                      nobody to debit - and a score the person cannot see or appeal must never
+                      move on a guess about who wrote it.
+                    */
+                    if ("junk".equals(cleaned) && authorId != null && confidenceRepo != null) {
+                        confidenceRepo.apply(authorId, ConfidenceRepository.REVIEW_DELETED_JUNK,
+                                ConfidenceRepository.REVIEW_DELETED_JUNK_DELTA,
+                                "review", reviewId.toString())
+                            .onFailure(err -> System.err.println(
+                                "Confidence debit failed for review " + reviewId + ": " + err.getMessage()));
+                    }
+
+                    return managerRepo.recalculate(managerId)
+                        .compose(v -> companyRepo == null
+                            ? Future.succeededFuture()
+                            : companyRepo.syncStatsForManager(managerId))
+                        .map(v -> new JsonObject()
+                            .put("success", true)
+                            .put("reason", cleaned)
+                            .put("confidencePenalty", "junk".equals(cleaned) && authorId != null));
+                });
+            }));
+    }
+
+    /**
      * The company a career entry belongs to, and the logo the admin chose for it.
      *
      * <p>Identity comes from the picked id - re-resolving by name is what created a second

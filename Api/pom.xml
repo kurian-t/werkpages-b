@@ -152,6 +152,10 @@
 						below already gets this right.
 					-->
 					<argLine>@{jacoco.agent.argLine}</argLine>
+					<systemPropertyVariables>
+						<!-- Same rule as failsafe below: unit tests never reach a metered API. -->
+						<resolver.network>off</resolver.network>
+					</systemPropertyVariables>
 				</configuration>
 			</plugin>
 			<!-- Integration tests run during the verify phase (mvn verify / mvn install) -->
@@ -171,6 +175,13 @@
 					</environmentVariables>
 					<systemPropertyVariables>
 						<api.version>1.44</api.version>
+						<!--
+							No test may spend a metered search hit. Logo.dev Search and Brandfetch
+							Search are billed, and Clearbit needs no credential at all - so "no key
+							configured" is not protection. DomainResolver refuses every outbound
+							call while this is off. See DomainResolver.networkEnabled().
+						-->
+						<resolver.network>off</resolver.network>
 					</systemPropertyVariables>
 				</configuration>
 				<executions>

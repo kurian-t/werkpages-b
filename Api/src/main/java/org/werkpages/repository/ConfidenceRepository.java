@@ -44,6 +44,23 @@ public class ConfidenceRepository {
     public static final String MANAGER_REJECTED_JUNK  = "manager_rejected_junk";
     public static final String CHALLENGE_REJECTED     = "challenge_rejected";
 
+    /**
+     * An admin removed a rating as junk or a fake contribution.
+     *
+     * <p>The analogue of {@link #MANAGER_REJECTED_JUNK} for the other thing a person can submit,
+     * and it carries the same -20, because it is the same act: fabricating something to get past
+     * a gate. Deleting the junk without it cleans the average and leaves the account untouched to
+     * do it again tomorrow - the debit is what closes the loop, since the next submission from an
+     * account below {@link #WATCH_BELOW} is held rather than published.
+     *
+     * <p>Applied ONLY for the {@code junk} deletion reason. A duplicate, or an administrative
+     * correction, is not the author's fault and must cost them nothing.
+     */
+    public static final String REVIEW_DELETED_JUNK    = "review_deleted_junk";
+
+    /** What removing a junk rating costs, matching the manager-side penalty exactly. */
+    public static final int REVIEW_DELETED_JUNK_DELTA = -20;
+
     private final SqlClient db;
 
     public ConfidenceRepository(SqlClient db) {

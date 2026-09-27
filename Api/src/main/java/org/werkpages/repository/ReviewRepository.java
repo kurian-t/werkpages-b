@@ -520,13 +520,101 @@ public class ReviewRepository {
             .mapEmpty();
     }
 
-    /** Restores reviews whose 3-day soft-delete window has expired, making them anonymous. */
+    /**
+     * Restores reviews whose 3-day soft-delete window has expired, making them anonymous.
+     *
+     * <p><b>A moderator's deletion is never restored.</b> This sweep exists for somebody who
+     * withdrew their own rating and may change their mind, and it used to un-delete every row it
+     * found. A review an admin removed as junk would therefore come back three days later - live,
+     * anonymous, and counting toward the manager's average again - with nothing on the page to
+     * show it had ever been actioned. The confidence debit would stand while the rating it was
+     * for quietly returned.
+     *
+     * <p>{@code deleted_reason} is what separates the two. A reason means a person decided; no
+     * reason means an author withdrew.
+     */
     public Future<Integer> restoreExpiredDeletions() {
         return db.preparedQuery(
                 "UPDATE reviews SET deleted_at = NULL " +
-                "WHERE deleted_at IS NOT NULL AND deleted_at < now() - INTERVAL '3 days'")
+                "WHERE deleted_at IS NOT NULL AND deleted_at < now() - INTERVAL '3 days' " +
+                "AND deleted_reason IS NULL")
             .execute()
             .map(RowSet::rowCount);
+    }
+
+    /**
+     * The moderation queue: recent ratings, newest first, with the context needed to judge one.
+     *
+     * <p>Built for the drive-by-unlock shape - a brand-new account rating a manager it never
+     * searched for, purely to get past the contribution gate. Spotting that needs more than the
+     * rating itself, so this carries the author's standing and how many ratings they have ever
+     * written; a first-ever contribution from a fresh account reads very differently from the
+     * fiftieth.
+     *
+     * <p>Deleted rows are excluded but HELD ones are not: a held rating is precisely the thing an
+     * admin has been asked to look at.
+     */
+    public Future<RowSet<Row>> listRecentForModeration(int limit, int offset) {
+        return db.preparedQuery("""
+                SELECT r.id, r.overall_rating, r.created_at, r.disposition,
+                       r.author, r.author_confidence, r.gate_eligible,
+                       r.manager_id, r.manager_company, r.manager_title,
+                       m.name AS manager_name, m.slug AS manager_slug,
+                       c.slug AS company_slug,
+                       u.confidence AS author_confidence_now,
+                       (SELECT COUNT(*) FROM reviews prior
+                         WHERE prior.user_id = r.user_id AND prior.deleted_at IS NULL)
+                           AS author_total_ratings
+                  FROM reviews r
+                  JOIN managers m  ON m.id = r.manager_id
+                  LEFT JOIN companies c ON c.id = m.company_id
+                  LEFT JOIN users u     ON u.id = r.user_id
+                 WHERE r.deleted_at IS NULL
+                 ORDER BY r.created_at DESC
+                 LIMIT $1 OFFSET $2
+                """)
+            .execute(Tuple.of(limit, offset));
+    }
+
+    /** How many ratings the moderation queue can page through. */
+    public Future<Long> countForModeration() {
+        return db.preparedQuery("SELECT COUNT(*) FROM reviews WHERE deleted_at IS NULL")
+            .execute()
+            .map(rows -> rows.iterator().next().getLong(0));
+    }
+
+    /**
+     * Who wrote a rating and which manager it is on, before it is deleted.
+     *
+     * <p>Read first because the deletion itself cannot tell us afterwards: an author's own
+     * withdrawal clears {@code user_id}, and the manager's average has to be recomputed against
+     * the right manager once the row is gone.
+     */
+    public Future<Optional<Row>> findAuthorAndManager(UUID reviewId) {
+        return db.preparedQuery(
+                "SELECT user_id, manager_id, author_confidence FROM reviews "
+              + "WHERE id = $1 AND deleted_at IS NULL")
+            .execute(Tuple.of(reviewId))
+            .map(rs -> rs.iterator().hasNext() ? Optional.of(rs.iterator().next()) : Optional.empty());
+    }
+
+    /**
+     * A moderator removes a rating, recording why and who.
+     *
+     * <p>Deliberately NOT {@link #delete(UUID, long)}: that one clears {@code user_id}, because a
+     * person withdrawing their own rating is entitled to take their name off it. Doing that here
+     * would destroy the only link to the account being penalised, and with it any way to answer
+     * "whose was this?" when the debit is questioned later.
+     *
+     * <p>Returns whether a row was actually hit, so a double-submitted delete cannot be reported
+     * as a second successful moderation - and cannot debit the author twice.
+     */
+    public Future<Boolean> adminDelete(UUID reviewId, String reason, UUID adminUserId) {
+        return db.preparedQuery(
+                "UPDATE reviews SET deleted_at = now(), deleted_reason = $2, deleted_by = $3 "
+              + "WHERE id = $1 AND deleted_at IS NULL")
+            .execute(Tuple.of(reviewId, reason, adminUserId))
+            .map(rs -> rs.rowCount() > 0);
     }
 
     /** Records that a user deleted a review for a manager (for the 30-day re-review cooldown). */

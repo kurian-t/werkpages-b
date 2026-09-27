@@ -264,6 +264,41 @@ public class AdminHandler {
             .onFailure(err -> ManagersHandler.handleError(ctx, err));
     }
 
+    // ── GET /api/admin/reviews ────────────────────────────────────────────────
+
+    /** The moderation queue: recent ratings with the context needed to judge one. */
+    public void handleGetReviews(RoutingContext ctx) {
+        String auth0Id = ctx.get("auth0Id");
+        int limit  = parseIntParam(ctx.request().getParam("limit"),  50, 1, 100);
+        int offset = parseIntParam(ctx.request().getParam("offset"), 0,  0, Integer.MAX_VALUE);
+        service.getRecentReviews(auth0Id, limit, offset)
+            .onSuccess(json -> ok(ctx, json))
+            .onFailure(err -> ManagersHandler.handleError(ctx, err));
+    }
+
+    // ── DELETE /api/admin/reviews/:reviewId ───────────────────────────────────
+
+    /**
+     * Removes a rating, with the reason that decides whether its author is penalised.
+     *
+     * <p>The reason travels in the body rather than a query parameter: it is part of the decision
+     * being recorded, not a way of selecting what to act on.
+     */
+    public void handleDeleteReview(RoutingContext ctx) {
+        String auth0Id = ctx.get("auth0Id");
+        UUID reviewId;
+        try {
+            reviewId = UUID.fromString(ctx.pathParam("reviewId"));
+        } catch (Exception e) {
+            bad(ctx, "Invalid review ID"); return;
+        }
+        JsonObject body = ctx.body() != null ? ctx.body().asJsonObject() : null;
+        String reason = body != null ? body.getString("reason") : null;
+        service.adminDeleteReview(auth0Id, reviewId, reason)
+            .onSuccess(json -> ok(ctx, json))
+            .onFailure(err -> ManagersHandler.handleError(ctx, err));
+    }
+
     // ── GET /api/admin/users ──────────────────────────────────────────────────
 
     public void handleGetUsers(RoutingContext ctx) {

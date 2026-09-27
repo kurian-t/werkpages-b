@@ -81,6 +81,8 @@ public class ManagersHandler {
                     .put("linkedinUrl", row.getString("linkedin_url"))
                     .put("country", row.getString("country"))
                     .put("companyLogoUrl", logoUrl)
+                    .put("companyDomain", companyIdentity(row, "company_domain"))
+                    .put("companyBrandfetchIconUrl", companyIdentity(row, "company_brandfetch_icon_url"))
                     .put("createdAt", row.getOffsetDateTime("created_at").toString())
                     .put("careerHistory", row.getJsonArray("career_history"))
                     // Industry of the manager's company — the third line on manager cards.
@@ -143,6 +145,8 @@ public class ManagersHandler {
             .put("linkedinUrl", row.getString("linkedin_url"))
             .put("country", row.getString("country"))
             .put("companyLogoUrl", logoUrl)
+                    .put("companyDomain", companyIdentity(row, "company_domain"))
+                    .put("companyBrandfetchIconUrl", companyIdentity(row, "company_brandfetch_icon_url"))
             .put("createdAt", row.getOffsetDateTime("created_at").toString())
             .put("careerHistory", row.getJsonArray("career_history"))
             .put("slug", row.getString("slug"))
@@ -308,7 +312,15 @@ public class ManagersHandler {
                         }
                         if (out.size() >= 6) break;
                     }
-                    if (!out.isEmpty()) return Future.succeededFuture(out);
+                    /*
+                      Attach any Brandfetch icon we have ALREADY resolved for these domains.
+
+                      The picker could only ever render logo.dev, so when its monthly quota ran
+                      out the dropdown went blank - including for companies whose logo we already
+                      hold. This is one lookup against our own table: no third-party call and
+                      nothing metered, so a suggestion we have never seen simply has no icon.
+                    */
+                    if (!out.isEmpty()) return attachKnownIcons(out);
                 }
                 return service.suggestCompanies(query);
             })
@@ -358,6 +370,9 @@ public class ManagersHandler {
                         .put("linkedinUrl", row.getString("linkedin_url"))
                         .put("country", row.getString("country"))
                         .put("companyLogoUrl", logo)
+                        // Same identity every other surface gets - see companyIdentity().
+                        .put("companyDomain", companyIdentity(row, "company_domain"))
+                        .put("companyBrandfetchIconUrl", companyIdentity(row, "company_brandfetch_icon_url"))
                         .put("createdAt", row.getOffsetDateTime("created_at").toString())
                     );
                 }
@@ -779,4 +794,33 @@ public class ManagersHandler {
         catch (NumberFormatException e) { return defaultVal; }
     }
 
+
+    /**
+     * The company's resolved identity, for the logo chain.
+     *
+     * <p>A logo provider is only ever given a domain somebody established - never one derived
+     * from the company name. A guessed domain that happens to resolve renders a DIFFERENT
+     * company's logo with full confidence, which is how "Lime" spent months showing lime.com's
+     * mark. Absent means the client shows its letter tile, which is the honest answer.
+     */
+    private static String companyIdentity(io.vertx.sqlclient.Row row, String column) {
+        if (row.getColumnIndex(column) < 0) return null;
+        String v = row.getString(column);
+        return v == null || v.isBlank() ? null : v;
+    }
+
+    /** Fills in brandfetchIconUrl on picker suggestions from logos we have already resolved. */
+    private io.vertx.core.Future<JsonArray> attachKnownIcons(JsonArray suggestions) {
+        java.util.List<String> domains = new java.util.ArrayList<>();
+        for (Object o : suggestions) domains.add(((JsonObject) o).getString("domain"));
+        return service.iconsByDomain(domains).map(icons -> {
+            for (Object o : suggestions) {
+                JsonObject s = (JsonObject) o;
+                String d = s.getString("domain");
+                String icon = d == null ? null : icons.get(d.trim().toLowerCase());
+                if (icon != null) s.put("brandfetchIconUrl", icon);
+            }
+            return suggestions;
+        }).otherwise(suggestions);
+    }
 }

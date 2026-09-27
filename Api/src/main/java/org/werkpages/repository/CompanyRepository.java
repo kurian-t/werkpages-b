@@ -181,6 +181,216 @@ public class CompanyRepository {
      * for every manager at that company - which is the point. It is a company's logo, not one
      * manager's.
      */
+    /**
+     * Records the real identity of a company, resolved once from its name.
+     *
+     * <p>Writes the domain and the logo together because they are one answer: the logo is only
+     * correct BECAUSE the domain is. Splitting them invites a row whose logo belongs to a
+     * different company than its domain says, which is precisely the bug this replaces - a
+     * guessed domain handed to a logo provider, returning a stranger's mark.
+     *
+     * <p>Only fills gaps. A domain or logo already on the row was put there by somebody - an
+     * admin picking from the dropdown, or an earlier resolution - and a background sweep must
+     * never overwrite a human's answer with a search result.
+     */
+    public Future<Void> storeResolvedBrand(long companyId, String domain, String logoUrl) {
+        if ((domain == null || domain.isBlank()) && (logoUrl == null || logoUrl.isBlank())) {
+            return Future.succeededFuture();
+        }
+        return db.preparedQuery("""
+                UPDATE companies
+                   SET domain     = COALESCE(NULLIF(domain, ''), $2),
+                       logo_url   = COALESCE(NULLIF(logo_url, ''), $3),
+                       updated_at = now()
+                 WHERE id = $1
+                   AND (NULLIF(domain, '') IS NULL OR NULLIF(logo_url, '') IS NULL)
+                """)
+            .execute(Tuple.of(companyId,
+                              domain  == null || domain.isBlank()  ? null : domain.trim(),
+                              logoUrl == null || logoUrl.isBlank() ? null : logoUrl.trim()))
+            .mapEmpty();
+    }
+
+    /**
+     * Writes a domain two independent resolvers agreed on, plus the logo that goes with it.
+     *
+     * <p>Consensus is the whole safety mechanism, and it is not decoration. A single resolver
+     * returns {@code microsoft.com} for a company called "Mi" with a quality score of 1.00 and
+     * its verified flag set - the score measures how well the result matches the QUERY STRING,
+     * not whether it is the right company. No threshold can separate that from a correct answer.
+     * Two resolvers independently arriving at the same domain can.
+     *
+     * <p>Never overwrites ADMIN: a person's decision outranks any number of agreeing machines.
+     */
+    public Future<Void> storeConsensusDomain(long companyId, String domain,
+                                             String brandId, String iconUrl,
+                                             java.time.OffsetDateTime iconExpiresAt,
+                                             String source) {
+        return db.preparedQuery("""
+                UPDATE companies
+                   SET domain                  = $2,
+                       domain_source           = COALESCE($6, 'RESOLVER_CONSENSUS'),
+                       domain_resolution_state = 'RESOLVED',
+                       domain_resolved_at      = now(),
+                       brandfetch_brand_id        = COALESCE($3, brandfetch_brand_id),
+                       brandfetch_icon_url        = COALESCE($4, brandfetch_icon_url),
+                       brandfetch_icon_expires_at = COALESCE($5, brandfetch_icon_expires_at),
+                       updated_at = now()
+                 WHERE id = $1
+                   AND COALESCE(domain_source, '') <> 'ADMIN'
+                """)
+            .execute(Tuple.of(companyId, domain, brandId, iconUrl, iconExpiresAt, source))
+            .mapEmpty();
+    }
+
+    /** Marks a company as needing a human, so it stops being retried every night. */
+    public Future<Void> markDomainNeedsReview(long companyId) {
+        return db.preparedQuery("""
+                UPDATE companies
+                   SET domain_resolution_state = 'PENDING_REVIEW', updated_at = now()
+                 WHERE id = $1 AND COALESCE(domain_source, '') <> 'ADMIN'
+                   AND domain_resolution_state <> 'RESOLVED'
+                """)
+            .execute(Tuple.of(companyId))
+            .mapEmpty();
+    }
+
+    /** Records what one resolver said, so a reviewer sees evidence rather than a verdict. */
+    public Future<Void> recordDomainCandidate(long companyId, String resolver, String domain,
+                                              String brandId, String iconUrl, Double confidence) {
+        return db.preparedQuery("""
+                INSERT INTO company_domain_candidates
+                    (company_id, resolver, domain, brand_id, icon_url, confidence, resolved_at)
+                VALUES ($1, $2, $3, $4, $5, $6, now())
+                ON CONFLICT (company_id, resolver) DO UPDATE SET
+                    domain = EXCLUDED.domain, brand_id = EXCLUDED.brand_id,
+                    icon_url = EXCLUDED.icon_url, confidence = EXCLUDED.confidence,
+                    resolved_at = now()
+                """)
+            .execute(Tuple.of(companyId, resolver, domain, brandId, iconUrl,
+                              confidence == null ? null : java.math.BigDecimal.valueOf(confidence)))
+            .mapEmpty();
+    }
+
+    /**
+     * Brandfetch icons we have already resolved, keyed by domain.
+     *
+     * <p>For the company picker. Its suggestions come from Clearbit and carry a real domain, but
+     * the only logo it could render was logo.dev's - so when logo.dev's monthly quota ran out the
+     * dropdown went blank, even for companies whose logo we already hold.
+     *
+     * <p>A single lookup against data we own: no third-party call, nothing metered, and a
+     * suggestion we have never seen simply has no icon and falls back as before.
+     */
+    public Future<RowSet<Row>> findIconsByDomains(java.util.List<String> domains) {
+        if (domains == null || domains.isEmpty()) {
+            return db.preparedQuery("SELECT NULL::text AS domain, NULL::text AS brandfetch_icon_url WHERE FALSE")
+                .execute();
+        }
+        return db.preparedQuery("""
+                SELECT LOWER(TRIM(domain)) AS domain, brandfetch_icon_url
+                  FROM companies
+                 WHERE brandfetch_icon_url IS NOT NULL
+                   AND LOWER(TRIM(domain)) = ANY($1)
+                """)
+            .execute(Tuple.of(domains.stream().map(d -> d.trim().toLowerCase()).toArray(String[]::new)));
+    }
+
+    /** Companies still awaiting a first resolution attempt. */
+    public Future<RowSet<Row>> findCompaniesNeedingIdentity(int limit) {
+        return db.preparedQuery("""
+                SELECT id, name, domain, domain_source FROM companies
+                 WHERE status <> 'merged'
+                   AND domain_resolution_state = 'UNRESOLVED'
+                   AND COALESCE(domain_source, '') <> 'ADMIN'
+                 ORDER BY id
+                 LIMIT $1
+                """)
+            .execute(Tuple.of(limit));
+    }
+
+    /**
+     * Stores the Brandfetch asset for a company, and the domain it came with.
+     *
+     * <p>Deliberately NOT gated on domain consensus. Getting a correct logo on the page and
+     * establishing a company's canonical identity are two different problems, and the second is
+     * much harder - Brandfetch returns google.com for "Google DeepMind" with perfect confidence,
+     * which is a fine logo source and the wrong identity. So the icon is stored whenever
+     * Brandfetch is confident about the BRAND, while the domain is only promoted to the
+     * company's canonical one when it is not already set by something better.
+     *
+     * <p>{@code domain_source} is never downgraded: an ADMIN choice, or an existing CLEARBIT
+     * domain, outranks this and is left alone.
+     *
+     * <p>The icon URL is a CACHE, not identity. Brandfetch signs it with roughly a 24h expiry,
+     * so it is stored with that expiry and refreshed before it lapses; the brand id is the
+     * stable part and is what a refresh is keyed on.
+     */
+    public Future<Void> storeBrandfetchAsset(long companyId, String domain, String brandId,
+                                             String iconUrl, java.time.OffsetDateTime expiresAt) {
+        return db.preparedQuery("""
+                UPDATE companies
+                   SET brandfetch_brand_id        = COALESCE($3, brandfetch_brand_id),
+                       brandfetch_icon_url        = COALESCE($4, brandfetch_icon_url),
+                       brandfetch_icon_expires_at = COALESCE($5, brandfetch_icon_expires_at),
+                       -- Only fills a gap. Never overwrites ADMIN, and never overwrites a domain
+                       -- that is already set by any earlier resolver.
+                       domain        = COALESCE(NULLIF(domain, ''), $2),
+                       domain_source = CASE
+                           WHEN NULLIF(domain, '') IS NULL AND $2 IS NOT NULL THEN 'BRANDFETCH'
+                           ELSE domain_source
+                       END,
+                       domain_resolution_state = CASE
+                           WHEN domain_resolution_state = 'UNRESOLVED'
+                            AND COALESCE(NULLIF(domain, ''), $2) IS NOT NULL THEN 'RESOLVED'
+                           ELSE domain_resolution_state
+                       END,
+                       domain_resolved_at = COALESCE(domain_resolved_at,
+                           CASE WHEN $2 IS NOT NULL THEN now() ELSE NULL END),
+                       updated_at = now()
+                 WHERE id = $1
+                   AND COALESCE(domain_source, '') <> 'ADMIN'
+                """)
+            .execute(Tuple.of(companyId, domain, brandId, iconUrl, expiresAt))
+            .mapEmpty();
+    }
+
+    /**
+     * Companies whose Brandfetch icon is missing or about to lapse.
+     *
+     * <p>Two populations in one query because they need the same work: never resolved, and
+     * resolved but carrying a signature that expires within the safety margin. Serving a URL
+     * that dies in four minutes wastes the render and poisons whatever cached it.
+     */
+    public Future<RowSet<Row>> findCompaniesNeedingBrandfetch(int limit, java.time.Duration margin) {
+        return db.preparedQuery("""
+                SELECT id, name, domain FROM companies
+                 WHERE status <> 'merged'
+                   AND (brandfetch_icon_url IS NULL
+                        OR brandfetch_icon_expires_at IS NULL
+                        OR brandfetch_icon_expires_at < now() + ($2 || ' seconds')::interval)
+                 ORDER BY brandfetch_icon_expires_at NULLS FIRST, id
+                 LIMIT $1
+                """)
+            .execute(Tuple.of(limit, String.valueOf(margin.toSeconds())));
+    }
+
+    /**
+     * Companies that have never been resolved, oldest first.
+     *
+     * <p>Drives the backfill. A row missing EITHER field is a candidate: a company with a domain
+     * but no logo is just as unrendered as one with neither.
+     */
+    public Future<RowSet<Row>> findUnresolvedBrands(int limit) {
+        return db.preparedQuery("""
+                SELECT id, name FROM companies
+                 WHERE NULLIF(domain, '') IS NULL OR NULLIF(logo_url, '') IS NULL
+                 ORDER BY id
+                 LIMIT $1
+                """)
+            .execute(Tuple.of(limit));
+    }
+
     public Future<Void> updateLogoUrl(long companyId, String logoUrl) {
         if (logoUrl == null || logoUrl.isBlank()) return Future.succeededFuture();
         return db.preparedQuery(
@@ -455,7 +665,11 @@ public class CompanyRepository {
     /** Companies within an industry, same card shape as findCompanyListing(). */
     public Future<RowSet<Row>> findCompaniesByIndustry(String industry) {
         return db.preparedQuery("""
-                SELECT c.id, c.name, c.slug, c.industry, cs.logo_url, cs.manager_count, cs.total_reviews, cs.avg_rating,
+                SELECT c.id, c.name, c.slug, c.industry, cs.logo_url,
+                       -- The identity a logo provider may be given. Never a guessed domain: a
+                       -- guess that resolves is a different company's logo rendered confidently.
+                       c.domain, c.brandfetch_icon_url,
+                       cs.manager_count, cs.total_reviews, cs.avg_rating,
                        cs.workplace_count, cs.workplace_avg_rating, cs.interview_count, cs.interview_avg_rating
                 FROM company_stats_live cs
                 JOIN companies c ON c.id = cs.company_id
@@ -471,7 +685,11 @@ public class CompanyRepository {
      */
     public Future<RowSet<Row>> findCompanyListing() {
         return db.query("""
-                SELECT c.id, c.name, c.slug, c.industry, cs.logo_url, cs.manager_count, cs.total_reviews, cs.avg_rating,
+                SELECT c.id, c.name, c.slug, c.industry, cs.logo_url,
+                       -- The identity a logo provider may be given. Never a guessed domain: a
+                       -- guess that resolves is a different company's logo rendered confidently.
+                       c.domain, c.brandfetch_icon_url,
+                       cs.manager_count, cs.total_reviews, cs.avg_rating,
                        cs.workplace_count, cs.workplace_avg_rating, cs.interview_count, cs.interview_avg_rating
                 FROM company_stats_live cs
                 JOIN companies c ON c.id = cs.company_id
@@ -682,6 +900,8 @@ public class CompanyRepository {
     public Future<Optional<Row>> findBySlug(String slug) {
         return db.preparedQuery("""
                 SELECT c.id, c.name, c.slug, c.logo_url, c.status, c.industry,
+                       -- Resolved identity, for the logo chain. Never a guessed domain.
+                       c.domain, c.brandfetch_icon_url,
                        cs.logo_url AS stats_logo_url
                 FROM companies c
                 LEFT JOIN company_stats_live cs ON cs.company_id = c.id
@@ -697,9 +917,17 @@ public class CompanyRepository {
     /** All approved/ghost managers belonging to this company, ordered by review count. */
     public Future<RowSet<Row>> findManagersByCompanyId(long companyId) {
         return db.preparedQuery("""
-                WITH target AS (SELECT LOWER(TRIM(name)) AS lname FROM companies WHERE id = $1)
+                WITH target AS (
+                    SELECT LOWER(TRIM(name)) AS lname, domain, brandfetch_icon_url
+                      FROM companies WHERE id = $1
+                )
                 SELECT DISTINCT m.id, m.name, m.title, m.image, m.overall_rating, m.reviews_count,
-                       m.company_logo_url, m.category_averages, m.company, m.slug, m.approval_status
+                       m.company_logo_url, m.category_averages, m.company, m.slug, m.approval_status,
+                       -- Every manager on this page works at THIS company, so its resolved
+                       -- identity is theirs. Without it each card fell back to a letter on a
+                       -- page that was already showing the company's own logo.
+                       target.domain AS company_domain,
+                       target.brandfetch_icon_url AS company_brandfetch_icon_url
                 FROM managers m, target
                 WHERE m.approval_status IN ('approved', 'ghost')
                   AND (m.external_id IS NULL OR m.external_id NOT LIKE 'seed_%')
@@ -852,6 +1080,8 @@ public class CompanyRepository {
         // pointed at the right company; the row shape was what broke.
         return db.preparedQuery("""
                 SELECT c.id, c.name, c.slug, c.logo_url, c.status, c.industry,
+                       -- Resolved identity, for the logo chain. Never a guessed domain.
+                       c.domain, c.brandfetch_icon_url,
                        cs.logo_url AS stats_logo_url
                 FROM company_redirects r
                 JOIN companies c ON c.id = r.company_id
