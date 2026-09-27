@@ -157,10 +157,22 @@ public class ReviewRepository {
      * what the panel shows - they were separate queries with separate grouping, which is its own
      * way to be wrong.
      */
+    /*
+      Segments group on a WHITESPACE-INSENSITIVE company key.
+
+      TRIM only strips the ends, so "100 kellogg" and "100kellogg" grouped as two different
+      employers and the trajectory drew two tiles for one job - same company, same title, side by
+      side, splitting the ratings between them. Merging duplicate managers is what surfaces it:
+      the survivor inherits reviews written against both spellings.
+
+      Internal spaces are removed for the company, because that is the difference that actually
+      occurs, and collapsed to one for the title, where they separate words that should stay
+      separate. Neither touches what is DISPLAYED - MIN(company) still shows a real spelling.
+    */
     private static final String SEGMENTS_SQL = """
             WITH ch AS (
-                SELECT LOWER(TRIM(company)) AS ck,
-                       LOWER(TRIM(title))   AS tk,
+                SELECT REGEXP_REPLACE(LOWER(TRIM(company)), '\\s+', '', 'g') AS ck,
+                       REGEXP_REPLACE(LOWER(TRIM(title)),   '\\s+', ' ', 'g') AS tk,
                        MIN(company)         AS company,
                        MIN(title)           AS title,
                        MIN(start_date)::date AS start_date,
@@ -172,8 +184,8 @@ public class ReviewRepository {
                  GROUP BY 1, 2
             ),
             rv AS (
-                SELECT LOWER(TRIM(manager_company)) AS ck,
-                       LOWER(TRIM(manager_title))   AS tk,
+                SELECT REGEXP_REPLACE(LOWER(TRIM(manager_company)), '\\s+', '', 'g') AS ck,
+                       REGEXP_REPLACE(LOWER(TRIM(manager_title)),   '\\s+', ' ', 'g') AS tk,
                        MIN(manager_company)         AS company,
                        MIN(manager_title)           AS title,
                        MIN(worked_from)             AS start_date,
