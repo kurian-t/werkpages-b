@@ -333,6 +333,20 @@ public class AdminService {
 
                 // Compute the real rating from submitted reviews now that the manager is live.
                 // Awaited below, before the company sync: see the ordering note there.
+                /*
+                  A real profile has gone live, so one seeded stand-in can retire.
+
+                  This only happened when somebody SUBMITTED through the add form - a pending row
+                  that might still be rejected - and nowhere at all when a manager actually became
+                  live. So "Fake Profiles Left" sat unchanged however many real managers arrived
+                  by approval or by search, which is the count an admin is watching to know when
+                  the seeded set can be retired.
+
+                  Retiring on the transition to LIVE is also the correct trade: a fake profile is
+                  replaced by a real one, not by a submission that may never publish.
+                */
+                managerRepo.deleteFakeManagerInBackground();
+
                 Future<Void> recalculated = reslugged.compose(v -> managerRepo.recalculate(managerId));
                 JsonObject ok = new JsonObject()
                     .put("success", true)
@@ -921,6 +935,13 @@ public class AdminService {
      * Overload for callers with no picker selection: identity is resolved from the company name,
      * as it was before company IDs existed.
      */
+    /** Without location - the long-standing form. */
+    public Future<JsonObject> adminEditManager(String auth0Id, long managerId, String name,
+            String title, String company, String linkedinUrl, Long companyId) {
+        return adminEditManager(auth0Id, managerId, name, title, company, linkedinUrl, companyId,
+                                null, null, null, null);
+    }
+
     public Future<JsonObject> adminEditManager(String auth0Id, long managerId,
                                                String name, String title,
                                                String company, String linkedinUrl) {
@@ -936,7 +957,9 @@ public class AdminService {
     public Future<JsonObject> adminEditManager(String auth0Id, long managerId,
                                                String name, String title,
                                                String company, String linkedinUrl,
-                                               Long companyId) {
+                                               Long companyId,
+                                              String newCountry, String newState, String newCity,
+                                              String newCompanyLogoUrl) {
         if (name        != null && name.isBlank())        return Future.failedFuture(ServiceException.badRequest("Name cannot be blank"));
         if (title       != null && title.isBlank())       return Future.failedFuture(ServiceException.badRequest("Title cannot be blank"));
         if (company     != null && company.isBlank())     return Future.failedFuture(ServiceException.badRequest("Company cannot be blank"));
@@ -954,7 +977,10 @@ public class AdminService {
             : Future.succeededFuture(null);
         return requireAdmin(auth0Id)
             .compose(adminId -> companyIdFuture)
-            .compose(newCompanyId -> managerRepo.adminEdit(managerId, effName, effTitle, effCompany, effLinkedinUrl, newCompanyId))
+            .compose(newCompanyId -> managerRepo.adminEdit(managerId, effName, effTitle, effCompany,
+                                                           effLinkedinUrl, newCompanyId,
+                                                           newCountry, newState, newCity,
+                                                           newCompanyLogoUrl))
             .compose(opt -> opt.isPresent()
                 ? Future.succeededFuture(opt.get())
                 : Future.failedFuture(ServiceException.notFound("Manager not found")));

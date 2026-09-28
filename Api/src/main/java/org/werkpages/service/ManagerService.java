@@ -3299,7 +3299,17 @@ public class ManagerService {
                                         syncStatsForManager is deliberately left as it was: it touches company_stats, not this
                                         row, and nothing here needs to wait for it.
                                     */
-                                    .compose(ignored -> managerRepo.recalculate(newId))
+                                    /*
+                                      A ghost is LIVE the moment it is created, so it replaces a
+                                      seeded stand-in exactly as an approved manager does. Only
+                                      the add form retired one before, which is why the admin's
+                                      "Fake Profiles Left" never moved for managers arriving by
+                                      search.
+                                    */
+                                    .compose(ignored -> {
+                                        managerRepo.deleteFakeManagerInBackground();
+                                        return managerRepo.recalculate(newId);
+                                    })
                                     .compose(recalced -> managerRepo.findById(newId))
                                     .compose(fresh -> companyRepo.syncStatsForManager(newId)
                                         .map(statsDone -> fresh.orElse(row)))

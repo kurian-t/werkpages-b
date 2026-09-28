@@ -2823,6 +2823,16 @@ paths:
                   nullable: true
                 linkedinUrl:
                   type: string
+                country:
+                  type: string
+                  nullable: true
+                  description: Where the manager works. Omit to leave unchanged.
+                state:
+                  type: string
+                  nullable: true
+                city:
+                  type: string
+                  nullable: true
       responses:
         '200':
           description: Manager updated

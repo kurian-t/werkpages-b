@@ -372,7 +372,19 @@ public class AdminHandler {
         String companyLogoUrl = body.getString("companyLogoUrl");
         // Present when the admin picked the company from the typeahead rather than retyping it.
         Long companyId = body.getLong("companyId");
-        service.adminEditManager(auth0Id, managerId, name, title, company, linkedinUrl, companyId)
+        /*
+          Where the manager works. Settable only on the ADD form until now - no edit surface
+          could correct a manager filed against the wrong country, which is what the directory
+          filters on. Null means "leave it alone", so editing a title cannot blank a location.
+        */
+        String country = body.getString("country");
+        String state   = body.getString("state");
+        String city    = body.getString("city");
+
+        // companyLogoUrl was read here and then silently dropped - an admin picking a logo saw
+        // nothing change. It now reaches the write, and a changed company clears a stale one.
+        service.adminEditManager(auth0Id, managerId, name, title, company, linkedinUrl, companyId,
+                                 country, state, city, companyLogoUrl)
             .onSuccess(json -> {
                 if (company != null && !company.isBlank()) {
                     String logoUrl = (companyLogoUrl != null && !companyLogoUrl.isBlank())

@@ -1002,9 +1002,19 @@ public class ManagerRepository {
      * title/company corrections to reviews and career_history where old values match.
      * Pass null for any field that should not change.
      */
-    public Future<Optional<io.vertx.core.json.JsonObject>> adminEdit(long managerId, String newName, String newTitle,
-                                                                      String newCompany, String newLinkedinUrl,
-                                                                      Long newCompanyId) {
+/** Without location - the long-standing form, unchanged for its callers. */
+    public Future<Optional<io.vertx.core.json.JsonObject>> adminEdit(long managerId, String newName,
+            String newTitle, String newCompany, String newLinkedinUrl, Long newCompanyId) {
+        return adminEdit(managerId, newName, newTitle, newCompany, newLinkedinUrl, newCompanyId,
+                         null, null, null, null);
+    }
+
+    /** With location. Any of country/state/city may be null, meaning "leave it alone". */
+    public Future<Optional<io.vertx.core.json.JsonObject>> adminEdit(long managerId, String newName,
+                                                                     String newTitle, String newCompany,
+                                                                     String newLinkedinUrl, Long newCompanyId,
+                                                                     String newCountry, String newState,
+                                                                     String newCity, String newCompanyLogoUrl) {
         return ((Pool) db).withTransaction(conn ->
             conn.preparedQuery("SELECT name, title, company FROM managers WHERE id = $1")
                 .execute(Tuple.of(managerId))
@@ -1019,6 +1029,10 @@ public class ManagerRepository {
                     String effTitle   = newTitle   != null ? newTitle   : oldTitle;
                     String effCompany = newCompany != null ? newCompany : oldCompany;
 
+                    // Computed before the UPDATE, because the logo decision depends on it.
+                    boolean companyChangedEarly =
+                        (newCompany != null && !newCompany.equals(oldCompany)) || newCompanyId != null;
+
                     List<Object> params = new ArrayList<>();
                     params.add(effName); params.add(effTitle); params.add(effCompany);
                     int idx = 4;
@@ -1031,6 +1045,49 @@ public class ManagerRepository {
                     if (newCompanyId != null) {
                         sql.append(", company_id = $").append(idx++);
                         params.add(newCompanyId);
+                    }
+                    /*
+                      A changed company must not keep the old company's logo.
+
+                      company_logo_url is the FIRST thing the logo chain tries, ahead of the
+                      company's own resolved identity - so moving a manager to a different
+                      employer while leaving this set meant the profile went on showing the
+                      previous company's mark, and re-picking in the admin editor appeared to do
+                      nothing at all.
+
+                      Cleared rather than guessed at: with it empty the chain resolves from the
+                      NEW company's domain, which is the identity the admin just chose. An
+                      explicitly picked logo overrides that and is stored as given.
+                    */
+                    if (newCompanyLogoUrl != null && !newCompanyLogoUrl.isBlank()) {
+                        sql.append(", company_logo_url = $").append(idx++);
+                        params.add(newCompanyLogoUrl.trim());
+                    } else if (companyChangedEarly) {
+                        sql.append(", company_logo_url = NULL");
+                    }
+                    /*
+                      Where the manager actually works.
+                      
+                      Stored on the row since the beginning and settable only on the ADD form -
+                      no edit surface, admin or otherwise, could correct it. A manager filed
+                      against the wrong country stayed there, and country is what the directory
+                      filters and what the geo checks read.
+                      
+                      Each part is optional and independent: passing null leaves it alone, so an
+                      edit that touches only the title cannot blank a location it never asked
+                      about.
+                    */
+                    if (newCountry != null) {
+                        sql.append(", country = $").append(idx++);
+                        params.add(newCountry.isBlank() ? null : newCountry);
+                    }
+                    if (newState != null) {
+                        sql.append(", state = $").append(idx++);
+                        params.add(newState.isBlank() ? null : newState);
+                    }
+                    if (newCity != null) {
+                        sql.append(", city = $").append(idx++);
+                        params.add(newCity.isBlank() ? null : newCity);
                     }
                     params.add(managerId);
                     sql.append(" WHERE id = $").append(idx).append(" RETURNING id");
