@@ -380,11 +380,13 @@ public class AdminHandler {
         String country = body.getString("country");
         String state   = body.getString("state");
         String city    = body.getString("city");
+        // The exact place. Negative means "clear it"; absent means "leave it alone".
+        Long companyLocationId = body.getLong("companyLocationId");
 
         // companyLogoUrl was read here and then silently dropped - an admin picking a logo saw
         // nothing change. It now reaches the write, and a changed company clears a stale one.
         service.adminEditManager(auth0Id, managerId, name, title, company, linkedinUrl, companyId,
-                                 country, state, city, companyLogoUrl)
+                                 country, state, city, companyLogoUrl, companyLocationId)
             .onSuccess(json -> {
                 if (company != null && !company.isBlank()) {
                     String logoUrl = (companyLogoUrl != null && !companyLogoUrl.isBlank())

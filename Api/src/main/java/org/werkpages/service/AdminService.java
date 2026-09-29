@@ -939,7 +939,7 @@ public class AdminService {
     public Future<JsonObject> adminEditManager(String auth0Id, long managerId, String name,
             String title, String company, String linkedinUrl, Long companyId) {
         return adminEditManager(auth0Id, managerId, name, title, company, linkedinUrl, companyId,
-                                null, null, null, null);
+                                null, null, null, null, null);
     }
 
     public Future<JsonObject> adminEditManager(String auth0Id, long managerId,
@@ -959,7 +959,8 @@ public class AdminService {
                                                String company, String linkedinUrl,
                                                Long companyId,
                                               String newCountry, String newState, String newCity,
-                                              String newCompanyLogoUrl) {
+                                              String newCompanyLogoUrl,
+                                              Long newCompanyLocationId) {
         if (name        != null && name.isBlank())        return Future.failedFuture(ServiceException.badRequest("Name cannot be blank"));
         if (title       != null && title.isBlank())       return Future.failedFuture(ServiceException.badRequest("Title cannot be blank"));
         if (company     != null && company.isBlank())     return Future.failedFuture(ServiceException.badRequest("Company cannot be blank"));
@@ -980,7 +981,7 @@ public class AdminService {
             .compose(newCompanyId -> managerRepo.adminEdit(managerId, effName, effTitle, effCompany,
                                                            effLinkedinUrl, newCompanyId,
                                                            newCountry, newState, newCity,
-                                                           newCompanyLogoUrl))
+                                                           newCompanyLogoUrl, newCompanyLocationId))
             .compose(opt -> opt.isPresent()
                 ? Future.succeededFuture(opt.get())
                 : Future.failedFuture(ServiceException.notFound("Manager not found")));

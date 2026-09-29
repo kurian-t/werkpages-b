@@ -80,6 +80,22 @@ public class ManagersHandler {
                     .put("categoryAverages", row.getJsonObject("category_averages"))
                     .put("linkedinUrl", row.getString("linkedin_url"))
                     .put("country", row.getString("country"))
+                    // Selected alongside country so an edited location can be shown back.
+                    .put("state",   managerLocation(row, "state"))
+                    .put("city",    managerLocation(row, "city"))
+                    /*
+                      The exact place, when one was chosen. country/state/city is the coarse
+                      answer; a manager pinned to a real address has one of these too, and
+                      without it the profile showed only the city for somebody who had been
+                      placed at a specific building.
+                    */
+                    .put("locationName",       managerLocation(row, "location_name"))
+                    .put("locationStreet",     managerLocation(row, "location_street"))
+                    .put("locationPostalCode", managerLocation(row, "location_postal_code"))
+                    .put("locationCity",       managerLocation(row, "location_city"))
+                    .put("locationState",      managerLocation(row, "location_state"))
+                    .put("companyLocationId",  row.getColumnIndex("company_location_id") >= 0
+                                                 ? row.getLong("company_location_id") : null)
                     .put("companyLogoUrl", logoUrl)
                     .put("companyDomain", companyIdentity(row, "company_domain"))
                     .put("companyBrandfetchIconUrl", companyIdentity(row, "company_brandfetch_icon_url"))
@@ -144,6 +160,22 @@ public class ManagersHandler {
             .put("categoryAverages", categoryAverages)
             .put("linkedinUrl", row.getString("linkedin_url"))
             .put("country", row.getString("country"))
+                    // Selected alongside country so an edited location can be shown back.
+                    .put("state",   managerLocation(row, "state"))
+                    .put("city",    managerLocation(row, "city"))
+                    /*
+                      The exact place, when one was chosen. country/state/city is the coarse
+                      answer; a manager pinned to a real address has one of these too, and
+                      without it the profile showed only the city for somebody who had been
+                      placed at a specific building.
+                    */
+                    .put("locationName",       managerLocation(row, "location_name"))
+                    .put("locationStreet",     managerLocation(row, "location_street"))
+                    .put("locationPostalCode", managerLocation(row, "location_postal_code"))
+                    .put("locationCity",       managerLocation(row, "location_city"))
+                    .put("locationState",      managerLocation(row, "location_state"))
+                    .put("companyLocationId",  row.getColumnIndex("company_location_id") >= 0
+                                                 ? row.getLong("company_location_id") : null)
             .put("companyLogoUrl", logoUrl)
                     .put("companyDomain", companyIdentity(row, "company_domain"))
                     .put("companyBrandfetchIconUrl", companyIdentity(row, "company_brandfetch_icon_url"))
@@ -369,6 +401,22 @@ public class ManagersHandler {
                         .put("approvalStatus", row.getString("approval_status"))
                         .put("linkedinUrl", row.getString("linkedin_url"))
                         .put("country", row.getString("country"))
+                    // Selected alongside country so an edited location can be shown back.
+                    .put("state",   managerLocation(row, "state"))
+                    .put("city",    managerLocation(row, "city"))
+                    /*
+                      The exact place, when one was chosen. country/state/city is the coarse
+                      answer; a manager pinned to a real address has one of these too, and
+                      without it the profile showed only the city for somebody who had been
+                      placed at a specific building.
+                    */
+                    .put("locationName",       managerLocation(row, "location_name"))
+                    .put("locationStreet",     managerLocation(row, "location_street"))
+                    .put("locationPostalCode", managerLocation(row, "location_postal_code"))
+                    .put("locationCity",       managerLocation(row, "location_city"))
+                    .put("locationState",      managerLocation(row, "location_state"))
+                    .put("companyLocationId",  row.getColumnIndex("company_location_id") >= 0
+                                                 ? row.getLong("company_location_id") : null)
                         .put("companyLogoUrl", logo)
                         // Same identity every other surface gets - see companyIdentity().
                         .put("companyDomain", companyIdentity(row, "company_domain"))
@@ -408,6 +456,22 @@ public class ManagersHandler {
                     .put("categoryAverages", row.getJsonObject("category_averages"))
                     .put("linkedinUrl", row.getString("linkedin_url"))
                     .put("country", row.getString("country"))
+                    // Selected alongside country so an edited location can be shown back.
+                    .put("state",   managerLocation(row, "state"))
+                    .put("city",    managerLocation(row, "city"))
+                    /*
+                      The exact place, when one was chosen. country/state/city is the coarse
+                      answer; a manager pinned to a real address has one of these too, and
+                      without it the profile showed only the city for somebody who had been
+                      placed at a specific building.
+                    */
+                    .put("locationName",       managerLocation(row, "location_name"))
+                    .put("locationStreet",     managerLocation(row, "location_street"))
+                    .put("locationPostalCode", managerLocation(row, "location_postal_code"))
+                    .put("locationCity",       managerLocation(row, "location_city"))
+                    .put("locationState",      managerLocation(row, "location_state"))
+                    .put("companyLocationId",  row.getColumnIndex("company_location_id") >= 0
+                                                 ? row.getLong("company_location_id") : null)
                     .put("state", row.getString("state"))
                     .put("city", row.getString("city"))
                     .put("createdAt", row.getOffsetDateTime("created_at").toString())
@@ -822,5 +886,12 @@ public class ManagersHandler {
             }
             return suggestions;
         }).otherwise(suggestions);
+    }
+
+    /** A manager location column when the query selected it, else null. */
+    private static String managerLocation(io.vertx.sqlclient.Row row, String column) {
+        if (row.getColumnIndex(column) < 0) return null;
+        String v = row.getString(column);
+        return v == null || v.isBlank() ? null : v;
     }
 }

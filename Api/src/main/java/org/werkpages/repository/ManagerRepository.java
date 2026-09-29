@@ -26,7 +26,24 @@ public class ManagerRepository {
             SELECT
                 m.id, m.name, m.company, m.title, m.image, m.overall_rating,
                 m.reviews_count, m.bio, m.status, m.approval_status,
-                m.category_averages, m.linkedin_url, m.company_logo_url, m.country,
+                m.category_averages, m.linkedin_url, m.company_logo_url,
+                -- Where the manager works. country was selected and state/city were not, so an
+                -- edit could save them and nothing could ever show them back.
+                m.country, m.state, m.city,
+                /*
+                  The exact place, when one was chosen.
+
+                  country/state/city is the coarse answer; a manager can also be pinned to a real
+                  address through company_location_id. Nothing selected it, so an exact location
+                  could be stored and never shown - the profile fell back to "Toronto" for a
+                  manager somebody had placed at a specific building.
+                */
+                m.company_location_id,
+                loc.display_name AS location_name,
+                loc.street       AS location_street,
+                loc.postal_code  AS location_postal_code,
+                loc.city         AS location_city,
+                loc.state        AS location_state,
                 m.created_at, m.submitted_by, m.company_id, m.slug,
                 c.slug AS company_slug,
                 -- The company's RESOLVED identity, for the logo chain. Never a guessed domain.
@@ -37,6 +54,7 @@ public class ManagerRepository {
                 COALESCE(r.reviews, '[]') AS reviews
             FROM managers m
             LEFT JOIN companies c ON c.id = m.company_id
+            LEFT JOIN company_locations loc ON loc.id = m.company_location_id
             LEFT JOIN (
                 SELECT manager_id,
                     json_agg(jsonb_build_object(
@@ -76,7 +94,8 @@ public class ManagerRepository {
             SELECT
                 m.id, m.name, m.company, m.title, m.image, m.overall_rating,
                 m.reviews_count, m.bio, m.status, m.approval_status,
-                m.category_averages, m.linkedin_url, m.company_logo_url, m.country, m.created_at,
+                m.category_averages, m.linkedin_url, m.company_logo_url,
+                m.country, m.state, m.city, m.created_at,
                 m.submitted_by, m.external_id, m.company_id, m.slug,
                 c.slug AS company_slug,
                 -- The company's RESOLVED identity, for the logo chain. Never a guessed domain.
@@ -92,6 +111,7 @@ public class ManagerRepository {
                 ) AS career_history
             FROM managers m
             LEFT JOIN companies c ON c.id = m.company_id
+            LEFT JOIN company_locations loc ON loc.id = m.company_location_id
             LEFT JOIN career_history ch ON ch.manager_id = m.id
             """;
 
@@ -318,7 +338,7 @@ public class ManagerRepository {
         return db.preparedQuery("""
                 SELECT m.id, m.name, m.company, m.company_id, m.title, m.image, m.overall_rating,
                        m.reviews_count, m.bio, m.status, m.approval_status, m.linkedin_url,
-                       m.company_logo_url, m.country, m.created_at,
+                       m.company_logo_url, m.country, m.state, m.city, m.created_at,
                        /*
                          The employer's resolved identity, so a pending card renders the same
                          logo the directory does.
@@ -338,6 +358,7 @@ public class ManagerRepository {
                            AS company_brandfetch_icon_url
                 FROM managers m
                 LEFT JOIN companies c ON c.id = m.company_id
+            LEFT JOIN company_locations loc ON loc.id = m.company_location_id
                 LEFT JOIN companies byname
                        ON NULLIF(c.domain, '') IS NULL
                       AND LOWER(TRIM(byname.name)) = LOWER(TRIM(m.company))
@@ -1006,7 +1027,7 @@ public class ManagerRepository {
     public Future<Optional<io.vertx.core.json.JsonObject>> adminEdit(long managerId, String newName,
             String newTitle, String newCompany, String newLinkedinUrl, Long newCompanyId) {
         return adminEdit(managerId, newName, newTitle, newCompany, newLinkedinUrl, newCompanyId,
-                         null, null, null, null);
+                         null, null, null, null, null);
     }
 
     /** With location. Any of country/state/city may be null, meaning "leave it alone". */
@@ -1014,7 +1035,8 @@ public class ManagerRepository {
                                                                      String newTitle, String newCompany,
                                                                      String newLinkedinUrl, Long newCompanyId,
                                                                      String newCountry, String newState,
-                                                                     String newCity, String newCompanyLogoUrl) {
+                                                                     String newCity, String newCompanyLogoUrl,
+                                                                     Long newCompanyLocationId) {
         return ((Pool) db).withTransaction(conn ->
             conn.preparedQuery("SELECT name, title, company FROM managers WHERE id = $1")
                 .execute(Tuple.of(managerId))
@@ -1088,6 +1110,20 @@ public class ManagerRepository {
                     if (newCity != null) {
                         sql.append(", city = $").append(idx++);
                         params.add(newCity.isBlank() ? null : newCity);
+                    }
+                    /*
+                      The exact place, when one was picked.
+                      
+                      country/state/city is the coarse answer and company_location_id is the
+                      precise one; an admin could see an address on the profile but never set or
+                      correct it, because nothing wrote this column.
+                      
+                      A negative id means "clear it" - the only way to express "this manager is no
+                      longer at a specific building" through a field that is otherwise additive.
+                    */
+                    if (newCompanyLocationId != null) {
+                        sql.append(", company_location_id = $").append(idx++);
+                        params.add(newCompanyLocationId < 0 ? null : newCompanyLocationId);
                     }
                     params.add(managerId);
                     sql.append(" WHERE id = $").append(idx).append(" RETURNING id");
@@ -1740,6 +1776,7 @@ public class ManagerRepository {
                 SELECT m.name, m.slug, c.slug AS company_slug
                 FROM managers m
                 LEFT JOIN companies c ON c.id = m.company_id
+            LEFT JOIN company_locations loc ON loc.id = m.company_location_id
                 WHERE m.id = $1
                 """)
             .execute(Tuple.of(managerId))
@@ -1824,6 +1861,7 @@ public class ManagerRepository {
                 SELECT m.slug, c.slug AS company_slug
                 FROM managers m
                 LEFT JOIN companies c ON c.id = m.company_id
+            LEFT JOIN company_locations loc ON loc.id = m.company_location_id
                 WHERE m.id = $1
                 """)
             .execute(Tuple.of(managerId))

@@ -2833,6 +2833,12 @@ paths:
                 city:
                   type: string
                   nullable: true
+                companyLocationId:
+                  type: integer
+                  nullable: true
+                  description: >-
+                    The exact place this manager works, from company_locations. Omit to leave
+                    unchanged; send a negative value to clear it.
       responses:
         '200':
           description: Manager updated
