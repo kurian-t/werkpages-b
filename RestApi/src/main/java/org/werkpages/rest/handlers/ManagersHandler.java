@@ -94,8 +94,7 @@ public class ManagersHandler {
                     .put("locationPostalCode", managerLocation(row, "location_postal_code"))
                     .put("locationCity",       managerLocation(row, "location_city"))
                     .put("locationState",      managerLocation(row, "location_state"))
-                    .put("companyLocationId",  row.getColumnIndex("company_location_id") >= 0
-                                                 ? row.getLong("company_location_id") : null)
+                    .put("companyLocationId",  managerLocationId(row))
                     .put("companyLogoUrl", logoUrl)
                     .put("companyDomain", companyIdentity(row, "company_domain"))
                     .put("companyBrandfetchIconUrl", companyIdentity(row, "company_brandfetch_icon_url"))
@@ -174,8 +173,7 @@ public class ManagersHandler {
                     .put("locationPostalCode", managerLocation(row, "location_postal_code"))
                     .put("locationCity",       managerLocation(row, "location_city"))
                     .put("locationState",      managerLocation(row, "location_state"))
-                    .put("companyLocationId",  row.getColumnIndex("company_location_id") >= 0
-                                                 ? row.getLong("company_location_id") : null)
+                    .put("companyLocationId",  managerLocationId(row))
             .put("companyLogoUrl", logoUrl)
                     .put("companyDomain", companyIdentity(row, "company_domain"))
                     .put("companyBrandfetchIconUrl", companyIdentity(row, "company_brandfetch_icon_url"))
@@ -415,8 +413,7 @@ public class ManagersHandler {
                     .put("locationPostalCode", managerLocation(row, "location_postal_code"))
                     .put("locationCity",       managerLocation(row, "location_city"))
                     .put("locationState",      managerLocation(row, "location_state"))
-                    .put("companyLocationId",  row.getColumnIndex("company_location_id") >= 0
-                                                 ? row.getLong("company_location_id") : null)
+                    .put("companyLocationId",  managerLocationId(row))
                         .put("companyLogoUrl", logo)
                         // Same identity every other surface gets - see companyIdentity().
                         .put("companyDomain", companyIdentity(row, "company_domain"))
@@ -888,10 +885,56 @@ public class ManagersHandler {
         }).otherwise(suggestions);
     }
 
-    /** A manager location column when the query selected it, else null. */
+    /**
+     * A manager location column when the query selected it, else null.
+     *
+     * <p><b>Sub-country detail is published only when somebody confirmed it.</b> {@code country}
+     * always is; everything finer depends on {@code location_source}.
+     *
+     * <p>The distinction is provenance, not approval status. {@code createAutoApproved} stamps the
+     * SEARCHER's Cloudflare geography onto the manager they were looking for, so a ghost's city is
+     * frequently about a different person in a different place - and the person named has never
+     * seen it, let alone agreed to it. But a ghost whose location somebody has since EDITED is a
+     * declaration like any other and must be shown, which is exactly what keying this on
+     * {@code approval_status} got wrong: the edit saved and could never be displayed.
+     *
+     * <p>V72 sets the same policy in the data and explains it at length: it revoked V70's state
+     * promotion for visitor-inferred rows while deliberately keeping their country, "already
+     * displayed on every manager profile today, ghost or not, and already correctable through the
+     * edit-request flow - so recording it as declared publishes nothing new".
+     */
     private static String managerLocation(io.vertx.sqlclient.Row row, String column) {
         if (row.getColumnIndex(column) < 0) return null;
+        if (!"country".equals(column) && !locationConfirmed(row)) return null;
         String v = row.getString(column);
         return v == null || v.isBlank() ? null : v;
+    }
+
+    /** The exact workplace id - the most identifying value of all, so it follows the same rule. */
+    private static Long managerLocationId(io.vertx.sqlclient.Row row) {
+        if (row.getColumnIndex("company_location_id") < 0 || !locationConfirmed(row)) return null;
+        return row.getLong("company_location_id");
+    }
+
+    /**
+     * Whether this row's location is somebody's answer rather than a visitor's headers.
+     *
+     * <p>A null source means nothing was ever declared - V72 only labelled rows that already had a
+     * {@code declared_precision} - so it is treated as unconfirmed. That costs nothing, because a
+     * row with no declared location has no sub-country detail to withhold.
+     *
+     * <p>Fails OPEN when the query did not select the column, rather than silently blanking the
+     * location on every endpoint whose projection has not been updated. The three public manager
+     * reads do select it.
+     */
+    private static boolean locationConfirmed(io.vertx.sqlclient.Row row) {
+        if (row.getColumnIndex("location_source") < 0) return true;
+        String source = row.getString("location_source");
+        if (source == null) return false;
+        return switch (source) {
+            case "contributor_declared", "company_location", "legacy_form_confirmed" -> true;
+            // legacy_visitor_inferred, and anything added later that has not been considered here.
+            default -> false;
+        };
     }
 }

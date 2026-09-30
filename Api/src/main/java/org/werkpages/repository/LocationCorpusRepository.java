@@ -135,6 +135,14 @@ public class LocationCorpusRepository {
     private final ThreadLocal<Connection> perThread = new ThreadLocal<>();
 
     private volatile Connection connection;
+
+    /**
+     * Whether the active release's {@code search_text} is sorted, from its own manifest.
+     *
+     * <p>Decides whether the anchored predicate is used. Defaults to false so a release that says
+     * nothing behaves exactly as it does today. See {@link #anchoredTokensClause} for the numbers.
+     */
+    private volatile boolean searchTextSorted = false;
     private volatile String release;
     private volatile boolean unavailable;
 
@@ -163,12 +171,31 @@ public class LocationCorpusRepository {
      * walks straight back through queries just answered. Each miss is a read of Parquet on S3,
      * which is the whole cost of this control; each hit is free.
      *
-     * <p>Small and short-lived on purpose. The corpus changes when a release is published, not
-     * between keystrokes, so a minute of staleness is invisible; and a cache large enough to
-     * matter for memory would defeat the reason the corpus is not in Postgres.
+     * <h2>Why an hour, not a minute</h2>
+     *
+     * <p>This was 60 seconds and 256 entries, on the reasoning that a minute of staleness is
+     * invisible. The reasoning was right and the number was still far too small, because it was
+     * chosen against the wrong cost. Measured against the live bucket: a warm Canadian query is
+     * ~0.35s, a United States one is <b>16–21s</b>, and a cache hit is 0.003s. A minute is shorter
+     * than the gap between somebody typing a city and coming back to correct it, so the same
+     * twenty-second scan was being paid repeatedly.
+     *
+     * <p>There is no staleness to trade away. A corpus release is immutable, they are published
+     * roughly twice a year, and the active release id is resolved once when the connection is set
+     * up and memoised for the life of the process — so a new release is not picked up without a
+     * restart whatever this value is. An hour is bounded only so a long-lived process eventually
+     * lets go of queries nobody is asking any more.
+     *
+     * <p>Memory is the real constraint and it is small: an entry holds at most
+     * {@link #SUGGESTION_ROWS} short rows, so a few thousand of them is single-digit megabytes —
+     * nothing against the engine's own {@code memory_limit}, and nowhere near enough to defeat the
+     * reason the corpus is not in Postgres.
      */
-    private static final long   CACHE_TTL_MS  = 60_000;
-    private static final int    CACHE_MAX     = 256;
+    private static final long   CACHE_TTL_MS  = 60 * 60_000L;
+    private static final int    CACHE_MAX     = 4_096;
+
+    /** Rows an entry can hold, for the memory note above. Matches the query LIMIT. */
+    private static final int    SUGGESTION_ROWS = LIMIT;
     private final java.util.Map<String, CacheEntry> cache =
         java.util.Collections.synchronizedMap(new java.util.LinkedHashMap<>(16, 0.75f, true) {
             @Override protected boolean removeEldestEntry(java.util.Map.Entry<String, CacheEntry> eldest) {
@@ -206,6 +233,7 @@ public class LocationCorpusRepository {
         java.util.List<String> words = withoutCountryWord(tokens(needle), country);
 
         return cached("geo|" + iso + "|" + blankToNull(state) + "|" + needle, () ->
+          anchoredThenContains(anchored ->
             query(release -> """
                 SELECT name, kind, state_name, state_code
                 FROM read_parquet('s3://%s/processed/%s/geography/country_code=%s/*.parquet')
@@ -216,10 +244,11 @@ public class LocationCorpusRepository {
                               ELSE 2 END,
                          population DESC NULLS LAST
                 LIMIT %d
-                """.formatted(bucket, release, partition(iso), allTokensClause(words.size()), LIMIT),
+                """.formatted(bucket, release, partition(iso), tokensClause(words.size(), anchored), LIMIT),
             statement -> {
                 int i = 1;
-                for (String word : words) statement.setString(i++, "%" + word + "%");
+                bindTokens(statement, words, i, anchored);
+                i += words.size();
                 statement.setString(i++, blankToNull(state));
                 statement.setString(i++, blankToNull(state));
                 statement.setString(i++, needle);
@@ -230,7 +259,7 @@ public class LocationCorpusRepository {
                 .put("name", rs.getString("name"))
                 .put("geoKind", rs.getString("kind"))
                 .put("stateName", rs.getString("state_name"))
-                .put("stateCode", rs.getString("state_code"))));
+                .put("stateCode", rs.getString("state_code")))));
     }
 
     /**
@@ -266,6 +295,7 @@ public class LocationCorpusRepository {
             () -> forPlaces(tokens(needle), country, iso);
 
         return cached("place|" + iso + "|" + brand + "|" + needle, () ->
+          anchoredThenContains(anchored ->
             query(release -> """
                 SELECT source_place_id, name, brand_name, street, city, state_code, postal_code
                 FROM (
@@ -312,10 +342,11 @@ public class LocationCorpusRepository {
                               ELSE 2 END,
                          confidence DESC NULLS LAST
                 LIMIT %d
-                """.formatted(bucket, release, partition(iso), allTokensClause(words.get().size()), LIMIT),
+                """.formatted(bucket, release, partition(iso), tokensClause(words.get().size(), anchored), LIMIT),
             statement -> {
                 int i = 1;
-                for (String word : words.get()) statement.setString(i++, "%" + word + "%");
+                bindTokens(statement, words.get(), i, anchored);
+                i += words.get().size();
                 statement.setString(i++, brand);
                 statement.setString(i, brand);
             },
@@ -327,7 +358,7 @@ public class LocationCorpusRepository {
                 .put("street", rs.getString("street"))
                 .put("city", rs.getString("city"))
                 .put("stateCode", rs.getString("state_code"))
-                .put("postalCode", rs.getString("postal_code"))));
+                .put("postalCode", rs.getString("postal_code")))));
     }
 
     // ── Plumbing ─────────────────────────────────────────────────────────────
@@ -530,11 +561,32 @@ public class LocationCorpusRepository {
      * something that changes twice a year.
      */
     private String activeRelease(Connection conn) throws SQLException {
-        String sql = "SELECT release FROM read_json_auto('s3://" + bucket + "/current.json')";
+        String sql = "SELECT * FROM read_json_auto('s3://" + bucket + "/current.json')";
         try (Statement statement = conn.createStatement();
              ResultSet rs = statement.executeQuery(sql)) {
             if (!rs.next()) return null;
-            String value = rs.getString(1);
+            /*
+              The release declares whether its search_text is sorted, rather than a flag somebody
+              has to remember to flip alongside publishing one.
+
+              The anchored predicate is only worth using on a sorted release: anchoring is what
+              lets row-group statistics prune, and on an unsorted one an anchored MISS still reads
+              the whole partition and then pays for the contains fallback on top - slower than
+              simply doing the contains. So a release that has not been sorted keeps today's
+              behaviour exactly, and a sorted one turns the fast path on by existing.
+
+              Read tolerantly: releases published before this field existed do not carry it.
+            */
+            java.sql.ResultSetMetaData meta = rs.getMetaData();
+            String value = null;
+            for (int i = 1; i <= meta.getColumnCount(); i++) {
+                String column = meta.getColumnLabel(i);
+                if ("release".equalsIgnoreCase(column)) {
+                    value = rs.getString(i);
+                } else if ("search_text_sorted".equalsIgnoreCase(column)) {
+                    searchTextSorted = rs.getBoolean(i);
+                }
+            }
             return (value == null || value.isBlank() || "none".equals(value)) ? null : value;
         }
     }
@@ -683,6 +735,91 @@ public class LocationCorpusRepository {
     /** {@code search_text LIKE ? AND search_text LIKE ?…}, one per token. */
     private static String allTokensClause(int count) {
         return String.join(" AND ", java.util.Collections.nCopies(count, "search_text LIKE ?"));
+    }
+
+    /** Anchored on a sorted release, plain contains otherwise. */
+    private String tokensClause(int count) {
+        return tokensClause(count, searchTextSorted);
+    }
+
+    private String tokensClause(int count, boolean anchored) {
+        return anchored ? anchoredTokensClause(count) : allTokensClause(count);
+    }
+
+    /**
+     * Runs an anchored attempt first and falls back to contains when it finds nothing.
+     *
+     * <p>Anchoring matches the start of {@code search_text}, which is the place's own name. That is
+     * what people type first, and it is the case worth making fast. It is NOT how somebody finds
+     * "the Walmart in Kitchener" — that city sits in the middle of the string and never
+     * prefix-matches — so an empty anchored result has to mean "ask the slow way", not "no such
+     * place". Without this a sorted release would quietly stop answering city and street queries.
+     *
+     * <p>On an unsorted release there is nothing to gain and a fallback to pay for, so the anchored
+     * attempt is skipped entirely and this is exactly today's single query.
+     */
+    private Future<JsonArray> anchoredThenContains(
+            java.util.function.Function<Boolean, Future<JsonArray>> run) {
+        if (!searchTextSorted) return run.apply(false);
+        return run.apply(true).compose(found -> found.isEmpty() ? run.apply(false)
+                                                                : Future.succeededFuture(found));
+    }
+
+    /**
+     * Binds the token patterns to match {@link #tokensClause}.
+     *
+     * <p>The leading token loses its leading wildcard on a sorted release - that is the whole
+     * point of anchoring - and the rest stay as contains.
+     */
+    private void bindTokens(PreparedStatement statement, java.util.List<String> words, int from,
+                            boolean anchored) throws SQLException {
+        int i = from;
+        boolean first = true;
+        for (String word : words) {
+            String pattern = (anchored && first) ? word + "%" : "%" + word + "%";
+            statement.setString(i++, pattern);
+            first = false;
+        }
+    }
+
+    /**
+     * The same test, with the FIRST token anchored to the start of {@code search_text}.
+     *
+     * <h2>Why this exists</h2>
+     *
+     * <p>{@code LIKE '%needle%'} has a leading wildcard, so no Parquet row-group statistic can
+     * exclude anything and every query reads the whole country partition. That is the entire cost
+     * of this control. Measured against the live bucket, the United States places partition is
+     * 16.1M rows and takes 16-21s through the backend, against 0.35s for Canada's 1.5M.
+     *
+     * <p>An anchored first token is a range predicate — {@code search_text >= 'austin' AND < 'austio'}
+     * in effect — which min/max statistics CAN prune. Measured on the real 16.1M-row partition,
+     * locally, at two threads:
+     *
+     * <pre>
+     *   predicate                unsorted   sorted by search_text
+     *   LIKE '%austin%'            0.59s          0.58s
+     *   LIKE 'austin%'             0.36s          0.03s
+     * </pre>
+     *
+     * <p><b>Sorting alone buys nothing and anchoring alone buys little; together they are ~20x.</b>
+     * So this is half of a change: the other half is {@code ORDER BY search_text} in the corpus
+     * build, and until a release is published that way this is worth about the 0.59 → 0.36
+     * improvement rather than the 0.59 → 0.03 one. It is correct either way.
+     *
+     * <h2>Why the remaining tokens stay unanchored</h2>
+     *
+     * <p>{@code search_text} is the name, then the brand, street and city. Anchoring the leading
+     * token matches what people actually type first — the name of the place or the city — while
+     * "kitchener" for a Walmart on Ottawa Street appears in the middle of the string and never
+     * prefix-matches. So the leading token narrows the scan and the rest filter inside it, and
+     * {@link #allTokensClause} remains the fallback for a query that the anchored form misses.
+     */
+    private static String anchoredTokensClause(int count) {
+        if (count == 0) return "TRUE";
+        StringBuilder sql = new StringBuilder("search_text LIKE ?");
+        for (int i = 1; i < count; i++) sql.append(" AND search_text LIKE ?");
+        return sql.toString();
     }
 
     private static String blankToNull(String value) {

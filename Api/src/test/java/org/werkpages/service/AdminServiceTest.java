@@ -333,7 +333,7 @@ class AdminServiceTest {
             .thenReturn(Future.succeededFuture(1));
         when(managerRepo.insertCareerEntry(eq(MANAGER_ID), anyString(), anyString(), any(), isNull(), any()))
             .thenReturn(Future.succeededFuture());
-        when(managerRepo.update(eq(MANAGER_ID), anyString(), anyString(), isNull(), isNull(), isNull(), isNull(), isNull(), isNull(), any()))
+        when(managerRepo.update(eq(MANAGER_ID), anyString(), anyString(), isNull(), isNull(), isNull(), isNull(), any(), any(), any(), isNull(), isNull(), any()))
             .thenReturn(Future.succeededFuture(Optional.empty()));
         when(editRepo.approve(eq(editId), eq(ADMIN_ID), any()))
             .thenReturn(Future.succeededFuture());
@@ -361,7 +361,7 @@ class AdminServiceTest {
             .thenReturn(Future.succeededFuture(0));
         when(managerRepo.insertCareerEntry(eq(MANAGER_ID), anyString(), anyString(), any(), any(), any()))
             .thenReturn(Future.succeededFuture());
-        when(managerRepo.update(eq(MANAGER_ID), anyString(), anyString(), isNull(), isNull(), isNull(), isNull(), isNull(), isNull(), any()))
+        when(managerRepo.update(eq(MANAGER_ID), anyString(), anyString(), isNull(), isNull(), isNull(), isNull(), any(), any(), any(), isNull(), isNull(), any()))
             .thenReturn(Future.succeededFuture(Optional.empty()));
         when(editRepo.approve(eq(editId), eq(ADMIN_ID), any()))
             .thenReturn(Future.succeededFuture());
@@ -387,7 +387,7 @@ class AdminServiceTest {
             .thenReturn(Future.succeededFuture(1));
         when(managerRepo.insertCareerEntry(eq(MANAGER_ID), anyString(), anyString(), any(), isNull(), any()))
             .thenReturn(Future.succeededFuture());
-        when(managerRepo.update(eq(MANAGER_ID), anyString(), anyString(), isNull(), isNull(), isNull(), isNull(), isNull(), isNull(), any()))
+        when(managerRepo.update(eq(MANAGER_ID), anyString(), anyString(), isNull(), isNull(), isNull(), isNull(), any(), any(), any(), isNull(), isNull(), any()))
             .thenReturn(Future.succeededFuture(Optional.empty()));
         when(editRepo.approve(eq(editId), eq(ADMIN_ID), any()))
             .thenReturn(Future.succeededFuture());

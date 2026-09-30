@@ -2203,6 +2203,31 @@ paths:
                   nullable: true
                 title:
                   type: string
+                # The location, as the shared LocationField collects it. V70 gave manager_edits
+                # somewhere to store these; until the edit form used that control there was
+                # nothing to send. Each is optional and independent - an edit about a job title
+                # must not blank a location it never asked about.
+                country:
+                  type: string
+                  nullable: true
+                state:
+                  type: string
+                  nullable: true
+                city:
+                  type: string
+                  nullable: true
+                # No enum here on purpose: an OpenAPI 3.0 enum combined with nullable rejects an
+                # explicit null unless null is listed, which is the exact shape that broke /find
+                # before. The service validates the four allowed values and returns a clear 400.
+                precision:
+                  type: string
+                  nullable: true
+                # A building the editor picked. Negative means "no longer at a specific building",
+                # which is the only way to clear a field that is otherwise additive.
+                companyLocationId:
+                  type: integer
+                  format: int64
+                  nullable: true
       responses:
         '201':
           description: Edit request created

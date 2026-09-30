@@ -2656,11 +2656,20 @@ public class ManagerService {
         String newTitle          = body.getString("title");
         String newStatus         = body.getString("status");
         String newCountry        = body.getString("country");
+        /*
+          The rest of the location, which the edit form now collects through the same control
+          every other form uses. V70 added somewhere to put it; until this, nothing sent it.
+        */
+        String newState          = body.getString("state");
+        String newCity           = body.getString("city");
+        String newPrecision      = body.getString("precision");
+        Long   newCompanyLocationId = body.getLong("companyLocationId");
         String newLinkedinUrl    = body.getString("linkedinUrl");
         String startDateStr   = body.getString("startDate");
         String endDateStr     = body.getString("endDate");
 
-        if (isBlank(newCompany) && isBlank(newTitle) && isBlank(newStatus) && isBlank(newCountry) && isBlank(newLinkedinUrl)
+        if (isBlank(newCompany) && isBlank(newTitle) && isBlank(newStatus) && isBlank(newCountry)
+                && isBlank(newState) && isBlank(newCity) && newCompanyLocationId == null && isBlank(newLinkedinUrl)
                 && isBlank(startDateStr) && isBlank(endDateStr)) {
             return Future.failedFuture(ServiceException.badRequest("At least one field is required"));
         }
@@ -2668,6 +2677,12 @@ public class ManagerService {
         if (newTitle      != null && newTitle.length()   > 100)    return Future.failedFuture(ServiceException.badRequest("Title must be at most 100 characters"));
         if (newStatus     != null && !newStatus.equals("active") && !newStatus.equals("retired")) return Future.failedFuture(ServiceException.badRequest("Status must be 'active' or 'retired'"));
         if (newCountry    != null && newCountry.length() > 100)    return Future.failedFuture(ServiceException.badRequest("Country must be at most 100 characters"));
+        if (newState      != null && newState.length()   > 100)    return Future.failedFuture(ServiceException.badRequest("State must be at most 100 characters"));
+        if (newCity       != null && newCity.length()    > 100)    return Future.failedFuture(ServiceException.badRequest("City must be at most 100 characters"));
+        if (newPrecision  != null && !newPrecision.isBlank()
+                && !List.of("country", "state", "city", "exact").contains(newPrecision)) {
+            return Future.failedFuture(ServiceException.badRequest("Precision must be one of country, state, city, exact"));
+        }
         if (newLinkedinUrl != null && newLinkedinUrl.length() > 500) return Future.failedFuture(ServiceException.badRequest("LinkedIn URL must be at most 500 characters"));
 
         LocalDate startDateLocal = parseYearMonth(startDateStr);
@@ -2680,6 +2695,21 @@ public class ManagerService {
         String effectiveTitle          = toNullIfBlank(newTitle);
         String effectiveStatus         = toNullIfBlank(newStatus);
         String effectiveCountry        = toNullIfBlank(newCountry);
+        /*
+          NOT toNullIfBlank, unlike every field above it.
+
+          Null and empty mean different things for a location part. Null is "this edit did not ask
+          about the city", so approval leaves it alone - that is what stops a title correction from
+          wiping a location. Empty is "the editor removed the city", which has to reach the
+          database as a NULL column.
+
+          Collapsing empty to null here made the two indistinguishable, so a city could be entered
+          and corrected but never removed: the clearing edit arrived looking like an edit that had
+          not mentioned the city at all. Caught by anEmptyStringClearsAPartOfTheLocation.
+        */
+        String effectiveState          = newState;
+        String effectiveCity           = newCity;
+        String effectivePrecision      = toNullIfBlank(newPrecision);
         String effectiveLinkedinUrl    = toNullIfBlank(newLinkedinUrl);
 
         return userRepo.findByAuth0IdWithBan(auth0Id)
@@ -2695,7 +2725,7 @@ public class ManagerService {
                                 if (mgrOpt.isEmpty()) return Future.failedFuture(ServiceException.notFound("Manager not found"));
                                 // The company the user picked travels with the request. The name
                                 // beside it is a snapshot for the admin to read, not identity.
-                                return editRepo.upsert(managerId, userId, effectiveCompany, body.getLong("companyId"), effectiveCompanyLogoUrl, effectiveTitle, effectiveStatus, effectiveCountry, effectiveLinkedinUrl, newStartDate, newEndDate)
+                                return editRepo.upsert(managerId, userId, effectiveCompany, body.getLong("companyId"), effectiveCompanyLogoUrl, effectiveTitle, effectiveStatus, effectiveCountry, effectiveState, effectiveCity, effectivePrecision, newCompanyLocationId, effectiveLinkedinUrl, newStartDate, newEndDate)
                                     .map(row -> new JsonObject()
                                         .put("id", row.getUUID("id").toString())
                                         .put("managerId", managerId)
@@ -2703,6 +2733,9 @@ public class ManagerService {
                                         .put("newTitle", effectiveTitle)
                                         .put("newStatus", effectiveStatus)
                                         .put("newCountry", effectiveCountry)
+                                        .put("newState", effectiveState)
+                                        .put("newCity", effectiveCity)
+                                        .put("newCompanyLocationId", newCompanyLocationId)
                                         .put("newLinkedinUrl", effectiveLinkedinUrl)
                                         .put("status", "pending")
                                         .put("createdAt", row.getOffsetDateTime("created_at").toString())

@@ -30,6 +30,9 @@ public class ManagerRepository {
                 -- Where the manager works. country was selected and state/city were not, so an
                 -- edit could save them and nothing could ever show them back.
                 m.country, m.state, m.city,
+                -- How that location was arrived at. Never shown; it decides whether the
+                -- sub-country detail may be shown at all. See V72 and managerLocation().
+                m.location_source,
                 /*
                   The exact place, when one was chosen.
 
@@ -95,7 +98,7 @@ public class ManagerRepository {
                 m.id, m.name, m.company, m.title, m.image, m.overall_rating,
                 m.reviews_count, m.bio, m.status, m.approval_status,
                 m.category_averages, m.linkedin_url, m.company_logo_url,
-                m.country, m.state, m.city, m.created_at,
+                m.country, m.state, m.city, m.location_source, m.created_at,
                 m.submitted_by, m.external_id, m.company_id, m.slug,
                 c.slug AS company_slug,
                 -- The company's RESOLVED identity, for the logo chain. Never a guessed domain.
@@ -338,7 +341,7 @@ public class ManagerRepository {
         return db.preparedQuery("""
                 SELECT m.id, m.name, m.company, m.company_id, m.title, m.image, m.overall_rating,
                        m.reviews_count, m.bio, m.status, m.approval_status, m.linkedin_url,
-                       m.company_logo_url, m.country, m.state, m.city, m.created_at,
+                       m.company_logo_url, m.country, m.state, m.city, m.location_source, m.created_at,
                        /*
                          The employer's resolved identity, so a pending card renders the same
                          logo the directory does.
@@ -428,6 +431,25 @@ public class ManagerRepository {
                                          String newImage, String newBio, String newStatus,
                                          String newCountry, String newLinkedinUrl, String newLogoUrl,
                                          Long newCompanyId) {
+        return update(id, newCompany, newTitle, newImage, newBio, newStatus, newCountry,
+                      null, null, null, newLinkedinUrl, newLogoUrl, newCompanyId);
+    }
+
+    /**
+     * As above, but able to write the whole location rather than only the country.
+     *
+     * <p>Approving an edit request went through the country-only form, so an approved request to
+     * move a manager to "Kitchener, Ontario" silently kept the old city. Each part stays
+     * independent and optional: null leaves a column alone, so an edit about a job title cannot
+     * blank a location it never asked about. A negative {@code newCompanyLocationId} clears the
+     * exact place, matching {@code adminEdit}.
+     */
+    public Future<Optional<Row>> update(long id, String newCompany, String newTitle,
+                                         String newImage, String newBio, String newStatus,
+                                         String newCountry, String newState, String newCity,
+                                         Long newCompanyLocationId,
+                                         String newLinkedinUrl, String newLogoUrl,
+                                         Long newCompanyId) {
         StringBuilder sql = new StringBuilder("UPDATE managers SET updated_at = now()");
         List<Object> params = new ArrayList<>();
         int idx = 1;
@@ -436,7 +458,22 @@ public class ManagerRepository {
         if (newImage       != null) { sql.append(", image = $").append(idx++);             params.add(newImage); }
         if (newBio         != null) { sql.append(", bio = $").append(idx++);               params.add(newBio); }
         if (newStatus      != null) { sql.append(", status = $").append(idx++);            params.add(newStatus); }
-        if (newCountry     != null) { sql.append(", country = $").append(idx++);           params.add(newCountry); }
+        boolean locationTouched = newCountry != null || newState != null || newCity != null
+                                  || newCompanyLocationId != null;
+        if (newCountry     != null) { sql.append(", country = $").append(idx++);           params.add(newCountry.isBlank() ? null : newCountry); }
+        if (newState       != null) { sql.append(", state = $").append(idx++);             params.add(newState.isBlank()   ? null : newState); }
+        if (newCity        != null) { sql.append(", city = $").append(idx++);              params.add(newCity.isBlank()    ? null : newCity); }
+        if (newCompanyLocationId != null) { sql.append(", company_location_id = $").append(idx++); params.add(newCompanyLocationId < 0 ? null : newCompanyLocationId); }
+        /*
+          An edited location is somebody's answer, so it is recorded as one.
+
+          Without this the write succeeds and stays invisible: the reads publish sub-country detail
+          only for a confirmed location, and a manager created by a search carries
+          'legacy_visitor_inferred' until something says otherwise. Correcting a ghost's city would
+          save and never display - the same silently-discarded edit this whole change set exists to
+          remove.
+        */
+        if (locationTouched) { sql.append(", location_source = $").append(idx++); params.add("contributor_declared"); }
         if (newLinkedinUrl != null) { sql.append(", linkedin_url = $").append(idx++);      params.add(newLinkedinUrl); }
         if (newLogoUrl     != null) { sql.append(", company_logo_url = $").append(idx++);  params.add(newLogoUrl); }
         if (newCompanyId   != null) { sql.append(", company_id = $").append(idx++);        params.add(newCompanyId); }
@@ -1124,6 +1161,19 @@ public class ManagerRepository {
                     if (newCompanyLocationId != null) {
                         sql.append(", company_location_id = $").append(idx++);
                         params.add(newCompanyLocationId < 0 ? null : newCompanyLocationId);
+                    }
+                    /*
+                      An admin setting a location is declaring one, so it is recorded as declared.
+
+                      Same reason as in update(): the reads publish sub-country detail only for a
+                      confirmed location, and a search-created manager carries
+                      'legacy_visitor_inferred'. Without this an admin could correct a ghost's city
+                      and the profile would carry on showing the country alone.
+                    */
+                    if (newCountry != null || newState != null || newCity != null
+                            || newCompanyLocationId != null) {
+                        sql.append(", location_source = $").append(idx++);
+                        params.add("contributor_declared");
                     }
                     params.add(managerId);
                     sql.append(" WHERE id = $").append(idx).append(" RETURNING id");

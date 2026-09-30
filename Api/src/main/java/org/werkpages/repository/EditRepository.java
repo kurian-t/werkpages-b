@@ -49,29 +49,57 @@ public class EditRepository {
                                String newTitle, String newStatus, String newCountry,
                                String newLinkedinUrl,
                                OffsetDateTime newStartDate, OffsetDateTime newEndDate) {
+        return upsert(managerId, proposedBy, newCompany, requestedCompanyId, newCompanyLogoUrl, newTitle,
+                      newStatus, newCountry, null, null, null, null, newLinkedinUrl, newStartDate, newEndDate);
+    }
+
+    /**
+     * Records an edit request that carries a whole location rather than only a country.
+     *
+     * <p>V70 added these four columns so that a location could be corrected the same way a title
+     * can. Nothing ever wrote them: the form asked for a country from a dropdown, so there was
+     * nothing else to store. Now that every form asks the same question through one control, an
+     * edit can say "Kitchener, Ontario" or name a building, and the answer has somewhere to go.
+     *
+     * @param newCompanyLocationId a building the editor picked. When set, the coarse columns are a
+     *                             snapshot for the admin to read; the row itself is the authority.
+     */
+    public Future<Row> upsert(long managerId, UUID proposedBy, String newCompany, Long requestedCompanyId,
+                               String newCompanyLogoUrl,
+                               String newTitle, String newStatus, String newCountry,
+                               String newState, String newCity, String newPrecision,
+                               Long newCompanyLocationId,
+                               String newLinkedinUrl,
+                               OffsetDateTime newStartDate, OffsetDateTime newEndDate) {
         return db.preparedQuery("""
-                INSERT INTO manager_edits(manager_id, proposed_by, new_company, requested_company_id, new_company_logo_url, new_title, new_status, new_country, new_linkedin_url, new_start_date, new_end_date)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+                INSERT INTO manager_edits(manager_id, proposed_by, new_company, requested_company_id, new_company_logo_url, new_title, new_status, new_country, new_declared_state, new_declared_city, new_declared_precision, new_company_location_id, new_linkedin_url, new_start_date, new_end_date)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
                 ON CONFLICT (manager_id, proposed_by) WHERE status = 'pending'
-                DO UPDATE SET new_company          = EXCLUDED.new_company,
-                              requested_company_id = EXCLUDED.requested_company_id,
-                              new_company_logo_url = EXCLUDED.new_company_logo_url,
-                              new_title            = EXCLUDED.new_title,
-                              new_status           = EXCLUDED.new_status,
-                              new_country          = EXCLUDED.new_country,
-                              new_linkedin_url     = EXCLUDED.new_linkedin_url,
-                              new_start_date       = EXCLUDED.new_start_date,
-                              new_end_date         = EXCLUDED.new_end_date,
-                              created_at           = now()
+                DO UPDATE SET new_company             = EXCLUDED.new_company,
+                              requested_company_id    = EXCLUDED.requested_company_id,
+                              new_company_logo_url    = EXCLUDED.new_company_logo_url,
+                              new_title               = EXCLUDED.new_title,
+                              new_status              = EXCLUDED.new_status,
+                              new_country             = EXCLUDED.new_country,
+                              new_declared_state      = EXCLUDED.new_declared_state,
+                              new_declared_city       = EXCLUDED.new_declared_city,
+                              new_declared_precision  = EXCLUDED.new_declared_precision,
+                              new_company_location_id = EXCLUDED.new_company_location_id,
+                              new_linkedin_url        = EXCLUDED.new_linkedin_url,
+                              new_start_date          = EXCLUDED.new_start_date,
+                              new_end_date            = EXCLUDED.new_end_date,
+                              created_at              = now()
                 RETURNING id, created_at
                 """)
-            .execute(Tuple.of(managerId, proposedBy, newCompany, requestedCompanyId, newCompanyLogoUrl, newTitle, newStatus, newCountry, newLinkedinUrl, newStartDate, newEndDate))
+            .execute(Tuple.of(managerId, proposedBy, newCompany, requestedCompanyId, newCompanyLogoUrl, newTitle, newStatus, newCountry, newState, newCity, newPrecision, newCompanyLocationId, newLinkedinUrl, newStartDate, newEndDate))
             .map(rows -> rows.iterator().next());
     }
 
     public Future<RowSet<Row>> findPendingByManagerAndUser(long managerId, UUID userId) {
         return db.preparedQuery("""
-                SELECT id, new_company, new_title, new_status, new_country, new_linkedin_url, new_start_date, new_end_date, created_at
+                SELECT id, new_company, new_title, new_status, new_country,
+                       new_declared_state, new_declared_city, new_declared_precision, new_company_location_id,
+                       new_linkedin_url, new_start_date, new_end_date, created_at
                 FROM manager_edits
                 WHERE manager_id = $1 AND proposed_by = $2 AND status = 'pending'
                 ORDER BY created_at DESC LIMIT 1
@@ -85,6 +113,7 @@ public class EditRepository {
                        m.company AS current_company, m.title AS current_title,
                        u.username AS requested_by,
                        pe.new_company, pe.new_title, pe.new_status, pe.new_country,
+                       pe.new_declared_state, pe.new_declared_city, pe.new_company_location_id,
                        pe.new_linkedin_url, pe.status, pe.created_at
                 FROM manager_edits pe
                 JOIN managers m ON m.id = pe.manager_id
@@ -99,7 +128,9 @@ public class EditRepository {
     public Future<Optional<Row>> findByIdWithManager(UUID editId) {
         return db.preparedQuery("""
                 SELECT pe.id, pe.manager_id, pe.new_company, pe.requested_company_id, pe.new_company_logo_url, pe.new_title, pe.new_status,
-                       pe.new_country, pe.new_linkedin_url, pe.new_start_date, pe.new_end_date,
+                       pe.new_country, pe.new_declared_state, pe.new_declared_city,
+                       pe.new_declared_precision, pe.new_company_location_id,
+                       pe.new_linkedin_url, pe.new_start_date, pe.new_end_date,
                        pe.status, pe.proposed_by,
                        m.company AS current_company, m.title AS current_title,
                        m.company_id AS current_company_id,

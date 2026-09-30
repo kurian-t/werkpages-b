@@ -206,4 +206,65 @@ class LocationCorpusRepositoryTest {
                      LocationCorpusRepository.withoutCountryWord(
                          List.of("toronto", "ontario", "canada"), "Canada"));
     }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // The anchored predicate
+    // ══════════════════════════════════════════════════════════════════════════
+
+    private static String clause(int tokens, boolean anchored) throws Exception {
+        var m = LocationCorpusRepository.class.getDeclaredMethod("tokensClause", int.class, boolean.class);
+        m.setAccessible(true);
+        return (String) m.invoke(unreachable(), tokens, anchored);
+    }
+
+    @Test
+    @DisplayName("an unsorted release keeps the contains predicate it was built for")
+    void unsortedUsesContains() throws Exception {
+        /*
+          The anchored form is only worth using when the corpus is sorted on search_text, because
+          anchoring is what lets row-group statistics prune. On an unsorted release an anchored MISS
+          still reads the whole partition AND then pays for the contains fallback, which is slower
+          than simply doing the contains once.
+
+          So a release that does not declare itself sorted must produce byte-for-byte the query it
+          produced before this existed.
+        */
+        assertEquals("search_text LIKE ?", clause(1, false));
+        assertEquals("search_text LIKE ? AND search_text LIKE ?", clause(2, false));
+    }
+
+    @Test
+    @DisplayName("a sorted release anchors the leading token and only the leading token")
+    void sortedAnchorsTheLeadingToken() throws Exception {
+        /*
+          The SQL is the same shape either way - the difference is in the bound pattern, "denver%"
+          rather than "%denver%". What this pins is that the clause is built for the right number of
+          tokens in both modes, so the binder and the clause cannot drift apart and produce a
+          parameter-count mismatch at runtime.
+        */
+        assertEquals("search_text LIKE ?", clause(1, true));
+        assertEquals("search_text LIKE ? AND search_text LIKE ?", clause(2, true));
+        assertEquals("search_text LIKE ? AND search_text LIKE ? AND search_text LIKE ?", clause(3, true));
+    }
+
+    @Test
+    @DisplayName("no tokens is a query, not a syntax error")
+    void zeroTokensIsValidSql() throws Exception {
+        // withoutCountryWord can in principle strip everything; "WHERE " with nothing after it is
+        // not a query, so the anchored builder answers TRUE rather than the empty string.
+        assertEquals("TRUE", clause(0, true));
+    }
+
+    @Test
+    @DisplayName("an unreachable corpus is treated as unsorted, so it degrades to today's query")
+    void unreachableDefaultsToUnsorted() throws Exception {
+        /*
+          searchTextSorted is read from the release manifest when the connection is established. A
+          corpus that was never reached has no manifest, so the flag must stay false - anything else
+          would have an unreachable bucket silently change how queries are built.
+        */
+        var field = LocationCorpusRepository.class.getDeclaredField("searchTextSorted");
+        field.setAccessible(true);
+        assertEquals(false, field.get(unreachable()));
+    }
 }

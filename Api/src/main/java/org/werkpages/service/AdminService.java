@@ -638,6 +638,8 @@ public class AdminService {
                         .put("newTitle", row.getString("new_title"))
                         .put("newStatus", row.getString("new_status"))
                         .put("newCountry", row.getString("new_country"))
+                        .put("newState", row.getString("new_declared_state"))
+                        .put("newCity", row.getString("new_declared_city"))
                         .put("newLinkedinUrl", row.getString("new_linkedin_url"))
                         .put("status", row.getString("status"))
                         .put("createdAt", row.getOffsetDateTime("created_at").toString())
@@ -664,6 +666,11 @@ public class AdminService {
                     String newTitle            = row.getString("new_title");
                     String newStatus        = row.getString("new_status");
                     String newCountry       = row.getString("new_country");
+                    // The location the editor actually gave. Approving used to apply the country
+                    // and drop the rest, so an approved "Kitchener, Ontario" kept the old city.
+                    String newState         = row.getString("new_declared_state");
+                    String newCity          = row.getString("new_declared_city");
+                    Long   newCompanyLocationId = row.getLong("new_company_location_id");
                     String newLinkedinUrl   = row.getString("new_linkedin_url");
                     OffsetDateTime newStartDate = row.getOffsetDateTime("new_start_date");
                     OffsetDateTime newEndDate   = row.getOffsetDateTime("new_end_date");
@@ -736,6 +743,7 @@ public class AdminService {
                                               careerStart, newEndDate, newCompanyId);
                                     return entry.compose(v -> applyEditAndApprove(managerId, editId,
                                         newCompany, newCompanyLogoUrl, newTitle, newStatus, newCountry,
+                                        newState, newCity, newCompanyLocationId,
                                         newLinkedinUrl, effectiveCo, effectiveTit, adminId, now,
                                         proposedBy, managerName, newCompanyId));
                                 });
@@ -749,7 +757,7 @@ public class AdminService {
                               boolean isHistorical = newStartDate != null && currentStart != null && newStartDate.isBefore(currentStart);
                               if (isHistorical) {
                                   return managerRepo.insertCareerEntry(managerId, effectiveCo, effectiveTit, careerStart, currentStart, newCompanyId)
-                                      .compose(v -> applyEditAndApprove(managerId, editId, null, null, null, newStatus, newCountry, newLinkedinUrl, effectiveCo, effectiveTit, adminId, now, proposedBy, managerName, null));
+                                      .compose(v -> applyEditAndApprove(managerId, editId, null, null, null, newStatus, newCountry, newState, newCity, newCompanyLocationId, newLinkedinUrl, effectiveCo, effectiveTit, adminId, now, proposedBy, managerName, null));
                               }
                               return managerRepo.closeOpenCareerEntry(managerId, careerStart)
                                 .compose(closed -> {
@@ -771,7 +779,7 @@ public class AdminService {
                                         managerRepo.insertCareerEntry(managerId, effectiveCo, effectiveTit, careerStart, null, newCompanyId)
                                     );
                                 })
-                                .compose(v -> applyEditAndApprove(managerId, editId, newCompany, newCompanyLogoUrl, newTitle, newStatus, newCountry, newLinkedinUrl, effectiveCo, effectiveTit, adminId, now, proposedBy, managerName, newCompanyId))
+                                .compose(v -> applyEditAndApprove(managerId, editId, newCompany, newCompanyLogoUrl, newTitle, newStatus, newCountry, newState, newCity, newCompanyLocationId, newLinkedinUrl, effectiveCo, effectiveTit, adminId, now, proposedBy, managerName, newCompanyId))
                                 .compose(result -> {
                                     if (newCompany != null) {
                                         // Fire-and-forget: refresh old company's stats so its logo/counts stay accurate
@@ -799,10 +807,12 @@ public class AdminService {
 
     private Future<JsonObject> applyEditAndApprove(long managerId, UUID editId,
                                                      String newCompany, String newCompanyLogoUrl, String newTitle, String newStatus, String newCountry,
+                                                     String newState, String newCity, Long newCompanyLocationId,
                                                      String newLinkedinUrl, String effectiveCo, String effectiveTit,
                                                      UUID adminId, OffsetDateTime reviewedAt,
                                                      UUID proposedBy, String managerName, Long newCompanyId) {
-        return managerRepo.update(managerId, newCompany, newTitle, null, null, newStatus, newCountry, newLinkedinUrl, null, newCompanyId)
+        return managerRepo.update(managerId, newCompany, newTitle, null, null, newStatus, newCountry,
+                                  newState, newCity, newCompanyLocationId, newLinkedinUrl, null, newCompanyId)
             /*
               Career history has the last word on the headline.
 
