@@ -836,6 +836,19 @@ public class ManagerService {
 
     private Future<JsonArray> appendCorpusSuggestions(JsonArray confirmed, String companyName,
                                                       String query, String country, String state) {
+        return appendCorpusSuggestions(confirmed, companyName, query, country, state, true);
+    }
+
+    /**
+     * @param withPlaces whether to read the buildings file as well as the geography one.
+     *
+     * <p>They cost very different amounts. Measured against the live bucket for one United States
+     * query: <b>geography 0.76s over 194k rows, places 4.82s over 16.1M</b>. A location field is
+     * mostly asked "which city", and the city lives in the cheap file.
+     */
+    private Future<JsonArray> appendCorpusSuggestions(JsonArray confirmed, String companyName,
+                                                      String query, String country, String state,
+                                                      boolean withPlaces) {
         if (confirmed.size() >= SUGGESTION_LIMIT) return Future.succeededFuture(confirmed);
 
         /*
@@ -846,15 +859,31 @@ public class ManagerService {
         */
         if (country == null || country.isBlank()) {
             Future<JsonArray> chain = Future.succeededFuture(confirmed);
+            boolean first = true;
             for (String fallback : DEFAULT_SEARCH_COUNTRIES) {
                 // The DISPLAY name, not the code. This string is not only a search scope: it ends
                 // up in the suggestion's label and in the country stored when somebody picks it,
                 // so passing "CA" through would offer "Toronto, Ontario, CA" and then save a
                 // manager's country as "CA" while every other row says "Canada".
                 String named = displayNameOf(fallback);
+                /*
+                  BUILDINGS ONLY FROM THE FIRST COUNTRY.
+
+                  Widening exists so somebody whose country we cannot read can still name their
+                  city. Geography answers that and is cheap; the buildings file is six times the
+                  cost and is not what "Palo Alto" is asking for. Reading it once per fallback
+                  country is what made an unmatched query take ten seconds: Canada found too few
+                  rows to fill the list, so the search moved to the United States and paid 4.8s
+                  for buildings nobody had asked about.
+
+                  Once a suggestion is picked the country is known, and the building search runs
+                  normally against it.
+                */
+                boolean places = first;
+                first = false;
                 chain = chain.compose(soFar -> soFar.size() >= SUGGESTION_LIMIT
                     ? Future.succeededFuture(soFar)
-                    : appendCorpusSuggestions(soFar, companyName, query, named, null));
+                    : appendCorpusSuggestions(soFar, companyName, query, named, null, places));
             }
             return chain;
         }
@@ -869,7 +898,9 @@ public class ManagerService {
           Both at once. They are independent reads of different files, and running them one after
           the other doubled the wait on every keystroke for no reason.
         */
-        Future<JsonArray> placesF    = locationCorpus.suggestPlaces(companyName, query, country);
+        Future<JsonArray> placesF    = withPlaces
+            ? locationCorpus.suggestPlaces(companyName, query, country)
+            : Future.succeededFuture(new JsonArray());
         Future<JsonArray> geographyF = locationCorpus.suggestGeography(query, country, null);
 
         return Future.all(placesF, geographyF).map(cf -> {
