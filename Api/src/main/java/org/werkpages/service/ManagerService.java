@@ -898,14 +898,30 @@ public class ManagerService {
           Both at once. They are independent reads of different files, and running them one after
           the other doubled the wait on every keystroke for no reason.
         */
-        Future<JsonArray> placesF    = withPlaces
-            ? locationCorpus.suggestPlaces(companyName, query, country)
-            : Future.succeededFuture(new JsonArray());
+        /*
+          GEOGRAPHY FIRST, AND USUALLY INSTEAD.
+
+          These were read together on every keystroke, and they do not cost the same. Measured
+          against the live bucket for one United States query: geography 0.76s over 194k rows,
+          places 4.82s over 16.1M. Reading both meant every keystroke paid the larger number, and
+          at the production thread count that is the 6-8s people were waiting for while typing a
+          city.
+
+          A location field is overwhelmingly asked "which city", and the city is in the cheap file.
+          The expensive one answers a different question - "which branch of this company" - and it
+          is only worth asking when the coarse answer came back empty, which is exactly what
+          somebody naming a business rather than a place produces.
+
+          So the buildings file is read only when geography found nothing. Typing "Toronto" no
+          longer scans sixteen million rows to offer a bar and grill nobody asked about.
+        */
         Future<JsonArray> geographyF = locationCorpus.suggestGeography(query, country, null);
 
-        return Future.all(placesF, geographyF).map(cf -> {
-            JsonArray places    = cf.resultAt(0);
-            JsonArray geography = cf.resultAt(1);
+        return geographyF.compose(geography -> {
+            boolean needPlaces = withPlaces && geography.isEmpty();
+            return (needPlaces ? locationCorpus.suggestPlaces(companyName, query, country)
+                               : Future.succeededFuture(new JsonArray()))
+                .map(places -> {
             JsonArray merged = confirmed.copy();
 
             /*
@@ -932,6 +948,7 @@ public class ManagerService {
             addCorpusPlaces(merged, places, seen, country, SUGGESTION_LIMIT);
             addCorpusGeography(merged, geography, seen, country, SUGGESTION_LIMIT);
             return merged;
+                });
         });
     }
 
