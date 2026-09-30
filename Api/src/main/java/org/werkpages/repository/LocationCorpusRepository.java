@@ -725,6 +725,19 @@ public class LocationCorpusRepository {
         // loses all of its words rather than the first one.
         java.util.Set<String> countryWords = new java.util.HashSet<>(
             java.util.Arrays.asList(country.trim().toLowerCase().split("[\\s,]+")));
+        /*
+          The country arrives as a display name from the forms and as an ISO code from anything
+          that has already resolved one - the default-country fallback passes "CA".
+
+          Both have to strip the same words, or the two callers disagree: "kitchener, ontario,
+          canada" searched under "Canada" drops "canada" and finds the city, and the same query
+          searched under "CA" keeps it, requires it of a search_text that never contains a country,
+          and returns a car dealership instead of Kitchener.
+        */
+        String displayName = displayCountry(country.trim());
+        if (displayName != null) {
+            countryWords.addAll(java.util.Arrays.asList(displayName.toLowerCase().split("[\\s,]+")));
+        }
         java.util.List<String> kept = new java.util.ArrayList<>();
         for (String word : words) {
             if (!countryWords.contains(word)) kept.add(word);
@@ -838,6 +851,14 @@ public class LocationCorpusRepository {
      * caller then offers no corpus suggestions — the same soft failure as an unreachable bucket,
      * rather than an error on a form that is otherwise fine.
      */
+    /** The English display name for a country given its code or its name, or null. */
+    private static String displayCountry(String country) {
+        String code = iso(country);
+        if (code == null) return null;
+        String name = java.util.Locale.of("", code).getDisplayCountry(java.util.Locale.ENGLISH);
+        return (name == null || name.isBlank() || name.equalsIgnoreCase(code)) ? null : name;
+    }
+
     public static String iso(String country) {
         if (country == null) return null;
         String value = country.trim();

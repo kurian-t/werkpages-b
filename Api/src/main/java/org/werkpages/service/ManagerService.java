@@ -801,9 +801,63 @@ public class ManagerService {
      * <p>Failure is silent, by construction: the corpus repository returns an empty array rather
      * than failing, so an unreachable bucket costs suggestions and nothing else.
      */
+    /**
+     * The countries searched when the caller knows of none.
+     *
+     * <p>The corpus is partitioned by country, so a lookup needs one to read. The forms used to
+     * always have one because the location field arrived prefilled from the visitor's IP - and
+     * that prefill was removed deliberately, because a guessed city published against a named
+     * person is identifying in a way nobody agreed to.
+     *
+     * <p>Removing it left nothing to scope the search by. A visitor whose geography we cannot
+     * read - no Cloudflare header, which is every local developer and anyone behind a proxy that
+     * strips it - got an empty list for every query, so the field could not be filled in at all.
+     *
+     * <p>A short, configured list rather than "search everywhere": every extra country is another
+     * partition read on the same keystroke, and the answer for somebody in an unlisted country
+     * still arrives as soon as they type its name, which {@code countryNamedIn} picks up.
+     */
+    private static final List<String> DEFAULT_SEARCH_COUNTRIES =
+        List.of(defaultCountriesFromEnv().split("\\s*,\\s*"));
+
+    /** A country's English display name, given its code or its name; the input if neither. */
+    private static String displayNameOf(String country) {
+        String code = org.werkpages.repository.LocationCorpusRepository.iso(country);
+        if (code == null) return country;
+        String name = java.util.Locale.of("", code).getDisplayCountry(java.util.Locale.ENGLISH);
+        return (name == null || name.isBlank() || name.equalsIgnoreCase(code)) ? country : name;
+    }
+
+    /** The configured list, or the built-in one when nothing is set. */
+    private static String defaultCountriesFromEnv() {
+        String configured = System.getenv("LOCATION_DEFAULT_COUNTRIES");
+        return (configured == null || configured.isBlank()) ? "CA,US,GB" : configured.trim();
+    }
+
     private Future<JsonArray> appendCorpusSuggestions(JsonArray confirmed, String companyName,
                                                       String query, String country, String state) {
         if (confirmed.size() >= SUGGESTION_LIMIT) return Future.succeededFuture(confirmed);
+
+        /*
+          With no country there is no partition to read, so fall back to the configured list and
+          merge what each one finds. Sequential rather than parallel on purpose: the first country
+          usually answers, and firing three corpus reads per keystroke to discard two is the cost
+          this whole area has been trying to remove.
+        */
+        if (country == null || country.isBlank()) {
+            Future<JsonArray> chain = Future.succeededFuture(confirmed);
+            for (String fallback : DEFAULT_SEARCH_COUNTRIES) {
+                // The DISPLAY name, not the code. This string is not only a search scope: it ends
+                // up in the suggestion's label and in the country stored when somebody picks it,
+                // so passing "CA" through would offer "Toronto, Ontario, CA" and then save a
+                // manager's country as "CA" while every other row says "Canada".
+                String named = displayNameOf(fallback);
+                chain = chain.compose(soFar -> soFar.size() >= SUGGESTION_LIMIT
+                    ? Future.succeededFuture(soFar)
+                    : appendCorpusSuggestions(soFar, companyName, query, named, null));
+            }
+            return chain;
+        }
 
         java.util.Set<String> seen = new java.util.HashSet<>();
         for (Object entry : confirmed) {

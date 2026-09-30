@@ -155,6 +155,29 @@ class LocationCorpusRepositoryTest {
     }
 
     @Test
+    @DisplayName("REGRESSION: the country word is dropped whether the country is a name or a code")
+    void theCountryWordIsDroppedForAnIsoCodeToo() {
+        /*
+          Two callers, two spellings. The forms pass a display name; the default-country fallback -
+          used when the visitor's geography is unknown, which is every local developer since the
+          location prefill was removed - passes an ISO code.
+
+          Only the name was recognised, so "kitchener, ontario, canada" searched under "CA" kept
+          "canada" as a required substring of a search_text that never contains a country. The city
+          did not match and the list led with a car dealership called Kitchener Ford.
+        */
+        assertEquals(List.of("kitchener", "ontario"),
+                     LocationCorpusRepository.withoutCountryWord(
+                         List.of("kitchener", "ontario", "canada"), "CA"));
+        assertEquals(List.of("austin"),
+                     LocationCorpusRepository.withoutCountryWord(
+                         List.of("austin", "united", "states"), "US"));
+        // Lower case, and the name form, must behave identically.
+        assertEquals(List.of("kitchener"),
+                     LocationCorpusRepository.withoutCountryWord(List.of("kitchener", "canada"), "ca"));
+    }
+
+    @Test
     @DisplayName("a query that is only the country still searches for it")
     void aBareCountryIsStillAQuery() {
         // Somebody who typed just "Canada" is asking for the country, and the country row is
