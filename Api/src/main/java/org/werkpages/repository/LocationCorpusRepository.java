@@ -561,6 +561,26 @@ public class LocationCorpusRepository {
      * something that changes twice a year.
      */
     private String activeRelease(Connection conn) throws SQLException {
+        /*
+          An override, so a candidate release can be proved before it is published.
+
+          The release is otherwise read only from current.json, which means the only way to try a
+          newly built corpus was to repoint production at it and find out in front of users. A
+          rebuild is a multi-hour job over tens of millions of rows; it deserves to be measured
+          against a real backend first.
+
+          LOCATION_CORPUS_RELEASE names the release directly and LOCATION_CORPUS_SORTED says
+          whether it carries a sorted search_text, since a candidate has no manifest of its own
+          until it is published. Neither is set in production, where current.json stays the single
+          source of truth.
+        */
+        String pinned = System.getenv("LOCATION_CORPUS_RELEASE");
+        if (pinned != null && !pinned.isBlank()) {
+            searchTextSorted = "true".equalsIgnoreCase(System.getenv("LOCATION_CORPUS_SORTED"));
+            LOG.info("location corpus pinned to " + pinned.trim()
+                     + " (sorted=" + searchTextSorted + ") by LOCATION_CORPUS_RELEASE");
+            return pinned.trim();
+        }
         String sql = "SELECT * FROM read_json_auto('s3://" + bucket + "/current.json')";
         try (Statement statement = conn.createStatement();
              ResultSet rs = statement.executeQuery(sql)) {
