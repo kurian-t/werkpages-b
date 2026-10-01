@@ -159,6 +159,26 @@ public class AdminService {
                         .put("submittedBy", row.getString("submitted_by_username"))
                         .put("createdAt", row.getOffsetDateTime("created_at").toString())
                         .put("isAutoCreated", row.getBoolean("is_auto_created") == Boolean.TRUE)
+                        /*
+                          Where the manager works.
+
+                          An admin reviewing a submission could not see the location and therefore
+                          could not correct one before approving it into the public directory. The
+                          whole location travels, not just the country, because the edit form sets
+                          the whole thing.
+
+                          Unlike the public projections this is NOT reduced for an unconfirmed
+                          location: an admin deciding whether to publish a row needs to see what
+                          the row actually holds, including a city inferred from a searcher's IP
+                          that they may well want to clear.
+                        */
+                        .put("country", row.getString("country"))
+                        .put("state", row.getString("state"))
+                        .put("city", row.getString("city"))
+                        .put("companyLocationId", row.getLong("company_location_id"))
+                        .put("locationName", row.getString("location_name"))
+                        .put("locationStreet", row.getString("location_street"))
+                        .put("locationSource", row.getString("location_source"))
                     );
                 }
                 return new JsonObject().put("data", result).put("limit", limit).put("offset", offset);

@@ -59,12 +59,30 @@ public class ManagerRepository {
             LEFT JOIN companies c ON c.id = m.company_id
             LEFT JOIN company_locations loc ON loc.id = m.company_location_id
             LEFT JOIN (
-                SELECT manager_id,
+                SELECT ch2.manager_id,
                     json_agg(jsonb_build_object(
-                        'id', id, 'company', company, 'title', title,
-                        'startDate', start_date, 'endDate', end_date
-                    ) ORDER BY start_date DESC) AS career_history
-                FROM career_history GROUP BY manager_id
+                        'id', ch2.id, 'company', ch2.company, 'title', ch2.title,
+                        'startDate', ch2.start_date, 'endDate', ch2.end_date,
+                        /*
+                          The employer's identity, so the tile can draw its logo.
+
+                          It carried the company NAME and nothing else, so the career trajectory
+                          had no domain to build a logo URL from and fell through to a letter -
+                          while the profile header above it, which does get the identity, showed
+                          the real logo. The same company, two tiles, two different answers.
+
+                          Guessing a domain from the name is not the fix and was removed on
+                          purpose: it resolved "Lime" to lime.com and put a stranger's logo on a
+                          manager. The identity is looked up, not inferred.
+                        */
+                        'companyId', ch2.company_id,
+                        'companyDomain', cc.domain,
+                        'companyBrandfetchIconUrl', cc.brandfetch_icon_url,
+                        'companyLogoUrl', cc.logo_url
+                    ) ORDER BY ch2.start_date DESC) AS career_history
+                FROM career_history ch2
+                LEFT JOIN companies cc ON cc.id = ch2.company_id
+                GROUP BY ch2.manager_id
             ) ch ON ch.manager_id = m.id
             LEFT JOIN (
                 SELECT manager_id,
@@ -401,9 +419,15 @@ public class ManagerRepository {
         return db.preparedQuery("""
                 SELECT m.id, m.name, m.company, m.title, m.image, m.created_at,
                        u.username AS submitted_by_username,
-                       (m.search_created_by_user_id IS NOT NULL OR m.submitted_by IS NULL) AS is_auto_created
+                       (m.search_created_by_user_id IS NOT NULL OR m.submitted_by IS NULL) AS is_auto_created,
+                       -- Where the manager works, so the queue can show it and an admin can fix it.
+                       -- It was not selected at all, so a location nobody could see was also a
+                       -- location nobody could correct before approving it into the directory.
+                       m.country, m.state, m.city, m.company_location_id, m.location_source,
+                       loc.display_name AS location_name, loc.street AS location_street
                 FROM managers m
                 LEFT JOIN users u ON u.id = m.submitted_by
+                LEFT JOIN company_locations loc ON loc.id = m.company_location_id
                 WHERE m.approval_status = 'pending_approval'
                 ORDER BY m.created_at ASC
                 LIMIT $1 OFFSET $2
