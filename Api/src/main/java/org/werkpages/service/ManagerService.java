@@ -948,6 +948,31 @@ public class ManagerService {
             addCorpusPlaces(merged, places, seen, country, SUGGESTION_LIMIT);
             addCorpusGeography(merged, geography, seen, country, SUGGESTION_LIMIT);
             return merged;
+                })
+                .compose(merged -> {
+                    if (merged.size() > confirmed.size()) return Future.succeededFuture(merged);
+                    /*
+                      A HOUSE NUMBER WE DO NOT HAVE MUST NOT BLANK THE STREET.
+
+                      Overture lists businesses, not every address. "45 Cedarhill Crescent" found
+                      nothing at all even though the corpus holds 142 and 143 on that street: every
+                      token must match and no row contains "45". Somebody typing their real address
+                      was told their street does not exist.
+
+                      Retried without the numbers, and answered with the CITY rather than with the
+                      other businesses on that street. Offering those would be worse than offering
+                      nothing: picking one stores its company_location_id, so a person at number 45
+                      would be recorded at number 142. A wrong precise answer is harder to notice,
+                      and to undo, than a coarse right one.
+                    */
+                    String withoutNumbers = org.werkpages.repository.LocationCorpusRepository
+                        .stripLeadingNumbers(query);
+                    if (withoutNumbers == null) return Future.succeededFuture(merged);
+                    return locationCorpus.citiesOnStreet(withoutNumbers, country).map(cities -> {
+                        JsonArray out = merged.copy();
+                        addCorpusGeography(out, cities, new java.util.HashSet<>(), country, SUGGESTION_LIMIT);
+                        return out;
+                    });
                 });
         });
     }

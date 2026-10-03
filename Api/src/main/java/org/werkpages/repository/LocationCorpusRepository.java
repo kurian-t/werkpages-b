@@ -232,34 +232,63 @@ public class LocationCorpusRepository {
         // The partition already guarantees the country, and neither search_text contains it.
         java.util.List<String> words = withoutCountryWord(tokens(needle), country);
 
-        return cached("geo|" + iso + "|" + blankToNull(state) + "|" + needle, () ->
-          anchoredThenContains(anchored ->
-            query(release -> """
-                SELECT name, kind, state_name, state_code
-                FROM read_parquet('s3://%s/processed/%s/geography/country_code=%s/*.parquet')
-                WHERE %s
-                  AND (? IS NULL OR state_code = ? OR kind = 'country')
-                ORDER BY CASE WHEN lower(name) = ?      THEN 0
-                              WHEN lower(name) LIKE ? THEN 1
-                              ELSE 2 END,
-                         population DESC NULLS LAST
-                LIMIT %d
-                """.formatted(bucket, release, partition(iso), tokensClause(words.size(), anchored), LIMIT),
-            statement -> {
-                int i = 1;
-                bindTokens(statement, words, i, anchored);
-                i += words.size();
-                statement.setString(i++, blankToNull(state));
-                statement.setString(i++, blankToNull(state));
-                statement.setString(i++, needle);
-                statement.setString(i, needle + "%");
-            },
-            rs -> new JsonObject()
-                .put("kind", "geo")
-                .put("name", rs.getString("name"))
-                .put("geoKind", rs.getString("kind"))
-                .put("stateName", rs.getString("state_name"))
-                .put("stateCode", rs.getString("state_code")))));
+        /*
+          One attempt. "folded" strips accents from both the column and the typed words. The
+          ranking expression folds with the WHERE clause, or "montreal" would match Montréal and
+          then be ranked as though it had not.
+        */
+        java.util.function.BiFunction<Boolean, Boolean, Future<JsonArray>> attempt =
+            (anchored, folded) -> {
+                String nameExpr = folded ? "strip_accents(lower(name))" : "lower(name)";
+                String ranked   = folded ? stripAccents(rankingNeedle(needle, country))
+                                         : rankingNeedle(needle, country);
+                return query(release -> """
+                    SELECT name, kind, state_name, state_code
+                    FROM %s
+                    WHERE %s%s
+                      AND (? IS NULL OR state_code = ? OR kind = 'country')
+                    ORDER BY CASE WHEN %s = ?      THEN 0
+                                  WHEN %s LIKE ? THEN 1
+                                  ELSE 2 END,
+                             population DESC NULLS LAST
+                    LIMIT %d
+                    """.formatted(geographyFrom(release, iso),
+                                   tokensClause(words.size(), anchored, folded),
+                                   geographyCountryClause(iso), nameExpr, nameExpr, LIMIT),
+                statement -> {
+                    int i = 1;
+                    bindTokens(statement, words, i, anchored, folded);
+                    i += words.size();
+                    statement.setString(i++, blankToNull(state));
+                    statement.setString(i++, blankToNull(state));
+                    statement.setString(i++, ranked);
+                    statement.setString(i, ranked + "%");
+                },
+                rs -> new JsonObject()
+                    .put("kind", "geo")
+                    .put("name", rs.getString("name"))
+                    .put("geoKind", rs.getString("kind"))
+                    .put("stateName", rs.getString("state_name"))
+                    .put("stateCode", rs.getString("state_code")));
+            };
+
+        /*
+          Always folded, and deliberately NOT behind a fallback.
+
+          A fallback fires only on an EMPTY result. That fixed "Montreal, Quebec, Canada" and left
+          "Montreal" on its own still broken: Montreal Lake, Saskatchewan matches
+          accent-sensitively, so the result was never empty, the fallback never ran, and Montréal
+          - 1.7 million people - was missing from a list that did contain a hamlet. Every accented
+          place had the same hole for as long as somebody was still typing.
+
+          Anchoring buys nothing here anyway: strip_accents() on the column defeats Parquet
+          row-group pruning whatever the pattern looks like, so this is one scan rather than two.
+          Measured at roughly 20ms against the materialised geography file, which is the reason
+          this dataset is copied locally at all. The sorted release's real win was the places
+          dataset over S3, which is untouched by this and still anchored.
+        */
+        return cached("geo|" + iso + "|" + blankToNull(state) + "|" + needle,
+                      () -> attempt.apply(false, true));
     }
 
     /**
@@ -277,6 +306,76 @@ public class LocationCorpusRepository {
      * returns eight entries for three actual stores.
      */
     public Future<JsonArray> suggestPlaces(String companyName, String query, String country) {
+        return placesFor(companyName, query, country);
+    }
+
+    /**
+     * The cities a street runs through, as coarse suggestions.
+     *
+     * <p>Used only when an address was not found. Returns {@code geo} rows at city precision, so
+     * what gets stored is the city rather than somebody else's front door.
+     */
+    public Future<JsonArray> citiesOnStreet(String query, String country) {
+        String needle = normalise(query);
+        String iso = iso(country);
+        if (needle == null || iso == null) return Future.succeededFuture(new JsonArray());
+        java.util.List<String> words = tokens(needle);
+        return cached("street-city|" + iso + "|" + needle, () ->
+            query(release -> """
+                SELECT DISTINCT p.city, p.state_code,
+                       /*
+                         The region's NAME, not its code.
+
+                         The places file carries only "ON", so this fallback offered "Kitchener,
+                         ON, Canada" while every other suggestion said "Ontario".
+
+                         Joined on the CITY NAME, not on the region code: the two datasets spell
+                         regions differently - GeoNames keys admin1 as "CA.08", Overture uses the
+                         ISO "ON" - so a code join silently matches nothing and quietly falls back
+                         to the code, which is how the first attempt at this looked correct and
+                         changed nothing. Geography is a local file now, so this costs ~15ms.
+                       */
+                       COALESCE(g.state_name, p.state_code) AS state_name
+                FROM read_parquet('s3://%s/processed/%s/places/country_code=%s/*.parquet') p
+                LEFT JOIN (SELECT DISTINCT lower(name) AS city_key, state_name FROM %s
+                            WHERE kind = 'locality' AND state_name IS NOT NULL%s) g
+                       ON g.city_key = lower(p.city)
+                WHERE %s AND p.city IS NOT NULL
+                LIMIT %d
+                """.formatted(bucket, release, partition(iso),
+                               geographyFrom(release, iso), geographyCountryClause(iso),
+                               allTokensClause(words.size()).replace("search_text", "p.search_text"),
+                               LIMIT),
+            statement -> {
+                int i = 1;
+                for (String word : words) statement.setString(i++, "%" + word + "%");
+            },
+            rs -> new JsonObject()
+                .put("kind", "geo")
+                .put("name", rs.getString("city"))
+                .put("geoKind", "locality")
+                .put("stateName", rs.getString("state_name"))
+                .put("stateCode", rs.getString("state_code"))));
+    }
+
+    /** The query as typed, minus any purely numeric words, or null if that changes nothing. */
+    public static String stripLeadingNumbers(String query) {
+        if (query == null) return null;
+        String[] words = query.trim().split("[\\s,]+");
+        StringBuilder kept = new StringBuilder();
+        boolean dropped = false;
+        for (String word : words) {
+            // Purely numeric, or a number with a unit suffix like "12b". A word that merely
+            // CONTAINS a digit - "a1a 1a1", a postcode - is left alone.
+            if (word.matches("\\d+[a-zA-Z]?")) { dropped = true; continue; }
+            if (kept.length() > 0) kept.append(' ');
+            kept.append(word);
+        }
+        // Nothing dropped, or nothing left worth searching for.
+        return (!dropped || kept.length() < 2) ? null : kept.toString();
+    }
+
+    private Future<JsonArray> placesFor(String companyName, String query, String country) {
         String needle = normalise(query);
         String iso = iso(country);
         if (needle == null || iso == null) return Future.succeededFuture(new JsonArray());
@@ -533,6 +632,8 @@ public class LocationCorpusRepository {
             release = active;
             connection = conn;
             LOG.info("location corpus ready, release " + active);
+            // In the background: a cold start serves from S3 and gets faster, rather than waiting.
+            materialiseGeography(conn, active);
             return conn;
         } catch (UnsatisfiedLinkError | NoClassDefFoundError err) {
             // Named separately because these are Errors, not Exceptions, and because the cause is
@@ -609,6 +710,101 @@ public class LocationCorpusRepository {
             }
             return (value == null || value.isBlank() || "none".equals(value)) ? null : value;
         }
+    }
+
+    /**
+     * Where the geography rows are read from: a local file when we have one, S3 otherwise.
+     *
+     * <h2>Why a local copy at all</h2>
+     *
+     * <p>Every corpus query pays a round trip to ca-central-1 before it does any work. Measured
+     * against the live bucket, an anchored query that matches <b>nothing</b> still takes 0.50s:
+     * that is latency, not scanning. The same query against a local file is <b>0.03s</b>.
+     *
+     * <p>Geography is the half worth holding: the entire world is <b>54MB</b> and downloads in
+     * about eight seconds, against 13GB for places. A typical request reads geography twice - the
+     * anchored attempt and the contains fallback - so removing those two round trips takes the
+     * worst case from roughly 1.5s to 0.8s, and an ordinary city search to almost nothing.
+     *
+     * <p>Held as ONE file with country_code as a column rather than as partitioned folders: a
+     * partition per country means a footer read per file, and reading 132 footers over HTTP was
+     * the thing that made the sorted corpus no faster than the unsorted one.
+     *
+     * <p>Failure is not fatal. If the download does not finish, this stays null and every query
+     * reads S3 exactly as before - slower, and correct.
+     */
+    private volatile String localGeography = null;
+
+    /** The FROM clause for geography, and the country predicate that goes with it. */
+    private String geographyFrom(String release, String iso) {
+        String local = localGeography;
+        return local != null
+            ? "read_parquet('" + local + "')"
+            : "read_parquet('s3://" + bucket + "/processed/" + release
+              + "/geography/country_code=" + partition(iso) + "/*.parquet')";
+    }
+
+    /** Restricts a local read to one country; the S3 path already does that by partition. */
+    private String geographyCountryClause(String iso) {
+        return localGeography != null ? " AND country_code = '" + partition(iso) + "'" : "";
+    }
+
+    /**
+     * Downloads the geography dataset to local disk, once, in the background.
+     *
+     * <p>Runs on the worker after the connection is established, so a cold start serves from S3
+     * and gets faster rather than waiting. Writing to a temporary file and renaming means a query
+     * never sees a half-written copy.
+     */
+    private void materialiseGeography(Connection conn, String release) {
+        worker.submit(() -> {
+            try {
+                java.nio.file.Path dir = java.nio.file.Path.of(
+                    System.getProperty("java.io.tmpdir"), "location-corpus");
+                java.nio.file.Files.createDirectories(dir);
+                java.nio.file.Path tmp   = dir.resolve("geography-" + release + ".parquet.tmp");
+                java.nio.file.Path final_ = dir.resolve("geography-" + release + ".parquet");
+
+                if (java.nio.file.Files.exists(final_)) {
+                    localGeography = final_.toString();
+                    LOG.info("location corpus geography already local: " + final_);
+                    return;
+                }
+                long started = System.currentTimeMillis();
+                /*
+                  Its own connection, not the shared one.
+
+                  A DuckDBConnection is not safe to use from two threads at once, which is why
+                  every query already runs on a duplicate. This download takes seconds and would
+                  otherwise be holding the shared connection while requests use it.
+
+                  Its own memory limit too: the engine is capped at a few hundred megabytes so two
+                  of them fit on a 4GB box, and a COPY of five million rows under that cap spills
+                  or dies. It is a one-off read of a 54MB dataset, so it gets room to do it.
+                */
+                try (Connection own = ((org.duckdb.DuckDBConnection) conn).duplicate();
+                     Statement statement = own.createStatement()) {
+                    statement.execute("SET memory_limit='2GB'");
+                    statement.execute("COPY (SELECT * FROM read_parquet('s3://" + bucket
+                        + "/processed/" + release + "/geography/*/*.parquet', hive_partitioning=true))"
+                        + " TO '" + tmp + "' (FORMAT parquet, COMPRESSION zstd)");
+                }
+                java.nio.file.Files.move(tmp, final_,
+                    java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+                localGeography = final_.toString();
+                LOG.info("location corpus geography cached locally in "
+                         + (System.currentTimeMillis() - started) + "ms: " + final_);
+            } catch (Throwable err) {
+                /*
+                  Throwable, not Exception.
+
+                  The first version caught Exception and the task died in silence: an engine that
+                  runs out of memory throws an Error, so nothing was logged, no file appeared, and
+                  every query carried on hitting S3 with no indication why.
+                */
+                LOG.log(Level.WARNING, "could not cache geography locally; using S3", err);
+            }
+        });
     }
 
     /** Lower-cased and trimmed, or null when there is nothing worth searching for. */
@@ -727,6 +923,30 @@ public class LocationCorpusRepository {
     }
 
     /**
+     * The text the ORDER BY compares a row's name against.
+     *
+     * <p>It has to be the text the WHERE clause matched on, which is the needle minus the country
+     * word. Binding the raw needle instead made "Wisconsin, United States" unselectable: no
+     * {@code search_text} and no {@code name} contains a country, so
+     * {@code lower(name) = 'wisconsin united states'} was false for every row, the exact and
+     * prefix tiers caught nothing, and the whole result set fell through to
+     * {@code population DESC NULLS LAST}.
+     *
+     * <p>Region rows carry NULL population - every one of the 51 US states does - so the state
+     * somebody had just typed in full came back last, below three cities that merely share its
+     * prefix, one of them a hamlet of population 0.
+     *
+     * <p>"Ontario, Canada" concealed this entirely, because exactly one Canadian row matches
+     * {@code ontario%} and a one-row result cannot be mis-ordered.
+     *
+     * <p>Derived the same way as the WHERE clause's words, from the same call, so the two cannot
+     * disagree about what was being searched for.
+     */
+    static String rankingNeedle(String needle, String country) {
+        return String.join(" ", withoutCountryWord(tokens(needle), country));
+    }
+
+    /**
      * The same words, minus the one naming the country already being searched.
      *
      * <p>Both datasets are partitioned by country and the query reads one partition, so every row
@@ -767,7 +987,11 @@ public class LocationCorpusRepository {
 
     /** {@code search_text LIKE ? AND search_text LIKE ?…}, one per token. */
     private static String allTokensClause(int count) {
-        return String.join(" AND ", java.util.Collections.nCopies(count, "search_text LIKE ?"));
+        return allTokensClause(count, "search_text");
+    }
+
+    private static String allTokensClause(int count, String column) {
+        return String.join(" AND ", java.util.Collections.nCopies(count, column + " LIKE ?"));
     }
 
     /** Anchored on a sorted release, plain contains otherwise. */
@@ -776,7 +1000,13 @@ public class LocationCorpusRepository {
     }
 
     private String tokensClause(int count, boolean anchored) {
-        return anchored ? anchoredTokensClause(count) : allTokensClause(count);
+        return tokensClause(count, anchored, false);
+    }
+
+    /** @param folded test an accent-stripped column, so "montreal" reaches "Montréal" */
+    private String tokensClause(int count, boolean anchored, boolean folded) {
+        String column = folded ? "strip_accents(search_text)" : "search_text";
+        return anchored ? anchoredTokensClause(count, column) : allTokensClause(count, column);
     }
 
     /**
@@ -806,14 +1036,35 @@ public class LocationCorpusRepository {
      */
     private void bindTokens(PreparedStatement statement, java.util.List<String> words, int from,
                             boolean anchored) throws SQLException {
+        bindTokens(statement, words, from, anchored, false);
+    }
+
+    private void bindTokens(PreparedStatement statement, java.util.List<String> words, int from,
+                            boolean anchored, boolean folded) throws SQLException {
         int i = from;
         boolean first = true;
         for (String word : words) {
-            String pattern = (anchored && first) ? word + "%" : "%" + word + "%";
+            // Folded on both sides, so somebody who DOES type "Montréal" is not then excluded by
+            // the very attempt added to help the people who do not.
+            String token = folded ? stripAccents(word) : word;
+            String pattern = (anchored && first) ? token + "%" : "%" + token + "%";
             statement.setString(i++, pattern);
             first = false;
         }
     }
+
+    /**
+     * Drops diacritics, matching DuckDB's {@code strip_accents}.
+     *
+     * <p>NFD splits a letter into its base plus its combining marks; stripping the mark block
+     * leaves the base letter, so "Montréal" becomes "montreal".
+     */
+    static String stripAccents(String value) {
+        if (value == null) return null;
+        return java.text.Normalizer.normalize(value, java.text.Normalizer.Form.NFD)
+            .replaceAll("\\p{InCombiningDiacriticalMarks}+", "");
+    }
+
 
     /**
      * The same test, with the FIRST token anchored to the start of {@code search_text}.
@@ -849,9 +1100,13 @@ public class LocationCorpusRepository {
      * {@link #allTokensClause} remains the fallback for a query that the anchored form misses.
      */
     private static String anchoredTokensClause(int count) {
+        return anchoredTokensClause(count, "search_text");
+    }
+
+    private static String anchoredTokensClause(int count, String column) {
         if (count == 0) return "TRUE";
-        StringBuilder sql = new StringBuilder("search_text LIKE ?");
-        for (int i = 1; i < count; i++) sql.append(" AND search_text LIKE ?");
+        StringBuilder sql = new StringBuilder(column + " LIKE ?");
+        for (int i = 1; i < count; i++) sql.append(" AND ").append(column).append(" LIKE ?");
         return sql.toString();
     }
 

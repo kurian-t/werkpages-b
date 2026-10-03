@@ -290,4 +290,128 @@ class LocationCorpusRepositoryTest {
         field.setAccessible(true);
         assertEquals(false, field.get(unreachable()));
     }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // A house number we do not have must not blank the street
+    // ══════════════════════════════════════════════════════════════════════════
+
+    @Test
+    @DisplayName("REGRESSION: a street number is dropped so the street can still be found")
+    void dropsTheHouseNumber() {
+        /*
+          Reported as "an actual street address just fails to populate all together".
+
+          Overture lists businesses, not every address. The corpus holds 142 and 143 Cedarhill
+          Crescent; it does not hold 45. Every token has to match, no row contains "45", and the
+          search returned nothing at all - so somebody typing their real address was told their
+          street does not exist, with the street sitting right there in the data.
+        */
+        assertEquals("Cedarhill Crescent", LocationCorpusRepository.stripLeadingNumbers("45 Cedarhill Crescent"));
+        assertEquals("Ottawa St N",        LocationCorpusRepository.stripLeadingNumbers("1005 Ottawa St N"));
+        // A unit suffix is still a number.
+        assertEquals("King St",            LocationCorpusRepository.stripLeadingNumbers("12b King St"));
+    }
+
+    @Test
+    @DisplayName("nothing is retried when there was no number to drop")
+    void noNumberMeansNoRetry() {
+        // Null means "this retry would ask the same question again", and the caller skips it
+        // rather than paying for a second identical scan.
+        assertNull(LocationCorpusRepository.stripLeadingNumbers("Cedarhill Crescent"));
+        assertNull(LocationCorpusRepository.stripLeadingNumbers("Toronto"));
+    }
+
+    @Test
+    @DisplayName("a query that is ONLY a number is not reduced to nothing")
+    void aBareNumberIsNotStrippedToNothing() {
+        // Searching "45" would otherwise become an empty query, which matches every row.
+        assertNull(LocationCorpusRepository.stripLeadingNumbers("45"));
+        assertNull(LocationCorpusRepository.stripLeadingNumbers("45 12"));
+    }
+
+    @Test
+    @DisplayName("a postcode is not mistaken for a house number")
+    void postcodesSurvive() {
+        // "N2E" and "4E2" contain digits but are not house numbers; dropping them would turn a
+        // precise search into a vague one.
+        assertNull(LocationCorpusRepository.stripLeadingNumbers("N2E 4E2"));
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // What the ranking compares against
+    // ══════════════════════════════════════════════════════════════════════════
+
+    /**
+     * "Wisconsin, United States" could not be selected at all.
+     *
+     * <p>The WHERE clause matched on the country-stripped words, because no {@code search_text}
+     * contains a country. The ORDER BY exact/prefix boost was bound the RAW needle instead, so
+     * {@code lower(name) = 'wisconsin united states'} was false for every row and the whole
+     * result set fell through to the {@code population DESC NULLS LAST} tie-break.
+     *
+     * <p>Region rows carry NULL population - all 51 US states do - so the state somebody had
+     * just typed in full sorted BELOW every city sharing its prefix, including Wisconsin
+     * Junction, population 0. It was returned 4th of 4 and nobody scrolls a picker for the thing
+     * they typed exactly.
+     *
+     * <p>"Ontario, Canada" hid this for months purely because exactly one Canadian row matches
+     * {@code ontario%}, so the broken ordering had nothing to get wrong.
+     */
+    @Test
+    @DisplayName("the ranking text drops the country, like the matching text does")
+    void rankingNeedleDropsTheCountry() {
+        assertEquals("wisconsin",
+                     LocationCorpusRepository.rankingNeedle("wisconsin united states", "United States"),
+                     "an exactly-typed state has to be comparable to the region row's name");
+        // The same query arriving with an ISO code rather than a display name, which is what the
+        // default-country fallback passes.
+        assertEquals("wisconsin",
+                     LocationCorpusRepository.rankingNeedle("wisconsin us", "US"));
+        assertEquals("ontario",
+                     LocationCorpusRepository.rankingNeedle("ontario canada", "Canada"));
+    }
+
+    @Test
+    @DisplayName("a query that is only a country keeps its words, so the country row still ranks")
+    void rankingNeedleKeepsABareCountry() {
+        /*
+          withoutCountryWord drops the country only when something else remains. Somebody who
+          typed just "Canada" is asking for the country, and the country row is matched on its own
+          name - so stripping here would leave an empty string that prefix-matches everything and
+          ranks nothing.
+        */
+        assertEquals("canada", LocationCorpusRepository.rankingNeedle("canada", "Canada"));
+    }
+
+    @Test
+    @DisplayName("a city plus its region is left alone")
+    void rankingNeedleLeavesACityAndRegion() {
+        // No country word to drop, so this is unchanged and still ranked by population.
+        assertEquals("madison wisconsin",
+                     LocationCorpusRepository.rankingNeedle("madison wisconsin", "United States"));
+    }
+
+    /**
+     * "Montreal, Quebec, Canada" returned no city at all.
+     *
+     * <p>The corpus stores names as they are spelled - "Montréal", "Québec", "Trois-Rivières" -
+     * and {@code normalise} only lowercased. So the thing everybody types, and the exact string
+     * this field displays back to them, matched no geography row whatsoever. The query fell
+     * through to the places dataset and offered "Montreal South KOA Journey" and "Montreal
+     * Martial Arts" instead of Canada's second-largest city.
+     *
+     * <p>Folded on BOTH sides, so somebody who does type the accent is not then excluded by the
+     * very change that helps the people who do not.
+     */
+    @Test
+    @DisplayName("accents are folded, in both directions")
+    void foldsAccents() {
+        assertEquals("montreal", LocationCorpusRepository.stripAccents("Montréal").toLowerCase());
+        assertEquals("quebec",   LocationCorpusRepository.stripAccents("Québec").toLowerCase());
+        assertEquals("trois-rivieres",
+                     LocationCorpusRepository.stripAccents("Trois-Rivières").toLowerCase());
+        // Already plain: unchanged, so the common case cannot be damaged by folding it twice.
+        assertEquals("montreal", LocationCorpusRepository.stripAccents("montreal"));
+        assertNull(LocationCorpusRepository.stripAccents(null));
+    }
 }

@@ -387,7 +387,56 @@ public class AdminService {
             });
     }
 
+    /** Why a moderator took a pending submission down. Only the first costs the submitter. */
+    public static final java.util.Set<String> MANAGER_REJECT_CATEGORIES =
+        java.util.Set.of("junk", "duplicate", "correction", "other");
+
+    /**
+     * Rejects without saying why, and therefore without penalising anybody.
+     *
+     * <p>Kept so that a caller predating the category cannot be turned into a 400 by a deploy.
+     * Prefer {@link #rejectPendingManager(String, long, String, String)}: a moderator who has
+     * decided to reject something has also decided whether it was the submitter's fault, and
+     * this overload throws that answer away.
+     */
     public Future<JsonObject> rejectPendingManager(String auth0Id, long managerId, String reason) {
+        return rejectPendingManager(auth0Id, managerId, reason, null);
+    }
+
+    /**
+     * A moderator rejects a pending manager, and says whether it was the submitter's fault.
+     *
+     * <p>This used to debit {@value ConfidenceRepository#MANAGER_REJECTED_JUNK_DELTA} on every
+     * rejection. The {@code reason} it already took was free text for the notification email and
+     * was never consulted, so a submission taken down as a duplicate of one already in the
+     * directory cost its submitter exactly as much as typing gibberish into the add form. Since
+     * duplicates come from the people who contribute most, the accounts quietly pushed under
+     * {@link ConfidenceRepository#WATCH_BELOW} were disproportionately the good ones.
+     *
+     * <p>{@code category} decides the consequence, exactly as the reason does for
+     * {@link #adminDeleteReview}: only {@code junk} debits anybody. {@code reason} keeps its old
+     * job of explaining the decision to the submitter, because the two answer different
+     * questions - one is for them to read, one is for us to act on.
+     *
+     * <p>An absent category means no penalty rather than a default one. The frontend always sends
+     * it, so absent means a caller that predates this parameter, and the worst a lagging deploy
+     * can then do is under-punish. A confidence score is invisible to the person carrying it and
+     * cannot be appealed by them, which makes a debit nobody deliberately chose indefensible.
+     *
+     * @param reason   free text shown to the submitter; may be null
+     * @param category one of {@link #MANAGER_REJECT_CATEGORIES}, or null for no penalty
+     */
+    public Future<JsonObject> rejectPendingManager(String auth0Id, long managerId, String reason,
+                                                   String category) {
+        String cleaned = category == null ? "" : category.trim().toLowerCase();
+        /*
+          Absent is allowed; wrong is not. "junkk" is a bug or somebody probing, and quietly
+          treating it as no-penalty would hide both behind a successful-looking rejection.
+        */
+        if (!cleaned.isEmpty() && !MANAGER_REJECT_CATEGORIES.contains(cleaned)) {
+            return Future.failedFuture(ServiceException.badRequest(
+                "Unrecognised rejection category: junk, duplicate, correction or other"));
+        }
         return requireAdmin(auth0Id)
             // reject() also sweeps up the ghost twins the submission left behind, in the same
             // statement, so a person cannot be rejected here and still appear under a half-typed
@@ -410,25 +459,44 @@ public class AdminService {
                 String managerName    = row.getString("name");
                 String managerCompany = row.getString("company");
                 boolean isSearchCreated = searchCreatedBy != null;
-                // Only notify users who explicitly submitted — search-created managers must not
-                // send rejection emails the user would find confusing (they just searched).
-                if (submittedBy != null && !isSearchCreated) {
-                    // Same test, same reason, now also gating confidence. A ghost manager created
-                    // by somebody's search on /find is not a submission: they typed a name into a
-                    // search box. Rejecting it must cost them nothing, because a score they cannot
-                    // see, appeal, or even know exists must never move on something we chose to
-                    // keep silent. If we would not tell you about it, it cannot count against you.
-                    if (confidenceRepo != null) {
-                        confidenceRepo.apply(submittedBy, ConfidenceRepository.MANAGER_REJECTED_JUNK,
-                                -20, "manager", String.valueOf(managerId))
-                            .onFailure(err -> System.err.println(
-                                "Confidence debit failed for manager " + managerId + ": " + err.getMessage()));
-                    }
+
+                /*
+                  A ghost manager created by somebody's search on /find is not a submission: they
+                  typed a name into a search box. It is silent - no notification - so a score they
+                  cannot see, appeal, or even know exists must never move on it. If we would not
+                  tell you about it, it cannot count against you.
+                */
+                boolean theirSubmission = submittedBy != null && !isSearchCreated;
+                boolean penalise = theirSubmission
+                                && "junk".equals(cleaned)
+                                && confidenceRepo != null;
+
+                if (penalise) {
+                    confidenceRepo.apply(submittedBy, ConfidenceRepository.MANAGER_REJECTED_JUNK,
+                            ConfidenceRepository.MANAGER_REJECTED_JUNK_DELTA,
+                            "manager", String.valueOf(managerId))
+                        .onFailure(err -> System.err.println(
+                            "Confidence debit failed for manager " + managerId + ": " + err.getMessage()));
+                }
+
+                /*
+                  Notified for every category, not only the penalised one. Somebody whose
+                  submission duplicated an existing manager still needs to know it will not
+                  appear, and telling them only when we are also penalising them would make the
+                  notification itself an accusation.
+                */
+                if (theirSubmission) {
                     String msg = "Your submitted manager profile for " + managerName + " at " + managerCompany + " was not approved.";
                     if (reason != null && !reason.isBlank()) msg += " Reason: " + reason.trim();
                     notifRepo.sendAsync(submittedBy, "manager_rejected", "Manager Not Approved", msg);
                 }
-                return Future.succeededFuture(new JsonObject().put("success", true));
+
+                return Future.succeededFuture(new JsonObject()
+                    .put("success", true)
+                    .put("category", cleaned.isEmpty() ? null : cleaned)
+                    // Told rather than inferred: the admin panel cannot work this out from the
+                    // category alone, because junk on a search-created row penalises nobody.
+                    .put("confidencePenalty", penalise));
             });
     }
 

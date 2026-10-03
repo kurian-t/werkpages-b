@@ -61,6 +61,15 @@ public class ConfidenceRepository {
     /** What removing a junk rating costs, matching the manager-side penalty exactly. */
     public static final int REVIEW_DELETED_JUNK_DELTA = -20;
 
+    /**
+     * What a manager rejected as junk costs whoever submitted it.
+     *
+     * <p>Named for the same reason as its review-side twin: the call site used to carry a bare
+     * {@code -20}, which told the next reader nothing about why the two penalties are equal.
+     * They are equal because they are the same act, fabricating something to get past a gate.
+     */
+    public static final int MANAGER_REJECTED_JUNK_DELTA = -20;
+
     private final SqlClient db;
 
     public ConfidenceRepository(SqlClient db) {

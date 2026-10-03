@@ -208,8 +208,11 @@ public class AdminHandler {
             bad(ctx, "Invalid manager ID"); return;
         }
         JsonObject body = ctx.getBodyAsJson();
-        String reason = body != null ? body.getString("reason") : null;
-        service.rejectPendingManager(auth0Id, managerId, reason)
+        // Two different questions. "reason" is free text the submitter reads; "category" is what
+        // the backend acts on, and only "junk" costs them any confidence.
+        String reason   = body != null ? body.getString("reason")   : null;
+        String category = body != null ? body.getString("category") : null;
+        service.rejectPendingManager(auth0Id, managerId, reason, category)
             .onSuccess(json -> ok(ctx, json))
             .onFailure(err -> ManagersHandler.handleError(ctx, err));
     }

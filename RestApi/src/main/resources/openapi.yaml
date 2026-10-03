@@ -2771,6 +2771,12 @@ paths:
     post:
       operationId: rejectPendingManager
       summary: Reject a pending manager (admin only)
+      description: >-
+        The category decides consequences: only "junk" debits the submitter's confidence, because
+        a duplicate or an administrative correction is not their fault. A search-created ghost is
+        never debited whatever is chosen, since the person typed into a search box rather than
+        submitting anything. An absent category means no penalty, so a caller predating it cannot
+        apply one by accident.
       tags:
         - Admin
       parameters:
@@ -2788,9 +2794,35 @@ paths:
               properties:
                 reason:
                   type: string
+                  description: >-
+                    Free text shown to the submitter in the rejection notification. Does not
+                    affect confidence.
+                category:
+                  type: string
+                  enum: [junk, duplicate, correction, other]
+                  description: >-
+                    junk = fake or garbage submission (penalises the submitter);
+                    duplicate and correction carry no penalty; other is a deliberate choice.
       responses:
         '200':
           description: Manager rejected
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  category:
+                    type: string
+                    nullable: true
+                  confidencePenalty:
+                    type: boolean
+                    description: >-
+                      Whether this rejection actually debited anybody. Reported rather than
+                      inferred from the category, which would be wrong for a search-created row.
+        '400':
+          description: Unrecognised category
         '403':
           description: Forbidden
         '404':
