@@ -993,7 +993,10 @@ class ManagerServiceValidationTest {
                 any(SqlClient.class), any(), anyLong(), any(), any(),
                 anyDouble(), anyDouble(), anyDouble(), anyDouble(), anyDouble(), anyDouble(),
                 anyDouble(), anyDouble(), anyDouble(), anyDouble(), anyDouble(),
-                any(), any(), any(), any(), any(), any(), any(), any()))
+                any(), any(), any(), any(), any(), any(), any(), any(),
+                // datesHidden: whether the author withheld their working period. Stubbed rather
+                // than asserted here - these cases are about the 404 and the recalculation.
+                anyBoolean()))
             .thenReturn(Future.succeededFuture(Optional.of(updatedRow)));
 
         Row result = await(service.updateReview(AUTH0_ID, MANAGER_ID, reviewId, validBody()));
@@ -1008,7 +1011,10 @@ class ManagerServiceValidationTest {
                 any(SqlClient.class), any(), anyLong(), any(), any(),
                 anyDouble(), anyDouble(), anyDouble(), anyDouble(), anyDouble(), anyDouble(),
                 anyDouble(), anyDouble(), anyDouble(), anyDouble(), anyDouble(),
-                any(), any(), any(), any(), any(), any(), any(), any()))
+                any(), any(), any(), any(), any(), any(), any(), any(),
+                // datesHidden: whether the author withheld their working period. Stubbed rather
+                // than asserted here - these cases are about the 404 and the recalculation.
+                anyBoolean()))
             .thenReturn(Future.succeededFuture(Optional.empty()));
 
         ServiceException ex = assertServiceFails(service.updateReview(AUTH0_ID, MANAGER_ID, reviewId, validBody()));
@@ -1024,7 +1030,10 @@ class ManagerServiceValidationTest {
                 any(SqlClient.class), any(), anyLong(), any(), any(),
                 anyDouble(), anyDouble(), anyDouble(), anyDouble(), anyDouble(), anyDouble(),
                 anyDouble(), anyDouble(), anyDouble(), anyDouble(), anyDouble(),
-                any(), any(), any(), any(), any(), any(), any(), any()))
+                any(), any(), any(), any(), any(), any(), any(), any(),
+                // datesHidden: whether the author withheld their working period. Stubbed rather
+                // than asserted here - these cases are about the 404 and the recalculation.
+                anyBoolean()))
             .thenReturn(Future.succeededFuture(Optional.of(updatedRow)));
 
         Row result = await(service.updateReview(AUTH0_ID, MANAGER_ID, reviewId, validBody()));

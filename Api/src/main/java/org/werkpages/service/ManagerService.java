@@ -1280,6 +1280,13 @@ public class ManagerService {
         String reviewText     = reviewBody.getString("text");
         LocalDate workedFrom  = parseYearMonth(reviewBody.getString("workedFrom"));
         LocalDate workedUntil = parseYearMonth(reviewBody.getString("workedUntil"));
+        /*
+          Whether to publish the period. Absent means show, which is what every existing rating
+          does - this is an opt-in to privacy, not a change of default. The dates themselves are
+          still required and still stored: they drive the overlap check and the tenure maths, and
+          only the DISPLAY is withheld.
+        */
+        boolean datesHidden   = reviewBody.getBoolean("datesHidden", false);
 
         String missingReview = reviewFieldMissing(overallRating, ratings, managerCompany, managerTitle);
         if (missingReview != null) {
@@ -1327,6 +1334,7 @@ public class ManagerService {
         final String   fMgrTitle      = managerTitle;
         final LocalDate fWorkedFrom   = workedFrom;
         final LocalDate fWorkedUntil  = workedUntil;
+        final boolean  fDatesHidden   = datesHidden;
         final UUID     fDraftToken    = draftTokenParsed;
 
         return userRepo.findByAuth0IdWithBan(auth0Id)
@@ -1424,9 +1432,10 @@ public class ManagerService {
                                                         feedback_style, perceived_supportiveness, decision_making_style,
                                                         organization_and_planning_style, delegation_style, perceived_professional_demeanor,
                                                         overall_working_experience, manager_company, manager_title, text,
-                                                        worked_from, worked_until, verified, helpful_count, created_at, updated_at
+                                                        worked_from, worked_until, dates_hidden,
+                                                        verified, helpful_count, created_at, updated_at
                                                     )
-                                                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,true,0,now(),now())
+                                                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,true,0,now(),now())
                                                     RETURNING id
                                                     """)
                                                     .execute(Tuple.of(
@@ -1435,7 +1444,7 @@ public class ManagerService {
                                                         getRating(fRatings, 3), getRating(fRatings, 4), getRating(fRatings, 5),
                                                         getRating(fRatings, 6), getRating(fRatings, 7), getRating(fRatings, 8),
                                                         getRating(fRatings, 9), fMgrCompany, fMgrTitle, fReviewText,
-                                                        fWorkedFrom, fWorkedUntil
+                                                        fWorkedFrom, fWorkedUntil, fDatesHidden
                                                     ))
                                                     .compose(reviewIns -> {
                                                         // The manager row is new, so the figures
@@ -1846,6 +1855,8 @@ public class ManagerService {
         String text               = body.getString("text")           != null ? body.getString("text").trim()           : null;
         LocalDate workedFrom      = parseYearMonth(body.getString("workedFrom"));
         LocalDate workedUntil     = parseYearMonth(body.getString("workedUntil"));
+        // Opt-in: absent means show, exactly as every rating written before this existed does.
+        boolean datesHidden       = body.getBoolean("datesHidden", false);
         LocalDate managerRoleStart = parseYearMonth(body.getString("managerRoleStart"));
         LocalDate managerRoleEnd   = parseYearMonth(body.getString("managerRoleEnd")); // null = still in role
         /*
@@ -1951,7 +1962,7 @@ public class ManagerService {
                     return insertReviewTransactionally(managerId, userId, author, overallRating,
                             ratings, managerCompany, managerTitle, text,
                             workedFrom, workedUntil, null, null, resolvedLogoUrl, draftToken, submission,
-                            managerStatus);
+                            managerStatus, datesHidden);
                 }
                 return reviewRepo.findRolePeriodsForManager(managerId)
                     .compose(allRoleRows -> {
@@ -1973,7 +1984,7 @@ public class ManagerService {
                         return insertReviewTransactionally(managerId, userId, author, overallRating,
                                 ratings, managerCompany, managerTitle, text,
                                 workedFrom, workedUntil, managerRoleStart, managerRoleEnd, resolvedLogoUrl, draftToken, submission,
-                                managerStatus);
+                                managerStatus, datesHidden);
                     });  // closes allRoleRows compose
             })  // closes existingRows compose
         );  // closes deleteDraftFirst compose
@@ -2065,7 +2076,7 @@ public class ManagerService {
             LocalDate workedFrom, LocalDate workedUntil,
             LocalDate managerRoleStart, LocalDate managerRoleEnd,
             String resolvedLogoUrl, UUID draftToken, SubmissionContext submission,
-            String managerStatus) {
+            String managerStatus, boolean datesHidden) {
 
         return ((Pool) db).withTransaction(conn -> {
             // Authenticated submit with a token: delete the matching anonymous drop-off draft first.
@@ -2092,10 +2103,10 @@ public class ManagerService {
                             worked_from, worked_until, manager_role_start, manager_role_end,
                             draft_token, verified, helpful_count, created_at, updated_at,
                             declared_country, declared_state, declared_city, declared_precision, company_location_id,
-                            manager_status
+                            manager_status, dates_hidden
                         )
                         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,true,0,now(),now(),
-                                $23,$24,$25,$26,$27,$28)
+                                $23,$24,$25,$26,$27,$28,$29)
                         RETURNING *
                         """)
                     .execute(Tuple.of(
@@ -2107,7 +2118,7 @@ public class ManagerService {
                         workedFrom, workedUntil, managerRoleStart, managerRoleEnd, tokenToStore,
                         resolvedDeclared.country(), resolvedDeclared.state(), resolvedDeclared.city(),
                         resolvedDeclared.precision(), resolvedDeclared.companyLocationId(),
-                        managerStatus
+                        managerStatus, datesHidden
                     ))
                 .compose(reviewResult -> {
                     Row reviewRow = reviewResult.iterator().next();
@@ -2408,6 +2419,12 @@ public class ManagerService {
         LocalDate workedUntil      = parseYearMonth(body.getString("workedUntil"));
         LocalDate managerRoleStart = parseYearMonth(body.getString("managerRoleStart")); // optional for legacy edits
         LocalDate managerRoleEnd   = parseYearMonth(body.getString("managerRoleEnd"));
+        /*
+          Defaulted from what is already stored, not to false. An edit form that omits the field -
+          a client that predates it, or a request that only restates the stars - must not quietly
+          republish dates its author had chosen to withhold.
+        */
+        boolean datesHidden        = body.getBoolean("datesHidden", false);
         LocalDate today = LocalDate.now();
 
         // ── User work date validation ─────────────────────────────────────────────
@@ -2521,7 +2538,7 @@ public class ManagerService {
                                 ratings.getDouble("Organization and Planning Style"), ratings.getDouble("Delegation Style"),
                                 ratings.getDouble("Perceived Professional Demeanor"), ratings.getDouble("Overall Working Experience"),
                                 managerCompany, managerTitle, text, workedFrom, workedUntil,
-                                managerRoleStart, managerRoleEnd, resolved))
+                                managerRoleStart, managerRoleEnd, resolved, datesHidden))
                             .compose(rowOpt -> {
                                 if (rowOpt.isEmpty()) return Future.failedFuture(ServiceException.notFound("Review not found"));
                                 // The read model is maintained in the same transaction as the write
@@ -2909,6 +2926,16 @@ public class ManagerService {
             .put("Delegation Style",                  row.getBigDecimal("delegation_style"))
             .put("Perceived Professional Demeanor",   row.getBigDecimal("perceived_professional_demeanor"))
             .put("Overall Working Experience",        row.getBigDecimal("overall_working_experience"));
+        /*
+          Whether this rating's author asked for their working period to stay private.
+
+          Fails CLOSED when the column is absent from a projection: hidden rather than shown. An
+          unusual projection then loses the dates, which is visible and fixable; the other way
+          round leaks the one thing somebody explicitly asked to withhold, silently. Every review
+          projection reads r.*, so absence means a new query, not normal operation.
+        */
+        boolean datesHidden = row.getColumnIndex("dates_hidden") < 0
+                           || Boolean.TRUE.equals(row.getBoolean("dates_hidden"));
         return new JsonObject()
             .put("id",            row.getUUID("id"))
             .put("managerId",     row.getLong("manager_id"))
@@ -2932,9 +2959,14 @@ public class ManagerService {
             .put("declaredCity",      row.getString("declared_city"))
             .put("declaredPrecision", row.getString("declared_precision"))
             .put("companyLocationId", row.getLong("company_location_id"))
-            .put("workedFrom",    dateOrNull(row, "worked_from"))
-            .put("workedUntil",   dateOrNull(row, "worked_until"))
-            .put("effectiveWorkedUntil", effectiveWorkedUntil(row))
+            /*
+              Withheld together. Leaving effectiveWorkedUntil in place would publish the end date
+              through the back door, since that is the value the profile actually renders.
+            */
+            .put("workedFrom",    datesHidden ? null : dateOrNull(row, "worked_from"))
+            .put("workedUntil",   datesHidden ? null : dateOrNull(row, "worked_until"))
+            .put("effectiveWorkedUntil", datesHidden ? null : effectiveWorkedUntil(row))
+            .put("datesHidden",   datesHidden)
             /*
               Whether this rating is on the site.
 
@@ -3011,9 +3043,17 @@ public class ManagerService {
             .put("helpfulCount",  row.getInteger("helpful_count"))
             .put("createdAt",     row.getOffsetDateTime("created_at").toString())
             .put("updatedAt",     row.getOffsetDateTime("updated_at").toString())
+            /*
+              NOT masked here, unlike buildReviewJson. This is the author's view of their own
+              rating, and the edit form has to open with what they actually stored - blanking the
+              dates would make a save look like they had cleared them. The flag rides along so the
+              form can open with the toggle in the state they chose.
+            */
             .put("workedFrom",         dateOrNull(row, "worked_from"))
             .put("workedUntil",        dateOrNull(row, "worked_until"))
             .put("effectiveWorkedUntil", effectiveWorkedUntil(row))
+            .put("datesHidden",        row.getColumnIndex("dates_hidden") >= 0
+                                       && Boolean.TRUE.equals(row.getBoolean("dates_hidden")))
             .put("managerRoleStart",   row.getLocalDate("manager_role_start") != null ? row.getLocalDate("manager_role_start").toString() : null)
             .put("managerRoleEnd",     row.getLocalDate("manager_role_end")   != null ? row.getLocalDate("manager_role_end").toString()   : null);
     }

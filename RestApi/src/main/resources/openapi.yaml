@@ -1616,6 +1616,15 @@ paths:
                       type: string
                     workedUntil:
                       type: string
+                    datesHidden:
+                      type: boolean
+                      default: false
+                      description: >-
+                        Do not publish the working period. Declared HERE as well as on
+                        ManagerReviewInput because this endpoint carries its own inline review
+                        schema: the router drops any property a schema does not name, so the
+                        field reached the handler as absent and every submission saved as
+                        "not hidden" however the box was ticked.
                     effectiveWorkedUntil:
                       type: string
                       nullable: true
@@ -2066,6 +2075,13 @@ paths:
                 workedUntil:
                   type: string
                   nullable: true
+                datesHidden:
+                  type: boolean
+                  default: false
+                  description: >-
+                    Carried on a captured draft too, so somebody who ticked the box before being
+                    bounced to sign in does not have the choice silently dropped when the draft
+                    is promoted.
                 draftToken:
                   type: string
                   format: uuid
@@ -4577,10 +4593,19 @@ components:
           type: integer
           format: int64
           nullable: true
+        datesHidden:
+          type: boolean
+          description: >-
+            The author chose not to publish the period they worked under this manager. When true,
+            workedFrom, workedUntil and effectiveWorkedUntil are all null on this view - the dates
+            are still stored, but withheld on read. Also set automatically when an author
+            withdraws their own rating, so the row returns dateless after the 3-day window.
         workedFrom:
           type: string
           nullable: true
-          description: "YYYY-MM date the reviewer started working with this manager"
+          description: >-
+            YYYY-MM date the reviewer started working with this manager. Null when datesHidden,
+            or on a rating that never recorded one.
         workedUntil:
           type: string
           nullable: true
@@ -4631,6 +4656,13 @@ components:
         text:
           type: string
           nullable: true
+        datesHidden:
+          type: boolean
+          default: false
+          description: >-
+            Do not publish the working period. Opt-in: omitted means show, which is what every
+            rating written before this field existed does. The dates are still required and still
+            stored, because the overlap check and the tenure arithmetic read them back.
         workedFrom:
           type: string
           nullable: true
@@ -4711,6 +4743,13 @@ components:
         text:
           type: string
           nullable: true
+        datesHidden:
+          type: boolean
+          default: false
+          description: >-
+            Do not publish the working period. Opt-in: omitted means show, which is what every
+            rating written before this field existed does. The dates are still required and still
+            stored, because the overlap check and the tenure arithmetic read them back.
         workedFrom:
           type: string
           nullable: true

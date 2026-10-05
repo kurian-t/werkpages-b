@@ -417,7 +417,7 @@ public class ReviewRepository {
             feedbackStyle, perceivedSupportiveness, decisionMakingStyle,
             organizationAndPlanningStyle, delegationStyle, perceivedProfessionalDemeanor,
             overallWorkingExperience, managerCompany, managerTitle, text,
-            workedFrom, workedUntil, managerRoleStart, managerRoleEnd, null);
+            workedFrom, workedUntil, managerRoleStart, managerRoleEnd, null, false);
     }
 
     /**
@@ -442,13 +442,19 @@ public class ReviewRepository {
                                          String managerCompany, String managerTitle, String text,
                                          LocalDate workedFrom, LocalDate workedUntil,
                                          LocalDate managerRoleStart, LocalDate managerRoleEnd,
-                                         DeclaredLocation declared) {
+                                         DeclaredLocation declared, boolean datesHidden) {
         // COALESCE is not an option here: it cannot express "clear this column", which is exactly
         // what coarsening an exact pick has to do. Two statements, one intent each.
         String locationSql = declared == null ? "" : """
                     , declared_country = $23, declared_state = $24, declared_city = $25,
                       declared_precision = $26, company_location_id = $27
                 """;
+        /*
+          Appended last, so its index depends on whether the optional location block claimed
+          $23-$27 before it. Computed rather than hard-coded, because getting it wrong writes
+          somebody's city into a boolean column and the compiler cannot see it.
+        */
+        int datesHiddenIndex = declared == null ? 23 : 28;
         Tuple params = Tuple.of(
             overallRating, communicationStyle, perceivedApproachability,
             perceivedClarityOfExpectations, feedbackStyle, perceivedSupportiveness,
@@ -462,6 +468,8 @@ public class ReviewRepository {
                   .addString(declared.city()).addString(declared.precision())
                   .addValue(declared.companyLocationId());
         }
+        // Last, so it lines up with datesHiddenIndex whichever branch ran above.
+        params.addBoolean(datesHidden);
         return conn.preparedQuery("""
                 UPDATE reviews SET
                     overall_rating = $1,
@@ -474,7 +482,8 @@ public class ReviewRepository {
                     worked_from = $15, worked_until = $16, author = $17,
                     manager_role_start = $21, manager_role_end = $22,
                     updated_at = now()
-                """ + locationSql + """
+                """ + locationSql + ", dates_hidden = $" + datesHiddenIndex + """
+
                 WHERE id = $18 AND manager_id = $19 AND user_id = $20
                 RETURNING *
                 """)
@@ -524,10 +533,23 @@ public class ReviewRepository {
         return delete(db, reviewId, managerId);
     }
 
-    /** As above, inside a caller's transaction - so the projection moves with the hide. */
+    /**
+     * As above, inside a caller's transaction - so the projection moves with the hide.
+     *
+     * <p><b>Also hides the working period.</b> {@code user_id} is nulled here and the row returns
+     * after three days via {@link #restoreExpiredDeletions()}, anonymous. It used to return with
+     * "Mar 2019 - Aug 2024" still on it, which on a manager with a handful of direct reports
+     * identifies its author as precisely as a name would - and withdrawing is the one moment
+     * somebody has actively asked to be disassociated from what they wrote.
+     *
+     * <p>Set here rather than in the restore sweep, for the same reason {@code user_id} is: the
+     * decision belongs to the act of withdrawing, and a flag set at delete time travels with the
+     * row however it later comes back.
+     */
     public Future<Void> delete(SqlClient conn, UUID reviewId, long managerId) {
         return conn.preparedQuery(
-                "UPDATE reviews SET deleted_at = now(), user_id = NULL WHERE id = $1 AND manager_id = $2")
+                "UPDATE reviews SET deleted_at = now(), user_id = NULL, dates_hidden = TRUE "
+              + "WHERE id = $1 AND manager_id = $2")
             .execute(Tuple.of(reviewId, managerId))
             .mapEmpty();
     }
