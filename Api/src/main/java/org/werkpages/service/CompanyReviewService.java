@@ -97,6 +97,13 @@ public class CompanyReviewService {
 
                 LocalDate from  = parseDate(body.getString("workedFrom"));
                 LocalDate until = parseDate(body.getString("workedUntil"));
+                /*
+                  Whether to publish the period. Opt-in: absent means show, which is what every
+                  rating written before this existed does. The dates stay required and stored -
+                  the form reopens on them and the tenure arithmetic reads them - so only the
+                  DISPLAY is withheld.
+                */
+                boolean datesHidden = body.getBoolean("datesHidden", false);
                 LocalDate today = LocalDate.now();
                 if (from == null) {
                     return Future.failedFuture(ServiceException.badRequest("When did you start working here?"));
@@ -145,7 +152,7 @@ public class CompanyReviewService {
                         CorpusPlace.fromBody(body), companyId)
                     .compose(declared ->
                        reviewRepo.upsert(companyId, userId, overall, values, from, until, signedAs,
-                                         declared))
+                                         declared, datesHidden))
                     // The draft this rating came from is finished work now, not a queue item.
                     // Clearing it here rather than on a schedule means an admin never opens one
                     // whose author came back a minute later.
@@ -298,12 +305,18 @@ public class CompanyReviewService {
                             .put("id",            row.getUUID("id").toString())
                             .put("overallRating", withholdScores ? null : numberOrNull(row, "overall_rating"))
                             .put("categories",    categories)
-                            .put("workedFrom",    row.getLocalDate("worked_from") == null
+                            /*
+                              Withheld together when the author asked for it. "current" goes with
+                              them: left behind, a hidden period would still announce that its
+                              author is there right now, which is most of what the dates gave away.
+                            */
+                            .put("datesHidden",   datesHiddenOf(row))
+                            .put("workedFrom",    datesHiddenOf(row) || row.getLocalDate("worked_from") == null
                                                   ? null : row.getLocalDate("worked_from").toString())
-                            .put("workedUntil",   row.getLocalDate("worked_until") == null
+                            .put("workedUntil",   datesHiddenOf(row) || row.getLocalDate("worked_until") == null
                                                   ? null : row.getLocalDate("worked_until").toString())
                             // Still employed there, said as a fact rather than a missing field.
-                            .put("current",       row.getLocalDate("worked_until") == null)
+                            .put("current",       !datesHiddenOf(row) && row.getLocalDate("worked_until") == null)
                             .put("createdAt",     row.getOffsetDateTime("created_at").toString())
                             // So the card can say "edited 3 days ago" rather than implying the
                             // rating has said the same thing since the day it was written.
@@ -383,6 +396,18 @@ public class CompanyReviewService {
         });
     }
 
+    /**
+     * Whether this rating's author withheld their working period.
+     *
+     * <p>Fails CLOSED when a projection does not carry the column: hidden rather than shown. A
+     * missing column then costs a card its dates, which is visible and fixable; the other way
+     * round leaks the one thing somebody explicitly asked to withhold, silently.
+     */
+    private static boolean datesHiddenOf(Row row) {
+        return row.getColumnIndex("dates_hidden") < 0
+            || Boolean.TRUE.equals(row.getBoolean("dates_hidden"));
+    }
+
     private static LocalDate parseDate(String raw) {
         if (raw == null || raw.isBlank()) return null;
         try {
@@ -401,6 +426,12 @@ public class CompanyReviewService {
             .put("companyId",     row.getLong("company_id"))
             .put("overallRating", numberOrNull(row, "overall_rating"))
             .put("ratings",       ratings)
+            /*
+              NOT masked here, unlike the list above: this is the author's own rating and the form
+              reopens on it. Blanking the dates would make a save look like they had cleared them.
+              The flag rides along so the box opens in the state they chose.
+            */
+            .put("datesHidden",   datesHiddenOf(row))
             .put("workedFrom",    row.getLocalDate("worked_from") == null
                                     ? null : row.getLocalDate("worked_from").toString());
         LocalDate until = row.getLocalDate("worked_until");

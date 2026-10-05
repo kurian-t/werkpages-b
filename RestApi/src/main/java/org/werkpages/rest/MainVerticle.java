@@ -180,6 +180,9 @@ public class MainVerticle extends AbstractVerticle {
                                              new BrandfetchClient(vertx, brandfetchClientId))
                             .withResolver(new DomainResolver(vertx,
                                 System.getenv("LOGODEV_SECRET_KEY"), brandfetchClientId))
+                            // Withdrawn workplace ratings resurface anonymous on the same
+                            // schedule as withdrawn manager ratings.
+                            .withCompanyReviews(companyReviewRepo)
                             .schedule(vertx);
 
                         // ── company_stats_live reconciliation (safety net — primary updates go

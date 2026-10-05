@@ -830,6 +830,14 @@ paths:
               type: object
               description: Whatever the form held. Stored verbatim; no key is required.
               properties:
+                datesHidden:
+                  type: boolean
+                  default: false
+                  description: >-
+                    Declared explicitly even though this body is stored verbatim: the
+                    router drops properties a schema does not name, so an undeclared
+                    field reaches the handler as absent however the box was ticked. That
+                    exact trap already cost the manager form a release.
                 draftToken:
                   type: string
                   format: uuid
@@ -4005,6 +4013,13 @@ components:
             flexibility:             { type: number, minimum: 0, maximum: 5 }
             inclusion_belonging:     { type: number, minimum: 0, maximum: 5 }
             tools_resources:         { type: number, minimum: 0, maximum: 5 }
+        datesHidden:
+          type: boolean
+          default: false
+          description: >-
+            Do not publish the period worked at this company. Opt-in: omitted means show. The
+            dates stay required and stored - the form reopens on them - so only the display is
+            withheld. Mirrors the same field on a manager rating.
         workedFrom:
           type: string
           description: YYYY-MM. An employer in 2019 says little about it now, so the period is data.

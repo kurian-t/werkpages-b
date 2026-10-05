@@ -55,7 +55,7 @@ public class CompanyReviewRepository {
     */
     private static final String COLUMNS =
         "id, company_id, user_id, overall_rating, " + String.join(", ", CATEGORIES)
-        + ", worked_from, worked_until, author, created_at, updated_at, "
+        + ", worked_from, worked_until, dates_hidden, author, created_at, updated_at, "
         + "declared_country, declared_state, declared_city, declared_precision, company_location_id";
 
     /**
@@ -67,7 +67,7 @@ public class CompanyReviewRepository {
      */
     public Future<Row> upsert(long companyId, UUID userId, double overall, List<Double> categories,
                               LocalDate workedFrom, LocalDate workedUntil, String author,
-                              DeclaredLocation declared) {
+                              DeclaredLocation declared, boolean datesHidden) {
         if (categories.size() != CATEGORIES.size()) {
             return Future.failedFuture(
                 "Expected " + CATEGORIES.size() + " category ratings, got " + categories.size());
@@ -91,6 +91,8 @@ public class CompanyReviewRepository {
         tuple.addValue(loc.city());
         tuple.addValue(loc.precision());
         tuple.addValue(loc.companyLocationId());
+        // Appended last so the computed indices below stay readable; see datesHiddenParam.
+        tuple.addBoolean(datesHidden);
 
         int workedUntilParam = 5 + CATEGORIES.size();
         int authorParam      = workedUntilParam + 1;
@@ -99,17 +101,21 @@ public class CompanyReviewRepository {
         int cityParam        = stateParam + 1;
         int precisionParam   = cityParam + 1;
         int locationIdParam  = precisionParam + 1;
+        int datesHiddenParam = locationIdParam + 1;
 
         return db.preparedQuery("""
                 INSERT INTO company_reviews (company_id, user_id, overall_rating, worked_from, %s, worked_until, author,
                                              declared_country, declared_state, declared_city,
-                                             declared_precision, company_location_id)
-                VALUES ($1, $2, $3, $4%s, $%d, $%d, $%d, $%d, $%d, $%d, $%d)
+                                             declared_precision, company_location_id, dates_hidden)
+                VALUES ($1, $2, $3, $4%s, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d)
                 ON CONFLICT (user_id, company_id) WHERE deleted_at IS NULL
                 DO UPDATE SET overall_rating = EXCLUDED.overall_rating,
                               %s
                               worked_from  = EXCLUDED.worked_from,
                               worked_until = EXCLUDED.worked_until,
+                              -- Replaced, not COALESCEd: the form always sends the box's state,
+                              -- so an edit that unticks it has to be able to republish the dates.
+                              dates_hidden = EXCLUDED.dates_hidden,
                               -- Kept, not overwritten, when an edit omits it: the handle is the
                               -- identity a reader already saw on this rating, and silently
                               -- replacing it on an edit would make one person look like two.
@@ -135,6 +141,7 @@ public class CompanyReviewRepository {
                 RETURNING %s
                 """.formatted(cols, placeholders, workedUntilParam, authorParam,
                               countryParam, stateParam, cityParam, precisionParam, locationIdParam,
+                              datesHiddenParam,
                               updates, COLUMNS))
             .execute(tuple)
             .map(rs -> rs.iterator().next());
@@ -210,10 +217,21 @@ public class CompanyReviewRepository {
      * existed until something unrelated happened to touch the same company.
      *
      * <p>Empty means nothing was deleted - either no such rating, or not this person's.
+     *
+     * <p><b>Unlinks the account and hides the period, in the same statement.</b> This is a three
+     * day soft delete: the row returns anonymous when the window expires, so the opinion survives
+     * - it is still true, and the corpus is still better for it - while the link to the person
+     * does not. {@code author} is deliberately kept: the rating holds the identity readers
+     * already saw, and this removes the account, not the pseudonym.
+     *
+     * <p>{@code user_id} is nulled HERE rather than on restore, because the decision belongs to
+     * the act of withdrawing, and a row that comes back should carry what was decided about it.
+     * Matching {@code ReviewRepository.delete}, which does exactly this for a manager rating.
      */
     public Future<Optional<Long>> softDelete(UUID reviewId, UUID userId) {
         return db.preparedQuery(
-                "UPDATE company_reviews SET deleted_at = now(), updated_at = now() "
+                "UPDATE company_reviews SET deleted_at = now(), updated_at = now(), "
+              + "dates_hidden = TRUE, user_id = NULL "
                 + "WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL "
                 + "RETURNING company_id")
             .execute(Tuple.of(reviewId, userId))
@@ -240,5 +258,34 @@ public class CompanyReviewRepository {
                 """)
             .execute(Tuple.of(keepId, mergeId))
             .map(rs -> rs.iterator().next().getLong("c"));
+    }
+
+    /**
+     * Restores withdrawn ratings whose 3-day window has expired, leaving them anonymous.
+     *
+     * <p><b>A moderator's deletion is never restored.</b> {@code deleted_reason} is what separates
+     * the two: a reason means a person decided, no reason means an author withdrew. Without that
+     * test this sweep would resurrect junk an admin had removed, live and counting toward the
+     * company average, with nothing on the page to show it had been actioned - the exact failure
+     * that manager reviews had to be fixed for.
+     *
+     * <p>{@code user_id} is already null by now, so nothing else has to be anonymised here.
+     *
+     * @return the company ids touched, so their averages can be recomputed
+     */
+    public Future<java.util.List<Long>> restoreExpiredDeletions() {
+        return db.preparedQuery("""
+                UPDATE company_reviews SET deleted_at = NULL, updated_at = now()
+                WHERE deleted_at IS NOT NULL
+                  AND deleted_at < now() - INTERVAL '3 days'
+                  AND deleted_reason IS NULL
+                RETURNING company_id
+                """)
+            .execute()
+            .map(rs -> {
+                java.util.List<Long> ids = new java.util.ArrayList<>();
+                for (Row r : rs) ids.add(r.getLong("company_id"));
+                return ids;
+            });
     }
 }

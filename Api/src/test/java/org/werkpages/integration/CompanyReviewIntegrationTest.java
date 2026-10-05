@@ -811,7 +811,7 @@ class CompanyReviewIntegrationTest {
             .put("declaredCity",    "Kitchener")
             .put("declaredPrecision", DeclaredLocation.CITY)));
 
-        Row stored = storedRating();
+        Row stored = wholeRating();
         assertEquals("Canada",    stored.getString("declared_country"));
         assertEquals("Ontario",   stored.getString("declared_state"));
         assertEquals("Kitchener", stored.getString("declared_city"));
@@ -831,7 +831,7 @@ class CompanyReviewIntegrationTest {
             .put("declaredState",   "Ontario")
             .put("declaredPrecision", DeclaredLocation.STATE)));
 
-        Row stored = storedRating();
+        Row stored = wholeRating();
         assertEquals("state", stored.getString("declared_precision"));
         assertNull(stored.getString("declared_city"));
     }
@@ -852,7 +852,7 @@ class CompanyReviewIntegrationTest {
             .put("declaredCity", "Waterloo")            // stale form - the building is in Toronto
             .put("declaredPrecision", DeclaredLocation.EXACT)));
 
-        Row stored = storedRating();
+        Row stored = wholeRating();
         assertEquals(location,  stored.getLong("company_location_id"));
         assertEquals("exact",   stored.getString("declared_precision"));
         assertEquals("Toronto", stored.getString("declared_city"),
@@ -922,7 +922,7 @@ class CompanyReviewIntegrationTest {
             .put("declaredCity",    "Kitchener")
             .put("declaredPrecision", DeclaredLocation.CITY)));
 
-        Row stored = storedRating();
+        Row stored = wholeRating();
         assertEquals("Kitchener", stored.getString("declared_city"));
         assertEquals("city",      stored.getString("declared_precision"));
         assertEquals(1L, count("SELECT COUNT(*) AS c FROM company_reviews"),
@@ -951,7 +951,7 @@ class CompanyReviewIntegrationTest {
             .put("declaredCity",    "Kitchener")
             .put("declaredPrecision", DeclaredLocation.CITY)));
 
-        Row stored = storedRating();
+        Row stored = wholeRating();
         assertEquals("city", stored.getString("declared_precision"));
         assertNull(stored.getLong("company_location_id"),
             "the building went with the precision that required it");
@@ -975,7 +975,7 @@ class CompanyReviewIntegrationTest {
 
         await(service.submit(auth, "red-hat", validBody(2.0)));
 
-        Row stored = storedRating();
+        Row stored = wholeRating();
         assertEquals(2.0, stored.getBigDecimal("overall_rating").doubleValue(),
             "the rating it did send was taken");
         assertEquals("Kitchener", stored.getString("declared_city"),
@@ -984,6 +984,18 @@ class CompanyReviewIntegrationTest {
     }
 
     /** The single rating in the database, for asserting on what was actually stored. */
+    /**
+     * The WHOLE stored row.
+     *
+     * <p>Distinct from {@link #storedRating()}, which projects only the columns its own cases
+     * assert on. The withdrawal and withheld-period cases read user_id, dates_hidden, deleted_at
+     * and author, so they need the row rather than a slice of it.
+     */
+    private static Row wholeRating() throws Exception {
+        return await(pool.query("SELECT * FROM company_reviews ORDER BY created_at LIMIT 1")
+            .execute().map(rs -> rs.iterator().next()));
+    }
+
     private static Row storedRating() throws Exception {
         return await(pool.query("""
                 SELECT overall_rating, declared_country, declared_state, declared_city,
@@ -1029,5 +1041,186 @@ class CompanyReviewIntegrationTest {
 
     private static <T> T await(Future<T> f) throws Exception {
         return f.toCompletionStage().toCompletableFuture().get(30, TimeUnit.SECONDS);
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // Withholding the working period
+    // ══════════════════════════════════════════════════════════════════════════
+
+    /*
+      A rating is anonymous by display name only. "Apr 2021 - Present" at a company with four
+      people in the office identifies its author as precisely as a signature would, and the author
+      is the only person who can judge whether that is safe for them.
+
+      A display rule, never a deletion: the dates stay in the row because the form reopens on them
+      and the tenure arithmetic reads them. What changes is who is told.
+    */
+
+    @Test
+    void aWithheldPeriodIsNotServedToAnybodyElse() throws Exception {
+        insertCompany("Hooli", "hooli");
+        String author = insertUser("auth0|cr-hide-1", "CrHide1");
+        String reader = insertUser("auth0|cr-hide-2", "CrHide2");
+        await(service.submit(author, "hooli", validBody(4.0).put("datesHidden", true)));
+        // The reader has rated something, so nothing below is the contribution gate talking.
+        insertCompany("Initech", "initech");
+        await(service.submit(reader, "initech", validBody(3.0)));
+
+        JsonObject listed = await(service.listFor(reader, "hooli", 20, 0));
+        JsonObject row = listed.getJsonArray("data").getJsonObject(0);
+
+        assertTrue(row.getBoolean("datesHidden"), "the card has to know, so it can say so");
+        assertNull(row.getString("workedFrom"),  "the start date is the half that dates a person");
+        assertNull(row.getString("workedUntil"));
+        assertFalse(row.getBoolean("current"),
+            "\"current\" is withheld WITH the dates: left behind it still announces that its "
+          + "author is there right now, which is most of what the period gave away");
+    }
+
+    @Test
+    void aWithheldPeriodIsStillReturnedToItsAuthor() throws Exception {
+        /*
+          The edit form reopens on what was stored. Masking the author's own copy would blank the
+          two fields they are about to edit, and saving that back would look like they had cleared
+          their own answer - so the privacy choice would quietly destroy the data it protects.
+        */
+        insertCompany("Hooli", "hooli");
+        String author = insertUser("auth0|cr-hide-3", "CrHide3");
+        await(service.submit(author, "hooli", validBody(4.0).put("datesHidden", true)));
+
+        JsonObject mine = await(service.findMine(author, "hooli")).getJsonObject("review");
+
+        assertTrue(mine.getBoolean("datesHidden"), "so the box reopens ticked");
+        assertEquals("2021-04-01", mine.getString("workedFrom"),
+            "the author's own view is never masked");
+    }
+
+    @Test
+    void withholdingKeepsTheDatesInTheDatabase() throws Exception {
+        // The whole design rests on this. If hiding deleted the dates, the overlap rules and the
+        // tenure arithmetic would quietly lose their input and nobody would notice for months.
+        insertCompany("Hooli", "hooli");
+        String author = insertUser("auth0|cr-hide-4", "CrHide4");
+        await(service.submit(author, "hooli", validBody(4.0).put("datesHidden", true)));
+
+        Row stored = wholeRating();
+        assertNotNull(stored.getLocalDate("worked_from"), "stored, merely not served");
+        assertTrue(stored.getBoolean("dates_hidden"));
+    }
+
+    @Test
+    void notAskingToHideLeavesEverythingAsItWas() throws Exception {
+        // Opt-in. Every rating written before this existed, and every one whose author does not
+        // tick the box, has to behave exactly as it always did.
+        insertCompany("Hooli", "hooli");
+        String author = insertUser("auth0|cr-hide-5", "CrHide5");
+        await(service.submit(author, "hooli", validBody(4.0)));
+
+        assertFalse(wholeRating().getBoolean("dates_hidden"));
+        JsonObject mine = await(service.findMine(author, "hooli")).getJsonObject("review");
+        assertFalse(mine.getBoolean("datesHidden"));
+        assertEquals("2021-04-01", mine.getString("workedFrom"));
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // Withdrawing, and coming back anonymous
+    // ══════════════════════════════════════════════════════════════════════════
+
+    /*
+      Deleting your own rating is a three-day soft delete on either form. The opinion survives
+      because it is still true and the corpus is still better for it; what goes is the link to the
+      person. A workplace rating used to be deleted outright, so the same act meant two different
+      things depending on which form you had filled in.
+    */
+
+    @Test
+    void withdrawingUnlinksTheAccountAndHidesThePeriod() throws Exception {
+        insertCompany("Hooli", "hooli");
+        String author = insertUser("auth0|cr-wd-1", "CrWd1");
+        // An author handle, because the point below is that withdrawing keeps it.
+        JsonObject submitted = await(service.submit(author, "hooli",
+                                     validBody(4.0).put("author", "QuietPanda42")));
+
+        await(service.delete(author, UUID.fromString(submitted.getString("id"))));
+
+        Row row = wholeRating();
+        assertNull(row.getUUID("user_id"), "unlinked at once, not when the window expires");
+        assertTrue(row.getBoolean("dates_hidden"),
+            "the period goes with the link - withdrawing is the one moment somebody has actively "
+          + "asked to be disassociated from what they wrote");
+        assertNotNull(row.getOffsetDateTime("deleted_at"), "hidden while the window runs");
+        assertNotNull(row.getString("author"),
+            "the handle stays: this removes the account, not the pseudonym");
+    }
+
+    @Test
+    void aWithdrawnRatingComesBackAnonymousOnceTheWindowHasPassed() throws Exception {
+        insertCompany("Hooli", "hooli");
+        String author = insertUser("auth0|cr-wd-2", "CrWd2");
+        JsonObject submitted = await(service.submit(author, "hooli", validBody(4.0)));
+        await(service.delete(author, UUID.fromString(submitted.getString("id"))));
+
+        await(pool.query("UPDATE company_reviews SET deleted_at = now() - INTERVAL '4 days'")
+            .execute().mapEmpty());
+        java.util.List<Long> touched = await(reviewRepo.restoreExpiredDeletions());
+
+        assertEquals(1, touched.size(),
+            "the company ids come back so their averages can be recomputed - a restore that does "
+          + "not say which company leaves the read model reporting a figure no row supports");
+        Row row = wholeRating();
+        assertNull(row.getOffsetDateTime("deleted_at"), "live again");
+        assertNull(row.getUUID("user_id"),              "and still anonymous");
+        assertTrue(row.getBoolean("dates_hidden"),      "and still dateless");
+    }
+
+    @Test
+    void aRatingInsideTheWindowIsLeftAlone() throws Exception {
+        // Three days is a chance to change your mind, not a formality.
+        insertCompany("Hooli", "hooli");
+        String author = insertUser("auth0|cr-wd-3", "CrWd3");
+        JsonObject submitted = await(service.submit(author, "hooli", validBody(4.0)));
+        await(service.delete(author, UUID.fromString(submitted.getString("id"))));
+
+        assertEquals(0, await(reviewRepo.restoreExpiredDeletions()).size());
+        assertNotNull(wholeRating().getOffsetDateTime("deleted_at"), "still withdrawn");
+    }
+
+    @Test
+    void aModeratorsDeletionIsNeverRestored() throws Exception {
+        /*
+          The trap this guard exists for. Without the deleted_reason test the sweep resurrects
+          whatever an admin removed - live, counting toward the company average, with nothing on
+          the page to show it had ever been actioned. Manager reviews had to be fixed for exactly
+          this, and the fix is only half-applied if the other form can still do it.
+        */
+        insertCompany("Hooli", "hooli");
+        String author = insertUser("auth0|cr-wd-4", "CrWd4");
+        await(service.submit(author, "hooli", validBody(4.0)));
+
+        await(pool.query("UPDATE company_reviews SET deleted_at = now() - INTERVAL '9 days', "
+                       + "deleted_reason = 'junk'").execute().mapEmpty());
+
+        assertEquals(0, await(reviewRepo.restoreExpiredDeletions()).size());
+        assertNotNull(wholeRating().getOffsetDateTime("deleted_at"),
+            "a rating a moderator removed must stay removed, however long it sits there");
+    }
+
+    @Test
+    void withdrawingFreesThePersonToRateThatCompanyAgain() throws Exception {
+        /*
+          One rating per person per company is enforced by a unique index that is partial on
+          deleted_at. Nulling user_id on withdrawal must not break that: the person is entitled to
+          a fresh opinion, and the withdrawn one is no longer theirs to collide with.
+        */
+        insertCompany("Hooli", "hooli");
+        String author = insertUser("auth0|cr-wd-5", "CrWd5");
+        JsonObject first = await(service.submit(author, "hooli", validBody(4.0)));
+        await(service.delete(author, UUID.fromString(first.getString("id"))));
+
+        JsonObject second = await(service.submit(author, "hooli", validBody(2.0)));
+
+        assertNotEquals(first.getString("id"), second.getString("id"), "a new opinion, not an edit");
+        assertEquals(2, count("SELECT COUNT(*) AS c FROM company_reviews"),
+            "the withdrawn one is still there, waiting out its window");
     }
 }

@@ -4,6 +4,7 @@ import io.vertx.core.Future;
 import io.vertx.core.Vertx;
 import io.vertx.sqlclient.Row;
 import org.werkpages.repository.CompanyRepository;
+import org.werkpages.repository.CompanyReviewRepository;
 import org.werkpages.repository.ConfidenceRepository;
 import org.werkpages.repository.ManagerRepository;
 import org.werkpages.repository.ProofChallengeRepository;
@@ -42,6 +43,14 @@ public class MaintenanceSweep {
     private final ReviewRepository         reviewRepo;
     private final ManagerRepository        managerRepo;
     private final CompanyRepository        companyRepo;
+    /**
+     * Optional, set after construction.
+     *
+     * <p>A setter rather than another constructor argument: this class already has two overloads
+     * and every existing caller and test would have had to change to add a dependency only one
+     * step uses. Null simply means that step does not run.
+     */
+    private CompanyReviewRepository companyReviewRepo;
     private final ProofChallengeRepository proofChallengeRepo;
     private final ConfidenceRepository     confidenceRepo;
 
@@ -115,9 +124,16 @@ public class MaintenanceSweep {
      *
      * <p>Callable directly, which is what makes any of this testable.
      */
+    /** Wires in the workplace-rating restore. Chainable, like {@code withResolver}. */
+    public MaintenanceSweep withCompanyReviews(CompanyReviewRepository repo) {
+        this.companyReviewRepo = repo;
+        return this;
+    }
+
     public Future<Void> runOnce() {
         return Future.join(
                 restoreExpiredDeletions(),
+                restoreExpiredCompanyDeletions(),
                 ageOutAbandonedChallenges(),
                 awardStandingCredit(),
                 refreshExpiredPlaceholders(),
@@ -414,6 +430,34 @@ public class MaintenanceSweep {
         return reviewRepo.restoreExpiredDeletions()
             .onSuccess(n -> { if (n > 0) System.out.println("✓ Restored " + n + " anonymised review(s)"); })
             .onFailure(err -> System.err.println("⚠ Review restore job failed: " + err.getMessage()))
+            .otherwiseEmpty()
+            .mapEmpty();
+    }
+
+    /**
+     * The workplace-rating half of the same rule.
+     *
+     * <p>Withdrawing a rating is a three-day soft delete on either form, so a rating of a company
+     * resurfaces anonymous exactly as a rating of a manager does. Its author link was already
+     * dropped at delete time; all that happens here is the row becoming visible again.
+     *
+     * <p>Each restored row changes a company average, so the read model is told which companies to
+     * recompute. Skipping that is how company_stats_live ends up reporting a figure that no row
+     * supports.
+     */
+    private Future<Void> restoreExpiredCompanyDeletions() {
+        if (companyReviewRepo == null) return Future.succeededFuture();
+        return companyReviewRepo.restoreExpiredDeletions()
+            .compose(companyIds -> {
+                if (companyIds.isEmpty()) return Future.succeededFuture();
+                System.out.println("✓ Restored " + companyIds.size() + " anonymised workplace rating(s)");
+                Future<Void> chain = Future.succeededFuture();
+                for (Long id : new java.util.LinkedHashSet<>(companyIds)) {
+                    chain = chain.compose(v -> companyRepo.syncStatsForCompany(id));
+                }
+                return chain;
+            })
+            .onFailure(err -> System.err.println("⚠ Workplace rating restore job failed: " + err.getMessage()))
             .otherwiseEmpty()
             .mapEmpty();
     }
