@@ -182,19 +182,19 @@ class CompanyListingIntegrationTest {
 
     @Test
     void liveStats_managerCountIncrementsImmediatelyOnAdd_withoutFullRefresh() throws Exception {
-        // Adding a manager must bump the company's live manager_count straight away via the
-        // targeted upsert the write path calls — WITHOUT the periodic refreshCompanyStats() sweep.
+        // Adding a manager must bump the company's live manager_count straight away, WITHOUT
+        // the periodic sweep. It used to be a targeted upsert the write path called; since V89 the
+        // managers trigger does it inside the insert, so this test now asserts the projection
+        // followed with no application code involved at all.
         long companyId = await(companyRepo.findOrCreate("Acme Corp", null, null)).getLong("id");
 
-        long id1 = insertApprovedManagerReturningId("Alice A", "Acme Corp", "Engineer", companyId);
-        await(companyRepo.updateCompanyStatsForManager(id1));
+        insertApprovedManagerReturningId("Alice A", "Acme Corp", "Engineer", companyId);
 
         JsonArray afterFirst = await(service.getCompanyListing()).getJsonArray("data");
         assertEquals(1, afterFirst.size());
         assertEquals(1L, afterFirst.getJsonObject(0).getLong("managerCount"));
 
-        long id2 = insertApprovedManagerReturningId("Bob B", "Acme Corp", "Director", companyId);
-        await(companyRepo.updateCompanyStatsForManager(id2));
+        insertApprovedManagerReturningId("Bob B", "Acme Corp", "Director", companyId);
 
         // No refreshCompanyStats() here — the live table must already reflect the second manager.
         JsonArray afterSecond = await(service.getCompanyListing()).getJsonArray("data");
@@ -207,13 +207,12 @@ class CompanyListingIntegrationTest {
     void liveStats_companyDropsFromListingWhenLastManagerDeleted() throws Exception {
         long companyId = await(companyRepo.findOrCreate("Solo Corp", null, null)).getLong("id");
         long id1 = insertApprovedManagerReturningId("Only One", "Solo Corp", "Engineer", companyId);
-        await(companyRepo.updateCompanyStatsForManager(id1));
 
         assertEquals(1, await(service.getCompanyListing()).getJsonArray("data").size());
 
-        // Delete the only manager and refresh that company's live stats (the delete path).
+        // Delete the only manager. The trigger fires on the DELETE and the orphan rule removes
+        // the row, so nothing here has to ask for a refresh.
         await(pool.preparedQuery("DELETE FROM managers WHERE id = $1").execute(Tuple.of(id1)));
-        await(companyRepo.updateCompanyStatsForCompany(companyId));
 
         JsonArray after = await(service.getCompanyListing()).getJsonArray("data");
         assertEquals(0, after.size(),

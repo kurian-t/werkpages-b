@@ -208,6 +208,22 @@ public class ManagerService {
     /** Looks up a manager by slug. Same access rules as getManagerById. */
     public Future<Row> getManagerBySlug(String slug, String auth0Id) {
         return managerRepo.findBySlugFollowingMerges(slug)
+            /*
+              A slug this manager used to live at still resolves.
+
+              manager_url_history is written every time a slug changes - approval, merges, a
+              company move - and nothing ever read it, so every URL this application has retired
+              has been answering "Manager not found". The frontend already canonicalises: given a
+              manager whose slug differs from the one in the address bar, BossProfile navigates to
+              managerPath(...manager.slug) and replaces the history entry. So resolving the old
+              slug here is the whole redirect.
+
+              Second, after the live slug, never instead of it: a current slug must always win, and
+              this must not cost a lookup on the normal path.
+            */
+            .compose(opt -> opt.isPresent()
+                ? Future.succeededFuture(opt)
+                : managerRepo.findByRetiredSlug(slug))
             .compose(opt -> {
                 if (opt.isEmpty()) return Future.failedFuture(ServiceException.notFound("Manager not found"));
                 Row row = opt.get();
@@ -1728,9 +1744,8 @@ public class ManagerService {
             .compose(opt -> {
                 if (opt.isEmpty()) return Future.failedFuture(ServiceException.notFound("Manager not found"));
                 Row row = opt.get();
-                return companyRepo.syncStatsForManager(managerId)
-                    .compose(statsDone -> managerRepo.getCareerHistory(managerId)
-                    .map(chRows -> buildManagerUpdateJson(row, chRows)));
+                return managerRepo.getCareerHistory(managerId)
+                    .map(chRows -> buildManagerUpdateJson(row, chRows));
             });
     }
 
@@ -2268,9 +2283,7 @@ public class ManagerService {
                 The sync was already awaited, and a comment here said so. The thing it depends on
                 was not, which made the guarantee half a guarantee.
             */
-            return managerRepo.recalculate(managerId)
-                .compose(recalced -> companyRepo.syncStatsForManager(managerId))
-                .map(statsDone -> row);
+            return managerRepo.recalculate(managerId).map(recalced -> row);
         });
     }
 
@@ -2605,8 +2618,7 @@ public class ManagerService {
 
                                         Separate defect from the ordering above; both live here.
                                     */
-                                    .compose(recalced -> companyRepo.syncStatsForManager(managerId))
-                                    .compose(synced -> reviewRepo.recordDeletion(userId, managerId)))
+                                    .compose(recalced -> reviewRepo.recordDeletion(userId, managerId)))
                             .map(v -> new JsonObject().put("success", true).put("message", "Review deleted"));
                     });
             });
@@ -3496,8 +3508,9 @@ public class ManagerService {
                                         profile therefore rendered with no rating even though the seed review was already in
                                         the database, and reloading fixed it - which is what made it look intermittent.
 
-                                        syncStatsForManager is deliberately left as it was: it touches company_stats, not this
-                                        row, and nothing here needs to wait for it.
+                                        The company projection needs nothing from here: recalculate() writes
+                                        managers.reviews_count and overall_rating, which the managers trigger fires on,
+                                        so company_stats_live follows inside that same statement.
                                     */
                                     /*
                                       A ghost is LIVE the moment it is created, so it replaces a
@@ -3511,13 +3524,11 @@ public class ManagerService {
                                         return managerRepo.recalculate(newId);
                                     })
                                     .compose(recalced -> managerRepo.findById(newId))
-                                    .compose(fresh -> companyRepo.syncStatsForManager(newId)
-                                        .map(statsDone -> fresh.orElse(row)))
+                                    .map(fresh -> fresh.orElse(row))
                                     .recover(err -> {
                                         System.err.println("Seed review creation failed for auto-approved manager " + newId + ": " + err.getMessage());
                                         err.printStackTrace(System.err);
-                                        return companyRepo.syncStatsForManager(newId)
-                                            .compose(statsDone -> Future.succeededFuture(row));
+                                        return Future.succeededFuture(row);
                                     });
                             })
                             .recover(err -> {
@@ -3751,17 +3762,16 @@ public class ManagerService {
                                 profile therefore rendered with no rating even though the seed review was already in
                                 the database, and reloading fixed it - which is what made it look intermittent.
 
-                                syncStatsForManager is deliberately left as it was: it touches company_stats, not this
-                                row, and nothing here needs to wait for it.
+                                The company projection needs nothing from here: recalculate() writes
+                                managers.reviews_count and overall_rating, which the managers trigger fires on,
+                                so company_stats_live follows inside that same statement.
                             */
                             .compose(ignored -> managerRepo.recalculate(newId))
                             .compose(recalced -> managerRepo.findById(newId))
-                            .compose(fresh -> companyRepo.syncStatsForManager(newId)
-                                .map(statsDone -> fresh.orElse(row)))
+                            .map(fresh -> fresh.orElse(row))
                             .recover(err -> {
                                 System.err.println("Seed review creation failed for ghost manager " + newId + ": " + err.getMessage());
-                                return companyRepo.syncStatsForManager(newId)
-                                    .compose(statsDone -> Future.succeededFuture(row));
+                                return Future.succeededFuture(row);
                             });
                     })
                     .compose(row -> {

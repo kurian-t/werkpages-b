@@ -185,14 +185,13 @@ public class MainVerticle extends AbstractVerticle {
                             .withCompanyReviews(companyReviewRepo)
                             .schedule(vertx);
 
-                        // ── company_stats_live reconciliation (safety net — primary updates go
-                        //    through updateCompanyStatsForManager/Company on each mutation) ──────
+                        // ── company_stats_live reconciliation (the projection is maintained by
+                        //    database triggers; this only reports disagreement) ─────────────────
                         //
                         // Not a materialized view. The matview this replaced was dropped in V40;
                         // company_stats_live is an ordinary table recomputed from source here, and
                         // calling it a matview in the logs sent more than one person looking for a
                         // database object that has not existed for thirty migrations.
-                        final CompanyRepository companyRepoForScheduler = companyRepo;
                         final AtomicBoolean statsRefreshRunning = new AtomicBoolean(false);
                         // ── Ghost quota retention ──────────────────────────────────────────────
                         //
@@ -208,11 +207,52 @@ public class MainVerticle extends AbstractVerticle {
                                 .onFailure(err -> System.err.println(
                                     "⚠ anonymous_ghost_quota sweep failed: " + err.getMessage())));
 
-                        // Same initial-delay fix; staggered so the two sweeps do not start together.
+                        final org.werkpages.service.CompanyStatsRebuilder companyStatsRebuilder =
+                            new org.werkpages.service.CompanyStatsRebuilder(
+                                (io.vertx.sqlclient.Pool) Database.getClient(), companyRepo);
+
+                        /*
+                          Reconcile, report, and then refresh. In that order, and the order is the
+                          whole design.
+
+                          This used to be a bare refreshCompanyStats every six hours. That job
+                          looked like a safety net and behaved like a blindfold: it overwrote the
+                          projection from source whether or not anything was wrong, so a broken
+                          writer was silently repaired over and over and nobody ever learned. The
+                          one failure it could not repair - a row whose company no longer qualifies,
+                          which its inner join cannot reach - was therefore also the only one that
+                          ever became visible, and it became visible as a wrong public listing.
+
+                          So the drift is measured FIRST, against the un-refreshed table, and
+                          reported. Nothing is repaired in response to it. A rebuild is an explicit
+                          request to POST /api/admin/company-stats/rebuild that a person makes after
+                          reading the report.
+
+                          Nothing is refreshed here any more. V89 made the database the only
+                          writer: refresh_company_stats writes all nine columns and triggers cover
+                          managers, companies.logo_url, company_reviews and interview_reviews. The
+                          unconditional refresh that used to follow this report existed because
+                          companies.logo_url had no trigger; it does now, so the job's only
+                          remaining purpose is to tell somebody when the projection and its source
+                          disagree.
+                        */
                         vertx.setPeriodic(120_000L, 6 * 3_600_000L, timerId -> {
                             if (statsRefreshRunning.compareAndSet(false, true)) {
-                                companyRepoForScheduler.refreshCompanyStats()
-                                    .onSuccess(v -> System.out.println("✓ company_stats_live reconciled from source"))
+                                companyStatsRebuilder.reconcile()
+                                    .onSuccess(drift -> {
+                                        if (drift.isEmpty()) {
+                                            System.out.println("✓ company_stats_live reconciled: in sync with source");
+                                        } else {
+                                            // Loud, enumerated, and actionable. Not repaired.
+                                            System.err.println("⚠ company_stats_live DRIFT: " + drift.size()
+                                                + " disagreement(s) with source. NOT repaired automatically —"
+                                                + " inspect GET /api/admin/company-stats/drift and, if the"
+                                                + " projection is wrong, POST /api/admin/company-stats/rebuild");
+                                            for (org.werkpages.service.CompanyStatsRebuilder.Drift d : drift) {
+                                                System.err.println("    " + d);
+                                            }
+                                        }
+                                    })
                                     .onFailure(err -> System.err.println("⚠ company_stats_live reconciliation failed: " + err.getMessage()))
                                     .onComplete(ignored -> statsRefreshRunning.set(false));
                             }
@@ -236,7 +276,8 @@ public class MainVerticle extends AbstractVerticle {
                         // ── Handlers ──────────────────────────────────────────────────────────
                         ManagersHandler      managersHandler      = new ManagersHandler(managerService, vertx, jwtAuth);
                         ReportsHandler       reportsHandler       = new ReportsHandler(reportService);
-                        AdminHandler         adminHandler         = new AdminHandler(adminService, deduplicationJob, industryJob, roleService);
+                        AdminHandler         adminHandler         = new AdminHandler(adminService, deduplicationJob, industryJob, roleService)
+                                                                            .withCompanyStats(companyStatsRebuilder);
                         NotificationsHandler notificationsHandler = new NotificationsHandler(notifService);
                         ResumesHandler       resumesHandler       = new ResumesHandler(resumeService);
                         IndustriesHandler    industriesHandler    = new IndustriesHandler(industryService);
@@ -343,6 +384,8 @@ public class MainVerticle extends AbstractVerticle {
                         routerFactory.addHandlerByOperationId("getMergeSuggestions",      adminHandler::handleGetMergeSuggestions);
                         routerFactory.addHandlerByOperationId("dismissMergeSuggestion",   adminHandler::handleDismissMergeSuggestion);
                         routerFactory.addHandlerByOperationId("triggerDeduplication",     adminHandler::handleTriggerDeduplication);
+                        routerFactory.addHandlerByOperationId("getCompanyStatsDrift",    adminHandler::handleGetCompanyStatsDrift);
+                        routerFactory.addHandlerByOperationId("rebuildCompanyStats",      adminHandler::handleRebuildCompanyStats);
                         routerFactory.addHandlerByOperationId("classifyIndustries",       adminHandler::handleClassifyIndustries);
                         routerFactory.addHandlerByOperationId("suggestRoles",             adminHandler::handleSuggestRoles);
                         routerFactory.addHandlerByOperationId("listRoleAliases",          adminHandler::handleListRoleAliases);
@@ -491,6 +534,33 @@ public class MainVerticle extends AbstractVerticle {
                                 secCtx.response().putHeader("Strict-Transport-Security", "max-age=31536000; includeSubDomains");
                             }
                             secCtx.next();
+                        });
+
+                        /*
+                          401 is an answer, not a crash.
+
+                          Vert.x's auth handler fails the context with a 401 when a protected route
+                          is called without a usable token. Nothing was registered to handle that,
+                          so every anonymous hit on a signed-in-only endpoint reached the router's
+                          default handler and was logged as
+
+                              SEVERE: Unhandled exception in router
+
+                          with no path, no method and no stack. The response was always a correct
+                          401; the only problem was the log, and the cost was that the line meant
+                          nothing. Ordinary visitors browsing while signed out produce it in
+                          normal operation, so a genuine fault logged the same way cannot be
+                          told apart from the noise around it.
+
+                          The body is written exactly as the default wrote it - the bare word, no
+                          content type - because the point here is the logging, and changing a
+                          live response shape is not in scope. Handled, so the router stops
+                          treating a routine 401 as an unhandled failure.
+                        */
+                        router.errorHandler(401, ctx -> {
+                            if (!ctx.response().ended()) {
+                                ctx.response().setStatusCode(401).end("Unauthorized");
+                            }
                         });
 
                         router.errorHandler(500, ctx -> {

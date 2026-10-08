@@ -1955,6 +1955,41 @@ public class ManagerRepository {
             .mapEmpty();
     }
 
+    /**
+     * Resolves a URL a manager used to live at, through {@code manager_url_history}.
+     *
+     * <p>The history table has been written since it was introduced - at approval, at merges, when
+     * a company changes - and until now <em>nothing read it</em>. {@code findByOldUrl} existed but
+     * was called only from tests, so every slug this application has ever changed left its old URL
+     * returning "Manager not found". {@link #reslug}'s own comment claimed the history row "means
+     * a bookmark somebody kept still resolves"; that was an intention the code never delivered.
+     *
+     * <p>Resolves to an id and then goes through {@link #findById}, exactly as
+     * {@link #findBySlugFollowingMerges} does, so the row has the same shape and the caller's
+     * approval checks still decide who may see it. A retired URL is a different address for a
+     * manager, never a way around the visibility rules.
+     *
+     * <p>The lookup is by manager slug alone because that is all the route carries
+     * ({@code /api/managers/by-slug/{managerSlug}}). A slug can appear more than once in history
+     * if two managers held it at different times, so the most recently recorded claim wins: it is
+     * the one whose URL was live most recently, and therefore the one a stale link most likely
+     * came from.
+     */
+    public Future<Optional<Row>> findByRetiredSlug(String managerSlug) {
+        return db.preparedQuery("""
+                SELECT h.manager_id
+                FROM manager_url_history h
+                JOIN managers m ON m.id = h.manager_id
+                WHERE h.manager_slug = $1
+                ORDER BY h.created_at DESC
+                LIMIT 1
+                """)
+            .execute(Tuple.of(managerSlug))
+            .compose(rows -> rows.iterator().hasNext()
+                ? findById(rows.iterator().next().getLong("manager_id"))
+                : Future.succeededFuture(Optional.empty()));
+    }
+
     /** Returns the manager_id for a stale (company_slug, manager_slug) URL, or empty if not found. */
     public Future<Optional<Long>> findByOldUrl(String companySlug, String managerSlug) {
         return db.preparedQuery("""

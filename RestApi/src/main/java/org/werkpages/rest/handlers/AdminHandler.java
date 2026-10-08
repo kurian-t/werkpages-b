@@ -4,6 +4,7 @@ import io.vertx.core.Future;
 import io.vertx.core.json.JsonObject;
 import io.vertx.ext.web.RoutingContext;
 import org.werkpages.service.AdminService;
+import org.werkpages.service.CompanyStatsRebuilder;
 import org.werkpages.service.DeduplicationJob;
 import org.werkpages.service.IndustryClassificationJob;
 import org.werkpages.service.RoleService;
@@ -18,6 +19,18 @@ public class AdminHandler {
 
     private final AdminService              service;
     private final DeduplicationJob          deduplicationJob;
+
+    /*
+      Set after construction rather than taken as a constructor argument, matching how
+      MaintenanceSweep takes its optional collaborators. Every existing AdminHandler constructor
+      stays valid, so nothing that builds one today has to change.
+    */
+    private CompanyStatsRebuilder companyStats;
+
+    public AdminHandler withCompanyStats(CompanyStatsRebuilder rebuilder) {
+        this.companyStats = rebuilder;
+        return this;
+    }
     private final IndustryClassificationJob industryJob;
     private final RoleService               roleService;
 
@@ -685,6 +698,91 @@ public class AdminHandler {
         industryJob.run()
             .onSuccess(summary -> System.out.println("✓ Industry classification: " + summary.encode()))
             .onFailure(err -> System.err.println("⚠ Industry classification failed: " + err.getMessage()));
+    }
+
+    // ── company_stats_live: drift report and rebuild ──────────────────────────
+
+    /*
+      Why these exist at all.
+
+      company_stats_live is a denormalised read table, and CLAUDE.md section 21 allows one only
+      alongside a rebuild that can recreate it from source and a reconciliation that proves it has
+      not drifted. Both existed as a class with tests and no way for an operator to reach them,
+      which is not a utility. These two endpoints are that reach.
+
+      They are deliberately separate, and the split is the point: reading the drift report changes
+      nothing, and repairing is an explicit decision somebody makes after seeing it. An endpoint
+      that silently rebuilt whenever it noticed a problem would destroy the only evidence that a
+      writer is broken.
+    */
+
+    /** Read-only. Reports disagreement; repairs nothing. */
+    public void handleGetCompanyStatsDrift(RoutingContext ctx) {
+        String auth0Id = ctx.get("auth0Id");
+        service.requireAdminPublic(auth0Id)
+            .compose(adminId -> {
+                if (companyStats == null) return Future.succeededFuture((JsonObject) null);
+                return companyStats.reconcile().map(AdminHandler::driftReport);
+            })
+            .onSuccess(report -> {
+                if (report == null) { unconfigured(ctx); return; }
+                ctx.response().setStatusCode(200).putHeader("Content-Type", "application/json")
+                    .end(report.encode());
+            })
+            .onFailure(err -> ManagersHandler.handleError(ctx, err));
+    }
+
+    /**
+     * Rebuilds, then reconciles again and reports what is left.
+     *
+     * <p>Reporting the after state matters: a rebuild that returns success while the projection
+     * still disagrees with source means the rebuild itself is wrong, and that is worth knowing
+     * immediately rather than discovering on the next report.
+     */
+    public void handleRebuildCompanyStats(RoutingContext ctx) {
+        String auth0Id = ctx.get("auth0Id");
+        service.requireAdminPublic(auth0Id)
+            .compose(adminId -> {
+                if (companyStats == null) return Future.succeededFuture((JsonObject) null);
+                return companyStats.reconcile()
+                    .compose(before -> companyStats.rebuild()
+                        .compose(v -> companyStats.reconcile())
+                        .map(after -> new JsonObject()
+                            .put("status", "rebuilt")
+                            .put("driftBefore", before.size())
+                            .put("driftAfter", after.size())
+                            .put("remaining", driftArray(after))));
+            })
+            .onSuccess(result -> {
+                if (result == null) { unconfigured(ctx); return; }
+                ctx.response().setStatusCode(200).putHeader("Content-Type", "application/json")
+                    .end(result.encode());
+            })
+            .onFailure(err -> ManagersHandler.handleError(ctx, err));
+    }
+
+    private static void unconfigured(RoutingContext ctx) {
+        ctx.response().setStatusCode(503).putHeader("Content-Type", "application/json")
+            .end(new JsonObject().put("error", "Company stats rebuilder not configured").encode());
+    }
+
+    private static JsonObject driftReport(java.util.List<CompanyStatsRebuilder.Drift> drift) {
+        return new JsonObject()
+            .put("drifted", drift.size())
+            .put("inSync", drift.isEmpty())
+            .put("drift", driftArray(drift));
+    }
+
+    private static io.vertx.core.json.JsonArray driftArray(java.util.List<CompanyStatsRebuilder.Drift> drift) {
+        io.vertx.core.json.JsonArray arr = new io.vertx.core.json.JsonArray();
+        for (CompanyStatsRebuilder.Drift d : drift) {
+            arr.add(new JsonObject()
+                .put("companyId", d.companyId())
+                .put("dataset",   d.dataset())
+                .put("projected", d.projected())
+                .put("actual",    d.actual()));
+        }
+        return arr;
     }
 
     // ── Merge suggestions ─────────────────────────────────────────────────────

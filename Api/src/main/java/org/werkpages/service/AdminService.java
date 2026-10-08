@@ -137,10 +137,8 @@ public class AdminService {
                 if (opt.isEmpty())
                     return Future.succeededFuture(new JsonObject().put("success", false).put("message", "Ghost manager not found"));
                 JsonObject ok = new JsonObject().put("success", true).put("message", "Manager marked as reviewed");
-                Long companyId = opt.get().getLong("company_id");
-                if (companyId == null || companyRepo == null) return Future.succeededFuture(ok);
-                // Awaited: the stats write must not outlive the request that triggered it.
-                return companyRepo.syncStatsForManager(managerId).map(statsDone -> ok);
+                // The projection maintains itself: the write above fired the managers trigger.
+                return Future.succeededFuture(ok);
             });
     }
 
@@ -381,9 +379,7 @@ public class AdminService {
                     recalculation lands writes the company's figures from the pre-approval
                     numbers. The sync was already awaited; the recalculation it depends on was not.
                 */
-                return recalculated
-                    .compose(v -> companyRepo.syncStatsForManager(managerId))
-                    .map(statsDone -> ok);
+                return recalculated.map(statsDone -> ok);
             });
     }
 
@@ -870,10 +866,9 @@ public class AdminService {
                                 .compose(v -> applyEditAndApprove(managerId, editId, newCompany, newCompanyLogoUrl, newTitle, newStatus, newCountry, newState, newCity, newCompanyLocationId, newLinkedinUrl, effectiveCo, effectiveTit, adminId, now, proposedBy, managerName, newCompanyId))
                                 .compose(result -> {
                                     if (newCompany != null) {
-                                        // Fire-and-forget: refresh old company's stats so its logo/counts stay accurate
-                                        if (currentCompanyId != null && companyRepo != null)
-                                            companyRepo.updateCompanyStatsForCompany(currentCompanyId)
-                                                .onFailure(err -> System.err.println("old company stats update failed: " + err.getMessage()));
+                                        // The old company's figures are recomputed by the trigger: moving a
+                                        // manager changes managers.company_id, which it fires on, and the
+                                        // trigger function refreshes both the old and the new company.
                                         // Fire-and-forget: record old URL so external/crawled links can resolve
                                         if (slugsOpt.isPresent()) {
                                             String oldCompanySlug = slugsOpt.get().getString("company_slug");
@@ -919,22 +914,20 @@ public class AdminService {
                         "Your edit request for " + managerName + " has been approved. The manager's profile has been updated.",
                         managerId);
                 }
-                Future<Void> statsFuture = companyRepo != null
-                    ? companyRepo.syncStatsForManager(managerId)
-                    : Future.succeededFuture();
                 JsonObject result = new JsonObject().put("success", true).put("message", "Edit approved and applied")
                     .put("managerId", managerId);
                 if (newCompany != null) {
                     result.put("newCompany", newCompany);
                     if (newCompanyLogoUrl != null) result.put("newCompanyLogoUrl", newCompanyLogoUrl);
                 }
-                return statsFuture.map(statsDone -> result);
+                return Future.succeededFuture(result);
             });
     }
 
     public Future<Void> updateManagerLogo(long managerId, String logoUrl) {
-        return managerRepo.updateLogoUrl(managerId, logoUrl)
-            .compose(ignored -> companyRepo.updateCompanyStatsForManager(managerId));
+        // company_logo_url is one of the columns the managers trigger fires on, so the
+        // projected logo follows this write without being told.
+        return managerRepo.updateLogoUrl(managerId, logoUrl).mapEmpty();
     }
 
     public Future<JsonObject> rejectEdit(String auth0Id, UUID editId) {
@@ -1080,6 +1073,49 @@ public class AdminService {
                                                            effLinkedinUrl, newCompanyId,
                                                            newCountry, newState, newCity,
                                                            newCompanyLogoUrl, newCompanyLocationId))
+            /*
+              A renamed manager moves to a URL that matches the new name.
+
+              managers_auto_slug_trg is BEFORE INSERT only, and nothing here recomputed the slug,
+              so correcting a first name from "Chi" to "Dawn" left the profile at
+              /managers/chi-bassant for ever. The name on the page and the name in the address
+              disagreed, which looks like the wrong person.
+
+              The rule is the approval path's rule, deliberately: take the clean name if it is
+              free, and if a live manager already holds it, leave this row where it is rather than
+              inventing a suffix. A second person genuinely called that is not something an
+              automatic rename should paper over.
+
+              reslug records the old URL in manager_url_history first, and getManagerBySlug now
+              reads it, so the previous address keeps resolving instead of 404ing.
+
+              Failure here never fails the edit. The rename is the thing the admin asked for; the
+              URL is a consequence, and a profile on a stale slug is a cosmetic problem where a
+              failed edit is a real one.
+            */
+            .compose(opt -> {
+                if (opt.isEmpty() || effName == null) return Future.succeededFuture(opt);
+                String desired = managerRepo.cleanSlugFor(effName);
+                /*
+                  Who holds the name answers both questions at once. If this manager is already on
+                  it, the holder is this manager and there is nothing to do; if another live
+                  manager is, the slug is genuinely taken and the row stays where it is. Only an
+                  unheld slug is moved onto. That is findLiveHolderOfSlug's existing contract, so
+                  the rename rule and the approval rule cannot drift apart.
+                */
+                return managerRepo.findLiveHolderOfSlug(desired)
+                    .compose(holder -> holder.isPresent()
+                        ? Future.<Void>succeededFuture()
+                        : managerRepo.reslug(managerId, desired))
+                    .recover(err -> {
+                        System.err.println("Reslug after rename failed for manager " + managerId
+                                           + ": " + err.getMessage());
+                        return Future.<Void>succeededFuture();
+                    })
+                    // The response shape is unchanged: adminEdit returns success/name/title/company
+                    // and the frontend re-reads the manager, where it canonicalises the URL.
+                    .map(v -> opt);
+            })
             .compose(opt -> opt.isPresent()
                 ? Future.succeededFuture(opt.get())
                 : Future.failedFuture(ServiceException.notFound("Manager not found")));
@@ -1092,17 +1128,11 @@ public class AdminService {
             .compose(adminId -> managerRepo.findById(managerId))
             .compose(opt -> {
                 if (opt.isEmpty()) return Future.failedFuture(ServiceException.notFound("Manager not found"));
-                Long companyId = opt.get().getLong("company_id");
                 // Keeps anything a person wrote: seeded placeholders are removed, real reviews
                 // are soft-deleted, and the manager row is retired rather than deleted when it
                 // holds any - because the cascade on reviews.manager_id would destroy them.
-                return managerRepo.deleteOrRetire(managerId)
-                    .compose(v -> {
-                        if (companyId != null && companyRepo != null) {
-                            return companyRepo.updateCompanyStatsForCompany(companyId);
-                        }
-                        return Future.succeededFuture();
-                    });
+                // Either way the managers write fires the trigger, so the figures follow.
+                return managerRepo.deleteOrRetire(managerId).mapEmpty();
             });
     }
 
@@ -1146,9 +1176,7 @@ public class AdminService {
                 Future<Void> resolved = mergeSuggestionsRepo == null
                     ? Future.succeededFuture()
                     : mergeSuggestionsRepo.markPairMerged(keepId, mergeId);
-                return resolved.compose(v -> companyRepo == null
-                    ? Future.succeededFuture(ok)
-                    : companyRepo.syncStatsForManager(keepId).map(statsDone -> ok));
+                return resolved.map(v -> ok);
             });
     }
 
@@ -1194,7 +1222,8 @@ public class AdminService {
                 return companyRepo.pinCurrentLogo(companyId)
                     .compose(v -> companyRepo.renameCompany(companyId, newName));
             })
-            .compose(v -> companyRepo.updateCompanyStatsForCompany(companyId))
+            // A rename does not touch the projection: company_stats_live holds no name, and the
+            // listing reads companies.name directly at query time.
             .map(v -> new JsonObject().put("success", true));
     }
 
@@ -1208,11 +1237,9 @@ public class AdminService {
         return requireAdmin(auth0Id)
             .compose(adminId -> companyRepo.undoMerge(mergeRecordId)
                 .recover(err -> Future.failedFuture(ServiceException.badRequest(err.getMessage()))))
-            // Both companies' cached figures are wrong until they are recomputed: one has just
-            // lost data and the other has just got it back.
-            .compose(result -> companyRepo.syncStatsForCompany(result.getLong("restoredCompanyId"))
-                .compose(v -> companyRepo.syncStatsForCompany(result.getLong("targetCompanyId")))
-                .map(v -> result));
+            // Both companies' figures are recomputed by the triggers as the undo moves the rows
+            // back: each manager and rating that changes company_id fires on both old and new.
+            ;
     }
 
     /** What a merge would move, and whether it can safely run. Reads only; writes nothing. */
@@ -1415,9 +1442,6 @@ public class AdminService {
                     }
 
                     return managerRepo.recalculate(managerId)
-                        .compose(v -> companyRepo == null
-                            ? Future.succeededFuture()
-                            : companyRepo.syncStatsForManager(managerId))
                         .map(v -> new JsonObject()
                             .put("success", true)
                             .put("reason", cleaned)
@@ -1500,7 +1524,6 @@ public class AdminService {
                 // A refusal here is a decision the admin has to make, not a server fault: surface
                 // it as a 400 with the reason rather than a 500.
                 .recover(err -> Future.failedFuture(ServiceException.badRequest(err.getMessage()))))
-            .compose(mergeUuid -> companyRepo.syncStatsForCompany(keepId).map(v -> mergeUuid))
             .map(mergeUuid -> new JsonObject()
                 .put("success", true)
                 .put("keepId", keepId)

@@ -6,6 +6,7 @@ import io.vertx.pgclient.PgBuilder;
 import io.vertx.pgclient.PgConnectOptions;
 import io.vertx.sqlclient.Pool;
 import io.vertx.sqlclient.PoolOptions;
+import io.vertx.sqlclient.Row;
 import io.vertx.sqlclient.Tuple;
 import org.flywaydb.core.Flyway;
 import org.junit.jupiter.api.*;
@@ -640,6 +641,82 @@ class CompanyMergeDataLossIntegrationTest {
     }
 
     // ── fixtures ──────────────────────────────────────────────────────────────
+
+
+    // ── A merged company must never be handed back by findOrCreate ────────────
+
+    /*
+      Production, 2026-10-07. Manager "Jeff Heath" was added at Meta and never appeared under
+      Meta Platforms, Inc.
+
+      Company 406 "Meta" had already been merged into 667 "Meta Platforms, Inc.". Somebody then
+      typed "Meta" into the company field, findOrCreate matched the slug `meta`, and handed back
+      the merged-away row. The manager was attached to a dead company: invisible on the surviving
+      company's page, because findManagersByCompanyId matches on company_id or on an EXACT
+      lowercased name, and 'meta' is not 'meta platforms, inc.'.
+
+      The merge itself is not at fault. It moves every manager with
+      `UPDATE managers SET company_id = $1, company = $2 WHERE company_id = $3`, with no status
+      filter, so nothing is left behind. Anything pointing at a merged company arrived afterwards,
+      which is why this is the only way those rows can exist.
+
+      suggestCompanies already refuses to offer a merged company, and says why in a comment:
+      "selecting one would attach a new manager to a company that has been absorbed, which is the
+      one thing a merge is supposed to have ended". findOrCreate is the free-text path that walked
+      straight past that rule.
+    */
+    @Test
+    void findOrCreateNeverResurrectsAMergedCompany() throws Exception {
+        // Fictional names: V64 seeds the real high-profile companies, and this class does not
+        // clean between tests, so "Meta" collides with companies_name_ci.
+        long keep  = insertCompany("Zenith Platforms, Inc.");
+        long merge = insertCompany("Zenith");
+        await(companyRepo.mergeCompanies(keep, merge, adminId));
+
+        // Exactly what the add-manager form does with a typed company name.
+        Row resolved = await(companyRepo.findOrCreate("Zenith", null, null));
+
+        assertEquals(keep, resolved.getLong("id"),
+            "a typed name that lands on a merged company must resolve to the survivor");
+        assertNotEquals(merge, resolved.getLong("id"),
+            "and must never be the absorbed row, which no public surface will show");
+        assertEquals("Zenith Platforms, Inc.", resolved.getString("name"));
+    }
+
+    /*
+      The same thing one hop further out, which production also has: `costco` was merged into
+      `Costco Wholesale`, and `Costco Wholesale` was then merged into something else. Both rows
+      are status='merged'. Resolving a single hop would hand back another dead company, so the
+      chain has to be followed to the end.
+    */
+    @Test
+    void findOrCreateFollowsAMergeChainToTheEnd() throws Exception {
+        long first  = insertCompany("costco");
+        long second = insertCompany("Costco Wholesale");
+        long third  = insertCompany("Costco Wholesale Corporation");
+
+        await(companyRepo.mergeCompanies(second, first,  adminId));   // costco -> Costco Wholesale
+        await(companyRepo.mergeCompanies(third,  second, adminId));   // -> Corporation
+
+        Row resolved = await(companyRepo.findOrCreate("costco", null, null));
+
+        assertEquals(third, resolved.getLong("id"),
+            "two hops: the survivor is the end of the chain, not the next link");
+    }
+
+    @Test
+    void findOrCreateStillReturnsALiveCompanyUnchanged() throws Exception {
+        // The ordinary path must be untouched: a company that was never merged resolves to
+        // itself, and a brand-new name still creates a row.
+        long live = insertCompany("Hooli");
+
+        Row existing = await(companyRepo.findOrCreate("Hooli", null, null));
+        assertEquals(live, existing.getLong("id"), "an unmerged company resolves to itself");
+
+        Row fresh = await(companyRepo.findOrCreate("Pied Piper", null, null));
+        assertNotEquals(live, fresh.getLong("id"));
+        assertEquals("Pied Piper", fresh.getString("name"), "a new name still mints a company");
+    }
 
     private long insertCompany(String name) throws Exception {
         return await(pool.preparedQuery(
