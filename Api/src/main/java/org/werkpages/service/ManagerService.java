@@ -1136,9 +1136,21 @@ public class ManagerService {
     public Future<JsonObject> getStats() {
         Future<Long> userSubmittedFuture = db.query("SELECT COUNT(*) FROM managers WHERE approval_status IN ('approved','ghost') AND external_id IS NULL")
             .execute().map(rows -> rows.iterator().next().getLong(0));
-        Future<Long> realReviewsFuture = db.query("SELECT COUNT(*) FROM reviews r JOIN managers m ON r.manager_id = m.id WHERE m.approval_status IN ('approved','ghost') AND m.external_id IS NULL AND r.weight = FALSE")
+        /*
+          Both counters count what EXISTS right now, and nothing else.
+
+          Two things used to stop that being true. Neither excluded soft-deleted rows, so a
+          withdrawn opinion kept being counted and the tiles only ever went up. And the seed
+          counter also required weight_expires_on to be in the future, which made it report
+          "unexpired seeds" rather than "seed rows that exist" - an expired seed is still a fake
+          review sitting in the table until the sweep hard-deletes it, and hiding it meant the
+          number did not fall when one was removed or rise when one was added.
+
+          So: weight = TRUE AND deleted_at IS NULL. A row is counted while it is there.
+        */
+        Future<Long> realReviewsFuture = db.query("SELECT COUNT(*) FROM reviews r JOIN managers m ON r.manager_id = m.id WHERE m.approval_status IN ('approved','ghost') AND m.external_id IS NULL AND r.weight = FALSE AND r.deleted_at IS NULL")
             .execute().map(rows -> rows.iterator().next().getLong(0));
-        Future<Long> weightedOpinionsFuture = db.query("SELECT COUNT(*) FROM reviews WHERE weight = TRUE AND (weight_expires_on IS NULL OR weight_expires_on > CURRENT_DATE)")
+        Future<Long> weightedOpinionsFuture = db.query("SELECT COUNT(*) FROM reviews WHERE weight = TRUE AND deleted_at IS NULL")
             .execute().map(rows -> rows.iterator().next().getLong(0));
         Future<Long> seededManagersFuture = db.query("SELECT COUNT(*) FROM managers WHERE approval_status IN ('approved','ghost') AND external_id LIKE 'seed_%'")
             .execute().map(rows -> rows.iterator().next().getLong(0));
