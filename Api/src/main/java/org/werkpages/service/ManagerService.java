@@ -1315,6 +1315,10 @@ public class ManagerService {
           only the DISPLAY is withheld.
         */
         boolean datesHidden   = reviewBody.getBoolean("datesHidden", false);
+        // TEMPORARY DIAGNOSTIC - remove once the hide-dates path is proven.
+        System.out.println("[hide-dates] createManager review keys=" + reviewBody.fieldNames()
+            + " datesHiddenRaw=" + reviewBody.getValue("datesHidden")
+            + " resolved=" + datesHidden);
 
         String missingReview = reviewFieldMissing(overallRating, ratings, managerCompany, managerTitle);
         if (missingReview != null) {
