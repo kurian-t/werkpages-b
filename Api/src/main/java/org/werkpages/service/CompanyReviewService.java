@@ -168,7 +168,24 @@ public class CompanyReviewService {
                       rating; the reconciler is what catches it if it does.
                     */
                     .compose(row -> companyRepo.syncStatsForCompany(companyId).map(v -> row))
-                    .map(CompanyReviewService::reviewToJson);
+                    .map(CompanyReviewService::reviewToJson)
+                    /*
+                      Which company this actually landed on, so the client can send the reader
+                      there.
+                      
+                      The caller posts to the company whose page it is on, but the company the
+                      author NAMED is what the rating is filed against - see resolveCompany. Those
+                      differ exactly when somebody changed the company on the form, and the client
+                      has no other way to learn the answer: it holds a slug that is now wrong, and
+                      the review row carries only an id. Without this the reader was returned to
+                      the previous company's page, where their new rating is nowhere to be seen.
+                      
+                      The name travels too, so the follow-up prompt on that page names the company
+                      they actually rated.
+                    */
+                    .map(json -> json
+                        .put("companySlug", company.getString("slug"))
+                        .put("companyName", company.getString("name")));
             }));
     }
 
@@ -379,20 +396,57 @@ public class CompanyReviewService {
         return resolveCompany(slug, null);
     }
 
+    /**
+     * Which company a rating is filed against.
+     *
+     * <p><b>The company the author NAMED wins over the page they were on.</b> The slug used to win
+     * whenever it resolved, which meant changing the company on the form and submitting replaced
+     * the ORIGINAL company's rating: open "edit my rating of Shopify", change the field to
+     * Discord, submit, and Shopify's rating was overwritten while the word "Discord" was thrown
+     * away. The reader is told their Discord rating saved; what happened is that their Shopify
+     * rating was destroyed.
+     *
+     * <p>The slug cannot be trusted as the subject because the company picker is backed by
+     * Clearbit and returns {@code {name, domain}} - no id, no slug - so choosing a different
+     * company cannot navigate, and the URL keeps naming whatever the page opened with. The body is
+     * the only place the author's real choice appears.
+     *
+     * <p>Nothing changes for an ordinary submission. The form seeds the field from the page, so
+     * the two agree and the name comparison short-circuits before any extra lookup. Only a genuine
+     * disagreement re-resolves, and the two callers that pass no name at all are untouched.
+     */
     private Future<Row> resolveCompany(String slug, String fallbackName) {
         boolean haveSlug = slug != null && !slug.isBlank();
-        if (!haveSlug && (fallbackName == null || fallbackName.isBlank())) {
+        boolean haveName = fallbackName != null && !fallbackName.isBlank();
+        if (!haveSlug && !haveName) {
             return Future.failedFuture(ServiceException.badRequest("Company is required"));
         }
         if (!haveSlug) {
             return companyRepo.findOrCreatePending(fallbackName.trim(), null, null);
         }
+        final String named = haveName ? fallbackName.trim() : null;
         return companyRepo.findBySlug(slug.trim()).compose(opt -> {
-            if (opt.isPresent()) return Future.succeededFuture(opt.get());
-            if (fallbackName != null && !fallbackName.isBlank()) {
-                return companyRepo.findOrCreatePending(fallbackName.trim(), null, null);
+            if (opt.isEmpty()) {
+                return named != null
+                    ? companyRepo.findOrCreatePending(named, null, null)
+                    : Future.<Row>failedFuture(ServiceException.notFound("Company not found"));
             }
-            return Future.failedFuture(ServiceException.notFound("Company not found"));
+            Row fromPath = opt.get();
+            if (named == null) return Future.succeededFuture(fromPath);
+
+            String pathName = fromPath.getString("name");
+            if (pathName != null && pathName.trim().equalsIgnoreCase(named)) {
+                // They agree, which is every ordinary submission. No extra query, no change.
+                return Future.succeededFuture(fromPath);
+            }
+            /*
+              They disagree, so the author chose something else. Resolved by name rather than
+              created outright: the name may well be a company we already hold, and minting a
+              second row for it would be its own bug.
+            */
+            return companyRepo.findByName(named).compose(byName -> byName.isPresent()
+                ? Future.succeededFuture(byName.get())
+                : companyRepo.findOrCreatePending(named, null, null));
         });
     }
 

@@ -4082,6 +4082,16 @@ components:
     CompanyRating:
       type: object
       properties:
+        companySlug:
+          type: string
+          description: >-
+            The company the rating was actually filed against. Equal to the path company on an
+            ordinary submission; different when the author changed the company on the form, since
+            the named company wins over the page. Clients must send the reader here rather than
+            back to the slug they posted to.
+        companyName:
+          type: string
+          description: Name of that same company, so a follow-up prompt can name it.
         id:            { type: string, format: uuid }
         companyId:     { type: integer, format: int64 }
         overallRating: { type: number }

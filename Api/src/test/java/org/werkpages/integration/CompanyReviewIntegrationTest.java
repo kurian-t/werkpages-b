@@ -1016,6 +1016,146 @@ class CompanyReviewIntegrationTest {
             .map(rs -> rs.iterator().next().getLong("id")));
     }
 
+    // ══════════════════════════════════════════════════════════════════════════
+    // Which company a rating is actually filed against
+    // ══════════════════════════════════════════════════════════════════════════
+
+    /**
+     * Regression: a rating was filed against the company in the URL, not the company the author
+     * chose, so changing the company on the form overwrote the original company's rating.
+     *
+     * <p>How it was seen: open "edit my rating of Shopify", change the company field to Discord,
+     * submit. The form posts to {@code /api/companies/shopify/rating} because that is the page it
+     * is on, and {@code resolveCompany} took the slug whenever the slug resolved - so the new
+     * answers replaced the Shopify rating and the word "Discord" was discarded. The reader is told
+     * their Discord rating was saved; what actually happened is that their Shopify rating was
+     * destroyed.
+     *
+     * <p>Why the slug cannot be trusted here: the company picker is backed by Clearbit and returns
+     * {@code {name, domain}} with no id and no slug, so choosing a different company cannot
+     * navigate and the URL keeps naming the company the page opened with. The body is the only
+     * place the author's actual choice appears.
+     *
+     * <p>The rule this asserts: when the body names a DIFFERENT company than the path, the body
+     * wins. When they agree - which is every ordinary submission, since the form seeds the field
+     * from the page - nothing changes.
+     */
+    @Test
+    void submit_companyNameNamesADifferentCompany_filesAgainstTheNamedOne() throws Exception {
+        String auth = insertUser("auth0|cr-subject-1", "CrSubjectOne");
+        insertCompany("Shopify", "shopify");
+        insertCompany("Discord", "discord");
+
+        await(service.submit(auth, "shopify",
+            validBody(4.0).put("companyName", "Discord")));
+
+        long discordId = companyId("discord");
+        long shopifyId = companyId("shopify");
+        Long ratedCompany = await(pool.preparedQuery(
+                "SELECT company_id FROM company_reviews WHERE deleted_at IS NULL")
+            .execute().map(rs -> rs.iterator().hasNext()
+                ? rs.iterator().next().getLong("company_id") : null));
+
+        assertEquals(discordId, ratedCompany,
+            "the rating belongs to the company the author named, not the page they were on");
+        assertNotEquals(shopifyId, ratedCompany,
+            "filing it against the page's company silently overwrites that company's rating");
+    }
+
+    /**
+     * Regression: the response did not say which company the rating landed on, so the client sent
+     * the reader back to the company it had posted to.
+     *
+     * <p>Consequence, once the named company started winning: rate Discord from Shopify's form and
+     * you were returned to Shopify's page, where the rating you had just written does not appear.
+     * For a company this submission had only just created, that read as the rating vanishing.
+     *
+     * <p>The slug is the part the client cannot work out for itself - it holds a slug that is now
+     * wrong, and the review row carries only a company id.
+     */
+    @Test
+    void submit_returnsTheCompanyItFiledAgainst() throws Exception {
+        String auth = insertUser("auth0|cr-subject-4", "CrSubjectFour");
+        insertCompany("Shopify", "shopify");
+        insertCompany("Discord", "discord");
+
+        JsonObject result = await(service.submit(auth, "shopify",
+            validBody(4.0).put("companyName", "Discord")));
+
+        assertEquals("discord", result.getString("companySlug"),
+            "the client needs the company it actually landed on to send the reader there");
+        assertEquals("Discord", result.getString("companyName"),
+            "and its name, so the follow-up prompt names the right company");
+    }
+
+    @Test
+    void submit_returnsACreatedCompanysSlug_soTheRatingIsReachable() throws Exception {
+        /*
+          The "disappears into the abyss" case. A company named from the picker that we hold no row
+          for is created by this write, and its page is reachable immediately - but only if the
+          client is told the slug. Without it the reader is returned to the old company and their
+          rating looks lost.
+        */
+        String auth = insertUser("auth0|cr-subject-5", "CrSubjectFive");
+        insertCompany("Shopify", "shopify");
+
+        JsonObject result = await(service.submit(auth, "shopify",
+            validBody(4.0).put("companyName", "Brand New Abyss Co")));
+
+        String slug = result.getString("companySlug");
+        assertNotNull(slug, "a created company must come back with a slug");
+        assertNotEquals("shopify", slug);
+
+        Long reachable = await(pool.preparedQuery("SELECT id FROM companies WHERE slug = $1")
+            .execute(Tuple.of(slug))
+            .map(rs -> rs.iterator().hasNext() ? rs.iterator().next().getLong("id") : null));
+        assertNotNull(reachable, "the slug has to resolve to a real company row");
+    }
+
+    @Test
+    void submit_companyNameMatchesThePath_isUnchanged() throws Exception {
+        /*
+          The control, and the reason the fix compares rather than always preferring the body: every
+          ordinary submission sends the page's own company name, and that must keep resolving
+          through the slug exactly as before.
+        */
+        String auth = insertUser("auth0|cr-subject-2", "CrSubjectTwo");
+        insertCompany("Red Hat", "red-hat");
+
+        await(service.submit(auth, "red-hat", validBody(4.0).put("companyName", "Red Hat")));
+
+        long redHatId = companyId("red-hat");
+        Long ratedCompany = await(pool.preparedQuery(
+                "SELECT company_id FROM company_reviews WHERE deleted_at IS NULL")
+            .execute().map(rs -> rs.iterator().hasNext()
+                ? rs.iterator().next().getLong("company_id") : null));
+
+        assertEquals(redHatId, ratedCompany);
+    }
+
+    @Test
+    void submit_companyNameNotHeldYet_createsItRatherThanUsingThePage() throws Exception {
+        /*
+          A company the picker offered from Clearbit that we have no row for. It has to be created
+          and rated, not quietly folded into whatever company the form happened to be open on.
+        */
+        String auth = insertUser("auth0|cr-subject-3", "CrSubjectThree");
+        insertCompany("Shopify", "shopify");
+
+        await(service.submit(auth, "shopify",
+            validBody(4.0).put("companyName", "Some Brand New Co")));
+
+        Long ratedName = await(pool.preparedQuery("""
+                SELECT c.id FROM company_reviews r JOIN companies c ON c.id = r.company_id
+                WHERE r.deleted_at IS NULL AND LOWER(TRIM(c.name)) = 'some brand new co'
+                """).execute().map(rs -> rs.iterator().hasNext()
+                    ? rs.iterator().next().getLong("id") : null));
+
+        assertNotNull(ratedName, "the named company should have been created and rated");
+        assertNotEquals(companyId("shopify"), ratedName,
+            "it must not be filed against the company the page was open on");
+    }
+
     private String insertCompany(String name, String slug) throws Exception {
         await(pool.preparedQuery("INSERT INTO companies(name, slug, status) VALUES ($1,$2,'approved')")
             .execute(Tuple.of(name, slug)).mapEmpty());
