@@ -452,6 +452,16 @@ public class ManagersHandler {
                     .put("approvalStatus", row.getString("approval_status"))
                     .put("categoryAverages", row.getJsonObject("category_averages"))
                     .put("linkedinUrl", row.getString("linkedin_url"))
+                    /*
+                      The employer's address, so the caller can offer to rate it.
+                    
+                      Without this the add-manager page had no slug to send anyone to, and the
+                      "rate the company too" prompt could not be shown there at all - the one place
+                      somebody has just told us where they worked. Guessing the slug from the name
+                      was the alternative and is not an option: a guess that resolves is a
+                      different company's page.
+                    */
+                    .put("companySlug", row.getString("company_slug"))
                     .put("country", row.getString("country"))
                     // Selected alongside country so an edited location can be shown back.
                     .put("state",   managerLocation(row, "state"))

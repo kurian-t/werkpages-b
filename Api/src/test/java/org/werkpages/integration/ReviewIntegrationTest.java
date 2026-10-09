@@ -1177,7 +1177,13 @@ class ReviewIntegrationTest {
 
         JsonObject stats = await(service.getStats());
 
-        assertEquals(0L, stats.getLong("weightedOpinions"),
-            "weightedOpinions must not count expired seeds");
+        /*
+          Changed deliberately, 2026-10-08, on the product owner's explicit instruction: the tile
+          must show how many fake reviews EXIST, rising and falling as they are added and removed.
+          Requiring weight_expires_on in the future made it report "unexpired seeds" instead, so
+          it never moved when an expired one was deleted. Now: weight = TRUE AND deleted_at IS NULL.
+        */
+        assertEquals(1L, stats.getLong("weightedOpinions"),
+            "an expired seed is still a fake review that exists, so it is still counted");
     }
 }

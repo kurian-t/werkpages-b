@@ -92,6 +92,64 @@ class PendingManagerRatingIntegrationTest {
         pool.close().toCompletionStage().toCompletableFuture().get(5, TimeUnit.SECONDS);
     }
 
+    /*
+      Production, 2026-10-08: a reviewer ticked "hide the dates" while adding a manager, and the
+      dates were shown anyway. The row came out dates_hidden = false.
+
+      The server receives it correctly - a diagnostic proved the review body arrives with
+      datesHidden=true and resolves to true - so this pins the step after that: whether the value
+      survives into the row createManager writes.
+    */
+    @Test
+    void createManager_withDatesHidden_persistsTheFlag() throws Exception {
+        String auth0Id = insertUser("auth0|hide-dates-1", "HideDatesUser");
+
+        JsonObject body = validCreateManagerBody("Hidden Dates", "HideCo", "Director");
+        body.getJsonObject("review").put("datesHidden", true);
+
+        Row result = await(managerService.createManager(auth0Id, body, null));
+        long managerId = result.getLong("id");
+
+        Boolean stored = await(pool.preparedQuery(
+                "SELECT dates_hidden FROM reviews WHERE manager_id = $1")
+            .execute(io.vertx.sqlclient.Tuple.of(managerId))
+            .map(rs -> rs.iterator().hasNext() ? rs.iterator().next().getBoolean("dates_hidden") : null));
+
+        assertEquals(Boolean.TRUE, stored,
+            "the reviewer asked for the dates to be hidden; the row must say so");
+    }
+
+    /*
+      The path that actually broke: attaching to an EXISTING manager.
+
+      createManager fuzzy-matches a manager at the same company and routes to doAttachToExisting,
+      which rebuilds the review body from its arguments. datesHidden was not one of them, so the
+      reviewer's choice was dropped and the row defaulted to false - while the server log showed
+      it had received true. That is why the dates kept showing.
+    */
+    @Test
+    void attachingToAnExistingManager_keepsDatesHidden() throws Exception {
+        String first  = insertUser("auth0|hide-dates-2a", "HideDatesA");
+        String second = insertUser("auth0|hide-dates-2b", "HideDatesB");
+
+        // First submission creates the manager.
+        await(managerService.createManager(first,
+            validCreateManagerBody("Dana Attach", "AttachCo", "Director"), null));
+
+        // Second submission fuzzy-matches it, so it attaches rather than creating a duplicate.
+        JsonObject body = validCreateManagerBody("Dana Attach", "AttachCo", "Director");
+        body.getJsonObject("review").put("datesHidden", true).put("author", "SecondAuthor77");
+        await(managerService.createManager(second, body, null));
+
+        Boolean stored = await(pool.preparedQuery(
+                "SELECT dates_hidden FROM reviews WHERE author = $1")
+            .execute(io.vertx.sqlclient.Tuple.of("SecondAuthor77"))
+            .map(rs -> rs.iterator().hasNext() ? rs.iterator().next().getBoolean("dates_hidden") : null));
+
+        assertEquals(Boolean.TRUE, stored,
+            "attaching to an existing manager must still honour the hide-dates choice");
+    }
+
     // ── createManager must NOT set a rating on the pending manager ────────────
 
     @Test

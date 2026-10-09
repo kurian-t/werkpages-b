@@ -1315,10 +1315,6 @@ public class ManagerService {
           only the DISPLAY is withheld.
         */
         boolean datesHidden   = reviewBody.getBoolean("datesHidden", false);
-        // TEMPORARY DIAGNOSTIC - remove once the hide-dates path is proven.
-        System.out.println("[hide-dates] createManager review keys=" + reviewBody.fieldNames()
-            + " datesHiddenRaw=" + reviewBody.getValue("datesHidden")
-            + " resolved=" + datesHidden);
 
         String missingReview = reviewFieldMissing(overallRating, ratings, managerCompany, managerTitle);
         if (missingReview != null) {
@@ -1415,7 +1411,8 @@ public class ManagerService {
                                     return doAttachToExisting(fuzzyMatch, userId, author,
                                         name, company, title, fStatus, fCountry, fLinkedinUrl, resolvedLogoUrl,
                                         fStartDate, fEndDate, fOverallRating, fRatings,
-                                        fMgrCompany, fMgrTitle, fReviewText, fWorkedFrom, fWorkedUntil, fDraftToken);
+                                        fMgrCompany, fMgrTitle, fReviewText, fWorkedFrom, fWorkedUntil, fDraftToken,
+                                        fDatesHidden);
                                 }
 
                                 // No match — create a new pending_approval manager with its first review.
@@ -1566,7 +1563,8 @@ public class ManagerService {
             LocalDate startDate, LocalDate endDate,
             double overallRating, JsonObject ratings,
             String mgrCompany, String mgrTitle, String reviewText,
-            LocalDate workedFrom, LocalDate workedUntil, UUID draftToken) {
+            LocalDate workedFrom, LocalDate workedUntil, UUID draftToken,
+            boolean datesHidden) {
 
         long existingId      = match.getLong("id");
         String approvalStatus = match.getString("approval_status");
@@ -1580,7 +1578,21 @@ public class ManagerService {
             .put("managerTitle",   mgrTitle)
             .put("text",           reviewText)
             .put("workedFrom",     workedFromStr)
-            .put("workedUntil",    workedUntilStr);
+            .put("workedUntil",    workedUntilStr)
+            /*
+              The reviewer's privacy choice travels with the dates it applies to.
+
+              This object is REBUILT from the arguments rather than forwarded, so anything not in
+              the parameter list is silently dropped and validateAndInsertReview reads it back as
+              its default. datesHidden was missing, so every review that attached to an existing
+              manager - the fuzzy-match path, which is the common one - was written with
+              dates_hidden = false no matter what the reviewer ticked. The dates then showed,
+              published or not.
+
+              Observed 2026-10-08: the server logged datesHiddenRaw=true, resolved=true, and the
+              row still came out false, because the value never reached this object.
+            */
+            .put("datesHidden",    datesHidden);
 
         if ("ghost".equals(approvalStatus)) {
             // Enrich the ghost record with the more complete form data, add career history,
