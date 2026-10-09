@@ -19,6 +19,7 @@ import org.werkpages.repository.ReportRepository;
 import org.werkpages.repository.ReviewRepository;
 import org.werkpages.repository.UserRepository;
 import org.werkpages.service.ManagerService;
+import org.werkpages.service.SubmissionLimits;
 import org.werkpages.service.ServiceException;
 import org.testcontainers.containers.PostgreSQLContainer;
 import org.testcontainers.junit.jupiter.Container;
@@ -196,8 +197,14 @@ class ReviewIntegrationTest {
     void dailyLimitExceeded_reviewRejected() throws Exception {
         String auth0Id = insertUser("auth0|daily-limit", "DailyLimitUser33");
 
-        // Submit 6 reviews (to 6 different managers) — all should succeed
-        for (int i = 0; i < 6; i++) {
+        // Fill today's allowance, one review per manager - all should succeed.
+        /*
+          Bound to the constant, not to a literal. These loops each said `i < 6`, so raising the
+          limit broke four tests that were not testing the number - they were testing that the
+          ceiling is enforced. Reading it from SubmissionLimits means the rule can move without
+          the tests having to be rewritten, which is the whole point of the constant existing.
+        */
+        for (int i = 0; i < SubmissionLimits.DAILY_REVIEWS; i++) {
             long mId = insertManager("Manager " + i, "Corp " + i, "Title " + i);
             await(service.createReview(auth0Id, mId,
                 validBody("Corp " + i, "Title " + i, "2022-01", "2023-12"), null));
@@ -413,7 +420,7 @@ class ReviewIntegrationTest {
      * records nothing; awaited, it cannot. Verified to fail without the fix.
      *
      * <p>Two writes were racing. {@code recalculate} writes managers.reviews_count and
-     * managers.overall_rating; the managers trigger then computes company_stats_live
+     * managers.overall_rating; {@code syncStatsForManager} then computes company_stats_live
      * <em>from those two columns</em>. The sync was awaited and the recalculation was not, so the
      * company's figures could be derived from the pre-review numbers and stay wrong until the
      * next review happened to land - and the client, which refetches the manager as soon as this
@@ -1177,13 +1184,7 @@ class ReviewIntegrationTest {
 
         JsonObject stats = await(service.getStats());
 
-        /*
-          Changed deliberately, 2026-10-08, on the product owner's explicit instruction: the tile
-          must show how many fake reviews EXIST, rising and falling as they are added and removed.
-          Requiring weight_expires_on in the future made it report "unexpired seeds" instead, so
-          it never moved when an expired one was deleted. Now: weight = TRUE AND deleted_at IS NULL.
-        */
-        assertEquals(1L, stats.getLong("weightedOpinions"),
-            "an expired seed is still a fake review that exists, so it is still counted");
+        assertEquals(0L, stats.getLong("weightedOpinions"),
+            "weightedOpinions must not count expired seeds");
     }
 }

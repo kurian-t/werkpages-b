@@ -3373,42 +3373,6 @@ paths:
         '503':
           description: Job not configured (ANTHROPIC_API_KEY missing)
 
-  /api/admin/company-stats/drift:
-    get:
-      operationId: getCompanyStatsDrift
-      summary: Report where company_stats_live disagrees with its source tables (admin only)
-      description: >
-        Read-only. Compares the projection against the tables it is derived from, across all three
-        datasets it carries, and reports every disagreement. Never repairs anything: a rebuild is a
-        separate, explicit request.
-      tags:
-        - Admin
-      security:
-        - bearerAuth: []
-      responses:
-        '200':
-          description: The drift report, empty when the projection agrees with source
-        '403':
-          description: Forbidden
-
-  /api/admin/company-stats/rebuild:
-    post:
-      operationId: rebuildCompanyStats
-      summary: Rebuild company_stats_live from its source tables (admin only)
-      description: >
-        Discards rows whose company no longer qualifies and recomputes the rest from source.
-        Reports the drift measured before the rebuild and whatever remains after it, so a rebuild
-        that did not fully repair the projection is visible rather than assumed successful.
-      tags:
-        - Admin
-      security:
-        - bearerAuth: []
-      responses:
-        '200':
-          description: Rebuild complete, with before and after drift counts
-        '403':
-          description: Forbidden
-
   /api/admin/merge-suggestions:
     get:
       operationId: getMergeSuggestions

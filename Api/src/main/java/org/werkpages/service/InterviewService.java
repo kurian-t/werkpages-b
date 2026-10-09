@@ -155,15 +155,15 @@ public class InterviewService {
                                                  parseDraftToken(body.getString("draftToken")))
                         .map(v -> row))
                     /*
-                      The company's read-model row is recomputed by the database, inside the
-                      statement that inserted the experience.
+                      The company's read-model row is recomputed as part of this write.
 
                       company_stats_live carries the interview average the tiles and the listing
-                      read. interview_reviews already had a trigger, but it maintains the separate
-                      company_interview_stats table and never touched this projection, so this
-                      awaited sync was the only thing keeping interview_count right. V89 added a
-                      second trigger for this projection.
+                      read, and a projection nothing updates is not a cache - it is a second
+                      source of truth that drifts. The sync awaits and swallows its own failure,
+                      so a stats problem can never fail somebody's submission.
                     */
+                    .compose(row -> companyRepo.syncStatsForCompany(row.getLong("company_id"))
+                        .map(v -> row))
                     .map(InterviewService::reviewToJson);
             }));
     }
@@ -218,9 +218,9 @@ public class InterviewService {
                     // would leave rounds from the old process stranded in the middle of the new one.
                     return interviewRepo.deleteRounds(id)
                         .compose(ignored -> interviewRepo.insertRounds(id, draft.rounds))
-                        // An edited score moves the company's interview average. overall_rating
-                        // is one of the columns the interview_reviews trigger fires on, so the
-                        // read model is recomputed by the write itself.
+                        // An edited score moves the company's interview average, so the read
+                        // model is recomputed as part of the write. See CLAUDE.md section 21.
+                        .compose(ignored -> companyRepo.syncStatsForCompany(companyId.get()))
                         .map(ignored -> reviewToJson(updated.get()));
                 }));
             });
@@ -290,9 +290,10 @@ public class InterviewService {
                 }
                 // Recorded so the same person cannot replace what is going to come back, which
                 // would leave the company counting one contributor twice.
-                // A removed experience changes the company's interview average; the soft
-                // delete sets deleted_at, which the trigger fires on.
-                return interviewRepo.recordDeletion(userId, companyId.get());
+                return interviewRepo.recordDeletion(userId, companyId.get())
+                    // A removed experience changes the company's interview average.
+                    .compose(result -> companyRepo.syncStatsForCompany(companyId.get())
+                        .map(v -> result));
             }));
     }
 

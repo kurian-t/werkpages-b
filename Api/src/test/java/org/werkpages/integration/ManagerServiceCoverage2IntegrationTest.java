@@ -19,6 +19,7 @@ import org.werkpages.repository.ReportRepository;
 import org.werkpages.repository.ReviewRepository;
 import org.werkpages.repository.UserRepository;
 import org.werkpages.service.ManagerService;
+import org.werkpages.service.SubmissionLimits;
 import org.testcontainers.containers.PostgreSQLContainer;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
@@ -95,6 +96,82 @@ class ManagerServiceCoverage2IntegrationTest {
         assertNotNull(result);
         assertEquals(0L, result.getLong("total").longValue());
         assertEquals(0,  result.getJsonArray("data").size());
+    }
+
+    /**
+     * Regression: the author of a rating with hidden dates could not see their own dates, so their
+     * edit form opened blank - and saving erased them.
+     *
+     * <p>How it was seen: a reviewer ticked "hide my dates", reopened the rating to change
+     * something unrelated, and the Work timeline step was empty. The UPDATE writes
+     * {@code worked_from} and {@code worked_until} unconditionally, and {@code updateReview} reads
+     * {@code datesHidden} with a default of false, so saving wrote NULL over both dates and
+     * cleared the flag. The reviewer lost data by editing, silently.
+     *
+     * <p>The cause: one serialiser masks these dates for every caller, which is right for every
+     * public surface and wrong for exactly one person. The flag says who may READ the dates, not
+     * that the dates should be forgotten.
+     *
+     * <p>Why this assertion matters: it is the difference between a privacy feature and a
+     * data-loss bug, and the masking is deliberately fail-closed, so only a test that names the
+     * author can tell "correctly hidden" from "lost".
+     */
+    @Test
+    void getManagerReviews_hiddenDates_areServedToTheirAuthor() throws Exception {
+        String auth0Id = insertUser("auth0|own-hidden-dates");
+        long managerId = insertManager("Hidden Mgr", "HideCorp", "Lead", "approved");
+        await(service.createReview(auth0Id, managerId,
+            reviewBody().put("workedFrom", "2021-03").put("workedUntil", "2023-07")
+                        .put("datesHidden", true), null));
+
+        JsonObject own = await(service.getManagerReviews(managerId, 10, 0, "recent", null, auth0Id));
+        JsonObject mine = own.getJsonArray("data").getJsonObject(0);
+
+        assertTrue(mine.getBoolean("datesHidden"), "the flag must still say the dates are hidden");
+        assertEquals("2021-03-01", mine.getString("workedFrom"),
+            "the author must be served their own start date - their edit form opens from it");
+        assertEquals("2023-07-01", mine.getString("workedUntil"),
+            "and their own end date, or saving an unrelated edit writes NULL over it");
+    }
+
+    @Test
+    void getManagerReviews_hiddenDates_stayHiddenFromEverybodyElse() throws Exception {
+        String author   = insertUser("auth0|hd-author");
+        String stranger = insertUser("auth0|hd-stranger");
+        long managerId  = insertManager("Hidden Mgr2", "HideCorp2", "Lead", "approved");
+        await(service.createReview(author, managerId,
+            reviewBody().put("workedFrom", "2021-03").put("workedUntil", "2023-07")
+                        .put("datesHidden", true), null));
+
+        for (String viewer : new String[] { stranger, null }) {
+            JsonObject result = await(service.getManagerReviews(managerId, 10, 0, "recent", null, viewer));
+            JsonObject review = result.getJsonArray("data").getJsonObject(0);
+            String who = viewer == null ? "a signed-out visitor" : "another signed-in reader";
+
+            assertTrue(review.getBoolean("datesHidden"), who + " is still told the dates are hidden");
+            assertNull(review.getString("workedFrom"),  who + " must not be served the start date");
+            assertNull(review.getString("workedUntil"), who + " must not be served the end date");
+            assertNull(review.getString("effectiveWorkedUntil"),
+                who + " must not get the end date through effectiveWorkedUntil either - that is the "
+                + "value the profile renders, and leaving it would publish the dates by the back door");
+        }
+    }
+
+    @Test
+    void getManagerReviews_unhiddenDates_areServedToEverybody() throws Exception {
+        // The control. Masking must depend on the flag, not on who is asking.
+        String author   = insertUser("auth0|hd-open-author");
+        String stranger = insertUser("auth0|hd-open-stranger");
+        long managerId  = insertManager("Open Mgr", "OpenCorp", "Lead", "approved");
+        await(service.createReview(author, managerId,
+            reviewBody().put("workedFrom", "2021-03").put("workedUntil", "2023-07"), null));
+
+        for (String viewer : new String[] { author, stranger, null }) {
+            JsonObject result = await(service.getManagerReviews(managerId, 10, 0, "recent", null, viewer));
+            JsonObject review = result.getJsonArray("data").getJsonObject(0);
+            assertFalse(review.getBoolean("datesHidden"));
+            assertEquals("2021-03-01", review.getString("workedFrom"));
+        }
     }
 
     // ── updateManager — success paths ─────────────────────────────────────────
@@ -247,8 +324,14 @@ class ManagerServiceCoverage2IntegrationTest {
     @Test
     void createEditRequest_dailyLimitExceeded_returnsTooManyRequests() throws Exception {
         String auth0Id = insertUser("auth0|edit-limit");
-        // Create 6 different managers and submit an edit for each (upsert is per manager+user)
-        for (int i = 0; i < 6; i++) {
+        // One edit per manager, filling today's allowance (the upsert is per manager+user).
+        /*
+          Bound to the constant, not to a literal. These loops each said `i < 6`, so raising the
+          limit broke four tests that were not testing the number - they were testing that the
+          ceiling is enforced. Reading it from SubmissionLimits means the rule can move without
+          the tests having to be rewritten, which is the whole point of the constant existing.
+        */
+        for (int i = 0; i < SubmissionLimits.DAILY_EDITS; i++) {
             long mgrId = insertManager("Edit Limit Mgr" + i, "Corp" + i, "Dev", "approved");
             await(service.createEditRequest(auth0Id, mgrId,
                 new JsonObject().put("company", "Updated Corp" + i)));

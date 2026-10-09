@@ -19,6 +19,7 @@ import org.werkpages.repository.ReportRepository;
 import org.werkpages.repository.ReviewRepository;
 import org.werkpages.repository.UserRepository;
 import org.werkpages.service.ManagerService;
+import org.werkpages.service.SubmissionLimits;
 import org.testcontainers.containers.PostgreSQLContainer;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
@@ -228,9 +229,15 @@ class ManagerServiceCoverage4IntegrationTest {
     @Test
     void createReview_dailyLimitReached_returnsTooManyRequests() throws Exception {
         String auth0Id = insertUser("auth0|cr-limit");
-        // Directly insert 6 review count entries for today to simulate daily limit
+        // Fill today's review allowance exactly, then expect the next one to be refused.
         UUID userId = getUserId(auth0Id);
-        for (int i = 0; i < 6; i++) {
+        /*
+          Bound to the constant, not to a literal. These loops each said `i < 6`, so raising the
+          limit broke four tests that were not testing the number - they were testing that the
+          ceiling is enforced. Reading it from SubmissionLimits means the rule can move without
+          the tests having to be rewritten, which is the whole point of the constant existing.
+        */
+        for (int i = 0; i < SubmissionLimits.DAILY_REVIEWS; i++) {
             long mgrId = insertManager("Daily Limit Mgr" + i, "LimitCorp" + i, "Dev", "approved");
             // Insert review directly in DB (bypasses service validation)
             pool.preparedQuery(

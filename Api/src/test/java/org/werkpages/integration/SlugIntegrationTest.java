@@ -172,45 +172,6 @@ class SlugIntegrationTest {
 
     // ── URL history ───────────────────────────────────────────────────────────
 
-    // ── A retired slug still resolves ──────────────────────────────────────────
-
-    /*
-      The other half, and the reason the first half is safe to do at all.
-
-      manager_url_history has been written since it was introduced and nothing ever read it:
-      findByOldUrl was called only from tests, so every slug this application changed left its old
-      URL returning "Manager not found". reslug's own comment claimed the history row "means a
-      bookmark somebody kept still resolves", which was an intention the code never delivered.
-    */
-    @Test
-    void aRetiredSlugStillResolvesToTheManager() throws Exception {
-        Row company = await(companyRepo.findOrCreate("RetiredSlugCorp", null, null));
-        Row manager = await(managerRepo.createAutoApproved(
-            "Chi Vanish", "RetiredSlugCorp", "Coordinator",
-            "CA", "ON", "Toronto", null, null, company.getLong("id")));
-        long id = manager.getLong("id");
-        String oldSlug = manager.getString("slug");
-
-        // reslug records the old URL before moving.
-        await(managerRepo.reslug(id, "dawn-vanish"));
-
-        // The live slug resolves, as always.
-        assertTrue(await(managerRepo.findBySlugFollowingMerges("dawn-vanish")).isPresent());
-
-        // And so does the one it used to live at, which is what was broken.
-        Optional<Row> viaOld = await(managerRepo.findByRetiredSlug(oldSlug));
-        assertTrue(viaOld.isPresent(), "a retired slug must still resolve, got nothing for " + oldSlug);
-        assertEquals(id, viaOld.get().getLong("id"));
-        assertEquals("dawn-vanish", viaOld.get().getString("slug"),
-            "it resolves to the manager's CURRENT slug, so the caller can canonicalise the URL");
-    }
-
-    @Test
-    void anUnknownSlugStillResolvesToNothing() throws Exception {
-        // The fallback must not invent a manager for a URL that never existed.
-        assertTrue(await(managerRepo.findByRetiredSlug("never-was-a-manager")).isEmpty());
-    }
-
     @Test
     void recordUrlHistory_and_findByOldUrl_roundtrip() throws Exception {
         Row company = await(companyRepo.findOrCreate("HistoryCorp", null, null));

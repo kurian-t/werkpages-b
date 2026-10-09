@@ -67,7 +67,7 @@ class GhostManagerValidationIntegrationTest {
     @BeforeEach
     void cleanDb() throws Exception {
         // Truncate company_stats_live first to avoid deadlock: the background
-        // company_stats_live write (fired by the managers trigger) holds a
+        // updateCompanyStatsForManager task (fired by createGhostManager) holds a
         // RowExclusiveLock on company_stats_live while checking the companies FK.
         // A single CASCADE TRUNCATE on companies would deadlock with that task because
         // PostgreSQL tries to lock company_stats_live (via cascade) after already holding

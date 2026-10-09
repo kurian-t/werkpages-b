@@ -55,9 +55,11 @@ class AdminServiceTest {
         notifRepo   = mock(NotificationRepository.class);
         companyRepo = mock(CompanyRepository.class);
         when(companyRepo.refreshCompanyStats()).thenReturn(Future.succeededFuture());
-        // The per-mutation stats stubs are gone with the methods they stood in for. The database
-        // maintains company_stats_live now (V89), so there is nothing here for a mock to answer.
-        // refreshCompanyStats stays because the rebuild escape hatch still uses it.
+        when(companyRepo.updateCompanyStatsForManager(anyLong())).thenReturn(Future.succeededFuture());
+        // The stats write is awaited now rather than fired and forgotten, so the mock has
+        // to answer with a real future instead of Mockito's default null.
+        when(companyRepo.syncStatsForManager(anyLong())).thenReturn(Future.succeededFuture());
+        when(companyRepo.updateCompanyStatsForCompany(anyLong())).thenReturn(Future.succeededFuture());
         // recalculate() is awaited by the service now rather than fired and forgotten, so the
         // mock must return a Future; unstubbed, Mockito hands back null and the compose NPEs.
         when(managerRepo.recalculate(anyLong())).thenReturn(Future.succeededFuture());

@@ -159,17 +159,15 @@ public class CompanyReviewService {
                     .compose(row -> drafts.clear(reviewRepo.client(), parseUuid(body.getString("draftToken")))
                         .map(v -> row))
                     /*
-                      The company's read-model row is recomputed by the database, inside the
-                      statement that inserted the rating.
+                      The company's read-model row is recomputed as part of this write.
 
                       company_stats_live carries the workplace average that the tiles and the
-                      listing read. This used to be an awaited syncStatsForCompany here, which was
-                      the only thing maintaining it - and the RateMyManagers copy of that call
-                      wrote six of the nine columns and silently left workplace_count alone, so the
-                      figure this application reads was wrong for up to six hours. V89 put the
-                      maintenance in a trigger on company_reviews, where neither backend can
-                      forget it.
+                      listing read, and a projection nothing updates is not a cache - it is a
+                      second source of truth that drifts. syncStatsForCompany awaits the write
+                      and swallows its failure, so a stats problem can never fail somebody's
+                      rating; the reconciler is what catches it if it does.
                     */
+                    .compose(row -> companyRepo.syncStatsForCompany(companyId).map(v -> row))
                     .map(CompanyReviewService::reviewToJson);
             }));
     }
@@ -226,10 +224,9 @@ public class CompanyReviewService {
                 // Ownership and existence are the same answer on purpose: telling someone their
                 // id was real but not theirs confirms it exists.
                 ? Future.failedFuture(ServiceException.notFound("Rating not found"))
-                // A removed rating changes the company's average. The soft delete sets
-                // deleted_at, which the company_reviews trigger fires on, so the read model
-                // follows without being told.
-                : Future.succeededFuture(new JsonObject().put("success", true))));
+                // A removed rating changes the company's average, so the read model is told.
+                : companyRepo.syncStatsForCompany(companyId.get())
+                    .map(v -> new JsonObject().put("success", true))));
     }
 
     /**

@@ -451,9 +451,11 @@ public class MaintenanceSweep {
             .compose(companyIds -> {
                 if (companyIds.isEmpty()) return Future.succeededFuture();
                 System.out.println("✓ Restored " + companyIds.size() + " anonymised workplace rating(s)");
-                // Restoring clears deleted_at, which the company_reviews trigger fires on, so
-                // every affected company's figures are already correct by the time we get here.
-                return Future.<Void>succeededFuture();
+                Future<Void> chain = Future.succeededFuture();
+                for (Long id : new java.util.LinkedHashSet<>(companyIds)) {
+                    chain = chain.compose(v -> companyRepo.syncStatsForCompany(id));
+                }
+                return chain;
             })
             .onFailure(err -> System.err.println("⚠ Workplace rating restore job failed: " + err.getMessage()))
             .otherwiseEmpty()
@@ -531,7 +533,9 @@ public class MaintenanceSweep {
                 for (Row row : rows) {
                     long managerId = row.getLong("id");
                     stale++;
-                    chain = chain.compose(v -> managerRepo.recalculate(managerId));
+                    chain = chain
+                        .compose(v -> managerRepo.recalculate(managerId))
+                        .compose(v -> companyRepo.syncStatsForManager(managerId));
                 }
                 final int total = stale;
                 return chain.map(v -> total);

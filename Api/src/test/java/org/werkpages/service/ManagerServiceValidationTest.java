@@ -71,9 +71,10 @@ class ManagerServiceValidationTest {
         companyRepo = mock(CompanyRepository.class);
         pool        = mock(Pool.class);
         when(companyRepo.refreshCompanyStats()).thenReturn(Future.succeededFuture());
-        // The per-mutation stats stubs are gone with the methods they stood in for. The database
-        // maintains company_stats_live now (Werkpages V89), so there is nothing here for a mock
-        // to answer. refreshCompanyStats stays because the rebuild escape hatch still uses it.
+        when(companyRepo.updateCompanyStatsForManager(anyLong())).thenReturn(Future.succeededFuture());
+        // The stats write is awaited now rather than fired and forgotten, so the mock has
+        // to answer with a real future instead of Mockito's default null.
+        when(companyRepo.syncStatsForManager(anyLong())).thenReturn(Future.succeededFuture());
         service     = new ManagerService(managerRepo, reviewRepo, userRepo, editRepo, reportRepo, companyRepo, pool, company -> null);
 
         // Build mock data BEFORE any when() chains to avoid nested stubbing
@@ -128,8 +129,10 @@ class ManagerServiceValidationTest {
 
     @Test
     void dailyLimitExceeded_returns429() {
+        // Exactly the allowance, read from the constant: this test is about the ceiling being
+        // enforced, not about the number, and a literal here broke when the limit moved.
         when(reviewRepo.countSubmittedTodayByUser(USER_ID))
-            .thenReturn(Future.succeededFuture(6L));
+            .thenReturn(Future.succeededFuture((long) SubmissionLimits.DAILY_REVIEWS));
 
         ServiceException ex = assertServiceFails(service.createReview(AUTH0_ID, MANAGER_ID, validBody(), null));
         assertEquals(429, ex.getStatusCode());
@@ -1274,7 +1277,7 @@ class ManagerServiceValidationTest {
 
     @Test
     void createEditRequest_dailyLimitReached_returns429() {
-        when(editRepo.countSubmittedTodayByUser(USER_ID)).thenReturn(Future.succeededFuture(6L));
+        when(editRepo.countSubmittedTodayByUser(USER_ID)).thenReturn(Future.succeededFuture((long) SubmissionLimits.DAILY_EDITS));
         JsonObject body = new JsonObject().put("company", "NewCo");
         ServiceException ex = assertServiceFails(service.createEditRequest(AUTH0_ID, MANAGER_ID, body));
         assertEquals(429, ex.getStatusCode());

@@ -22,6 +22,7 @@ import org.werkpages.repository.ReportRepository;
 import org.werkpages.repository.ReviewRepository;
 import org.werkpages.repository.UserRepository;
 import org.werkpages.service.ManagerService;
+import org.werkpages.service.SubmissionLimits;
 import org.testcontainers.containers.PostgreSQLContainer;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
@@ -618,8 +619,14 @@ class ManagerServiceCoverage3IntegrationTest {
     @Test
     void createManager_dailyLimitReached_returnsTooManyRequests() throws Exception {
         String auth0Id = insertUser("auth0|create-limit");
-        // Submit 6 managers to hit the daily limit
-        for (int i = 0; i < 6; i++) {
+        // Submit exactly today's allowance of managers, then expect the next one to be refused.
+        /*
+          Bound to the constant, not to a literal. These loops each said `i < 6`, so raising the
+          limit broke four tests that were not testing the number - they were testing that the
+          ceiling is enforced. Reading it from SubmissionLimits means the rule can move without
+          the tests having to be rewritten, which is the whole point of the constant existing.
+        */
+        for (int i = 0; i < SubmissionLimits.DAILY_MANAGERS; i++) {
             JsonObject body = validCreateBody()
                 .put("name", "Nadia Alvarez")
                 .put("company", "LimitCorp" + i);
@@ -664,6 +671,66 @@ class ManagerServiceCoverage3IntegrationTest {
         // Fuzzy match fired → existing ghost returned, not a new pending manager
         assertEquals("ghost", result.getString("approval_status"),
             "Should attach review to existing ghost, not create new pending_approval");
+    }
+
+    /**
+     * Regression: ticking "hide my dates" on the add-manager form was silently ignored whenever
+     * the submission fuzzy-matched a manager who already existed.
+     *
+     * How it was seen: a submitter hid their employment dates, the name they typed was one
+     * character off somebody already in the directory, and the review published with the dates
+     * on show anyway. Nothing failed and nothing was logged - the flag simply never reached the
+     * insert.
+     *
+     * The cause: doAttachToExisting does not forward the review body it was given. It rebuilds a
+     * fresh JsonObject from the individual values passed down to it, and datesHidden was not one
+     * of them, so validateAndInsertReview fell back to its default of false.
+     *
+     * Why this assertion matters: dates_hidden is a privacy choice the submitter made explicitly.
+     * Defaulting it to false publishes information somebody asked to withhold, and the attach
+     * path is the common one - most submissions for a well-known company match somebody already
+     * there.
+     */
+    @Test
+    void createManager_fuzzyMatchAttach_preservesDatesHidden() throws Exception {
+        String auth0Id = insertUser("auth0|attach-dates-hidden");
+        long existingId = insertManager("Margaret Williams", "Acme Industries", "Engineering Manager", "ghost");
+
+        JsonObject body = validCreateBody().put("name", "Margaret Wiliams"); // one character off → fuzzy attach
+        body.getJsonObject("review")
+            .put("managerCompany", "Acme Industries")
+            .put("workedFrom",     "2020-03")
+            .put("workedUntil",    "2022-06")
+            .put("datesHidden",    true);
+
+        Row result = await(service.createManager(auth0Id, body, null));
+        assertEquals("ghost", result.getString("approval_status"), "expected the fuzzy attach path");
+
+        assertTrue(datesHiddenOfLatestReview(existingId),
+            "dates_hidden must survive the attach path - the submitter asked for their dates to be hidden");
+    }
+
+    /**
+     * The control for the regression above: the no-match path builds its insert from the request
+     * body directly and has always carried the flag. Asserting it here records that the two
+     * manager-creating paths once disagreed, so a future change that drops the flag from this one
+     * is caught too.
+     */
+    @Test
+    void createManager_newManager_preservesDatesHidden() throws Exception {
+        String auth0Id = insertUser("auth0|new-dates-hidden");
+
+        JsonObject body = validCreateBody();
+        body.getJsonObject("review")
+            .put("workedFrom",  "2020-03")
+            .put("workedUntil", "2022-06")
+            .put("datesHidden", true);
+
+        Row result = await(service.createManager(auth0Id, body, null));
+        assertEquals("pending_approval", result.getString("approval_status"));
+
+        assertTrue(datesHiddenOfLatestReview(result.getLong("id")),
+            "dates_hidden must be persisted when a brand-new manager is created");
     }
 
     // ── getCompanyProfile ─────────────────────────────────────────────────────
@@ -900,6 +967,17 @@ class ManagerServiceCoverage3IntegrationTest {
             .execute(Tuple.of(name, company, title, status, companyId))
             .toCompletionStage().toCompletableFuture().get(5, TimeUnit.SECONDS)
             .iterator().next().getLong("id");
+    }
+
+    /** Reads dates_hidden straight off the newest review row for a manager. */
+    private boolean datesHiddenOfLatestReview(long managerId) throws Exception {
+        RowSet<Row> rows = pool.preparedQuery(
+                "SELECT dates_hidden FROM reviews WHERE manager_id = $1 " +
+                "ORDER BY created_at DESC LIMIT 1")
+            .execute(Tuple.of(managerId))
+            .toCompletionStage().toCompletableFuture().get(5, TimeUnit.SECONDS);
+        assertTrue(rows.iterator().hasNext(), "expected a review row for manager " + managerId);
+        return Boolean.TRUE.equals(rows.iterator().next().getBoolean("dates_hidden"));
     }
 
     private String insertUser(String auth0Id) throws Exception {

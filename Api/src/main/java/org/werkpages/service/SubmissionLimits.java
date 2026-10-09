@@ -26,13 +26,13 @@ public final class SubmissionLimits {
     private SubmissionLimits() {}
 
     /** Managers a person may submit per day. */
-    public static final int DAILY_MANAGERS = 6;
+    public static final int DAILY_MANAGERS = 10;
 
     /** Reviews a person may write per day. */
-    public static final int DAILY_REVIEWS = 6;
+    public static final int DAILY_REVIEWS = 10;
 
     /** Edit requests a person may raise per day. */
-    public static final int DAILY_EDITS = 6;
+    public static final int DAILY_EDITS = 10;
 
     /**
      * Interview experiences per day.

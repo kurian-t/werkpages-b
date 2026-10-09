@@ -208,22 +208,6 @@ public class ManagerService {
     /** Looks up a manager by slug. Same access rules as getManagerById. */
     public Future<Row> getManagerBySlug(String slug, String auth0Id) {
         return managerRepo.findBySlugFollowingMerges(slug)
-            /*
-              A slug this manager used to live at still resolves.
-
-              manager_url_history is written every time a slug changes - approval, merges, a
-              company move - and nothing ever read it, so every URL this application has retired
-              has been answering "Manager not found". The frontend already canonicalises: given a
-              manager whose slug differs from the one in the address bar, BossProfile navigates to
-              managerPath(...manager.slug) and replaces the history entry. So resolving the old
-              slug here is the whole redirect.
-
-              Second, after the live slug, never instead of it: a current slug must always win, and
-              this must not cost a lookup on the normal path.
-            */
-            .compose(opt -> opt.isPresent()
-                ? Future.succeededFuture(opt)
-                : managerRepo.findByRetiredSlug(slug))
             .compose(opt -> {
                 if (opt.isEmpty()) return Future.failedFuture(ServiceException.notFound("Manager not found"));
                 Row row = opt.get();
@@ -1136,21 +1120,9 @@ public class ManagerService {
     public Future<JsonObject> getStats() {
         Future<Long> userSubmittedFuture = db.query("SELECT COUNT(*) FROM managers WHERE approval_status IN ('approved','ghost') AND external_id IS NULL")
             .execute().map(rows -> rows.iterator().next().getLong(0));
-        /*
-          Both counters count what EXISTS right now, and nothing else.
-
-          Two things used to stop that being true. Neither excluded soft-deleted rows, so a
-          withdrawn opinion kept being counted and the tiles only ever went up. And the seed
-          counter also required weight_expires_on to be in the future, which made it report
-          "unexpired seeds" rather than "seed rows that exist" - an expired seed is still a fake
-          review sitting in the table until the sweep hard-deletes it, and hiding it meant the
-          number did not fall when one was removed or rise when one was added.
-
-          So: weight = TRUE AND deleted_at IS NULL. A row is counted while it is there.
-        */
-        Future<Long> realReviewsFuture = db.query("SELECT COUNT(*) FROM reviews r JOIN managers m ON r.manager_id = m.id WHERE m.approval_status IN ('approved','ghost') AND m.external_id IS NULL AND r.weight = FALSE AND r.deleted_at IS NULL")
+        Future<Long> realReviewsFuture = db.query("SELECT COUNT(*) FROM reviews r JOIN managers m ON r.manager_id = m.id WHERE m.approval_status IN ('approved','ghost') AND m.external_id IS NULL AND r.weight = FALSE")
             .execute().map(rows -> rows.iterator().next().getLong(0));
-        Future<Long> weightedOpinionsFuture = db.query("SELECT COUNT(*) FROM reviews WHERE weight = TRUE AND deleted_at IS NULL")
+        Future<Long> weightedOpinionsFuture = db.query("SELECT COUNT(*) FROM reviews WHERE weight = TRUE AND (weight_expires_on IS NULL OR weight_expires_on > CURRENT_DATE)")
             .execute().map(rows -> rows.iterator().next().getLong(0));
         Future<Long> seededManagersFuture = db.query("SELECT COUNT(*) FROM managers WHERE approval_status IN ('approved','ghost') AND external_id LIKE 'seed_%'")
             .execute().map(rows -> rows.iterator().next().getLong(0));
@@ -1580,17 +1552,10 @@ public class ManagerService {
             .put("workedFrom",     workedFromStr)
             .put("workedUntil",    workedUntilStr)
             /*
-              The reviewer's privacy choice travels with the dates it applies to.
-
-              This object is REBUILT from the arguments rather than forwarded, so anything not in
-              the parameter list is silently dropped and validateAndInsertReview reads it back as
-              its default. datesHidden was missing, so every review that attached to an existing
-              manager - the fuzzy-match path, which is the common one - was written with
-              dates_hidden = false no matter what the reviewer ticked. The dates then showed,
-              published or not.
-
-              Observed 2026-10-08: the server logged datesHiddenRaw=true, resolved=true, and the
-              row still came out false, because the value never reached this object.
+              This body is rebuilt from the values passed down rather than forwarded whole, so
+              every field the insert reads has to be restated here. datesHidden was missing, and
+              validateAndInsertReview defaults it to false - so a submitter who hid their dates
+              had them published whenever their manager fuzzy-matched somebody already present.
             */
             .put("datesHidden",    datesHidden);
 
@@ -1772,8 +1737,9 @@ public class ManagerService {
             .compose(opt -> {
                 if (opt.isEmpty()) return Future.failedFuture(ServiceException.notFound("Manager not found"));
                 Row row = opt.get();
-                return managerRepo.getCareerHistory(managerId)
-                    .map(chRows -> buildManagerUpdateJson(row, chRows));
+                return companyRepo.syncStatsForManager(managerId)
+                    .compose(statsDone -> managerRepo.getCareerHistory(managerId)
+                    .map(chRows -> buildManagerUpdateJson(row, chRows)));
             });
     }
 
@@ -2311,7 +2277,9 @@ public class ManagerService {
                 The sync was already awaited, and a comment here said so. The thing it depends on
                 was not, which made the guarantee half a guarantee.
             */
-            return managerRepo.recalculate(managerId).map(recalced -> row);
+            return managerRepo.recalculate(managerId)
+                .compose(recalced -> companyRepo.syncStatsForManager(managerId))
+                .map(statsDone -> row);
         });
     }
 
@@ -2357,7 +2325,7 @@ public class ManagerService {
             .map(cf -> {
                 JsonArray data = new JsonArray();
                 for (Row row : dataFuture.result()) {
-                    data.add(buildReviewJson(row));
+                    data.add(buildReviewJson(row, viewerId));
                 }
                 return new JsonObject()
                     .put("data",   data)
@@ -2646,7 +2614,8 @@ public class ManagerService {
 
                                         Separate defect from the ordering above; both live here.
                                     */
-                                    .compose(recalced -> reviewRepo.recordDeletion(userId, managerId)))
+                                    .compose(recalced -> companyRepo.syncStatsForManager(managerId))
+                                    .compose(synced -> reviewRepo.recordDeletion(userId, managerId)))
                             .map(v -> new JsonObject().put("success", true).put("message", "Review deleted"));
                     });
             });
@@ -2955,6 +2924,24 @@ public class ManagerService {
     // ── JSON builders ─────────────────────────────────────────────────────────
 
     public static JsonObject buildReviewJson(Row row) {
+        return buildReviewJson(row, null);
+    }
+
+    /**
+     * A review as JSON, with the working period masked unless the caller wrote it.
+     *
+     * <p>{@code viewerId} is the AUTHENTICATED caller, resolved from the token - never the
+     * {@code userId} query parameter, which is a display filter and carries no authority. Passing
+     * null masks, which is what every public surface wants.
+     *
+     * <p>Why the author is exempt: their edit form has to open with the dates they stored. It read
+     * this endpoint, got nulls, opened blank - and the UPDATE writes {@code worked_from} and
+     * {@code worked_until} unconditionally, so saving an unrelated change to a rating with hidden
+     * dates ERASED them. The flag is a decision about who may read the dates, not an instruction
+     * to forget them, and the one person it was never meant to hide them from is the person who
+     * chose it.
+     */
+    public static JsonObject buildReviewJson(Row row, UUID viewerId) {
         JsonObject ratings = new JsonObject()
             .put("Communication Style",               row.getBigDecimal("communication_style"))
             .put("Perceived Approachability",         row.getBigDecimal("perceived_approachability"))
@@ -2976,6 +2963,17 @@ public class ManagerService {
         */
         boolean datesHidden = row.getColumnIndex("dates_hidden") < 0
                            || Boolean.TRUE.equals(row.getBoolean("dates_hidden"));
+        /*
+          The author reads their own dates; everybody else does not.
+
+          Fails CLOSED like the flag above: a projection without user_id cannot establish
+          authorship, so it masks. Getting this wrong in the other direction would publish the one
+          thing somebody explicitly asked to withhold.
+        */
+        boolean isAuthor = viewerId != null
+                        && row.getColumnIndex("user_id") >= 0
+                        && viewerId.equals(row.getUUID("user_id"));
+        boolean maskDates = datesHidden && !isAuthor;
         return new JsonObject()
             .put("id",            row.getUUID("id"))
             .put("managerId",     row.getLong("manager_id"))
@@ -3003,9 +3001,14 @@ public class ManagerService {
               Withheld together. Leaving effectiveWorkedUntil in place would publish the end date
               through the back door, since that is the value the profile actually renders.
             */
-            .put("workedFrom",    datesHidden ? null : dateOrNull(row, "worked_from"))
-            .put("workedUntil",   datesHidden ? null : dateOrNull(row, "worked_until"))
-            .put("effectiveWorkedUntil", datesHidden ? null : effectiveWorkedUntil(row))
+            .put("workedFrom",    maskDates ? null : dateOrNull(row, "worked_from"))
+            .put("workedUntil",   maskDates ? null : dateOrNull(row, "worked_until"))
+            .put("effectiveWorkedUntil", maskDates ? null : effectiveWorkedUntil(row))
+            /*
+              The real flag either way. An author who can see their dates still needs to be told
+              they are hidden - it is what their edit form opens the toggle from, and what every
+              display rule keys off.
+            */
             .put("datesHidden",   datesHidden)
             /*
               Whether this rating is on the site.
@@ -3536,9 +3539,8 @@ public class ManagerService {
                                         profile therefore rendered with no rating even though the seed review was already in
                                         the database, and reloading fixed it - which is what made it look intermittent.
 
-                                        The company projection needs nothing from here: recalculate() writes
-                                        managers.reviews_count and overall_rating, which the managers trigger fires on,
-                                        so company_stats_live follows inside that same statement.
+                                        syncStatsForManager is deliberately left as it was: it touches company_stats, not this
+                                        row, and nothing here needs to wait for it.
                                     */
                                     /*
                                       A ghost is LIVE the moment it is created, so it replaces a
@@ -3552,11 +3554,13 @@ public class ManagerService {
                                         return managerRepo.recalculate(newId);
                                     })
                                     .compose(recalced -> managerRepo.findById(newId))
-                                    .map(fresh -> fresh.orElse(row))
+                                    .compose(fresh -> companyRepo.syncStatsForManager(newId)
+                                        .map(statsDone -> fresh.orElse(row)))
                                     .recover(err -> {
                                         System.err.println("Seed review creation failed for auto-approved manager " + newId + ": " + err.getMessage());
                                         err.printStackTrace(System.err);
-                                        return Future.succeededFuture(row);
+                                        return companyRepo.syncStatsForManager(newId)
+                                            .compose(statsDone -> Future.succeededFuture(row));
                                     });
                             })
                             .recover(err -> {
@@ -3790,16 +3794,17 @@ public class ManagerService {
                                 profile therefore rendered with no rating even though the seed review was already in
                                 the database, and reloading fixed it - which is what made it look intermittent.
 
-                                The company projection needs nothing from here: recalculate() writes
-                                managers.reviews_count and overall_rating, which the managers trigger fires on,
-                                so company_stats_live follows inside that same statement.
+                                syncStatsForManager is deliberately left as it was: it touches company_stats, not this
+                                row, and nothing here needs to wait for it.
                             */
                             .compose(ignored -> managerRepo.recalculate(newId))
                             .compose(recalced -> managerRepo.findById(newId))
-                            .map(fresh -> fresh.orElse(row))
+                            .compose(fresh -> companyRepo.syncStatsForManager(newId)
+                                .map(statsDone -> fresh.orElse(row)))
                             .recover(err -> {
                                 System.err.println("Seed review creation failed for ghost manager " + newId + ": " + err.getMessage());
-                                return Future.succeededFuture(row);
+                                return companyRepo.syncStatsForManager(newId)
+                                    .compose(statsDone -> Future.succeededFuture(row));
                             });
                     })
                     .compose(row -> {
