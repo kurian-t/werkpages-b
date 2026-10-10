@@ -159,15 +159,10 @@ public class CompanyReviewService {
                     .compose(row -> drafts.clear(reviewRepo.client(), parseUuid(body.getString("draftToken")))
                         .map(v -> row))
                     /*
-                      The company's read-model row is recomputed as part of this write.
-
-                      company_stats_live carries the workplace average that the tiles and the
-                      listing read, and a projection nothing updates is not a cache - it is a
-                      second source of truth that drifts. syncStatsForCompany awaits the write
-                      and swallows its failure, so a stats problem can never fail somebody's
-                      rating; the reconciler is what catches it if it does.
+                      The company's read-model row is recomputed by the database: the upsert above
+                      writes company_reviews.overall_rating, and the company_reviews trigger fires
+                      on it, so company_stats_live follows in the same statement (V89).
                     */
-                    .compose(row -> companyRepo.syncStatsForCompany(companyId).map(v -> row))
                     .map(CompanyReviewService::reviewToJson)
                     /*
                       Which company this actually landed on, so the client can send the reader
@@ -241,9 +236,11 @@ public class CompanyReviewService {
                 // Ownership and existence are the same answer on purpose: telling someone their
                 // id was real but not theirs confirms it exists.
                 ? Future.failedFuture(ServiceException.notFound("Rating not found"))
-                // A removed rating changes the company's average, so the read model is told.
-                : companyRepo.syncStatsForCompany(companyId.get())
-                    .map(v -> new JsonObject().put("success", true))));
+                /*
+                  A removed rating changes the average, and the read model follows on its own:
+                  softDelete writes company_reviews.deleted_at, which is triggered (V89).
+                */
+                : Future.succeededFuture(new JsonObject().put("success", true))));
     }
 
     /**

@@ -420,7 +420,7 @@ class ReviewIntegrationTest {
      * records nothing; awaited, it cannot. Verified to fail without the fix.
      *
      * <p>Two writes were racing. {@code recalculate} writes managers.reviews_count and
-     * managers.overall_rating; {@code syncStatsForManager} then computes company_stats_live
+     * managers.overall_rating; the managers trigger then recomputes company_stats_live
      * <em>from those two columns</em>. The sync was awaited and the recalculation was not, so the
      * company's figures could be derived from the pre-review numbers and stay wrong until the
      * next review happened to land - and the client, which refetches the manager as soon as this

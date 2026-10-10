@@ -336,11 +336,52 @@ class ManagerServiceCoverageIntegrationTest {
         assertTrue(result.containsKey("weightedOpinions"));
         assertTrue(result.containsKey("seededManagers"));
         assertTrue(result.containsKey("scrapedManagers"));
+        assertTrue(result.containsKey("companyReviews"));
         assertTrue(result.getLong("realManagers")     >= 0);
         assertTrue(result.getLong("realReviews")      >= 0);
         assertTrue(result.getLong("weightedOpinions") >= 0);
         assertTrue(result.getLong("seededManagers")   >= 0);
         assertTrue(result.getLong("scrapedManagers")  >= 0);
+        assertTrue(result.getLong("companyReviews")   >= 0);
+    }
+
+    /**
+     * The dashboard counter that replaced the seeded-profile countdown.
+     *
+     * <p>Counts live workplace ratings only. A withdrawn rating is gone as far as every reader is
+     * concerned, so a tile that kept counting it would disagree with the company pages it is meant
+     * to summarise - and an admin reading "12 company reviews" beside pages showing eleven has no
+     * way to tell which number is wrong.
+     */
+    @Test
+    void getStats_companyReviews_countsLiveRatingsAndDropsWithdrawnOnes() throws Exception {
+        String auth0Id = insertUser("auth0|stats-company-reviews");
+        long companyId = await(pool.preparedQuery(
+                "INSERT INTO companies(name, slug, status) VALUES ($1,$2,'approved') RETURNING id")
+            .execute(Tuple.of("Counted Co", "counted-co"))
+            .map(rs -> rs.iterator().next().getLong("id")));
+        java.util.UUID userId = await(pool.preparedQuery("SELECT id FROM users WHERE auth0_id = $1")
+            .execute(Tuple.of(auth0Id)).map(rs -> rs.iterator().next().getUUID("id")));
+
+        long before = await(service.getStats()).getLong("companyReviews");
+
+            await(pool.preparedQuery(
+                "INSERT INTO company_reviews(company_id, user_id, overall_rating, "
+              + "work_life_balance, compensation_benefits, career_growth, job_security, "
+              + "workload_sustainability, senior_leadership, company_communication, "
+              + "flexibility, inclusion_belonging, tools_resources, "
+              + "worked_from, author, created_at, updated_at) "
+              + "VALUES ($1,$2,4.0, 4,4,4,4,4,4,4,4,4,4, '2021-04-01','CountedAuthor',now(),now())")
+                .execute(Tuple.of(companyId, userId)));
+
+        assertEquals(before + 1, await(service.getStats()).getLong("companyReviews").longValue(),
+            "a new workplace rating must show up in the dashboard count");
+
+        await(pool.preparedQuery("UPDATE company_reviews SET deleted_at = now() WHERE company_id = $1")
+            .execute(Tuple.of(companyId)));
+
+        assertEquals(before, await(service.getStats()).getLong("companyReviews").longValue(),
+            "a withdrawn rating must stop being counted - it is invisible everywhere else");
     }
 
     // ── getMySubmittedManagers ────────────────────────────────────────────────

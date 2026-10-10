@@ -159,11 +159,10 @@ public class InterviewService {
 
                       company_stats_live carries the interview average the tiles and the listing
                       read, and a projection nothing updates is not a cache - it is a second
-                      source of truth that drifts. The sync awaits and swallows its own failure,
-                      so a stats problem can never fail somebody's submission.
+                      source of truth that drifts. It is maintained by the database: the insert
+                      above writes interview_reviews, and the interview_reviews trigger fires on
+                      it, so the projection follows inside that same statement (V89).
                     */
-                    .compose(row -> companyRepo.syncStatsForCompany(row.getLong("company_id"))
-                        .map(v -> row))
                     .map(InterviewService::reviewToJson);
             }));
     }
@@ -218,9 +217,12 @@ public class InterviewService {
                     // would leave rounds from the old process stranded in the middle of the new one.
                     return interviewRepo.deleteRounds(id)
                         .compose(ignored -> interviewRepo.insertRounds(id, draft.rounds))
-                        // An edited score moves the company's interview average, so the read
-                        // model is recomputed as part of the write. See CLAUDE.md section 21.
-                        .compose(ignored -> companyRepo.syncStatsForCompany(companyId.get()))
+                        /*
+                          An edited score moves the company's interview average, and the read model
+                          is recomputed as part of the write - by the database. The update above
+                          writes interview_reviews.overall_rating, which the interview_reviews
+                          trigger fires on (V89). See CLAUDE.md section 21.
+                        */
                         .map(ignored -> reviewToJson(updated.get()));
                 }));
             });
@@ -290,10 +292,12 @@ public class InterviewService {
                 }
                 // Recorded so the same person cannot replace what is going to come back, which
                 // would leave the company counting one contributor twice.
-                return interviewRepo.recordDeletion(userId, companyId.get())
-                    // A removed experience changes the company's interview average.
-                    .compose(result -> companyRepo.syncStatsForCompany(companyId.get())
-                        .map(v -> result));
+                /*
+                  A removed experience changes the company's interview average, and softDelete
+                  above already wrote interview_reviews.deleted_at - which is triggered, so the
+                  projection followed inside that statement (V89).
+                */
+                return interviewRepo.recordDeletion(userId, companyId.get()).mapEmpty();
             }));
     }
 

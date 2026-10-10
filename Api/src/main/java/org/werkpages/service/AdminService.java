@@ -137,10 +137,10 @@ public class AdminService {
                 if (opt.isEmpty())
                     return Future.succeededFuture(new JsonObject().put("success", false).put("message", "Ghost manager not found"));
                 JsonObject ok = new JsonObject().put("success", true).put("message", "Manager marked as reviewed");
-                Long companyId = opt.get().getLong("company_id");
-                if (companyId == null || companyRepo == null) return Future.succeededFuture(ok);
-                // Awaited: the stats write must not outlive the request that triggered it.
-                return companyRepo.syncStatsForManager(managerId).map(statsDone -> ok);
+                /*
+                  No stats write from here. approveGhost changes managers.approval_status and the managers trigger fires on it, so company_stats_live follows inside that same statement (V89).
+                */
+                return Future.succeededFuture(ok);
             });
     }
 
@@ -374,16 +374,12 @@ public class AdminService {
                     .put("_managerId", managerId)
                     .put("_needsLogo", existingLogo == null)
                     .put("_company", company);
-                if (companyRepo == null) return recalculated.map(recalcDone -> ok);
                 /*
-                    Both awaited, and in this order. company_stats_live is derived from
-                    managers.reviews_count and managers.overall_rating, so syncing before the
-                    recalculation lands writes the company's figures from the pre-approval
-                    numbers. The sync was already awaited; the recalculation it depends on was not.
+                  The recalculation is still awaited, and that is now the whole of it: it writes
+                  managers.reviews_count and managers.overall_rating, and the managers trigger
+                  fires on it, so company_stats_live follows inside that same statement (V89).
                 */
-                return recalculated
-                    .compose(v -> companyRepo.syncStatsForManager(managerId))
-                    .map(statsDone -> ok);
+                return recalculated.map(recalcDone -> ok);
             });
     }
 
@@ -870,10 +866,12 @@ public class AdminService {
                                 .compose(v -> applyEditAndApprove(managerId, editId, newCompany, newCompanyLogoUrl, newTitle, newStatus, newCountry, newState, newCity, newCompanyLocationId, newLinkedinUrl, effectiveCo, effectiveTit, adminId, now, proposedBy, managerName, newCompanyId))
                                 .compose(result -> {
                                     if (newCompany != null) {
-                                        // Fire-and-forget: refresh old company's stats so its logo/counts stay accurate
-                                        if (currentCompanyId != null && companyRepo != null)
-                                            companyRepo.updateCompanyStatsForCompany(currentCompanyId)
-                                                .onFailure(err -> System.err.println("old company stats update failed: " + err.getMessage()));
+                                        /*
+                                          No stats write for the old company. Moving a manager
+                                          changes managers.company_id, and the trigger recomputes
+                                          BOTH sides of that move (V47, kept by V89). This was
+                                          also the last fire-and-forget stats write.
+                                        */
                                         // Fire-and-forget: record old URL so external/crawled links can resolve
                                         if (slugsOpt.isPresent()) {
                                             String oldCompanySlug = slugsOpt.get().getString("company_slug");
@@ -919,22 +917,20 @@ public class AdminService {
                         "Your edit request for " + managerName + " has been approved. The manager's profile has been updated.",
                         managerId);
                 }
-                Future<Void> statsFuture = companyRepo != null
-                    ? companyRepo.syncStatsForManager(managerId)
-                    : Future.succeededFuture();
                 JsonObject result = new JsonObject().put("success", true).put("message", "Edit approved and applied")
                     .put("managerId", managerId);
                 if (newCompany != null) {
                     result.put("newCompany", newCompany);
                     if (newCompanyLogoUrl != null) result.put("newCompanyLogoUrl", newCompanyLogoUrl);
                 }
-                return statsFuture.map(statsDone -> result);
+                // Applying an edit writes the manager row, and the managers trigger fires on it, so company_stats_live follows inside that same statement (V89).
+                return Future.succeededFuture(result);
             });
     }
 
     public Future<Void> updateManagerLogo(long managerId, String logoUrl) {
-        return managerRepo.updateLogoUrl(managerId, logoUrl)
-            .compose(ignored -> companyRepo.updateCompanyStatsForManager(managerId));
+        // updateLogoUrl writes managers.company_logo_url, and the managers trigger fires on it, so company_stats_live follows inside that same statement (V89).
+        return managerRepo.updateLogoUrl(managerId, logoUrl).mapEmpty();
     }
 
     public Future<JsonObject> rejectEdit(String auth0Id, UUID editId) {
@@ -1096,13 +1092,8 @@ public class AdminService {
                 // Keeps anything a person wrote: seeded placeholders are removed, real reviews
                 // are soft-deleted, and the manager row is retired rather than deleted when it
                 // holds any - because the cascade on reviews.manager_id would destroy them.
-                return managerRepo.deleteOrRetire(managerId)
-                    .compose(v -> {
-                        if (companyId != null && companyRepo != null) {
-                            return companyRepo.updateCompanyStatsForCompany(companyId);
-                        }
-                        return Future.succeededFuture();
-                    });
+                // A DELETE, or an approval_status change; the trigger fires on both (V89).
+                return managerRepo.deleteOrRetire(managerId).mapEmpty();
             });
     }
 
@@ -1146,9 +1137,8 @@ public class AdminService {
                 Future<Void> resolved = mergeSuggestionsRepo == null
                     ? Future.succeededFuture()
                     : mergeSuggestionsRepo.markPairMerged(keepId, mergeId);
-                return resolved.compose(v -> companyRepo == null
-                    ? Future.succeededFuture(ok)
-                    : companyRepo.syncStatsForManager(keepId).map(statsDone -> ok));
+                // The merge moved managers.company_id and reviews, both triggered (V89).
+                return resolved.map(v -> ok);
             });
     }
 
@@ -1194,7 +1184,10 @@ public class AdminService {
                 return companyRepo.pinCurrentLogo(companyId)
                     .compose(v -> companyRepo.renameCompany(companyId, newName));
             })
-            .compose(v -> companyRepo.updateCompanyStatsForCompany(companyId))
+            /*
+              No stats write: a rename touches companies.name, and nothing in company_stats_live
+              is derived from the name.
+            */
             .map(v -> new JsonObject().put("success", true));
     }
 
@@ -1208,11 +1201,11 @@ public class AdminService {
         return requireAdmin(auth0Id)
             .compose(adminId -> companyRepo.undoMerge(mergeRecordId)
                 .recover(err -> Future.failedFuture(ServiceException.badRequest(err.getMessage()))))
-            // Both companies' cached figures are wrong until they are recomputed: one has just
-            // lost data and the other has just got it back.
-            .compose(result -> companyRepo.syncStatsForCompany(result.getLong("restoredCompanyId"))
-                .compose(v -> companyRepo.syncStatsForCompany(result.getLong("targetCompanyId")))
-                .map(v -> result));
+            /*
+              Both companies are recomputed by the undo itself: it moves managers, reviews and
+              interview rows back, and every one of those columns is triggered (V89).
+            */
+            ;
     }
 
     /** What a merge would move, and whether it can safely run. Reads only; writes nothing. */
@@ -1414,10 +1407,8 @@ public class AdminService {
                                 "Confidence debit failed for review " + reviewId + ": " + err.getMessage()));
                     }
 
+                    // recalculate writes reviews_count and overall_rating; the managers trigger fires on it, so company_stats_live follows inside that same statement (V89).
                     return managerRepo.recalculate(managerId)
-                        .compose(v -> companyRepo == null
-                            ? Future.succeededFuture()
-                            : companyRepo.syncStatsForManager(managerId))
                         .map(v -> new JsonObject()
                             .put("success", true)
                             .put("reason", cleaned)
@@ -1500,7 +1491,7 @@ public class AdminService {
                 // A refusal here is a decision the admin has to make, not a server fault: surface
                 // it as a 400 with the reason rather than a 500.
                 .recover(err -> Future.failedFuture(ServiceException.badRequest(err.getMessage()))))
-            .compose(mergeUuid -> companyRepo.syncStatsForCompany(keepId).map(v -> mergeUuid))
+            // mergeCompanies moves managers, company_reviews and interview_reviews; all triggered (V89).
             .map(mergeUuid -> new JsonObject()
                 .put("success", true)
                 .put("keepId", keepId)

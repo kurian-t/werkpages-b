@@ -451,11 +451,11 @@ public class MaintenanceSweep {
             .compose(companyIds -> {
                 if (companyIds.isEmpty()) return Future.succeededFuture();
                 System.out.println("✓ Restored " + companyIds.size() + " anonymised workplace rating(s)");
-                Future<Void> chain = Future.succeededFuture();
-                for (Long id : new java.util.LinkedHashSet<>(companyIds)) {
-                    chain = chain.compose(v -> companyRepo.syncStatsForCompany(id));
-                }
-                return chain;
+                /*
+                  No stats pass needed: the restore clears company_reviews.deleted_at, which is
+                  triggered, so each company was refreshed as its rows were restored (V89).
+                */
+                return Future.<Void>succeededFuture();
             })
             .onFailure(err -> System.err.println("⚠ Workplace rating restore job failed: " + err.getMessage()))
             .otherwiseEmpty()
@@ -533,9 +533,8 @@ public class MaintenanceSweep {
                 for (Row row : rows) {
                     long managerId = row.getLong("id");
                     stale++;
-                    chain = chain
-                        .compose(v -> managerRepo.recalculate(managerId))
-                        .compose(v -> companyRepo.syncStatsForManager(managerId));
+                    // recalculate writes reviews_count and overall_rating, both triggered (V89).
+                    chain = chain.compose(v -> managerRepo.recalculate(managerId));
                 }
                 final int total = stale;
                 return chain.map(v -> total);

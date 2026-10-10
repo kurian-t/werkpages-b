@@ -304,11 +304,33 @@ paths:
             application/json:
               schema:
                 type: object
+                description: >-
+                  The dashboard counters. This block previously documented totalManagers and
+                  totalReviews, which the endpoint has not returned for a long time - corrected
+                  here rather than left to mislead the next reader.
                 properties:
-                  totalManagers:
+                  realManagers:
                     type: integer
-                  totalReviews:
+                    description: Visible managers submitted by people, excluding seeded and scraped rows.
+                  realReviews:
                     type: integer
+                    description: Opinions on visible managers, excluding weighted placeholders.
+                  weightedOpinions:
+                    type: integer
+                    description: Unexpired weighted placeholder reviews.
+                  seededManagers:
+                    type: integer
+                    description: >-
+                      Seeded placeholder profiles still live. No longer shown on the dashboard,
+                      but still returned - removing a field is a breaking change for any other reader.
+                  scrapedManagers:
+                    type: integer
+                    description: Visible managers that arrived from a scrape rather than a person.
+                  companyReviews:
+                    type: integer
+                    description: >-
+                      Live workplace ratings (company_reviews, excluding withdrawn). Shown on the
+                      admin dashboard in place of the seeded-profile countdown.
 
   /api/companies/listing:
     get:

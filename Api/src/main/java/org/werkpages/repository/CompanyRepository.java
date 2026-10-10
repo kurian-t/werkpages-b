@@ -699,135 +699,9 @@ public class CompanyRepository {
             .execute();
     }
 
-    /** Targeted upsert for the company that owns the given manager. Fast — one indexed lookup. */
-    /**
-     * Updates the cached company stats and waits for it, turning failure into a logged no-op.
-     *
-     * Replaces the fire-and-forget pattern this used to be called with: the future was created
-     * inside a .map() and abandoned, so the request returned while the write was still running.
-     * Two consequences, both real. In tests, a background write outlived the test that triggered
-     * it and deadlocked against the next test's TRUNCATE - the statement holds company_stats_live
-     * and wants managers, TRUNCATE holds managers and wants company_stats_live through its cascade.
-     * In production the failure was swallowed, so the visible symptom was company stats quietly
-     * going stale rather than an error anyone would see.
-     *
-     * Awaited, so the write is finished before the response and its ordering is deterministic.
-     * Recovered, so a stats problem still cannot fail the user's actual operation - that part of
-     * the original intent was right and is kept.
-     */
-    public Future<Void> syncStatsForManager(long managerId) {
-        return updateCompanyStatsForManager(managerId)
-            .recover(err -> {
-                System.err.println("company_stats_live update failed for manager " + managerId
-                                   + ": " + err.getMessage());
-                return Future.succeededFuture();
-            });
-    }
 
-    /** Company-keyed counterpart of {@link #syncStatsForManager}. Same await-and-recover contract. */
-    public Future<Void> syncStatsForCompany(long companyId) {
-        return updateCompanyStatsForCompany(companyId)
-            .recover(err -> {
-                System.err.println("company_stats_live update failed for company " + companyId
-                                   + ": " + err.getMessage());
-                return Future.succeededFuture();
-            });
-    }
 
-    public Future<Void> updateCompanyStatsForManager(long managerId) {
-        return db.preparedQuery("""
-                INSERT INTO company_stats_live (company_id, manager_count, total_reviews, avg_rating, logo_url,
-                                workplace_count, workplace_avg_rating,
-                                interview_count, interview_avg_rating, updated_at)
-                SELECT c.id,
-                       COUNT(DISTINCT m.id),
-                       COALESCE(SUM(m.reviews_count), 0),
-                       ROUND(AVG(m.overall_rating) FILTER (WHERE m.overall_rating IS NOT NULL AND m.reviews_count > 0)::NUMERIC, 1),
-                       COALESCE(MIN(m.company_logo_url) FILTER (WHERE m.company_logo_url LIKE 'https://img.logo.dev/%'), c.logo_url, MIN(m.company_logo_url) FILTER (WHERE m.company_logo_url IS NOT NULL)),
-                       /*
-                          The other two datasets, as correlated subqueries rather than joins.
-
-                          A join to company_reviews and interview_reviews alongside the managers
-                          join would multiply the rows out, and every COUNT and AVG above it
-                          would silently inflate. Correlated scalars cannot fan out.
-                       */
-                       (SELECT COUNT(*) FROM company_reviews cr
-                         WHERE cr.company_id = c.id AND cr.deleted_at IS NULL),
-                       (SELECT ROUND(AVG(cr.overall_rating)::NUMERIC, 1) FROM company_reviews cr
-                         WHERE cr.company_id = c.id AND cr.deleted_at IS NULL),
-                       (SELECT COUNT(*) FROM interview_reviews ir
-                         WHERE ir.company_id = c.id AND ir.deleted_at IS NULL),
-                       (SELECT ROUND(AVG(ir.overall_rating)::NUMERIC, 1) FROM interview_reviews ir
-                         WHERE ir.company_id = c.id AND ir.deleted_at IS NULL),
-                       now()
-                FROM companies c
-                JOIN managers m ON m.company_id = c.id
-                WHERE c.id = (SELECT company_id FROM managers WHERE id = $1)
-                  AND m.approval_status IN ('approved', 'ghost')
-                  AND (m.external_id IS NULL OR m.external_id NOT LIKE 'seed_%')
-                GROUP BY c.id, c.logo_url
-                ON CONFLICT (company_id) DO UPDATE SET
-                    manager_count = EXCLUDED.manager_count,
-                    total_reviews = EXCLUDED.total_reviews,
-                    avg_rating    = EXCLUDED.avg_rating,
-                    logo_url      = EXCLUDED.logo_url,
-                    workplace_count      = EXCLUDED.workplace_count,
-                    workplace_avg_rating = EXCLUDED.workplace_avg_rating,
-                    interview_count      = EXCLUDED.interview_count,
-                    interview_avg_rating = EXCLUDED.interview_avg_rating,
-                    updated_at    = now()
-                """)
-            .execute(Tuple.of(managerId))
-            .mapEmpty();
-    }
-
-    /** Targeted upsert for a specific company. Used after rename/merge. */
-    public Future<Void> updateCompanyStatsForCompany(long companyId) {
-        return db.preparedQuery("""
-                INSERT INTO company_stats_live (company_id, manager_count, total_reviews, avg_rating, logo_url,
-                                workplace_count, workplace_avg_rating,
-                                interview_count, interview_avg_rating, updated_at)
-                SELECT c.id,
-                       COUNT(DISTINCT m.id),
-                       COALESCE(SUM(m.reviews_count), 0),
-                       ROUND(AVG(m.overall_rating) FILTER (WHERE m.overall_rating IS NOT NULL AND m.reviews_count > 0)::NUMERIC, 1),
-                       COALESCE(MIN(m.company_logo_url) FILTER (WHERE m.company_logo_url LIKE 'https://img.logo.dev/%'), c.logo_url, MIN(m.company_logo_url) FILTER (WHERE m.company_logo_url IS NOT NULL)),
-                       /*
-                          The other two datasets, as correlated subqueries rather than joins.
-
-                          A join to company_reviews and interview_reviews alongside the managers
-                          join would multiply the rows out, and every COUNT and AVG above it
-                          would silently inflate. Correlated scalars cannot fan out.
-                       */
-                       (SELECT COUNT(*) FROM company_reviews cr
-                         WHERE cr.company_id = c.id AND cr.deleted_at IS NULL),
-                       (SELECT ROUND(AVG(cr.overall_rating)::NUMERIC, 1) FROM company_reviews cr
-                         WHERE cr.company_id = c.id AND cr.deleted_at IS NULL),
-                       (SELECT COUNT(*) FROM interview_reviews ir
-                         WHERE ir.company_id = c.id AND ir.deleted_at IS NULL),
-                       (SELECT ROUND(AVG(ir.overall_rating)::NUMERIC, 1) FROM interview_reviews ir
-                         WHERE ir.company_id = c.id AND ir.deleted_at IS NULL),
-                       now()
-                FROM companies c
-                LEFT JOIN managers m ON m.company_id = c.id
-                    AND m.approval_status IN ('approved', 'ghost')
-                    AND (m.external_id IS NULL OR m.external_id NOT LIKE 'seed_%')
-                WHERE c.id = $1
-                GROUP BY c.id, c.logo_url
-                ON CONFLICT (company_id) DO UPDATE SET
-                    manager_count = EXCLUDED.manager_count,
-                    total_reviews = EXCLUDED.total_reviews,
-                    avg_rating    = EXCLUDED.avg_rating,
-                    logo_url      = EXCLUDED.logo_url,
-                    workplace_count      = EXCLUDED.workplace_count,
-                    workplace_avg_rating = EXCLUDED.workplace_avg_rating,
-                    interview_count      = EXCLUDED.interview_count,
-                    interview_avg_rating = EXCLUDED.interview_avg_rating,
-                    updated_at    = now()
-                """)
-            .execute(Tuple.of(companyId))
-            .mapEmpty();
-    }
+ 
 
     /** Full sync of company_stats_live from source tables.
      *  Background safety net — guarded by AtomicBoolean in MainVerticle, do not call on hot paths. */
@@ -895,6 +769,15 @@ public class CompanyRepository {
                 : Optional.empty());
     }
 
+    /*
+      There is deliberately no stats writer here any more.
+
+      company_stats_live is maintained solely by database triggers - see V89. Four methods used to
+      write it from application code (syncStatsForManager/ForCompany and the two updateCompanyStats*
+      they wrapped), which meant two products had to remember to call them forever and the four
+      columns V79 added were only ever filled when somebody did. Reintroducing one would restore
+      exactly that: a second writer, silently diverging, with the trigger disagreeing.
+    */
     /** Looks up a company by its URL slug. Also returns the logo from company_stats_live
      *  (which reflects only current FK-linked managers) as stats_logo_url. */
     public Future<Optional<Row>> findBySlug(String slug) {
