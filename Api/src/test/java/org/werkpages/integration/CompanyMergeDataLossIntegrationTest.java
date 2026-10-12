@@ -626,10 +626,21 @@ class CompanyMergeDataLossIntegrationTest {
         // data here so the two cannot drift apart again.
         long parent = insertCompany("Count Parent");
         long child  = insertCompany("Count Child");
+        /*
+          Every column the assertions below read must be set on the CONFLICT path too.
+
+          Since V90 the rule is one projection row per non-merged company, so inserting the company
+          already created a zero row and this statement ALWAYS takes DO UPDATE. When it refreshed
+          only total_reviews, manager_count stayed at the trigger's 0 and this test failed on a
+          fixture detail rather than on the behaviour it is about - which is that
+          findCompanyChildren exposes these columns at all.
+        */
         await(pool.preparedQuery("""
                 INSERT INTO company_stats_live (company_id, manager_count, total_reviews, avg_rating)
                 VALUES ($1, 1, 2, 4.3)
-                ON CONFLICT (company_id) DO UPDATE SET total_reviews = EXCLUDED.total_reviews
+                ON CONFLICT (company_id) DO UPDATE SET manager_count = EXCLUDED.manager_count,
+                                                       total_reviews = EXCLUDED.total_reviews,
+                                                       avg_rating    = EXCLUDED.avg_rating
                 """)
             .execute(Tuple.of(child)).mapEmpty());
         await(companyRepo.setCompanyParent(child, parent, "SUBSIDIARY_OF"));

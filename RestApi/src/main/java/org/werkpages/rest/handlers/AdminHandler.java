@@ -6,6 +6,7 @@ import io.vertx.ext.web.RoutingContext;
 import org.werkpages.service.AdminService;
 import org.werkpages.service.DeduplicationJob;
 import org.werkpages.service.IndustryClassificationJob;
+import org.werkpages.service.CompanyStatsRebuilder;
 import org.werkpages.service.RoleService;
 
 import java.util.UUID;
@@ -20,6 +21,11 @@ public class AdminHandler {
     private final DeduplicationJob          deduplicationJob;
     private final IndustryClassificationJob industryJob;
     private final RoleService               roleService;
+    /*
+      Held like the other admin-triggered jobs. Optional: when it is absent the endpoints answer
+      503 rather than pretending to have run, which is the same shape as the AI jobs above.
+    */
+    private CompanyStatsRebuilder           companyStats;
 
     public AdminHandler(AdminService service) {
         this(service, null, null);
@@ -40,6 +46,79 @@ public class AdminHandler {
         this.deduplicationJob = deduplicationJob;
         this.industryJob      = industryJob;
         this.roleService      = roleService;
+    }
+
+    /**
+     * Wires the company-statistics maintenance job.
+     *
+     * <p>A setter rather than another constructor overload, because this class already has four of
+     * them and the chain is the reason adding a dependency here is painful.
+     */
+    public AdminHandler withCompanyStats(CompanyStatsRebuilder companyStats) {
+        this.companyStats = companyStats;
+        return this;
+    }
+
+    // ── POST /api/admin/company-stats/maintain ───────────────────────────────
+
+    /**
+     * "Run maintenance now."
+     *
+     * <p>The optional recovery tool, not a requirement. The projection is maintained by database
+     * triggers on every write and repaired automatically every six hours; this exists for somebody
+     * who wants that to happen immediately rather than within six hours.
+     *
+     * <p>It runs the SAME implementation as both of those - detect, record, repair, verify - and
+     * contains no recount or orphan rule of its own. It cannot overlap the scheduled sweep or the
+     * other backend's: they share a session advisory lock in the database, and a losing caller is
+     * told so rather than queued behind the winner.
+     */
+    public void handleCompanyStatsMaintain(RoutingContext ctx) {
+        String auth0Id = ctx.get("auth0Id");
+        service.requireAdminPublic(auth0Id)
+            .onSuccess(adminId -> {
+                if (companyStats == null) {
+                    ctx.response().setStatusCode(503).putHeader("Content-Type", "application/json")
+                        .end(new JsonObject().put("error", "Company statistics maintenance not configured").encode());
+                    return;
+                }
+                companyStats.maintain()
+                    .onSuccess(result -> ok(ctx, new JsonObject()
+                        .put("ran", result.ran())
+                        .put("driftFound", result.driftFound())
+                        .put("companiesRepaired", result.companiesRepaired())
+                        .put("stillDrifted", result.stillDrifted())
+                        .put("summary", result.toString())))
+                    .onFailure(err -> ManagersHandler.handleError(ctx, err));
+            })
+            .onFailure(err -> ManagersHandler.handleError(ctx, err));
+    }
+
+    // ── POST /api/admin/company-stats/rebuild ────────────────────────────────
+
+    /**
+     * Recompute every company, whether or not it looks wrong.
+     *
+     * <p>Exposed separately from maintenance on purpose. Maintenance is cheap, bounded and leaves
+     * evidence; this walks every company and is the right answer only when the projection is
+     * believed wrong in a way detection might share - after a restore, say. Reports how many rows
+     * it wrote so the caller gets a definite result rather than a bare 200.
+     */
+    public void handleCompanyStatsRebuild(RoutingContext ctx) {
+        String auth0Id = ctx.get("auth0Id");
+        service.requireAdminPublic(auth0Id)
+            .onSuccess(adminId -> {
+                if (companyStats == null) {
+                    ctx.response().setStatusCode(503).putHeader("Content-Type", "application/json")
+                        .end(new JsonObject().put("error", "Company statistics maintenance not configured").encode());
+                    return;
+                }
+                companyStats.rebuild()
+                    .onSuccess(written -> ok(ctx, new JsonObject()
+                        .put("companiesWritten", written)))
+                    .onFailure(err -> ManagersHandler.handleError(ctx, err));
+            })
+            .onFailure(err -> ManagersHandler.handleError(ctx, err));
     }
 
     // ── GET /api/admin/captured-drafts ───────────────────────────────────────

@@ -68,6 +68,19 @@ public class Database {
         return client;
     }
 
+    /**
+     * The pool itself, for the few callers that need a connection rather than a query.
+     *
+     * <p>An advisory SESSION lock belongs to a connection, so anything coordinating across
+     * processes - company_stats maintenance, which must not overlap between the scheduled sweep and
+     * an admin action, and across the two backends sharing this database - has to pin one.
+     * {@link #getClient()} deliberately hides that, and remains the right accessor for ordinary
+     * queries.
+     */
+    public static Pool getPool() {
+        return client;
+    }
+
     private static void runMigrations(PgConnectOptions connectOptions) {
     	String sslSuffix = useSSL() ? "?sslmode=require" : "";
     	String jdbcUrl = String.format(

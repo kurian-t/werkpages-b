@@ -3545,24 +3545,69 @@ paths:
         '403':
           description: Forbidden
 
-  /api/admin/refresh-company-stats:
+  /api/admin/company-stats/maintain:
     post:
-      operationId: refreshCompanyStats
-      summary: Force a full resync of company_stats_live from source tables (admin only)
+      operationId: maintainCompanyStats
+      summary: >-
+        Run company-statistics maintenance now (admin only). Optional: the projection is maintained
+        by database triggers on every write and repaired automatically every six hours.
+      description: >-
+        Detects discrepancies between company_stats_live and its source tables, records them in
+        company_stats_drift_log, repairs the affected companies through the shared database
+        implementation, and verifies the result. Cannot overlap the scheduled sweep or the other
+        backend's: ran=false means another maintenance run holds the lock.
       tags:
         - Admin
       security:
         - bearerAuth: []
       responses:
         '200':
-          description: Stats refreshed
+          description: Maintenance outcome
           content:
             application/json:
               schema:
                 type: object
                 properties:
-                  success:
+                  ran:
                     type: boolean
+                    description: False when another maintenance run holds the cross-process lock.
+                  driftFound:
+                    type: integer
+                    description: Number of individual discrepancies detected.
+                  companiesRepaired:
+                    type: integer
+                  stillDrifted:
+                    type: integer
+                    description: Discrepancies that survived the repair. Non-zero needs investigation.
+                  summary:
+                    type: string
+        '503':
+          description: Maintenance not configured
+
+  /api/admin/company-stats/rebuild:
+    post:
+      operationId: rebuildCompanyStats
+      summary: Recompute company_stats_live for every company (admin only)
+      description: >-
+        The escape hatch, separate from maintenance on purpose. Maintenance is bounded and repairs
+        only what disagrees; this walks every company and is appropriate when the projection is
+        believed wrong in a way detection might share, such as after a restore.
+      tags:
+        - Admin
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Rebuild complete
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  companiesWritten:
+                    type: integer
+        '503':
+          description: Maintenance not configured
 
   /api/admin/country-stats:
     get:

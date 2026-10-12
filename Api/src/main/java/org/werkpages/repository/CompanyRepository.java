@@ -703,56 +703,25 @@ public class CompanyRepository {
 
  
 
-    /** Full sync of company_stats_live from source tables.
-     *  Background safety net — guarded by AtomicBoolean in MainVerticle, do not call on hot paths. */
+    /**
+     * Recompute company_stats_live for every company, through the database's own implementation.
+     *
+     * <p>This used to be a 40-line INSERT ... SELECT ... ON CONFLICT in Java, and it was the second
+     * implementation of these aggregates. It drifted from the trigger twice: it was never taught
+     * the four columns V79 added, and it kept an inner JOIN on managers after V89 moved the trigger
+     * to a LEFT JOIN, which made the rebuild delete every company that had a workplace rating and
+     * no managers listed.
+     *
+     * <p>There is now one implementation, {@code company_stats_apply}, in the migration stream. It
+     * is what the triggers call, what automatic repair calls and what the admin action calls, so
+     * this cannot disagree with them. NULL means every company.
+     *
+     * <p>Prefer {@link org.werkpages.service.CompanyStatsRebuilder} for anything other than "make
+     * it all correct now": maintain() compares first and repairs only what disagrees, and leaves a
+     * record of what was wrong.
+     */
     public Future<Void> refreshCompanyStats() {
-        return db.query("""
-                INSERT INTO company_stats_live (company_id, manager_count, total_reviews, avg_rating, logo_url,
-                                workplace_count, workplace_avg_rating,
-                                interview_count, interview_avg_rating, updated_at)
-                SELECT c.id,
-                       COUNT(DISTINCT m.id),
-                       COALESCE(SUM(m.reviews_count), 0),
-                       ROUND(AVG(m.overall_rating) FILTER (WHERE m.overall_rating IS NOT NULL AND m.reviews_count > 0)::NUMERIC, 1),
-                       COALESCE(
-                           MIN(m.company_logo_url) FILTER (WHERE m.company_logo_url LIKE 'https://img.logo.dev/%'),
-                           c.logo_url,
-                           MIN(m.company_logo_url) FILTER (WHERE m.company_logo_url IS NOT NULL)
-                       ),
-                       /*
-                          The other two datasets, as correlated subqueries rather than joins.
-
-                          A join to company_reviews and interview_reviews alongside the managers
-                          join would multiply the rows out, and every COUNT and AVG above it
-                          would silently inflate. Correlated scalars cannot fan out.
-                       */
-                       (SELECT COUNT(*) FROM company_reviews cr
-                         WHERE cr.company_id = c.id AND cr.deleted_at IS NULL),
-                       (SELECT ROUND(AVG(cr.overall_rating)::NUMERIC, 1) FROM company_reviews cr
-                         WHERE cr.company_id = c.id AND cr.deleted_at IS NULL),
-                       (SELECT COUNT(*) FROM interview_reviews ir
-                         WHERE ir.company_id = c.id AND ir.deleted_at IS NULL),
-                       (SELECT ROUND(AVG(ir.overall_rating)::NUMERIC, 1) FROM interview_reviews ir
-                         WHERE ir.company_id = c.id AND ir.deleted_at IS NULL),
-                       now()
-                FROM companies c
-                JOIN managers m ON m.company_id = c.id
-                WHERE m.approval_status IN ('approved', 'ghost')
-                  AND (m.external_id IS NULL OR m.external_id NOT LIKE 'seed_%')
-                GROUP BY c.id, c.logo_url
-                ON CONFLICT (company_id) DO UPDATE SET
-                    manager_count = EXCLUDED.manager_count,
-                    total_reviews = EXCLUDED.total_reviews,
-                    avg_rating    = EXCLUDED.avg_rating,
-                    logo_url      = EXCLUDED.logo_url,
-                    workplace_count      = EXCLUDED.workplace_count,
-                    workplace_avg_rating = EXCLUDED.workplace_avg_rating,
-                    interview_count      = EXCLUDED.interview_count,
-                    interview_avg_rating = EXCLUDED.interview_avg_rating,
-                    updated_at    = now()
-                """)
-            .execute()
-            .mapEmpty();
+        return db.query("SELECT company_stats_apply(NULL)").execute().mapEmpty();
     }
 
     /** Looks up a company by name (case-insensitive). */

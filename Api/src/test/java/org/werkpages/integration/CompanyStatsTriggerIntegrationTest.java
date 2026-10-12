@@ -34,6 +34,19 @@ import static org.junit.jupiter.api.Assertions.*;
  * <p>These tests drive the tables directly rather than going through a service, because the
  * guarantee under test belongs to the database: it must hold no matter which of the two
  * applications sharing this schema performed the write.
+ *
+ * <h2>The row-existence rule changed in V90</h2>
+ *
+ * This file originally asserted that the cached ROW IS DELETED when no qualifying managers remain.
+ * V90 replaced that with <b>one row per company whose status is not 'merged'</b>, because the old
+ * rule was destructive once managers stopped being the only dataset: a company rated as a
+ * workplace with no managers listed had its row - and the count of somebody's rating - deleted.
+ *
+ * <p>The GUARANTEE those tests were protecting is unchanged and still asserted below: a company
+ * with no qualifying managers must not advertise manager counts or ratings, and must not appear in
+ * the directory. That is now expressed as {@code manager_count = 0} plus the {@code manager_count
+ * > 0} filter every directory read already applies, instead of as the absence of a row. The
+ * assertions were updated to match; nothing they protected was dropped.
  */
 @Testcontainers
 class CompanyStatsTriggerIntegrationTest {
@@ -80,38 +93,43 @@ class CompanyStatsTriggerIntegrationTest {
     // ══════════════════════════════════════════════════════════════════════════
 
     @Test
-    void deletingLastManager_removesCachedStatsRow() throws Exception {
+    void deletingLastManager_zeroesCachedCounts() throws Exception {
         long companyId = insertCompany("Redwater Partnership");
         long managerId = insertManager("Solo Manager", companyId, "approved", null, 1, 4.1);
 
-        assertTrue(stats(companyId).isPresent(), "a qualifying manager must produce a cached row");
+        assertEquals(1L, stats(companyId).orElseThrow().getLong("manager_count"));
 
         await(pool.preparedQuery("DELETE FROM managers WHERE id = $1").execute(Tuple.of(managerId)));
 
-        assertTrue(stats(companyId).isEmpty(),
-            "with no managers left the cached row must be gone, not left advertising stale counts");
+        // The row remains (V90's rule) but must not advertise anything. In production the failure
+        // was a company showing "1 manager, 1 review, 4.1" with no managers left.
+        Row row = stats(companyId).orElseThrow();
+        assertEquals(0L, row.getLong("manager_count"), "no stale manager count");
+        assertEquals(0L, row.getLong("total_reviews"), "no stale review count");
+        assertNull(row.getBigDecimal("avg_rating"), "and no stale rating");
     }
 
     @Test
-    void demotingLastManagerOutOfPublicStatuses_removesCachedStatsRow() throws Exception {
+    void demotingLastManagerOutOfPublicStatuses_zeroesCachedCounts() throws Exception {
         long companyId = insertCompany("Rejected Co");
         long managerId = insertManager("Pending Pat", companyId, "approved", null, 2, 3.0);
-        assertTrue(stats(companyId).isPresent());
+        assertEquals(1L, stats(companyId).orElseThrow().getLong("manager_count"));
 
         await(pool.preparedQuery("UPDATE managers SET approval_status = 'rejected' WHERE id = $1")
             .execute(Tuple.of(managerId)));
 
-        assertTrue(stats(companyId).isEmpty(),
+        assertEquals(0L, stats(companyId).orElseThrow().getLong("manager_count"),
             "a manager leaving approved/ghost must not leave the company cached as populated");
     }
 
     @Test
-    void seedOnlyCompany_hasNoCachedStatsRow() throws Exception {
+    void seedOnlyCompany_countsNothing() throws Exception {
         long companyId = insertCompany("Seeded Only Co");
         insertManager("Seed Sam", companyId, "approved", "seed_123", 5, 4.9);
 
-        assertTrue(stats(companyId).isEmpty(),
-            "seed managers are excluded from these aggregates, so no row should exist");
+        assertEquals(0L, stats(companyId).orElseThrow().getLong("manager_count"),
+            "seed managers are excluded from these aggregates");
+        assertEquals(0L, stats(companyId).orElseThrow().getLong("total_reviews"));
     }
 
     // ══════════════════════════════════════════════════════════════════════════
@@ -153,7 +171,8 @@ class CompanyStatsTriggerIntegrationTest {
         await(pool.preparedQuery("UPDATE managers SET company_id = $1 WHERE id = $2")
             .execute(Tuple.of(toId, managerId)));
 
-        assertTrue(stats(fromId).isEmpty(), "the company left behind must be cleaned up");
+        assertEquals(0L, stats(fromId).orElseThrow().getLong("manager_count"),
+            "the company left behind must be recomputed, not left claiming the manager");
         assertEquals(1L, stats(toId).orElseThrow().getLong("manager_count"),
             "the destination company must pick the manager up");
     }

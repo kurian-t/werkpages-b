@@ -28,6 +28,7 @@ import org.werkpages.rest.handlers.IndustriesHandler;
 import org.werkpages.rest.handlers.InterviewsHandler;
 import org.werkpages.rest.handlers.CompanyRatingsHandler;
 import org.werkpages.rest.handlers.ProofChallengesHandler;
+import org.werkpages.service.CompanyStatsRebuilder;
 import org.werkpages.service.AdminService;
 import org.werkpages.service.AnthropicClient;
 import org.werkpages.rest.handlers.CompanyLogoUtils;
@@ -208,15 +209,94 @@ public class MainVerticle extends AbstractVerticle {
                                 .onFailure(err -> System.err.println(
                                     "⚠ anonymous_ghost_quota sweep failed: " + err.getMessage())));
 
-                        // Same initial-delay fix; staggered so the two sweeps do not start together.
+                        /*
+                          DETECT, RECORD, REPAIR, VERIFY - automatically. Same initial-delay fix;
+                          staggered so the two sweeps do not start together.
+
+                          Two earlier shapes of this job were both wrong. Originally it called
+                          refreshCompanyStats() every six hours, which made it a second writer of
+                          company_stats_live and blindly rewrote every row: a disagreement between
+                          the triggers and that query was repaired invisibly and nobody ever learned
+                          the triggers were wrong. It then became compare-and-complain, which told
+                          somebody there was drift and left the site inaccurate until a human acted.
+
+                          Now it compares, writes down what disagreed, repairs only those companies
+                          through the shared database implementation, re-checks them, and records the
+                          outcome. No button is required for the site to be accurate.
+                        */
+                        final CompanyStatsRebuilder companyStatsRebuilder =
+                            new CompanyStatsRebuilder(Database.getPool());
                         vertx.setPeriodic(120_000L, 6 * 3_600_000L, timerId -> {
                             if (statsRefreshRunning.compareAndSet(false, true)) {
-                                companyRepoForScheduler.refreshCompanyStats()
-                                    .onSuccess(v -> System.out.println("✓ company_stats_live reconciled from source"))
-                                    .onFailure(err -> System.err.println("⚠ company_stats_live reconciliation failed: " + err.getMessage()))
+                                companyStatsRebuilder.maintain()
+                                    .onSuccess(result -> {
+                                        if (!result.ran()) {
+                                            /*
+                                              Another sweep holds the lock - the other backend, or
+                                              an admin action. Ordinary. Not a heartbeat of WORK
+                                              though, which is why the staleness check below counts
+                                              only completed runs.
+                                            */
+                                            System.out.println("· company_stats maintenance skipped: " + result);
+                                        } else if (result.repairIncomplete()) {
+                                            // Repaired, re-checked, STILL wrong. Something is
+                                            // actively writing the table incorrectly and a repeat
+                                            // repair will not fix it.
+                                            System.err.println("⚠ company_stats_live REPAIR INCOMPLETE: " + result
+                                                + " - inspect company_stats_drift_log");
+                                        } else if (result.driftRecurring()) {
+                                            // Repairs ARE working, and the same companies keep
+                                            // breaking. Every individual run looks like a success,
+                                            // which is exactly why this needs saying out loud.
+                                            System.err.println("⚠ company_stats_live DRIFT RECURRING: " + result
+                                                + " - repairs are masking a live bug; see company_stats_recurring_drift(7, 2)");
+                                        } else if (result.driftFound() == 0) {
+                                            System.out.println("✓ company_stats_live agrees with source");
+                                        } else {
+                                            System.out.println("✓ company_stats_live repaired: " + result);
+                                        }
+                                    })
+                                    .onFailure(err -> {
+                                        /*
+                                          A sweep that ERRORS is its own alert condition. The
+                                          previous version only shouted about a completed-but-wrong
+                                          repair, so a SQL error, a lock timeout or a dropped
+                                          connection produced one line and no distinction from
+                                          healthy silence. The run is recorded as 'failed' inside
+                                          maintain(), after the sweep transaction has rolled back,
+                                          so repeated failure is visible in the run log too.
+                                        */
+                                        System.err.println("⚠ company_stats maintenance FAILED: " + err.getMessage()
+                                            + " - repeated failures are visible in company_stats_maintenance_runs");
+                                    })
                                     .onComplete(ignored -> statsRefreshRunning.set(false));
                             }
                         });
+
+                        /*
+                          Has maintenance been running at all?
+
+                          No process can reliably alert on its own death, so this is the next best
+                          thing: on every boot, check when a sweep last COMPLETED. If the timer died
+                          in the previous deployment, or the sweep lock was stuck, this is where it
+                          becomes visible rather than being inferred from stale numbers weeks later.
+                          company_stats_maintenance_age() is there for an external monitor to read
+                          on a schedule.
+                        */
+                        companyStatsRebuilder.timeSinceLastCompletedRun()
+                            .onSuccess(age -> {
+                                if (age.compareTo(CompanyStatsRebuilder.STALE_AFTER) > 0) {
+                                    System.err.println("⚠ company_stats maintenance last completed "
+                                        + age.toHours() + "h ago (threshold "
+                                        + CompanyStatsRebuilder.STALE_AFTER.toHours()
+                                        + "h) - the sweep may have stopped running");
+                                } else {
+                                    System.out.println("✓ company_stats maintenance last completed "
+                                        + age.toHours() + "h ago");
+                                }
+                            })
+                            .onFailure(err -> System.err.println(
+                                "⚠ could not read company_stats maintenance age: " + err.getMessage()));
 
                         // ── AI jobs (deduplication + industry classification) ──────────────────
                         DeduplicationJob          deduplicationJob;
@@ -236,7 +316,8 @@ public class MainVerticle extends AbstractVerticle {
                         // ── Handlers ──────────────────────────────────────────────────────────
                         ManagersHandler      managersHandler      = new ManagersHandler(managerService, vertx, jwtAuth);
                         ReportsHandler       reportsHandler       = new ReportsHandler(reportService);
-                        AdminHandler         adminHandler         = new AdminHandler(adminService, deduplicationJob, industryJob, roleService);
+                        AdminHandler         adminHandler         = new AdminHandler(adminService, deduplicationJob, industryJob, roleService)
+                                                                    .withCompanyStats(companyStatsRebuilder);
                         NotificationsHandler notificationsHandler = new NotificationsHandler(notifService);
                         ResumesHandler       resumesHandler       = new ResumesHandler(resumeService);
                         IndustriesHandler    industriesHandler    = new IndustriesHandler(industryService);
@@ -352,6 +433,9 @@ public class MainVerticle extends AbstractVerticle {
                         routerFactory.addHandlerByOperationId("adminUpdateCareerEntry",   adminHandler::handleUpdateCareerEntry);
                         routerFactory.addHandlerByOperationId("adminDeleteCareerEntry",   adminHandler::handleDeleteCareerEntry);
                         routerFactory.addHandlerByOperationId("getAdminCountryStats",     adminHandler::handleGetCountryStats);
+                        // The optional recovery tool. Normal accuracy needs neither of these.
+                        routerFactory.addHandlerByOperationId("maintainCompanyStats", adminHandler::handleCompanyStatsMaintain);
+                        routerFactory.addHandlerByOperationId("rebuildCompanyStats",  adminHandler::handleCompanyStatsRebuild);
                         routerFactory.addHandlerByOperationId("getMyResume",         resumesHandler::handleGetResume);
                         routerFactory.addHandlerByOperationId("saveMyResume",        resumesHandler::handleSaveResume);
                         routerFactory.addHandlerByOperationId("getResumePrefill",    resumesHandler::handleGetPrefill);
