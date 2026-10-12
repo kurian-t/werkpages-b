@@ -1621,6 +1621,100 @@ public class AdminService {
     }
 
 
+    /**
+     * Resolves a career stage that should not be on the profile.
+     *
+     * <h2>Why this exists separately from adminDeleteCareerEntry</h2>
+     *
+     * <p>That one deletes a {@code career_history} row, and the Delete control on the trajectory
+     * was therefore shown only on stages that had one. Most stages do not. The chart groups a
+     * manager's reviews by {@code reviews.manager_company}, so a stage appears wherever a review
+     * names a company, recorded role or not.
+     *
+     * <p>The consequence was a real one on a live profile: a placeholder review had captured a
+     * half-typed company name, and that fragment rendered as a complete career stage with its own
+     * rating, next to the manager's real employer. The admin had an Edit button and no way at all
+     * to remove it, because there was no row for the existing endpoint to delete. Fixing it took
+     * hand-written SQL against production.
+     *
+     * <h2>The two actions, and why both are needed</h2>
+     *
+     * <ul>
+     *   <li>{@code delete} removes the stage: its {@code career_history} row if it has one, and the
+     *       reviews that put it on the chart. For a stage invented by a placeholder this is the
+     *       whole repair.
+     *   <li>{@code reassign} moves the stage's reviews onto another role and removes the empty
+     *       stage. For when the company is wrong but the opinions are real: deleting them would
+     *       destroy somebody's genuine review to tidy up a chart.
+     * </ul>
+     *
+     * <p>A delete that would remove genuine reviews is refused unless {@code confirmRealReviews} is
+     * set. The caller has to have been told what it is about to destroy, and say so. Placeholders
+     * carry no such guard because nobody wrote them.
+     */
+    public Future<JsonObject> adminResolveCareerStage(String auth0Id, long managerId, JsonObject body) {
+        String action  = body.getString("action");
+        String company = body.getString("company");
+        if (company == null || company.isBlank())
+            return Future.failedFuture(ServiceException.badRequest("company is required"));
+        if (!"delete".equals(action) && !"reassign".equals(action))
+            return Future.failedFuture(ServiceException.badRequest("action must be 'delete' or 'reassign'"));
+
+        String toCompany = body.getString("toCompany");
+        String toTitle   = body.getString("toTitle");
+        if ("reassign".equals(action) && (toCompany == null || toCompany.isBlank()))
+            return Future.failedFuture(ServiceException.badRequest("toCompany is required to reassign"));
+        if ("reassign".equals(action) && toCompany.trim().equalsIgnoreCase(company.trim()))
+            return Future.failedFuture(ServiceException.badRequest("Cannot reassign a stage onto itself"));
+
+        boolean confirmReal = Boolean.TRUE.equals(body.getBoolean("confirmRealReviews"));
+
+        return requireAdmin(auth0Id)
+            .compose(adminId -> managerRepo.describeCareerStage(managerId, company))
+            .compose(stage -> {
+                int realReviews = stage.getInteger("real_reviews");
+                if ("delete".equals(action) && realReviews > 0 && !confirmReal) {
+                    /*
+                      Refused rather than silently obeyed. The count travels in the message so the
+                      caller can put a number in front of the person pressing the button: "this
+                      removes 2 real reviews" is a decision, "are you sure?" is not.
+                    */
+                    return Future.failedFuture(ServiceException.badRequest(
+                        "This stage holds " + realReviews + " real review"
+                      + (realReviews == 1 ? "" : "s")
+                      + ". Reassign them to another role, or confirm the deletion."));
+                }
+                return managerRepo.findCareerEntryIdByCompany(managerId, company)
+                    .compose(entryId -> {
+                        Future<Integer> reviewWork = "delete".equals(action)
+                            ? managerRepo.deleteCareerStageReviews(managerId, company)
+                            : managerRepo.reassignCareerStageReviews(managerId, company, toCompany, toTitle);
+                        return reviewWork.compose(affected -> {
+                            /*
+                              The row goes in both cases. After a reassign the stage has no reviews
+                              left, so a surviving career_history row would redraw the empty stage
+                              on the chart, which is the thing being removed.
+                            */
+                            Future<Integer> entryWork = entryId.isPresent()
+                                ? managerRepo.deleteCareerEntry(entryId.get(), managerId)
+                                : Future.succeededFuture(0);
+                            return entryWork.map(deletedEntries -> new int[]{ affected, deletedEntries });
+                        });
+                    });
+            })
+            // The cached rating and count are not maintained by any trigger, so they are rebuilt
+            // here. Without this the header keeps quoting a figure that included what was removed.
+            .compose(counts -> managerRepo.recalculate(managerId).map(v -> counts))
+            // Removing the current role must not leave the header advertising it, exactly as the
+            // single-entry delete above does.
+            .compose(counts -> managerRepo.syncHeadlineFromCareerHistory(managerId).map(v -> counts))
+            .map(counts -> new JsonObject()
+                .put("success", true)
+                .put("action", action)
+                .put("reviewsAffected", counts[0])
+                .put("entriesDeleted", counts[1]));
+    }
+
     // ── Captured drafts ───────────────────────────────────────────────────────
 
     /**

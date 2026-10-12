@@ -3474,6 +3474,58 @@ paths:
         '403':
           description: Forbidden
 
+  /api/admin/managers/{managerId}/career-stage:
+    post:
+      operationId: adminResolveCareerStage
+      summary: Delete or reassign a career stage, including one with no career-history row (admin only)
+      tags:
+        - Admin
+      parameters:
+        - name: managerId
+          in: path
+          required: true
+          schema:
+            type: integer
+            format: int64
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [action, company]
+              properties:
+                action:
+                  type: string
+                  enum: [delete, reassign]
+                company:
+                  type: string
+                  description: The stage's company, as it appears on the trajectory.
+                toCompany:
+                  type: string
+                  nullable: true
+                  description: Required when reassigning. The role the reviews move onto.
+                toTitle:
+                  type: string
+                  nullable: true
+                confirmRealReviews:
+                  type: boolean
+                  nullable: true
+                  description: >-
+                    Required to delete a stage that holds genuine reviews. Without it the request is
+                    refused and the count is returned in the message, so the caller can say what is
+                    about to be destroyed.
+      responses:
+        '200':
+          description: Stage resolved
+          content:
+            application/json:
+              schema:
+                type: object
+        '400':
+          description: Bad request, or refused because the stage holds real reviews
+        '403':
+          description: Forbidden
   /api/admin/managers/{managerId}/career-history/{entryId}:
     put:
       operationId: adminUpdateCareerEntry

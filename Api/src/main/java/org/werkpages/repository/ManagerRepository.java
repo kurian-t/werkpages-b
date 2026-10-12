@@ -5,6 +5,7 @@ import io.vertx.sqlclient.Pool;
 import io.vertx.sqlclient.Row;
 import io.vertx.sqlclient.RowSet;
 import io.vertx.sqlclient.SqlClient;
+import io.vertx.sqlclient.SqlResult;
 import io.vertx.sqlclient.Tuple;
 
 import java.math.BigDecimal;
@@ -907,6 +908,90 @@ public class ManagerRepository {
                 """)
             .execute(Tuple.of(entryId, managerId, company, title, startDate, endDate, companyId))
             .map(RowSet::rowCount);
+    }
+
+    /**
+     * What a career stage is actually made of, so an admin is told before they destroy it.
+     *
+     * <p>A stage on the trajectory is not necessarily a {@code career_history} row. Most are not:
+     * the chart groups a manager's reviews by {@code reviews.manager_company}, so a stage exists
+     * wherever a review claims one, whether or not anybody recorded the role. That is how a company
+     * nobody ever worked at can become a whole career stage, complete with a rating, from a single
+     * placeholder review that captured a half-typed company name.
+     *
+     * <p>Returns the seed count and the real count separately because they justify very different
+     * actions. Deleting placeholders is housekeeping. Deleting somebody's genuine review is not,
+     * and an admin pressing a button on a chart should be told which one they are about to do.
+     */
+    public Future<Row> describeCareerStage(long managerId, String company) {
+        return db.preparedQuery("""
+                SELECT
+                    COUNT(*)::INTEGER AS total_reviews,
+                    COUNT(*) FILTER (WHERE user_id IS NULL AND weight = TRUE)::INTEGER AS seed_reviews,
+                    COUNT(*) FILTER (WHERE NOT (user_id IS NULL AND weight = TRUE))::INTEGER AS real_reviews
+                FROM reviews
+                WHERE manager_id = $1
+                  AND LOWER(TRIM(COALESCE(manager_company, ''))) = LOWER(TRIM($2))
+                """)
+            .execute(Tuple.of(managerId, company))
+            .map(rows -> rows.iterator().next());
+    }
+
+    /**
+     * Removes every review belonging to one career stage.
+     *
+     * <p>Matched on the trimmed, lower-cased company exactly as {@link #describeCareerStage}
+     * counts them, so what is deleted is what the admin was shown. Matching on the raw string
+     * would let "Ro " and "Ro" be counted together and deleted apart.
+     */
+    public Future<Integer> deleteCareerStageReviews(long managerId, String company) {
+        return db.preparedQuery("""
+                DELETE FROM reviews
+                WHERE manager_id = $1
+                  AND LOWER(TRIM(COALESCE(manager_company, ''))) = LOWER(TRIM($2))
+                """)
+            .execute(Tuple.of(managerId, company))
+            .map(SqlResult::rowCount);
+    }
+
+    /**
+     * Moves a career stage's reviews onto another role.
+     *
+     * <p>For the case where the stage is wrong but the ratings are real: somebody's genuine review
+     * is sitting under a company name that should never have existed, and deleting it would throw
+     * away a real opinion to tidy up a chart.
+     *
+     * <p>The reviewer's own {@code worked_from} and {@code worked_until} are deliberately NOT
+     * touched. They are that person's statement about when they were there, not a property of the
+     * stage, and rewriting them to fit the target role would be inventing testimony. The visible
+     * effect is that the target stage may widen to cover the moved reviews' dates, which is
+     * correct: those months are now claimed under that role.
+     */
+    public Future<Integer> reassignCareerStageReviews(long managerId, String fromCompany,
+                                                      String toCompany, String toTitle) {
+        return db.preparedQuery("""
+                UPDATE reviews
+                SET manager_company = $3,
+                    manager_title   = COALESCE($4, manager_title),
+                    updated_at      = now()
+                WHERE manager_id = $1
+                  AND LOWER(TRIM(COALESCE(manager_company, ''))) = LOWER(TRIM($2))
+                """)
+            .execute(Tuple.of(managerId, fromCompany, toCompany, toTitle))
+            .map(SqlResult::rowCount);
+    }
+
+    /** The career_history row for a stage, when one exists. Matched the same way as the reviews. */
+    public Future<java.util.Optional<Long>> findCareerEntryIdByCompany(long managerId, String company) {
+        return db.preparedQuery("""
+                SELECT id FROM career_history
+                WHERE manager_id = $1 AND LOWER(TRIM(company)) = LOWER(TRIM($2))
+                ORDER BY start_date DESC LIMIT 1
+                """)
+            .execute(Tuple.of(managerId, company))
+            .map(rows -> rows.iterator().hasNext()
+                ? java.util.Optional.of(rows.iterator().next().getLong("id"))
+                : java.util.Optional.<Long>empty());
     }
 
     public Future<Integer> deleteCareerEntry(long entryId, long managerId) {

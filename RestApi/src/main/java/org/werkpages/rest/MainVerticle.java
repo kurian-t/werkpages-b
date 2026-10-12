@@ -432,6 +432,7 @@ public class MainVerticle extends AbstractVerticle {
                         routerFactory.addHandlerByOperationId("adminCreateCareerEntry",   adminHandler::handleCreateCareerEntry);
                         routerFactory.addHandlerByOperationId("adminUpdateCareerEntry",   adminHandler::handleUpdateCareerEntry);
                         routerFactory.addHandlerByOperationId("adminDeleteCareerEntry",   adminHandler::handleDeleteCareerEntry);
+                        routerFactory.addHandlerByOperationId("adminResolveCareerStage",  adminHandler::handleResolveCareerStage);
                         routerFactory.addHandlerByOperationId("getAdminCountryStats",     adminHandler::handleGetCountryStats);
                         // The optional recovery tool. Normal accuracy needs neither of these.
                         routerFactory.addHandlerByOperationId("maintainCompanyStats", adminHandler::handleCompanyStatsMaintain);

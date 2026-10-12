@@ -828,6 +828,28 @@ public class AdminHandler {
             .onFailure(err -> ManagersHandler.handleError(ctx, err));
     }
 
+    // ── POST /api/admin/managers/:managerId/career-stage ─────────────────────
+
+    /**
+     * Deletes or reassigns a whole career stage, including one with no career_history row.
+     *
+     * <p>The companion to {@link #handleDeleteCareerEntry}, which can only remove a recorded role.
+     * See {@code adminResolveCareerStage} for why a stage often has no row behind it.
+     */
+    public void handleResolveCareerStage(RoutingContext ctx) {
+        String auth0Id = ctx.get("auth0Id");
+        long managerId;
+        try {
+            managerId = Long.parseLong(ctx.pathParam("managerId"));
+        } catch (NumberFormatException e) { bad(ctx, "Invalid ID"); return; }
+        JsonObject body = ctx.getBodyAsJson();
+        if (body == null) { bad(ctx, "Request body required"); return; }
+        service.adminResolveCareerStage(auth0Id, managerId, body)
+            .onSuccess(json -> ctx.response().setStatusCode(200)
+                .putHeader("Content-Type", "application/json").end(json.encode()))
+            .onFailure(err -> ManagersHandler.handleError(ctx, err));
+    }
+
     // ── DELETE /api/admin/managers/:managerId/career-history/:entryId ────────
 
     public void handleDeleteCareerEntry(RoutingContext ctx) {
