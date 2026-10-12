@@ -696,7 +696,24 @@ public class ManagerService {
      * Idempotent, because the alternative is worse: a double-clicked submit or a retried request
      * would otherwise create the second Crumbl this whole effort exists to prevent.
      */
-    public Future<JsonObject> createCompany(String name) {
+    /**
+     * Create a company from a name, or return the one that name already resolves to.
+     *
+     * <p>Rate limited per person and per address. This is the only endpoint that turns free text
+     * into a public directory row, and it was the only write in the product with no per-user limit
+     * - managers, reviews and edits are each capped at 10 a day while this had nothing but the
+     * 30/minute per-IP write limiter, which permits 43,200 a day and is per address rather than per
+     * account.
+     *
+     * <p>The cap counts the user AND the hashed address together, so twelve accounts from one
+     * address are still twelve companies rather than one hundred and forty-four.
+     *
+     * <p><b>Returning an existing company does not count.</b> The endpoint is idempotent by design
+     * - a double-clicked submit must not mint a second row - and charging somebody for resolving a
+     * name that already exists would turn a safety feature into a penalty, and would let anybody
+     * exhaust their own allowance by retrying.
+     */
+    public Future<JsonObject> createCompany(String name, String auth0Id, String clientIp) {
         if (name == null || name.trim().length() < 2) {
             return Future.failedFuture(ServiceException.badRequest("Company name must be at least 2 characters"));
         }
@@ -704,16 +721,97 @@ public class ManagerService {
         return companyRepo.findByNormalizedName(trimmed).compose(existing -> {
             if (existing.isPresent()) {
                 Row row = existing.get();
+                // Resolving an existing name is free. See the note on idempotency above.
                 return Future.succeededFuture(new JsonObject()
                     .put("id", row.getLong("id"))
                     .put("name", row.getString("name"))
                     .put("created", false));
             }
-            return companyRepo.findOrCreate(trimmed, null, logoResolver.apply(trimmed))
-                .map(row -> new JsonObject()
-                    .put("id", row.getLong("id"))
-                    .put("name", row.getString("name"))
-                    .put("created", true));
+            // Only a genuinely new row is charged, and the check happens before the write.
+            return userRepo.findIdByAuth0Id(auth0Id).compose(createdBy ->
+                   companyRepo.countRecentCompanyCreations(createdBy.orElse(null), clientIp)
+                .compose(used -> {
+                    if (used >= SubmissionLimits.DAILY_COMPANIES) {
+                        return Future.failedFuture(ServiceException.tooManyRequests(
+                            "You have added as many companies as we allow in a day. "
+                          + "Please try again tomorrow."));
+                    }
+                    return companyRepo.findOrCreate(trimmed, null, logoResolver.apply(trimmed))
+                        .compose(row -> companyRepo.recordCompanyCreation(
+                                    createdBy.orElse(null), clientIp, row.getLong("id"))
+                            .map(ignored -> new JsonObject()
+                                .put("id", row.getLong("id"))
+                                .put("name", row.getString("name"))
+                                .put("created", true)));
+                }));
+        });
+    }
+
+    /**
+     * The company id for a row that is NOT being published, honouring the daily company cap.
+     *
+     * <p>Three anonymous paths - the exhausted-slot branch of {@code createGhostManager},
+     * {@code captureAnonymousSearch} and {@code createDropOffDraft} - create a
+     * {@code pending_approval} manager that nobody can see. Each one also called
+     * {@code companyRepo.resolve}, which creates the company when the name is new, and a created
+     * company is {@code status = 'ghost'}: publicly listed in the Companies tab the moment it
+     * exists (CLAUDE.md section 18).
+     *
+     * <p>So an anonymous caller could mint unlimited <b>public</b> companies by repeating a capture
+     * with a different company name each time, having published no manager at all. Nothing counted
+     * it: the only brake was the shared 30-writes-a-minute limiter, which allows 43,200 a day.
+     * Capping the authenticated endpoint alone would have left the larger hole open and keyed on
+     * the one identity that is harder to get.
+     *
+     * <h2>Over the cap, the capture still happens</h2>
+     *
+     * <p>This returns {@code null} rather than failing. The row is written with no company id and
+     * its free-text company name intact, which is the state section 17 already describes for a
+     * pending manager: "company_id is nullable because pending/rejected managers may not have a
+     * company entity attached yet". An admin approving it resolves the company then.
+     *
+     * <p>Failing instead would throw away the submission, which is the one thing the capture paths
+     * exist to prevent (section 44). The person is not the attacker here; the refusal is about not
+     * minting a public directory row, not about rejecting their work.
+     *
+     * <h2>What is NOT capped</h2>
+     *
+     * <p>The publishing branch of {@code createGhostManager} does not come through here. A
+     * published ghost is bounded already, and far more tightly: one per address per window via
+     * {@code anonymous_ghost_quota}, under a site-wide ceiling. It also must keep its company,
+     * because a public manager with no company would not appear under any company in the
+     * directory - and the section 41 invariant is that a tile is only rendered for a row the
+     * profile page serves properly.
+     *
+     * <p>Selecting an existing company costs nothing, and neither does naming one that already
+     * exists. Only a genuinely new row is charged, so ordinary use of these forms cannot exhaust
+     * the allowance.
+     */
+    private Future<Long> companyIdForCapture(Long companyId, String companyName,
+                                             String logoUrl, String clientIp) {
+        // An explicit selection is identity that already exists. Nothing is minted, nothing
+        // charged, and the id is honoured exactly as before.
+        if (companyId != null) {
+            return companyRepo.resolve(companyId, companyName, null, logoUrl).map(row -> row.getLong("id"));
+        }
+        if (isBlank(companyName)) return Future.succeededFuture(null);
+        String trimmed = companyName.trim();
+
+        return companyRepo.findByNormalizedName(trimmed).compose(existing -> {
+            // Already in the directory: resolving it creates nothing.
+            if (existing.isPresent()) return Future.succeededFuture(existing.get().getLong("id"));
+
+            return companyRepo.countRecentCompanyCreations(null, clientIp).compose(used -> {
+                if (used >= SubmissionLimits.DAILY_COMPANIES) {
+                    // Over the cap. The capture proceeds without a company row; see above.
+                    System.err.println("Company creation cap reached for this address; capturing \""
+                        + trimmed + "\" without a company row");
+                    return Future.succeededFuture((Long) null);
+                }
+                return companyRepo.findOrCreate(trimmed, null, logoUrl)
+                    .compose(row -> companyRepo.recordCompanyCreation(null, clientIp, row.getLong("id"))
+                        .map(ignored -> row.getLong("id")));
+            });
         });
     }
 
@@ -2985,7 +3083,27 @@ public class ManagerService {
         boolean isAuthor = viewerId != null
                         && row.getColumnIndex("user_id") >= 0
                         && viewerId.equals(row.getUUID("user_id"));
-        boolean maskDates = datesHidden && !isAuthor;
+        /*
+          A SEEDED review has no period to publish.
+
+          createSeedReview invents worked_from as "created_at minus 12-36 months" (ReviewRepository),
+          so the date is a plausible-looking fiction nobody ever stated. That was harmless while a
+          ghost manager had no career history - and stopped being harmless the moment one was added:
+          effective_worked_until caps the review at the manager's departure, and a cap earlier than
+          an invented start printed "Jun 2024 - Jan 2019" on a live profile. An end before its own
+          beginning, on a date nobody chose.
+
+          Treating a weighted review exactly as a hidden one is the honest fix, and it needs no new
+          concept: the dates simply are not published. The card already renders no period line when
+          both are absent, so nothing shows rather than something false. Clamping the invented date
+          to the manager's tenure was the alternative and it is worse - it would dress the fiction
+          up as corroborated.
+
+          Not expressed as datesHidden, because that flag is a person's privacy CHOICE and drives
+          the edit form's toggle. A seed has no author and no choice to represent.
+        */
+        boolean weighted  = row.getColumnIndex("weight") >= 0 && Boolean.TRUE.equals(row.getBoolean("weight"));
+        boolean maskDates = (datesHidden && !isAuthor) || weighted;
         return new JsonObject()
             .put("id",            row.getUUID("id"))
             .put("managerId",     row.getLong("manager_id"))
@@ -3452,9 +3570,34 @@ public class ManagerService {
                         }
 
                     // Manager not found: ghost/pending flow (regardless of contribution status).
-                    boolean shortNames = fullName.trim().length() < 4 || company.trim().length() < 4;
+                    boolean shortPerson  = fullName.trim().length() < 4;
+                    boolean shortCompany = company.trim().length() < 4;
 
-                    if (shortNames) {
+                    /*
+                      A company chosen from the dropdown is exempt from the company half of this
+                      guard. The person's own name is not, and is still judged on its own.
+
+                      The rule exists to stop a ghost being minted from a few characters somebody
+                      was still typing. It was never meant to refuse the short employers that are
+                      genuinely short - IBM, SAP, BBC, EY, 3M - and it did: a reader who picked IBM
+                      from the suggestions and searched for their manager got an empty result and no
+                      explanation, because three characters looked like an unfinished word.
+
+                      A selection is not an unfinished word. It carries the id of a row already in
+                      the directory, so there is nothing left to guess at. Typed text of three
+                      characters or fewer with nothing selected still gates, exactly as before.
+
+                      Verified rather than trusted: `companyId` comes from the request body, so the
+                      claim is checked against `companies` and against the text that accompanied it.
+                      An id that names no row, or names a different company than the text does, is
+                      treated as no selection at all and gates.
+                    */
+                    Future<Boolean> companyWasSelected = shortCompany
+                        ? companyRepo.isSelectedCompany(companyId, company)
+                        : Future.succeededFuture(false);
+
+                    return companyWasSelected.compose(selected -> {
+                    if (shortPerson || (shortCompany && !selected)) {
                         // Short name — can't safely ghost. Return empty; user can add explicitly.
                         return Future.succeededFuture(
                             new JsonObject()
@@ -3588,6 +3731,7 @@ public class ManagerService {
                             });
                     });
                     }); // isListedName guard
+                    }); // short-company dropdown waiver
                     }); // findByCompanyExact fuzzy-guard
                 });
             });
@@ -3772,13 +3916,26 @@ public class ManagerService {
                             ? ghostSlots.claim(clientIp)
                             : Future.succeededFuture(false));
 
+                /*
+                  The company is resolved differently depending on whether this will publish.
+
+                  A published ghost always gets its company: it is live and must appear under that
+                  company in the directory, and it is bounded to one per address per window
+                  already. An unpublished capture goes through the daily cap instead, which can
+                  hand back no company id at all - see companyIdForCapture. Both branches wrote a
+                  new public company row before, so a caller whose ghost slot was long gone could
+                  still mint companies indefinitely.
+                */
                 return mayPublish.compose(publish ->
-                    companyRepo.resolve(body.getLong("companyId"), company, null, resolvedLogoUrl)
-                    .compose(companyRow -> publish
+                    (publish
+                        ? companyRepo.resolve(body.getLong("companyId"), company, null, resolvedLogoUrl)
+                              .map(companyRow -> companyRow.getLong("id"))
+                        : companyIdForCapture(body.getLong("companyId"), company, resolvedLogoUrl, clientIp))
+                    .compose(resolvedCompanyId -> publish
                         ? managerRepo.createAutoApproved(name, company, title, country, fState, fCity,
-                                                         null, resolvedLogoUrl, companyRow.getLong("id"))
+                                                         null, resolvedLogoUrl, resolvedCompanyId)
                         : managerRepo.createCapturedDraft(name, company, title, country, fState, fCity,
-                                                          resolvedLogoUrl, companyRow.getLong("id")))
+                                                          resolvedLogoUrl, resolvedCompanyId))
                     .recover(err -> {
                         // The quota was spent before the insert was attempted, so a failure here
                         // would otherwise cost this address its window for nothing.
@@ -3901,9 +4058,12 @@ public class ManagerService {
             // If it's already pending (from a prior anonymous capture), skip — don't duplicate.
             .compose(rows -> {
                 if (rows.iterator().hasNext()) return Future.<Void>succeededFuture(); // already exists
-                return companyRepo.resolve(body.getLong("companyId"), fCompany, null, resolvedLogoUrl)
-                    .compose(companyRow -> managerRepo.createPending(
-                        name, fCompany, fTitle, "active", country, fState, resolvedLogoUrl, companyRow.getLong("id")))
+                // Capped: this row is pending_approval and never public, so it must not be
+                // able to mint public company rows without limit.
+                return companyIdForCapture(body.getLong("companyId"), fCompany, resolvedLogoUrl,
+                                           submission.clientIp())
+                    .compose(resolvedCompanyId -> managerRepo.createPending(
+                        name, fCompany, fTitle, "active", country, fState, resolvedLogoUrl, resolvedCompanyId))
                     .mapEmpty();
             });
     }
@@ -4003,8 +4163,11 @@ public class ManagerService {
                             .map(ignored -> new JsonObject().put("id", existingId).put("created", false));
                     }
                 } else {
-                    return companyRepo.resolve(body.getLong("companyId"), company, null, resolvedLogoUrl)
-                        .compose(companyRow -> managerRepo.createPending(name, company, title, fStatus, country, fState, resolvedLogoUrl, companyRow.getLong("id")))
+                    // Capped, as in captureAnonymousSearch: a drop-off draft is pending and
+                    // never public, and must not mint public companies without limit.
+                    return companyIdForCapture(body.getLong("companyId"), company, resolvedLogoUrl,
+                                               submission.clientIp())
+                        .compose(resolvedCompanyId -> managerRepo.createPending(name, company, title, fStatus, country, fState, resolvedLogoUrl, resolvedCompanyId))
                         .compose(managerRow -> {
                             long managerId = managerRow.getLong("id");
                             return validateAndInsertReview(review, managerId, null, fAuthor, resolvedLogoUrl, fDropOffToken, true, submission)

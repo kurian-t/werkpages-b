@@ -909,6 +909,68 @@ class ReviewIntegrationTest {
             "but the card cannot say Present for a manager who has gone");
     }
 
+    /**
+     * A seeded review publishes no working period at all.
+     *
+     * <h2>What went wrong in production</h2>
+     *
+     * A live profile showed "Jun 2024 - Jan 2019" - an end five years before its start.
+     *
+     * {@code createSeedReview} invents {@code worked_from} as "created_at minus 12-36 months", so
+     * the date is a plausible-looking fiction nobody stated, and it carries the day-of-month of the
+     * creation date rather than the day 01 that {@code parseYearMonth} always writes. That is how
+     * the affected rows were identified: all three had a worked_from whose day matched their
+     * created_at.
+     *
+     * <p>It was harmless while the ghost manager had no career history. Adding real history later
+     * made {@code effective_worked_until} cap the review at the manager's departure - and nothing
+     * required the cap to follow the start. The validation that would have refused this
+     * ("Your 'from' date cannot be after the manager's end date") never ran, because the career
+     * history did not exist when the seed was written.
+     *
+     * <h2>Why masking rather than fixing the date</h2>
+     *
+     * Dropping the cap would print "Present" for a manager who left in 2019: an impossible claim
+     * swapped for a false one. Clamping the invented date into the manager's tenure would dress the
+     * fiction up as corroborated. A seed has no author and never stated a period, so the honest
+     * outcome is to publish none - the card renders no period line when both dates are absent.
+     */
+    @Test
+    void seededReview_publishesNoWorkingPeriod() throws Exception {
+        long mgr = insertManager("Seeded Period Mgr", "SeedCorp", "SeedTitle");
+
+        // A seed review, exactly as createSeedReview writes one: weighted, with an invented start
+        // and no end.
+        await(pool.preparedQuery("""
+                INSERT INTO reviews(manager_id, author, overall_rating, manager_company,
+                                    manager_title, worked_from, weight)
+                VALUES ($1, 'SeedAuthor42', 4.2, 'SeedCorp', 'SeedTitle',
+                        DATE '2024-06-24', TRUE)
+                """).execute(Tuple.of(mgr)).mapEmpty());
+
+        // The manager left that role in 2019 - BEFORE the invented start, which is what produced
+        // the backwards range.
+        await(pool.preparedQuery(
+                "INSERT INTO career_history(manager_id, company, title, start_date, end_date) "
+              + "VALUES ($1, 'SeedCorp', 'SeedTitle', $2, $3)")
+            .execute(Tuple.of(mgr,
+                java.time.OffsetDateTime.parse("2013-08-01T00:00:00Z"),
+                java.time.OffsetDateTime.parse("2019-01-01T00:00:00Z")))
+            .mapEmpty());
+
+        io.vertx.core.json.JsonObject result =
+            (io.vertx.core.json.JsonObject) await(service.getManagerReviews(mgr, 50, 0, "recent", null));
+        io.vertx.core.json.JsonObject review = result.getJsonArray("data").getJsonObject(0);
+
+        assertNull(review.getString("workedFrom"),
+            "a seeded review never stated a start date, so none may be published - "
+          + "this invented date is what rendered \"Jun 2024\" on a live profile");
+        assertNull(review.getString("workedUntil"));
+        assertNull(review.getString("effectiveWorkedUntil"),
+            "and the cap must not leak the end through the back door, which is what produced "
+          + "\"Jun 2024 - Jan 2019\"");
+    }
+
     @Test
     void getMyReviews_unknownUser_returns404() {
         ServiceException ex = assertServiceException(service.getMyReviews("auth0|no-such-user", 50, 0));

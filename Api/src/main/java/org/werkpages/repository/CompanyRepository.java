@@ -151,6 +151,36 @@ public class CompanyRepository {
      * the stale-page case: somebody opened the form, an admin merged the company underneath them,
      * and their submission should land on the surviving company rather than on a headstone.
      */
+    /**
+     * Whether this id and this text are one company the directory already holds.
+     *
+     * <p>Answers "did they pick this from the dropdown", for the one caller that needs to waive a
+     * guard on the strength of a selection. Both halves are required:
+     *
+     * <ul>
+     *   <li>the <b>id must name a row</b>, because it arrives in the request body and a client's
+     *       claim is not evidence (CLAUDE.md section 24). An id naming nothing is not a selection;
+     *   <li>the <b>name must agree</b> with the text, because an id borrowed from a real company
+     *       and pasted beside unrelated text is not a selection either. A genuine pick always
+     *       sends the suggestion's own name.
+     * </ul>
+     *
+     * <p>Compared on {@code LOWER(TRIM(name))} - the same expression the uniqueness index uses -
+     * so casing and stray spaces do not make a real selection look forged.
+     *
+     * <p>Returns false for a null id or blank text rather than throwing: the callers treat "not a
+     * selection" and "cannot tell" identically, and both must take the guarded path.
+     */
+    public Future<Boolean> isSelectedCompany(Long companyId, String typedName) {
+        if (companyId == null || typedName == null || typedName.isBlank()) {
+            return Future.succeededFuture(false);
+        }
+        return db.preparedQuery(
+                "SELECT 1 FROM companies WHERE id = $1 AND LOWER(TRIM(name)) = LOWER(TRIM($2))")
+            .execute(Tuple.of(companyId, typedName))
+            .map(rows -> rows.iterator().hasNext());
+    }
+
     public Future<Row> resolve(Long companyId, String name, String domain, String logoUrl) {
         if (companyId == null) return findOrCreate(name, domain, logoUrl);
         return db.preparedQuery("SELECT * FROM companies WHERE id = $1")
@@ -721,7 +751,12 @@ public class CompanyRepository {
      * record of what was wrong.
      */
     public Future<Void> refreshCompanyStats() {
-        return db.query("SELECT company_stats_apply(NULL)").execute().mapEmpty();
+        // Both read tables over these sources. V93 added the second one; recomputing only the
+        // first here would leave the company page's interview figures untouched by a refresh that
+        // claims to have rebuilt the company statistics.
+        return db.query("SELECT company_stats_apply(NULL)").execute()
+            .compose(ignored -> db.query("SELECT company_interview_stats_apply(NULL)").execute())
+            .mapEmpty();
     }
 
     /** Looks up a company by name (case-insensitive). */
@@ -1697,5 +1732,79 @@ public class CompanyRepository {
                 """)
             .execute(Tuple.of(companyId, name.trim()))
             .map(rows -> rows.rowCount() > 0);
+    }
+
+    /**
+     * How many companies this person, or this address, has created in the last day.
+     *
+     * <p>Both are counted together rather than separately: switching accounts must not hand out a
+     * fresh allowance, and sharing an address must not inherit a stranger's usage as a penalty
+     * beyond the same shared total.
+     */
+    public Future<Long> countRecentCompanyCreations(UUID userId, String clientIp) {
+        return db.preparedQuery("SELECT company_creation_count($1, $2, 24) AS used")
+            .execute(Tuple.of(userId, hashAddress(clientIp)))
+            .map(rows -> rows.iterator().next().getLong("used"));
+    }
+
+    /**
+     * The address, hashed, or null when there is no address to hash.
+     *
+     * <p>Null rather than a constant for an unidentifiable caller: bucketing every unknown address
+     * together would make one person's twelve exhaust the allowance for everybody we cannot
+     * identify. The user half of the count still applies.
+     */
+    private static String hashAddress(String clientIp) {
+        if (clientIp == null || clientIp.isBlank()) return null;
+        try {
+            java.security.MessageDigest digest = java.security.MessageDigest.getInstance("SHA-256");
+            digest.update(quotaSalt().getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            // Domain separation from the ghost-slot hash of the same address. Both are derived from
+            // one configured salt, so the two quota tables cannot be joined on the hash to follow
+            // one address between them, while each table stays internally consistent.
+            digest.update(COMPANY_QUOTA_DOMAIN.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            return java.util.HexFormat.of().formatHex(
+                digest.digest(clientIp.trim().getBytes(java.nio.charset.StandardCharsets.UTF_8)));
+        } catch (java.security.NoSuchAlgorithmException impossible) {
+            throw new IllegalStateException("SHA-256 unavailable", impossible);  // required of every JVM
+        }
+    }
+
+    /**
+     * The domain tag mixed into the company-quota address hash.
+     *
+     * <p>Identical in both backends on purpose. Werkpages and RateMyManagers write to the one
+     * shared {@code company_creation_quota} table, so a salt or tag that differed between them
+     * would hash the same address two ways and hand out the daily allowance twice - once per
+     * brand - against a single shared directory. Do not brand this string.
+     */
+    private static final String COMPANY_QUOTA_DOMAIN = "company-quota:";
+
+    /**
+     * The configured hash salt, shared with the ghost-slot quota.
+     *
+     * <p>Same variable and same development fallback as
+     * {@code AnonymousGhostSlotRepository}: one deployment secret covers every address hash, and
+     * both backends must agree on it or the shared quota table splits in two.
+     */
+    private static String quotaSalt() {
+        String configured = System.getenv("GHOST_SLOT_SALT");
+        return (configured == null || configured.isBlank()) ? "werkpages-ghost-slot" : configured;
+    }
+
+    /**
+     * Records that a company was created, for the daily cap.
+     *
+     * <p>The address is stored hashed and never in the clear - this is a rate control, not a record
+     * of who created what from where. Failure here is swallowed deliberately: losing a quota row is
+     * a smaller harm than failing a company creation that has already succeeded, and the next
+     * creation is still counted.
+     */
+    public Future<Void> recordCompanyCreation(UUID userId, String clientIp, Long companyId) {
+        return db.preparedQuery(
+                "INSERT INTO company_creation_quota(user_id, ip_hash, company_id) VALUES ($1, $2, $3)")
+            .execute(Tuple.of(userId, hashAddress(clientIp), companyId))
+            .map(rows -> (Void) null)
+            .otherwise((Void) null);
     }
 }

@@ -35,6 +35,18 @@ public final class SubmissionLimits {
     public static final int DAILY_EDITS = 10;
 
     /**
+     * How many NEW companies one person, or one address, may create in a day.
+     *
+     * <p>Higher than the others because adding a company is usually incidental - somebody naming
+     * the employer of the manager they are rating - rather than the contribution itself. Twelve is
+     * generous for that and still bounds the one endpoint that turns free text into a public
+     * directory row.
+     *
+     * <p>Resolving a name that already exists does not count against it.
+     */
+    public static final int DAILY_COMPANIES = 12;
+
+    /**
      * Interview experiences per day.
      *
      * Lower than the others deliberately: an interview review is about a company rather than a

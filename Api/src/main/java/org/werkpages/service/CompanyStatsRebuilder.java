@@ -246,9 +246,23 @@ public class CompanyStatsRebuilder {
                         return Future.failedFuture(new IllegalStateException(
                             "another company_stats maintenance run is in progress"));
                     }
+                    /*
+                      Both projections, in this one transaction.
+
+                      company_interview_stats is the second incrementally maintained read table
+                      over the same sources (V93), and a rebuild that recomputed only the first
+                      would answer "get back to correct" with "half of it". They share the
+                      per-company advisory lock, so doing them together costs one lock acquisition
+                      per company rather than two, and either both land or neither does.
+                    */
                     return conn.query("SELECT company_stats_apply(NULL) AS written")
                         .execute()
-                        .map(rows -> rows.iterator().next().getLong("written"));
+                        .compose(rows -> {
+                            long live = rows.iterator().next().getLong("written");
+                            return conn.query("SELECT company_interview_stats_apply(NULL) AS written")
+                                .execute()
+                                .map(ivRows -> live + ivRows.iterator().next().getLong("written"));
+                        });
                 }));
     }
 
@@ -290,12 +304,28 @@ public class CompanyStatsRebuilder {
             .otherwise(NEVER_RUN);
     }
 
-    /** Recompute just these companies, through the shared implementation. */
+    /**
+     * Recompute just these companies, through the shared implementation.
+     *
+     * <p>Both projections, for the reason given on {@link #rebuild()}: they summarise the same
+     * sources, and recomputing one of them for a company leaves the other saying something else
+     * about it.
+     *
+     * <p>Returns the number of {@code company_stats_live} rows written, which is one per company.
+     * The interview projection has a row only for a company that has interview reviews, so adding
+     * its count here would make the figure mean neither "companies" nor "rows".
+     */
     public Future<Long> apply(List<Long> companyIds) {
         if (companyIds == null || companyIds.isEmpty()) return Future.succeededFuture(0L);
+        Long[] ids = companyIds.toArray(new Long[0]);
         return db.preparedQuery("SELECT company_stats_apply($1) AS written")
-            .execute(Tuple.of(companyIds.toArray(new Long[0])))
-            .map(rows -> rows.iterator().next().getLong("written"));
+            .execute(Tuple.of(ids))
+            .compose(rows -> {
+                long written = rows.iterator().next().getLong("written");
+                return db.preparedQuery("SELECT company_interview_stats_apply($1)")
+                    .execute(Tuple.of(ids))
+                    .map(ignored -> written);
+            });
     }
 
     /** One discrepancy between the source tables and the projection. */

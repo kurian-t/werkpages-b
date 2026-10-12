@@ -286,7 +286,9 @@ public class ManagersHandler {
         // Authenticated: creating a company is a write, and an anonymous caller could otherwise
         // fill the directory with names nobody chose.
         AuthTokenUtils.verifiedAuth0Id(ctx, jwtAuth)
-            .compose(auth0Id -> service.createCompany(name))
+            // The address is passed for the daily cap, hashed before it is stored and never kept
+            // in the clear - twelve accounts from one address are still twelve companies.
+            .compose(auth0Id -> service.createCompany(name, auth0Id, RateLimitHandler.clientIpOf(ctx)))
             .onSuccess(json -> respond(ctx, 200, json))
             .onFailure(err -> handleError(ctx, err));
     }
@@ -741,7 +743,10 @@ public class ManagersHandler {
         GeoUtils.stampGeo(ctx, body);
         String company = body != null ? body.getString("company") : null;
         String logoUrl = CompanyLogoUtils.resolveLogoUrl(company);
-        service.createDropOffDraft(body, logoUrl, SubmissionContext.of(GeoUtils.observed(ctx), body))
+        // The address is carried for the daily company cap. The two-argument overload leaves it
+        // null, which would have made the cap on this path quietly do nothing.
+        service.createDropOffDraft(body, logoUrl,
+            SubmissionContext.of(GeoUtils.observed(ctx), body, RateLimitHandler.clientIpOf(ctx)))
             .onSuccess(json -> {
                 int status = Boolean.TRUE.equals(json.getBoolean("created")) ? 201 : 200;
                 ctx.response().setStatusCode(status).putHeader("Content-Type", "application/json").end(json.encode());
@@ -757,8 +762,11 @@ public class ManagersHandler {
         GeoUtils.stampGeo(ctx, body);
         String company = body.getString("company");
         String logoUrl = CompanyLogoUtils.resolveLogoUrl(company);
+        // As above: the address is needed for the company cap, and withoutDeclared() keeps it
+        // while dropping the half that must never be published.
         service.captureAnonymousSearch(body, logoUrl,
-            SubmissionContext.of(GeoUtils.observed(ctx), body).withoutDeclared())
+            SubmissionContext.of(GeoUtils.observed(ctx), body, RateLimitHandler.clientIpOf(ctx))
+                .withoutDeclared())
             .onSuccess(v -> ctx.response().setStatusCode(202).end())
             .onFailure(err -> handleError(ctx, err));
     }

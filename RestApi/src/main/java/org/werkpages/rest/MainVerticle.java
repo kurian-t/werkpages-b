@@ -577,6 +577,33 @@ public class MainVerticle extends AbstractVerticle {
                             secCtx.next();
                         });
 
+                        /*
+                          Log EVERY failure that reaches the router, including the ones errorHandler
+                          never sees.
+
+                          router.errorHandler(500, ...) below only runs when the failure can still
+                          be turned into a response. An exception raised AFTER the response has
+                          ended - the shape that async work following a 202 produces - skips it
+                          entirely, and Vert.x logs a bare "Unhandled exception in router" with no
+                          method, no path and no stack trace.
+
+                          That happened in production and cost an evening: one SEVERE line, nothing
+                          to tie it to a request, nothing to debug. This runs first, logs what is
+                          actually needed, and does not interfere with the response handling below.
+                        */
+                        router.route().failureHandler(ctx -> {
+                            Throwable t = ctx.failure();
+                            if (t != null) {
+                                System.err.println("⚠ Router failure on " + ctx.request().method()
+                                    + " " + ctx.request().path()
+                                    + " (status " + ctx.statusCode()
+                                    + ", responseEnded=" + ctx.response().ended() + ")");
+                                t.printStackTrace(System.err);
+                            }
+                            // Never terminate here: the handlers below own the response.
+                            ctx.next();
+                        });
+
                         router.errorHandler(500, ctx -> {
                             Throwable t = ctx.failure();
                             if (t != null) {
