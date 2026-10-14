@@ -1686,6 +1686,77 @@ paths:
                   created:
                     type: boolean
 
+  /api/managers/search:
+    post:
+      operationId: searchManagers
+      summary: Submit a completed manager search
+      description: >
+        A COMPLETED four-field search, as opposed to the read-only discovery served by
+        GET /api/managers. This is a POST because it WRITES: a finished search resolves the
+        company and creates it when we do not hold it yet, which is a state change and must not
+        sit behind a GET. A crawler, a link prefetch or a retried URL would otherwise create
+        company rows on its own.
+
+        Matching itself is identical to the GET, and nothing here publishes a manager. Manager
+        creation stays with find-or-create and the ghost endpoint.
+      tags:
+        - Managers
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - firstName
+                - lastName
+              properties:
+                firstName:
+                  type: string
+                lastName:
+                  type: string
+                title:
+                  type: string
+                  nullable: true
+                company:
+                  type: string
+                  nullable: true
+                companyId:
+                  type: integer
+                  format: int64
+                  nullable: true
+                  description: A company the person PICKED from suggestions, if any. Validated server-side.
+                limit:
+                  type: integer
+                  default: 8
+                offset:
+                  type: integer
+                  default: 0
+      responses:
+        '200':
+          description: Ranked matches for the submitted name
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/ManagerSummary'
+                  total:
+                    type: integer
+                  hasMore:
+                    type: boolean
+                  moreMatchesMayExist:
+                    type: boolean
+                    description: >
+                      The candidate scan hit its budget, so classification may be incomplete.
+                      This is NOT the same as hasMore, which only says another page exists.
+        '400':
+          description: Missing or invalid name
+
   /api/managers:
     get:
       operationId: getManagers

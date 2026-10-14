@@ -1,6 +1,7 @@
 package org.werkpages.service;
 
 import io.vertx.core.Future;
+import io.vertx.core.Promise;
 import io.vertx.core.json.JsonArray;
 import io.vertx.core.json.JsonObject;
 import io.vertx.sqlclient.Pool;
@@ -838,6 +839,34 @@ public class ManagerService {
     public Future<JsonArray> suggestCompanyLocations(Long companyId, String companyName, String query,
                                                      String country, String state) {
         if (query == null || query.trim().length() < 2) return Future.succeededFuture(new JsonArray());
+        /*
+          Bounded on input length before anything else: the token work is linear in the number of
+          words, and an arbitrarily long paste should not become an arbitrarily large query.
+        */
+        String trimmed = query.trim();
+        if (trimmed.length() > 120) trimmed = trimmed.substring(0, 120);
+
+        /*
+          THE LOCAL INDEX IS NOT A REPLACEMENT FOR THIS QUERY.
+
+          It was wired in at the top of this method, returning its results INSTEAD of everything
+          below. That dropped both Postgres tiers whenever the local index answered, and they are
+          the tiers that must not be dropped: the buildings this company already has (carrying the
+          company_location_id the frontend persists) and the geography somebody already confirmed
+          for it. Losing them meant a branch that already existed stopped being offered, so the
+          next person to name it created a SECOND row for the same building - the exact duplication
+          CompanyLocationRepository.findOrCreate exists to prevent.
+
+          The local index substitutes for ONE tier, the corpus buildings read, inside
+          appendCorpusSuggestions where that read already happens. Everything else - the company
+          filter, the country and state filters, the suggestion cap, the dedup, the seat allocation
+          between coarse and exact answers - is left where it is and keeps applying.
+        */
+        return localSearchable(companyId, companyName, trimmed, country, state);
+    }
+
+    private Future<JsonArray> localSearchable(Long companyId, String companyName, String query,
+                                              String country, String state) {
         return new org.werkpages.repository.CompanyLocationRepository(db)
             .suggest(companyId, companyName, query, country, state)
             .map(rows -> {
@@ -867,6 +896,374 @@ public class ManagerService {
                 return out;
             })
             .compose(confirmed -> appendCorpusSuggestions(confirmed, companyName, query, country, state));
+    }
+
+    /**
+     * Whether a coarse row is the thing that was typed, rather than merely sharing a word with it.
+     *
+     * <p>Decides whether the expensive buildings file is read. A geography label leads with its own
+     * name - "Elk Grove, California, United States" - so a query the coarse file genuinely answers
+     * is a prefix of some label. "toronto" is; "canada goose" is not, and neither is a street
+     * address, which is how both reach the buildings they need.
+     *
+     * <p>Compared on a collapsed, lower-cased form so punctuation and spacing do not decide it.
+     */
+    static boolean geographyAnswers(JsonArray geography, String query) {
+        if (geography == null || geography.isEmpty()) return false;
+        String needle = collapse(query);
+        if (needle.isEmpty()) return false;
+        for (int i = 0; i < geography.size(); i++) {
+            JsonObject row = geography.getJsonObject(i);
+            if (row == null) continue;
+            /*
+              Built from the row's own fields, because a raw corpus row has no "label" yet.
+
+              This read getString("label"), which is null at this stage - the label is composed
+              later, when a suggestion is built. So the comparison was always against an empty
+              string, the gate never fired, and every keystroke read the 16.1M-row buildings file.
+              The instrumentation added alongside it is what caught this: the decision column said
+              a number on every single query and "skipped" on none.
+            */
+            String name  = row.getString("name");
+            String state = row.getString("stateName");
+            String text  = collapse(name + " " + (state == null ? "" : state));
+            if (text.startsWith(needle)) return true;
+        }
+        return false;
+    }
+
+    /** Lower-cased, punctuation-free, single-spaced, for comparing a typed query with a label. */
+    static String collapse(String value) {
+        if (value == null) return "";
+        return value.toLowerCase().replaceAll("[^a-z0-9]+", " ").trim();
+    }
+
+    /**
+     * Whether some building matched the query as a phrase, rather than only its stripped reading.
+     *
+     * <p>Carried from the corpus query, where the distinction is made: a row matching every token
+     * separately is a weak signal ("Northwest Face and Body" contains both words of "North Face"),
+     * while a row containing the typed phrase is strong evidence that an employer was meant.
+     */
+    static boolean hasLiteralPlace(JsonArray places) {
+        if (places == null) return false;
+        for (int i = 0; i < places.size(); i++) {
+            JsonObject row = places.getJsonObject(i);
+            if (row != null && Boolean.TRUE.equals(row.getBoolean("literalHit"))) return true;
+        }
+        return false;
+    }
+
+    // ── Local corpus search (feature-flagged) ────────────────────────────────
+
+    /**
+     * The local corpus pool, or null when local search is off or no usable release is published.
+     *
+     * <p>Built once at startup, not per request: opening a multi-gigabyte database for a keystroke
+     * would cost more than the search. Null is a supported state and means every suggestion falls
+     * through to the existing remote path, so a missing or incompatible artifact degrades the
+     * feature rather than the application.
+     */
+    /*
+      RESOLVED ON FIRST USE, not at class load.
+
+      It was a `static final` assigned from a static initialiser, which had two costs. Opening
+      several DuckDB connections ran during class initialisation, so a slow or broken release
+      delayed the first request that touched this class rather than the search it belongs to. And
+      nothing could ever enable it in a test: the field was fixed before any test could set an
+      environment variable, so the whole local path - including the defect where it REPLACED the
+      Postgres tiers - was unreachable by the test suite and had to be verified by hand.
+    */
+    private static volatile org.werkpages.repository.LocalCorpusPool localPool;
+    private static volatile boolean localPoolResolved;
+
+    private static org.werkpages.repository.LocalCorpusPool localPool() {
+        if (!localPoolResolved) {
+            synchronized (ManagerService.class) {
+                if (!localPoolResolved) {
+                    localPool = openLocalPool();
+                    localPoolResolved = true;
+                }
+            }
+        }
+        return localPool;
+    }
+
+    private static org.werkpages.repository.LocalCorpusPool openLocalPool() {
+        org.werkpages.repository.OffloadedSearch.configure(intEnv("LOCAL_CORPUS_POOL", 3));
+        // Off unless explicitly enabled, so the new path can be switched off without a deploy.
+        if (!"true".equalsIgnoreCase(setting("LOCATION_LOCAL_SEARCH", "false"))) return null;
+        String root = setting("LOCAL_CORPUS_ROOT", "/var/lib/location-corpus");
+        int pool    = intEnv("LOCAL_CORPUS_POOL", 3);
+        int threads = intEnv("LOCAL_CORPUS_THREADS", 2);
+        String mem  = setting("LOCAL_CORPUS_MEMORY", "384MB");
+        long waitMs = intEnv("LOCAL_CORPUS_ACQUIRE_MS", 120);
+        return org.werkpages.repository.LocalCorpusPool.openCurrent(
+            java.nio.file.Path.of(root), pool, threads, mem, java.time.Duration.ofMillis(waitMs));
+    }
+
+    /**
+     * A setting from a system property, else the environment, else the fallback.
+     *
+     * <p>Production sets the environment, as it always has. The property is what lets a test enable
+     * the local index against a fixture release; section 29 already relies on this precedence for
+     * {@code api.version}, which the shaded docker client reads only as a property.
+     */
+    private static String setting(String name, String fallback) {
+        String property = System.getProperty(name);
+        if (property != null && !property.isBlank()) return property;
+        String env = System.getenv(name);
+        return (env == null || env.isBlank()) ? fallback : env;
+    }
+
+    private static int intEnv(String name, int fallback) {
+        try { return Integer.parseInt(setting(name, null)); }
+        catch (Exception e) { return fallback; }
+    }
+
+    /** Health and metrics for the local corpus, or null when it is not in use. */
+    public static org.werkpages.repository.LocalCorpusPool.Stats localCorpusStats() {
+        return localPool() == null ? null : localPool().stats();
+    }
+
+    /**
+     * Suggestions from the local corpus, or null to fall through to the remote path.
+     *
+     * <p>Returns null rather than an empty array on failure, so "the local index is unavailable"
+     * and "there is no such place" stay distinguishable. Conflating them is what made an outage
+     * look like a legitimate empty result earlier in this work.
+     */
+    /**
+     * The buildings tier: the local index where it applies, the remote corpus otherwise.
+     *
+     * <p>Substituted HERE rather than ahead of the whole pipeline, so the Postgres tiers and every
+     * filter around this call keep applying. See the note in suggestCompanyLocations.
+     */
+    private Future<JsonArray> placesTier(String companyName, String query, String country) {
+        if (coveredByLocalIndex(country)) {
+            return localSuggestions(query, companyName, SUGGESTION_LIMIT).compose(local -> {
+                if (local != null) org.werkpages.repository.CorpusDiagnostics.servedLocally(local.size());
+                // null means the index could not answer (disabled, saturated, or failed). An EMPTY
+                // list IS an answer and is returned: falling through on a genuine miss is what made
+                // "Zzzqqx Nonexistent" a 26-second request, a full unprunable scan of the United
+                // States partition to re-establish what the index settled in a millisecond.
+                if (local != null) return Future.succeededFuture(local);
+                return remotePlaces(companyName, query, country);
+            });
+        }
+        // The US-only gate sent this elsewhere; counted so a validation run can tell a gated
+        // request from one the index failed to answer.
+        org.werkpages.repository.CorpusDiagnostics.fallbackNotCovered();
+        return remotePlaces(companyName, query, country);
+    }
+
+    private Future<JsonArray> remotePlaces(String companyName, String query, String country) {
+        org.werkpages.repository.CorpusDiagnostics.remoteCall();
+        return guarded(PLACES_BREAKER,
+            () -> locationCorpus.suggestPlaces(companyName, query, country),
+            "places", PLACES_DEADLINE_MS);
+    }
+
+    /**
+     * Whether the local index holds this country at all.
+     *
+     * <p><b>The release is UNITED STATES ONLY.</b> It is built from
+     * {@code places/country_code=US}, so answering a Canadian or British search from it would
+     * return nothing and, because an empty local answer is deliberately final, would REPLACE the
+     * remote answer that does cover those countries with silence. A narrower index must never
+     * shadow a wider one.
+     *
+     * <p>Matched on the display name because that is what this pipeline passes around - see the
+     * note on displayNameOf - with the ISO code accepted too for callers that pass one.
+     */
+    // Package-private so the US-only gate can be asserted directly; see LocationGateTest.
+    static boolean coveredByLocalIndex(String country) {
+        if (country == null || country.isBlank()) return false;   // widening handles this
+        String c = country.trim().toLowerCase();
+        return c.equals("united states") || c.equals("us") || c.equals("usa")
+            || c.equals("united states of america");
+    }
+
+    /** For the validation-only diagnostics listener; see CorpusDiagnostics. */
+    public static JsonObject corpusDiagnostics() {
+        return org.werkpages.repository.CorpusDiagnostics.snapshot(localPool(), corpusBreakerState());
+    }
+
+    /** Bounds a corpus read, so a slow one degrades to fewer suggestions rather than a hung form. */
+    private static Future<JsonArray> withDeadline(Future<JsonArray> read, String what,
+                                                  long deadlineMs) {
+        final io.vertx.core.Context caller = io.vertx.core.Vertx.currentContext();
+        Promise<JsonArray> bounded = Promise.promise();
+        java.util.concurrent.ScheduledFuture<?> timer = DEADLINE_TIMER.schedule(() -> {
+            if (!bounded.future().isComplete()) {
+                // FAILS rather than answering empty, so the breaker can count it. A timeout that
+                // looks like "no results" is indistinguishable from a dependency that is simply
+                // down, and the breaker would then never open.
+                resumeOn(caller, () -> bounded.tryFail(new java.util.concurrent.TimeoutException(
+                    "corpus " + what + " exceeded " + deadlineMs + "ms")));
+            }
+        }, deadlineMs, java.util.concurrent.TimeUnit.MILLISECONDS);
+        read.onComplete(ar -> {
+            timer.cancel(false);
+            if (ar.succeeded()) bounded.tryComplete(ar.result());
+            else bounded.tryFail(ar.cause());
+        });
+        return bounded.future();
+    }
+
+    /*
+      ONE BREAKER PER TIER, not one for the corpus.
+
+      They read different files at very different cost: geography is 194k rows, places is 16.1M.
+      A failure peculiar to the large file must not stop the cheap read that answers "which city",
+      which is what most of this field is actually asked.
+    */
+    private static final org.werkpages.repository.CorpusBreaker GEO_BREAKER =
+        new org.werkpages.repository.CorpusBreaker("geography", 5, 30_000);
+    private static final org.werkpages.repository.CorpusBreaker PLACES_BREAKER =
+        new org.werkpages.repository.CorpusBreaker("places", 5, 30_000);
+
+    /** Both breakers, for the health endpoint and the logs. */
+    public static String corpusBreakerState() {
+        return GEO_BREAKER.state() + " | " + PLACES_BREAKER.state();
+    }
+
+    /**
+     * One corpus read: skipped when its breaker is open, bounded by a deadline, never failing.
+     *
+     * <p>A corpus read is allowed to be down; it is not allowed to look empty to something that
+     * caches, and it is not allowed to make every keystroke wait for it to time out.
+     */
+    private Future<JsonArray> guarded(org.werkpages.repository.CorpusBreaker breaker,
+                                      java.util.function.Supplier<Future<JsonArray>> read,
+                                      String what, long deadlineMs) {
+        if (!breaker.allow()) {
+            // Open: answer from whatever else the caller has, immediately.
+            org.werkpages.repository.CorpusDiagnostics.breakerSkip();
+            return Future.succeededFuture(new JsonArray());
+        }
+        return withDeadline(read.get(), what, deadlineMs)
+            .onSuccess(v -> breaker.recordSuccess())
+            .otherwise(err -> {
+                breaker.recordFailure();
+                System.err.println("location corpus " + what + " unavailable: " + err);
+                return new JsonArray();
+            });
+    }
+
+    /*
+      A DEADLINE PER TIER, sized from what each tier actually costs.
+
+      One shared 1500ms deadline was wrong, and wrong in a way that would have shipped quietly. The
+      two reads differ by more than six times: measured against the live bucket for one United
+      States query, geography is 0.76s over 194k rows and places is 4.82s over 16.1M. A 1500ms bound
+      therefore let geography through and cut places off EVERY time - and five consecutive cut-offs
+      open the breaker, so the remote places tier would have switched itself off for thirty seconds
+      at a stretch.
+
+      That matters most where there is no local index: the release is United States only, so Canada
+      and the United Kingdom always read remotely, and this would have degraded them while the
+      change was nominally about making search faster. The flag being off would not have saved them
+      either, because the deadline applies to the remote path regardless.
+
+      The places bound still exists to stop the pathological case - a cold unprunable scan measured
+      at 26 seconds - rather than to trim a normal read.
+    */
+    /*
+      4s, not 1.5s. The first value was measured UNLOADED and had no margin.
+
+      Geography reads 194k rows in 0.76s on an idle machine, so 1500ms looked like twice the
+      headroom needed. Under two backends sharing two vCPUs it is not: measured 16 timeouts, the
+      breaker opening twice, and 30s blackouts in which **61 of 112 city queries returned no
+      geography at all**. A person typing "Chicago" was shown businesses in Chicago instead of the
+      city, and no correctness check caught it because the response was neither empty nor
+      unselectable - just wrong.
+
+      The deadline exists to stop a dependency hanging a request, not to trim a slow-but-working
+      read. Under contention this read legitimately takes seconds, so the bound belongs above that
+      and the real fix is to stop making it remotely at all: the local index already holds the
+      geography names it would need.
+    */
+    private static final long GEOGRAPHY_DEADLINE_MS = 4000;
+    private static final long PLACES_DEADLINE_MS    = 6000;
+
+    /** One daemon thread, for deadlines only. It never does work, it only fires timeouts. */
+    private static final java.util.concurrent.ScheduledExecutorService DEADLINE_TIMER =
+        java.util.concurrent.Executors.newSingleThreadScheduledExecutor(r -> {
+            Thread t = new Thread(r, "location-deadline"); t.setDaemon(true); return t;
+        });
+
+    /** Run {@code action} back on the context that started the request, or inline if there is none. */
+    private static void resumeOn(io.vertx.core.Context caller, Runnable action) {
+        if (caller == null) action.run();
+        else caller.runOnContext(v -> action.run());
+    }
+
+    /**
+     * The local search, OFF THE EVENT LOOP.
+     *
+     * <p>Offloaded through {@link org.werkpages.repository.OffloadedSearch}, which is shared with the
+     * tests that prove a saturated search does not stall the loop. {@code null} is the shed value:
+     * it means "no answer from the index", which is what makes the caller fall back to the remote
+     * corpus rather than treat an outage as an empty result.
+     */
+    private Future<JsonArray> localSuggestions(String query, String companyName, int limit) {
+        if (localPool() == null) return Future.succeededFuture(null);
+        return org.werkpages.repository.OffloadedSearch.run(
+            () -> localSuggestionsBlocking(query, companyName, limit),
+            // Saturated: no suggestions for THIS keystroke. Never the remote scan, which would
+            // amplify a local burst onto the metered path.
+            new JsonArray(),
+            // Genuinely broken: let the remote corpus try, bounded by its deadline.
+            null);
+    }
+
+    private JsonArray localSuggestionsBlocking(String query, String companyName, int limit) {
+        if (localPool() == null) { org.werkpages.repository.CorpusDiagnostics.fallbackDisabled(); return null; }
+        try {
+            java.util.List<org.werkpages.repository.LocalPlaceIndex.Hit> hits =
+                localPool().withIndex(idx -> idx.search(query, limit,
+                    org.werkpages.repository.LocalPlaceIndex.Completion.PARTIAL, companyName));
+            /*
+              RAW ROWS, in the shape suggestPlaces returns.
+
+              This built FINISHED suggestion objects, which meant none of them survived: the merge
+              reads `name` off each row to form the label, and a finished suggestion has `label`
+              instead, so addCorpusPlaces hit its `label == null` guard and skipped every single
+              local result. The local path silently contributed nothing, and the "places=N" log line
+              counted what went INTO the merge rather than what came out of it, so it still looked
+              like it was working.
+
+              Emitting raw rows means addCorpusPlaces builds the label, the detail, the countryCode
+              and the corpusPlace for BOTH paths. One implementation, so a local suggestion cannot
+              drift from a remote one - and corpusPlace, which is what makes a suggestion
+              selectable at all, is no longer assembled twice.
+            */
+            JsonArray out = new JsonArray();
+            for (var h : hits) {
+                out.add(new JsonObject()
+                    .put("kind", "place")
+                    .put("sourcePlaceId", h.sourcePlaceId())
+                    .put("name", h.name())
+                    .put("brandName", h.brandName())
+                    .put("street", h.street())
+                    .put("city", h.city())
+                    .put("stateCode", h.stateCode())
+                    .put("postalCode", h.postalCode()));
+            }
+            // The proof that a query really ran against the index, and what it returned.
+            org.werkpages.repository.CorpusDiagnostics.localQuery(out.size());
+            return out;
+        } catch (org.werkpages.repository.LocalCorpusPool.Overloaded o) {
+            // Shed rather than queue: an answer that arrives after the next keystroke is worthless.
+            System.err.println("local corpus overloaded, falling back: " + o.getMessage());
+            org.werkpages.repository.CorpusDiagnostics.fallbackShed();
+            return null;
+        } catch (Exception e) {
+            System.err.println("local corpus search failed, falling back: " + e);
+            org.werkpages.repository.CorpusDiagnostics.fallbackFailed();
+            return null;
+        }
     }
 
     /** How many suggestions the picker shows in total, across every tier. */
@@ -1013,14 +1410,59 @@ public class ManagerService {
           So the buildings file is read only when geography found nothing. Typing "Toronto" no
           longer scans sixteen million rows to offer a bar and grill nobody asked about.
         */
-        Future<JsonArray> geographyF = locationCorpus.suggestGeography(query, country, null);
+        /*
+          The corpus is allowed to be down; it is not allowed to look empty.
+
+          Softened HERE rather than inside the repository, so the failure is visible to something
+          that can act on it and is never written into the result cache as a valid answer. The
+          reader still gets whatever Postgres confirmed, which is the part that must keep working:
+          a form that cannot be submitted is worse than a form with fewer suggestions.
+        */
+        Future<JsonArray> geographyF =
+            guarded(GEO_BREAKER, () -> locationCorpus.suggestGeography(query, country, null),
+                    "geography", GEOGRAPHY_DEADLINE_MS);
 
         return geographyF.compose(geography -> {
-            boolean needPlaces = withPlaces && geography.isEmpty();
-            return (needPlaces ? locationCorpus.suggestPlaces(companyName, query, country)
+            /*
+              Places are skipped only when geography actually ANSWERED the question.
+
+              This read `geography.isEmpty()`, so one coarse row anywhere suppressed the entire
+              building search. "Canada Goose" matched the hamlet of Goose Cove, so the sixteen
+              Canada Goose stores in the corpus - one of them at confidence 0.999 - were never
+              looked for. The same silence hid North Face, and would hide Boston Pizza, Jersey
+              Mike's and every other business whose name shares a single word with a place name.
+              The cost saving was real; the condition for taking it was not.
+
+              The question "which city" is answered when a geography row IS the thing typed, not
+              when one merely shares a word with it. So the test is whether some coarse answer
+              starts with the whole query: "toronto" is answered by "Toronto, Ontario, Canada" and
+              skips the expensive file, while "canada goose" is answered by nothing and pays for
+              it. Typing a city still costs 0.76s rather than 4.82s, which is what the optimisation
+              was for.
+            */
+            boolean needPlaces = withPlaces && !geographyAnswers(geography, query);
+            return (needPlaces ? placesTier(companyName, query, country)
                                : Future.succeededFuture(new JsonArray()))
                 .map(places -> {
             JsonArray merged = confirmed.copy();
+
+            /*
+              One line per corpus suggestion, saying what actually happened.
+
+              Silence was being read as success. A stray per-cent sign in a SQL comment threw on
+              every query for a whole round of measurement, and because a failure returned an empty
+              array the benchmark reported ten legitimate "no match" results. Nothing in the log
+              said otherwise, and "no SQL error logged" was taken as evidence the query had run.
+
+              So the decision is recorded rather than inferred: whether the buildings file was read
+              at all, how much each tier returned, and which tier led. A skipped search and an
+              empty one are different events and have to look different.
+            */
+            System.err.println("location-suggest q=\"" + query + "\" country=" + country
+                + " geo=" + geography.size()
+                + " places=" + (needPlaces ? String.valueOf(places.size()) : "skipped")
+                + " lead=" + (geographyAnswers(geography, query) ? "city"
+                            : hasLiteralPlace(places) ? "employer" : "default"));
 
             /*
               Geography gets its own seats, and buildings cannot take them.
@@ -1040,11 +1482,40 @@ public class ManagerService {
               person who knows the exact branch three rows of scrolling; burying it cost everybody
               else the ability to answer at all.
             */
+            /*
+              WHICH TIER LEADS IS DECIDED BY MATCH QUALITY, NOT BY A FIXED ALLOCATION.
+
+              Geography used to hold the first three seats unconditionally, which is right for
+              somebody typing a city and wrong for everybody else: searching "Canada Goose" put
+              Goose Cove, Goose Creek and Goose River above the employer, which was the fourth row
+              on a list that is only eight long. One more loosely matching hamlet would have pushed
+              it off the list entirely.
+
+              So the question asked is which tier actually answered:
+
+                * a coarse row that IS what was typed - "toronto" against "Toronto, Ontario" -
+                  means this is a city query, and the city leads;
+                * otherwise a place matching the typed phrase means this is an employer query, and
+                  the employer leads;
+                * with neither, the old order stands, because a coarse answer is the one most
+                  people can give and it must stay reachable.
+
+              Both tiers always appear. This decides the order, never the membership, so somebody
+              who wanted the city can still find it under an employer and the other way round.
+            */
             int geoSeats = Math.min(GEOGRAPHY_FIRST, geography.size());
-            addCorpusGeography(merged, geography, seen, country,
-                               Math.min(merged.size() + geoSeats, SUGGESTION_LIMIT));
-            addCorpusPlaces(merged, places, seen, country, SUGGESTION_LIMIT);
-            addCorpusGeography(merged, geography, seen, country, SUGGESTION_LIMIT);
+            boolean cityQuery     = geographyAnswers(geography, query);
+            boolean employerQuery = !cityQuery && hasLiteralPlace(places);
+
+            if (employerQuery) {
+                addCorpusPlaces(merged, places, seen, country, SUGGESTION_LIMIT);
+                addCorpusGeography(merged, geography, seen, country, SUGGESTION_LIMIT);
+            } else {
+                addCorpusGeography(merged, geography, seen, country,
+                                   Math.min(merged.size() + geoSeats, SUGGESTION_LIMIT));
+                addCorpusPlaces(merged, places, seen, country, SUGGESTION_LIMIT);
+                addCorpusGeography(merged, geography, seen, country, SUGGESTION_LIMIT);
+            }
             return merged;
                 })
                 .compose(merged -> {
@@ -1098,8 +1569,25 @@ public class ManagerService {
                 .put("precision", DeclaredLocation.EXACT)
                 // No companyLocationId: this building is not in the database yet. The client sends
                 // corpusPlace back on submit and it is promoted then - see CorpusPlace.
-                .put("corpusPlace", place.copy().put("countryCode",
-                        org.werkpages.repository.LocationCorpusRepository.iso(country))));
+                /*
+                  THE COUNTRY GOES IN TOO, not just the code.
+
+                  findOrCreate stores place.country(), and CorpusPlace.fromBody reads it from this
+                  object - which carried only countryCode. So every location promoted from the
+                  corpus was written with country = NULL, and the Postgres tier of this very query
+                  filters on `l.country IS NOT DISTINCT FROM $3`. The effect was that a building,
+                  once stored, could never be offered back by its id: the next contributor was
+                  handed the corpus place again. The ON CONFLICT key on
+                  (company_id, source, source_place_id) stopped that becoming a duplicate ROW, which
+                  is why nothing looked broken, but the stored location was invisible to search.
+
+                  The DISPLAY name, for the same reason the geography tier uses it: a row saying
+                  "US" while every other row says "United States" does not match either.
+                */
+                .put("corpusPlace", place.copy()
+                        .put("country", country)
+                        .put("countryCode",
+                             org.werkpages.repository.LocationCorpusRepository.iso(country))));
         }
     }
 
@@ -3449,29 +3937,39 @@ public class ManagerService {
 
                   Text remains the fallback for a search that resolved no company at all.
                 */
-                Future<RowSet<Row>> searchFuture = companyId == null
-                    ? managerRepo.search(5, 0, "%" + fullName + "%", "%" + company.trim() + "%", "featured", userId)
-                    /*
-                      Note what is matched here: the FIRST name, not the whole typed string.
+                /*
+                  The company-filtered search that stood here has been REMOVED, not just bypassed.
 
-                      The company scope has already done the narrowing - this is one employer and
-                      its subsidiaries, not the directory - so the SQL's job is to hand the name
-                      rule a small, relevant set to judge. Matching the full string here instead
-                      put the decision back in an ILIKE: "Daniel Pa" excluded Daniel Perovic
-                      before anything had a chance to notice they might be the same person, which
-                      is the bug this whole change exists to fix.
+                  It narrowed by company before deciding whether the manager existed, which is the
+                  defect this work exists to fix, and once runMatcher took over the decision its
+                  result was never read - so every search was paying for a query whose answer was
+                  discarded. On the companyId path that was two: findDescendantIds followed by
+                  searchInCompanies.
+                */
+                /*
+                  THE CLIENT'S COMPANY ID IS VALIDATED ONCE, HERE, AND NOTHING DOWNSTREAM SEES
+                  THE RAW ONE.
 
-                      Company resolution narrows; name resolution decides.
-                    */
-                    : companyRepo.findDescendantIds(companyId).compose(scope ->
-                          managerRepo.searchInCompanies(20, 0, "%" + firstName.trim() + "%", scope, "featured", userId));
+                  Validating it inside the matcher only was half a fix: a fabricated id would be
+                  refused for matching and then handed straight to company resolution and ghost
+                  creation, which would happily attach the new manager to whatever company it
+                  named. An id that does not identify the company that was TYPED is treated as no
+                  selection at all - exactly what isSelectedCompany already decides for the
+                  short-company guard - so the rest of this method cannot trust what matching
+                  rejected.
 
-                return Future.all(
-                    userRepo.hasContributed(userId),
-                    searchFuture
-                ).compose(cf -> {
-                    boolean     contributed = cf.resultAt(0);
-                    RowSet<Row> rows        = cf.resultAt(1);
+                  A null id is not an error: it means "resolve the company by name", which is the
+                  ordinary path and leaves company creation behaviour untouched.
+                */
+                Future<Long> validatedCompanyId = companyId == null
+                    ? Future.succeededFuture(null)
+                    : companyRepo.isSelectedCompany(companyId, company)
+                          .map(ok -> ok ? companyId : null);
+
+                return Future.all(userRepo.hasContributed(userId), validatedCompanyId)
+                    .compose(pre -> {
+                    boolean contributed = pre.resultAt(0);
+                    final Long companyIdSafe = pre.resultAt(1);
 
                     /*
                       An exact name is a match. A plausible partial is a CANDIDATE.
@@ -3487,87 +3985,54 @@ public class ManagerService {
                       showing a near miss is a glance, where the cost of hiding it is a duplicate
                       human in the directory for good.
                     */
-                    List<Row> matched = new ArrayList<>();
-                    List<Row> candidates = new ArrayList<>();
-                    for (Row row : rows) {
-                        String candidateName = row.getString("name");
-                        if (candidateName == null) continue;
-                        if (candidateName.equalsIgnoreCase(fullName.trim())) matched.add(row);
-                        else if (isPlausibleSameName(fullName.trim(), candidateName)) candidates.add(row);
-                    }
-
-                    // Pending managers are never returned to users — they are invisible until
-                    // an admin approves them. Only approved/ghost managers are surfaced.
-                    List<Row> visibleMatched = matched.stream()
-                        .filter(r -> !"pending_approval".equals(r.getString("approval_status")))
-                        .collect(Collectors.toList());
-
-                    if (!visibleMatched.isEmpty()) {
-                        JsonArray data = new JsonArray();
-                        for (Row row : visibleMatched) data.add(rowToManagerJson(row));
-                        return Future.succeededFuture(
-                            new JsonObject()
-                                .put("data", data)
-                                .put("created", false)
-                                .put("hasContributed", contributed));
-                    }
-
                     /*
-                      No exact match, but somebody close enough to be worth showing.
+                      NAME-FIRST MATCHING. See manager-search-flow.md section 5a.
 
-                      Returned as data so the reader sees them, and - the point of this branch -
-                      nothing is created. Every row here is already approved or ghost, so each one
-                      has a profile that will actually render: the tile invariant in section 41
-                      holds.
+                      What stood here classified only the rows a company-filtered query had already
+                      returned, so a manager at a DIFFERENT employer was never a candidate at all -
+                      the search could not see somebody it was about to duplicate. Aaron Yip
+                      accumulated eight rows that way, and 21 people ended up with two public
+                      profiles each.
+
+                      runMatcher owns the whole decision now: it discovers by name alone, classifies
+                      every candidate, pairs company and title within single employment records, and
+                      consults non-public rows for existence without ever rendering them.
                     */
-                    List<Row> visibleCandidates = candidates.stream()
-                        .filter(r -> !"pending_approval".equals(r.getString("approval_status")))
-                        .collect(Collectors.toList());
-                    if (!visibleCandidates.isEmpty()) {
-                        JsonArray data = new JsonArray();
-                        for (Row row : visibleCandidates) data.add(rowToManagerJson(row));
-                        return Future.succeededFuture(
-                            new JsonObject()
-                                .put("data", data)
-                                .put("created", false)
-                                .put("candidates", true)
-                                .put("hasContributed", contributed));
-                    }
-
-                    // visibleMatched is empty. Two sub-cases:
-                    // (a) pending rows were filtered → manager already queued, don't create a duplicate
-                    // (b) matched is completely empty → manager doesn't exist yet
-                    boolean alreadyPending = !matched.isEmpty();
-
                     final String trimmedState = isBlank(state) ? null : state.trim();
                     final String trimmedCity  = isBlank(city)  ? null : city.trim();
 
-                    if (alreadyPending) {
-                        // Already in the admin queue — return empty, nothing to show.
-                        return Future.succeededFuture(
-                            new JsonObject()
-                                .put("data", new JsonArray())
+                    return runMatcher(firstName, lastName, company, title, companyIdSafe)
+                        .compose(outcome -> {
+                        ManagerMatcher.Decision decision = outcome.decision();
+
+                        if (decision.outcome() == ManagerMatcher.Outcome.RETURN_EXISTING) {
+                            return Future.succeededFuture(new JsonObject()
+                                .put("data", outcome.tiles())
                                 .put("created", false)
                                 .put("hasContributed", contributed));
-                    }
+                        }
 
-                    // Before creating anything, check for a Levenshtein-close name at the same
-                    // company (same guard used in createManager). A typo like "John Smyth" must
-                    // not spawn a new ghost/pending alongside the real "John Smith" at Starbucks.
-                    Future<RowSet<Row>> fuzzyPool = companyId == null
-                        ? managerRepo.findByCompanyExact(company.trim())
-                        : companyRepo.findDescendantIds(companyId)
-                              .compose(scope -> managerRepo.findInCompanies(scope));
-                    return fuzzyPool.compose(fuzzyCandidates -> {
-                        Row fuzzyMatch = findFuzzyNameMatch(fuzzyCandidates, fullName.trim());
-                        if (fuzzyMatch != null && !"pending_approval".equals(fuzzyMatch.getString("approval_status"))) {
-                            JsonArray data = new JsonArray().add(rowToManagerJson(fuzzyMatch));
-                            return Future.succeededFuture(
-                                new JsonObject()
-                                    .put("data", data)
+                        if (decision.outcome() == ManagerMatcher.Outcome.QUEUE_REVIEW) {
+                            /*
+                              The tiles are still returned. A search that needs review has usually
+                              found somebody worth showing - that is often WHY it needs review - and
+                              withholding them would send the reader away believing we hold nobody.
+
+                              incompleteEvidence is reported rather than hidden: a truncated list
+                              must never be presented as the whole answer.
+                            */
+                            return companyIdForCapture(companyIdSafe, company, resolvedLogoUrl, null)
+                                .compose(cid -> queueReview(firstName, lastName, company, title,
+                                                            cid, outcome.candidateIds(), decision))
+                                .map(v -> new JsonObject()
+                                    .put("data", outcome.tiles())
                                     .put("created", false)
+                                    .put("candidates", decision.nameClass() == ManagerMatcher.NameClass.PLAUSIBLE)
+                                    .put("moreMatchesMayExist", outcome.incompleteEvidence())
                                     .put("hasContributed", contributed));
                         }
+
+                        // CREATE_GHOST: fall through to the eligibility rules below, unchanged.
 
                     // Manager not found: ghost/pending flow (regardless of contribution status).
                     boolean shortPerson  = fullName.trim().length() < 4;
@@ -3593,7 +4058,7 @@ public class ManagerService {
                       treated as no selection at all and gates.
                     */
                     Future<Boolean> companyWasSelected = shortCompany
-                        ? companyRepo.isSelectedCompany(companyId, company)
+                        ? companyRepo.isSelectedCompany(companyIdSafe, company)
                         : Future.succeededFuture(false);
 
                     return companyWasSelected.compose(selected -> {
@@ -3613,7 +4078,7 @@ public class ManagerService {
                     if (!firstNamePassesVowelCheck(firstName)) {
                         final String fState2 = trimmedState;
                         final String fCity2  = trimmedCity;
-                        return companyRepo.resolve(companyId, company, null, resolvedLogoUrl)
+                        return companyRepo.resolve(companyIdSafe, company, null, resolvedLogoUrl)
                             .compose(cRow -> managerRepo.createSearchPending(
                                 fullName, company, title, country,
                                 fState2, fCity2, resolvedLogoUrl, cRow.getLong("id"), userId))
@@ -3636,7 +4101,7 @@ public class ManagerService {
                     if (listedName) {
                         final String fStateL = trimmedState;
                         final String fCityL  = trimmedCity;
-                        return companyRepo.resolve(companyId, company, null, resolvedLogoUrl)
+                        return companyRepo.resolve(companyIdSafe, company, null, resolvedLogoUrl)
                             .compose(cRow -> managerRepo.createSearchPending(
                                 fullName, company, title, country,
                                 fStateL, fCityL, resolvedLogoUrl, cRow.getLong("id"), userId))
@@ -3657,7 +4122,7 @@ public class ManagerService {
                             // about a submission they aren't aware of.
                             final String fState3 = trimmedState;
                             final String fCity3  = trimmedCity;
-                            return companyRepo.resolve(companyId, company, null, resolvedLogoUrl)
+                            return companyRepo.resolve(companyIdSafe, company, null, resolvedLogoUrl)
                                 .compose(cRow -> managerRepo.createSearchPending(
                                     fullName, company, title, country,
                                     fState3, fCity3, resolvedLogoUrl, cRow.getLong("id"), userId))
@@ -3669,10 +4134,35 @@ public class ManagerService {
 
                         // Slot claimed — create ghost. If the insert fails, release the slot so
                         // the user can try again on their next search.
-                        return companyRepo.resolve(companyId, company, null, resolvedLogoUrl)
-                            .compose(companyRow -> managerRepo.createAutoApproved(fullName, company, title, country,
+                        return companyRepo.resolve(companyIdSafe, company, null, resolvedLogoUrl)
+                            .compose(companyRow -> managerRepo.createAutoApprovedOrExisting(fullName, company, title, country,
                                 trimmedState, trimmedCity, userId, resolvedLogoUrl, companyRow.getLong("id")))
-                            .compose(row -> {
+                            .compose(insert -> {
+                                /*
+                                  LOSING THE RACE IS NOT AN ERROR.
+
+                                  Two people searching the same unknown manager at the same
+                                  instant both build the same slug, and the unique index rejects
+                                  the second INSERT. That used to reach this searcher as a raw
+                                  PgException: the manager they asked for now existed, and they
+                                  were shown a failure. Eight rounds of six simultaneous searches
+                                  hit it on the first round.
+
+                                  createAutoApprovedOrExisting hands back the published row
+                                  instead, and the post-insert work is then skipped entirely. It
+                                  must be: the winner already seeded the review, and seeding a
+                                  second one would count this search as a rating nobody gave.
+
+                                  The slot goes back, because this searcher published nothing.
+                                  Section 15 gives each person one auto-creation, and spending it
+                                  on a row somebody else wrote would deny them the next manager
+                                  that really is new.
+                                */
+                                if (!insert.created()) {
+                                    return userRepo.resetAutoCreatedManagerSlot(userId)
+                                        .map(v -> insert.row());
+                                }
+                                final Row row = insert.row();
                                 long newId = row.getLong("id");
                                 // Composed, not transactional — unlike every other path here.
                                 // The ghost flow is a chain of separate writes with a deliberate
@@ -3723,7 +4213,30 @@ public class ManagerService {
                                     .compose(v -> Future.failedFuture(err));
                             })
                             .map(row -> {
+                                /*
+                                  THE EXISTING TILES COME TOO.
+
+                                  This built a fresh array holding only the new ghost, which threw
+                                  away every same-name manager the matcher had just found. The
+                                  decision to publish is reached precisely BECAUSE those people
+                                  exist and are different (branch D: both company and title
+                                  differ), so the reader has to see them - otherwise we tell
+                                  somebody "no such manager, here is a new one" while holding three
+                                  others with that name, and they pick the one we minted.
+                                */
+                                /*
+                                  THE NEW GHOST LEADS, and the existing tiles follow.
+
+                                  It was appended last, below every unrelated same-name manager.
+                                  But a ghost is created FROM the search, so its company and title
+                                  are exactly what was typed - rank 0 by definition - while this
+                                  branch is only reached when no existing manager matched both. It
+                                  is therefore the single best answer to the question asked, and
+                                  burying it under four strangers is how somebody reviews the wrong
+                                  person.
+                                */
                                 JsonArray data = new JsonArray().add(rowToManagerJson(row));
+                                outcome.tiles().forEach(data::add);
                                 return new JsonObject()
                                     .put("data", data)
                                     .put("created", true)
@@ -3816,8 +4329,102 @@ public class ManagerService {
             exist for exactly that.
         */
         boolean callerIsSearch = Boolean.TRUE.equals(body.getBoolean("fromSearch"));
-        return (callerIsSearch
-                    ? managerRepo.findByNameAndCompany(name, company)
+
+        /*
+          ANONYMOUS SEARCH NOW USES THE SAME MATCHER AS THE LOGGED-IN PATH.
+
+          It used findByNameAndCompany, where company is a hard AND, so an anonymous visitor
+          searching somebody at a former employer could not find them and published a duplicate -
+          precisely the defect fixed on the logged-in side. The two paths are required to behave
+          identically, and until this they did not.
+
+          THE ADD FORM IS NOT TOUCHED. Section 41's trap is that this one endpoint serves two
+          intents: a deliberate search, and the drop-off capture from /add. Only the search intent
+          is routed through the matcher; the capture keeps findCapturedByNameAndCompany, which
+          deliberately matches pending drafts so a second visitor adopts a half-typed row instead
+          of filling the queue with copies. Making those two consistent is what caused the
+          "Manager Not Found" outage, so they stay different on purpose.
+
+          A search that reaches the matcher either answers here or arrives below with an empty
+          lookup, which sends it to the creation path exactly as before.
+        */
+        String ghostFirst = firstName, ghostLast = lastName;
+        Long   rawCompanyId = body.getLong("companyId");
+        Future<Long> ghostCompanyId = rawCompanyId == null
+            ? Future.succeededFuture(null)
+            : companyRepo.isSelectedCompany(rawCompanyId, company).map(ok -> ok ? rawCompanyId : null);
+
+        Future<JsonObject> searchDecision = !callerIsSearch
+            ? Future.succeededFuture(null)
+            : ghostCompanyId.compose(safeId -> runMatcher(ghostFirst, ghostLast, company, title, safeId)
+                .compose(outcome -> {
+                    ManagerMatcher.Decision d = outcome.decision();
+
+                    if (d.outcome() == ManagerMatcher.Outcome.RETURN_EXISTING
+                            && !outcome.tiles().isEmpty()) {
+                        JsonObject best = outcome.tiles().getJsonObject(0);
+                        return Future.succeededFuture(new JsonObject()
+                            .put("id", best.getLong("id"))
+                            .put("name", best.getString("name"))
+                            .put("created", false)
+                            // only ever true for a row the profile page will serve - section 41
+                            .put("published", true));
+                    }
+
+                    if (d.outcome() == ManagerMatcher.Outcome.QUEUE_REVIEW) {
+                        /*
+                          published=false, so the client renders NO tile. The anonymous search
+                          records its request for review exactly as the logged-in path does, with
+                          the same deduplication, and - as everywhere on this path - without a
+                          searcher identity, so no notification is possible even in principle.
+                        */
+                        /*
+                          published=false WHENEVER NOTHING WAS PUBLISHED, even when credible
+                          candidates exist.
+
+                          This flag drives two client behaviours at once: render a tile, and spend
+                          the one-per-browser ghost slot. Reporting true because a plausible
+                          candidate was found would burn a visitor's only ghost on a search that
+                          created nothing - the same harm the listed-name rule exists to prevent.
+
+                          Candidates are not lost: the anonymous flow reaches this endpoint only
+                          after its own search call, which is what displays existing managers.
+                          Surfacing fuzzy candidates through THIS response would need a second
+                          field and a frontend change, and is noted rather than smuggled in here.
+                        */
+                        JsonObject answer = new JsonObject()
+                            .put("created", false)
+                            .put("published", false)
+                            /*
+                              CANDIDATES, SEPARATE FROM published.
+
+                              Without this the visitor saw an empty page. The anonymous flow only
+                              reaches this endpoint when its own substring search found nothing,
+                              and that search is ILIKE '%First Last%': it happens to catch
+                              "Aaron Yi" and "Aron Yip" inside "Aaron Yip", but NOT "Aar Yip" or
+                              "Aaron Yap". For those the matcher correctly refuses to duplicate
+                              him - and then nobody was shown the Aaron Yip we hold, which is the
+                              original complaint wearing different clothes.
+
+                              A separate field because the two facts are different: these are
+                              existing public managers to display, while published stays false
+                              because nothing was created and the one-per-browser ghost allowance
+                              must not be spent. Every tile here is approved or ghost, so each one
+                              resolves to a profile the server will serve.
+                            */
+                            .put("candidates", outcome.tiles());
+                        return companyIdForCapture(safeId, company, resolvedLogoUrl, clientIp)
+                            .compose(cid -> queueReview(ghostFirst, ghostLast, company, title,
+                                                        cid, outcome.candidateIds(), d))
+                            .map(v -> answer);
+                    }
+                    return Future.succeededFuture((JsonObject) null);   // CREATE_GHOST: fall through
+                }));
+
+        return searchDecision.compose(answered -> {
+            if (answered != null) return Future.succeededFuture(answered);
+            return (callerIsSearch
+                    ? db.preparedQuery("SELECT 1 WHERE false").execute()
                     : managerRepo.findCapturedByNameAndCompany(name, company))
             .compose(rows -> {
                 if (rows.iterator().hasNext()) {
@@ -3932,10 +4539,19 @@ public class ManagerService {
                               .map(companyRow -> companyRow.getLong("id"))
                         : companyIdForCapture(body.getLong("companyId"), company, resolvedLogoUrl, clientIp))
                     .compose(resolvedCompanyId -> publish
-                        ? managerRepo.createAutoApproved(name, company, title, country, fState, fCity,
+                        /*
+                          Same race as the /find path, and this is the side most people are on:
+                          two anonymous visitors searching the same unknown manager at once. The
+                          loser is handed the row the winner published rather than an exception,
+                          and `created` tells the block below not to seed a second review onto it.
+                          A capture is never racing anybody - it writes its own pending row - so it
+                          reports created unconditionally.
+                        */
+                        ? managerRepo.createAutoApprovedOrExisting(name, company, title, country, fState, fCity,
                                                          null, resolvedLogoUrl, resolvedCompanyId)
                         : managerRepo.createCapturedDraft(name, company, title, country, fState, fCity,
-                                                          resolvedLogoUrl, resolvedCompanyId))
+                                                          resolvedLogoUrl, resolvedCompanyId)
+                              .map(r -> new ManagerRepository.GhostInsert(r, true)))
                     .recover(err -> {
                         // The quota was spent before the insert was attempted, so a failure here
                         // would otherwise cost this address its window for nothing.
@@ -3943,7 +4559,18 @@ public class ManagerService {
                         return ghostSlots.release(clientIp).compose(released -> Future.failedFuture(err));
                     })
                     .map(row -> { publishedRef.set(publish); return row; }))
-                    .compose(row -> {
+                    .compose(insert -> {
+                        /*
+                          A race loss is already published and already seeded, so it leaves here
+                          with the winner's row untouched. The address quota is handed back for
+                          the same reason the logged-in slot is: nothing was published here.
+                        */
+                        if (!insert.created()) {
+                            return Boolean.TRUE.equals(publishedRef.get())
+                                ? ghostSlots.release(clientIp).map(r -> insert.row())
+                                : Future.succeededFuture(insert.row());
+                        }
+                        final Row row = insert.row();
                         long newId = row.getLong("id");
                         // Composed rather than transactional, for the same reason as the /find
                         // path: this is a chain of separate writes and wrapping it would change
@@ -3990,6 +4617,8 @@ public class ManagerService {
                             : Future.succeededFuture(result);
                     });
             });
+        });   // end searchDecision.compose - the anonymous search either answered above or fell
+              // through to the creation path with an empty lookup
     }
 
     /**
@@ -4308,5 +4937,367 @@ public class ManagerService {
             }
             return out;
         }).otherwise(java.util.Map.of());
+    }
+
+    // ── The matching pipeline (see manager-search-flow.md section 5a) ─────────
+
+    /**
+     * How many candidates may be classified before the evidence is declared incomplete.
+     *
+     * <p>Measured: classification costs roughly 3 microseconds per candidate, so 20,000 is about
+     * 60ms of CPU - the point at which it starts competing with the rest of the request on a
+     * two-vCPU host. A realistic distribution produces about 4,000 candidates for the most common
+     * given name AND surname combination at 200,000 managers, so this is headroom rather than a
+     * routine limit.
+     */
+    static final int CANDIDATE_BUDGET = 20_000;
+
+    /**
+     * What the matcher concluded, and what may be shown.
+     *
+     * @param tiles            public managers that actually classified - never raw token overlap
+     * @param incompleteEvidence true when more candidates existed than the budget allowed. The
+     *                         caller must then never publish, and must say so rather than present
+     *                         a truncated list as the whole answer.
+     */
+    record MatchOutcome(ManagerMatcher.Decision decision, JsonArray tiles,
+                        java.util.List<Long> candidateIds, boolean incompleteEvidence) {}
+
+    /**
+     * Name-first discovery, classification, employment pairing and the decision.
+     *
+     * <p>Public display and existence detection are deliberately different questions. Only approved
+     * and ghost managers may become tiles, but a pending or rejected row still proves the manager
+     * EXISTS in some form, and publishing a ghost over one would duplicate a manager already in the
+     * admin queue or silently overturn an admin's rejection. So non-public rows are consulted, never
+     * rendered, and they downgrade a would-be ghost to a review rather than blocking the search.
+     */
+    private Future<MatchOutcome> runMatcher(String firstName, String lastName,
+                                            String company, String title, Long companyId) {
+        java.util.List<String> tokens = ManagerMatcher.candidateTokens(firstName, lastName);
+        if (tokens.isEmpty()) {
+            return Future.succeededFuture(new MatchOutcome(
+                new ManagerMatcher.Decision(ManagerMatcher.Outcome.QUEUE_REVIEW,
+                    ManagerMatcher.NameClass.NONE, null, null, "unusable_name"),
+                new JsonArray(), java.util.List.of(), false));
+        }
+
+        return Future.all(managerRepo.findNameCandidates(tokens),
+                          managerRepo.findNonPublicNameCandidates(tokens),
+                          companyRepo.resolveVerifiedCompanyIds(companyId, company))
+            .compose(fetched -> {
+                RowSet<Row> publicRows  = fetched.resultAt(0);
+                RowSet<Row> hiddenRows  = fetched.resultAt(1);
+                java.util.Set<Long> verifiedCompanyIds = fetched.resultAt(2);
+
+                /*
+                  THE BUDGET IS DETERMINISTIC.
+
+                  Classification stops at a fixed count in a fixed order, so the same search gives
+                  the same answer every time. What is classified is returned; what is not is
+                  declared, never silently dropped. And incomplete evidence can only ever produce a
+                  review - publishing on the strength of a partial scan is exactly how a duplicate
+                  gets created.
+                */
+                boolean incomplete = publicRows.size() > CANDIDATE_BUDGET;
+
+                java.util.List<Long> confirmedIds = new java.util.ArrayList<>();
+                java.util.List<Long> plausibleIds = new java.util.ArrayList<>();
+                int examined = 0;
+                for (Row row : publicRows) {
+                    if (examined++ >= CANDIDATE_BUDGET) break;
+                    ManagerMatcher.NameClass c =
+                        ManagerMatcher.classifyName(firstName, lastName, row.getString("name"));
+                    if (c == ManagerMatcher.NameClass.CONFIRMED) confirmedIds.add(row.getLong("id"));
+                    else if (c == ManagerMatcher.NameClass.PLAUSIBLE) plausibleIds.add(row.getLong("id"));
+                }
+
+                /*
+                  EXISTENCE ONLY. These never become tiles, and PENDING and REJECTED are judged
+                  differently.
+
+                  A plausible name alone is far too weak to block publication. "Daniel Pa" shares
+                  an initial with every Daniel P-something we ever rejected, and treating any of
+                  them as proof that this manager exists would refuse legitimate new people
+                  forever - the mirror of the duplication problem, and just as damaging.
+
+                  PENDING SPLITS IN TWO, and which one it is decides everything.
+
+                  Both kinds are 'pending_approval' and neither is servable, but they mean opposite
+                  things, and a single rule for both is wrong whichever way it is written. The
+                  column that tells them apart is search_created_by_user_id.
+
+                  A SEARCH-PENDING row (createSearchPending, the column set) is a person who
+                  searched for this exact manager after their one ghost was spent. It is somebody
+                  asserting the manager exists, and it is already queued for a decision. A second
+                  searcher publishing over it is how one manager reached ten pending rows at a
+                  single company. So a confirmed name at a verified-identical company BLOCKS, and
+                  the search is recorded for review instead.
+
+                  A CAPTURED DRAFT (createCapturedDraft, the column null) is somebody who started
+                  typing into the add form and left. It must never block. Blocking on it means one
+                  abandoned form makes that manager permanently unfindable by everybody who
+                  searches afterwards - they are shown nothing, and there is nothing they could be
+                  shown, because the profile page refuses a pending row to everybody. That is the
+                  outage in section 41 read from the other end, and DropOffDraftIntegrationTest
+                  exists to hold this behaviour down.
+
+                  The duplicate a published search leaves beside a draft is real, and it is the
+                  admin queue's job with the merge tools built for it. What must not happen is the
+                  draft silently deleting the manager from everybody's search results.
+
+                  A different employer is a different submission either way, and is never blocked.
+
+                  REJECTED is different again, and still blocks. It is not evidence that a person
+                  exists - an admin decided the record
+                  should not. It therefore never blocks a distinct person. It only intervenes when
+                  the search is the SAME submission again, name and company and title alike, which
+                  is a request to reconsider rather than a licence to republish what was refused.
+                */
+                java.util.List<Long> hiddenIds = new java.util.ArrayList<>();
+                java.util.Map<Long, String> hiddenStatus = new java.util.HashMap<>();
+                // Which pending rows a SEARCH created, as opposed to an abandoned add form.
+                java.util.Set<Long> hiddenFromSearch = new java.util.HashSet<>();
+                for (Row row : hiddenRows) {
+                    if (ManagerMatcher.classifyName(firstName, lastName, row.getString("name"))
+                            == ManagerMatcher.NameClass.CONFIRMED) {
+                        hiddenIds.add(row.getLong("id"));
+                        hiddenStatus.put(row.getLong("id"), row.getString("approval_status"));
+                        if (row.getUUID("search_created_by_user_id") != null) {
+                            hiddenFromSearch.add(row.getLong("id"));
+                        }
+                    }
+                }
+
+                java.util.List<Long> all = new java.util.ArrayList<>(confirmedIds);
+                all.addAll(plausibleIds);
+
+                // Resolve the non-public policy against the employment each hidden row carries.
+                Future<String> hiddenBlock = hiddenIds.isEmpty()
+                    ? Future.succeededFuture(null)
+                    : managerRepo.findEmployments(hiddenIds).map(rows2 -> {
+                        String blockReason = null;
+                        for (Row e : rows2) {
+                            String status = hiddenStatus.get(e.getLong("manager_id"));
+                            if (status == null) continue;
+                            ManagerMatcher.CompanyClass cc = ManagerMatcher.classifyCompany(
+                                verifiedCompanyIds, company, e.getLong("company_id"), e.getString("company"));
+                            ManagerMatcher.TitleClass tc =
+                                ManagerMatcher.classifyTitle(title, e.getString("title"));
+                            if ("pending_approval".equals(status)
+                                    && hiddenFromSearch.contains(e.getLong("manager_id"))
+                                    && cc == ManagerMatcher.CompanyClass.VERIFIED) {
+                                return "equivalent_pending";            // a queued search, not a draft
+                            }
+                            if ("rejected".equals(status)
+                                    && cc == ManagerMatcher.CompanyClass.VERIFIED
+                                    && tc == ManagerMatcher.TitleClass.EQUIVALENT) {
+                                blockReason = "previously_rejected";    // the same submission again
+                            }
+                        }
+                        return blockReason;
+                    });
+
+                if (all.isEmpty()) {
+                    return hiddenBlock.map(block -> {
+                        ManagerMatcher.Decision d = (block != null || incomplete)
+                            ? new ManagerMatcher.Decision(ManagerMatcher.Outcome.QUEUE_REVIEW,
+                                  ManagerMatcher.NameClass.NONE, null, null,
+                                  block != null ? block : "incomplete_evidence")
+                            : new ManagerMatcher.Decision(ManagerMatcher.Outcome.CREATE_GHOST,
+                                  ManagerMatcher.NameClass.NONE, null, null, "no_name_match");
+                        return new MatchOutcome(d, new JsonArray(), java.util.List.of(), incomplete);
+                    });
+                }
+
+                // Employments and full rows are loaded ONLY for managers that actually classified.
+                final boolean inc = incomplete;
+                return Future.all(managerRepo.findEmployments(all), managerRepo.findByIdsOrdered(all), hiddenBlock)
+                    .compose(loaded -> {
+                        RowSet<Row> employmentRows = loaded.resultAt(0);
+                        RowSet<Row> fullRows       = loaded.resultAt(1);
+                        String      hiddenReason   = loaded.resultAt(2);
+
+                        java.util.Map<Long, java.util.List<ManagerMatcher.Employment>> byManager =
+                            new java.util.HashMap<>();
+                        for (Row e : employmentRows) {
+                            byManager.computeIfAbsent(e.getLong("manager_id"), k -> new java.util.ArrayList<>())
+                                .add(new ManagerMatcher.Employment(
+                                    e.getLong("company_id"), e.getString("company"), e.getString("title")));
+                        }
+
+                        java.util.Map<ManagerMatcher.NameClass, java.util.List<java.util.List<ManagerMatcher.Employment>>> classified =
+                            new java.util.EnumMap<>(ManagerMatcher.NameClass.class);
+                        for (Long id : confirmedIds)
+                            classified.computeIfAbsent(ManagerMatcher.NameClass.CONFIRMED, k -> new java.util.ArrayList<>())
+                                .add(byManager.getOrDefault(id, java.util.List.of()));
+                        for (Long id : plausibleIds)
+                            classified.computeIfAbsent(ManagerMatcher.NameClass.PLAUSIBLE, k -> new java.util.ArrayList<>())
+                                .add(byManager.getOrDefault(id, java.util.List.of()));
+
+                        ManagerMatcher.Decision d =
+                            ManagerMatcher.decide(classified, verifiedCompanyIds, company, title);
+
+                        // An equivalent queued submission, a repeat of a rejected one, or a
+                        // partial scan can only ever DOWNGRADE a would-be ghost to a review.
+                        // None of them can turn a review into a publication.
+                        if ((hiddenReason != null || inc) && d.outcome() == ManagerMatcher.Outcome.CREATE_GHOST) {
+                            d = new ManagerMatcher.Decision(ManagerMatcher.Outcome.QUEUE_REVIEW,
+                                    d.nameClass(), d.bestCompany(), d.bestTitle(),
+                                    hiddenReason != null ? hiddenReason : "incomplete_evidence");
+                        }
+
+                        /*
+                          RANKED BY RELEVANCE TO WHAT WAS TYPED, not by name class alone.
+
+                          A reader has to pick the right person before leaving a review, so the
+                          manager who actually holds the searched job must lead. Ranking only by
+                          confirmed-before-plausible would put four unrelated Marcus Webbs ahead of
+                          the one at the company the reader named.
+
+                            0  confirmed name, company VERIFIED and title EQUIVALENT
+                            1  confirmed name, one of the two matches
+                            2  confirmed name, neither
+                            3  plausible name
+
+                          Reviews only break ties WITHIN a band - never across one, or a popular
+                          stranger would outrank the right person.
+                        */
+                        java.util.Map<Long, Integer> rank = new java.util.HashMap<>();
+                        for (Long id : all) {
+                            boolean confirmedName = confirmedIds.contains(id);
+                            ManagerMatcher.CompanyClass bc = ManagerMatcher.CompanyClass.DIFFERENT;
+                            ManagerMatcher.TitleClass   bt = ManagerMatcher.TitleClass.DIFFERENT;
+                            boolean pair = false;
+                            for (ManagerMatcher.Employment e : byManager.getOrDefault(id, java.util.List.of())) {
+                                ManagerMatcher.CompanyClass cc = ManagerMatcher.classifyCompany(
+                                    verifiedCompanyIds, company, e.companyId(), e.company());
+                                ManagerMatcher.TitleClass tc = ManagerMatcher.classifyTitle(title, e.title());
+                                if (cc.ordinal() < bc.ordinal()) bc = cc;
+                                if (tc.ordinal() < bt.ordinal()) bt = tc;
+                                if (cc == ManagerMatcher.CompanyClass.VERIFIED
+                                        && tc == ManagerMatcher.TitleClass.EQUIVALENT) pair = true;
+                            }
+                            int r;
+                            if (!confirmedName) r = 3;
+                            else if (pair) r = 0;
+                            else if (bc == ManagerMatcher.CompanyClass.VERIFIED
+                                     || bt == ManagerMatcher.TitleClass.EQUIVALENT) r = 1;
+                            else r = 2;
+                            rank.put(id, r);
+                        }
+
+                        java.util.List<JsonObject> ordered = new java.util.ArrayList<>();
+                        for (Row row : fullRows) ordered.add(rowToManagerJson(row));
+                        ordered.sort(java.util.Comparator
+                            .<JsonObject>comparingInt(o -> rank.getOrDefault(o.getLong("id"), 3))
+                            .thenComparing(o -> -o.getInteger("reviewsCount", 0))
+                            .thenComparing(o -> o.getLong("id")));
+
+                        JsonArray tiles = new JsonArray();
+                        ordered.forEach(tiles::add);
+                        return Future.succeededFuture(new MatchOutcome(d, tiles, all, inc));
+                    });
+            });
+    }
+
+
+    /**
+     * READ-ONLY discovery through the one matching policy. Creates nothing, decides nothing.
+     *
+     * <p>The anonymous flow used to discover with a substring query - {@code name ILIKE
+     * '%First Last%'} - and only consulted the matcher afterwards, when that query found nothing.
+     * Two definitions of "same person" in one journey, and the weaker one ran first: it caught
+     * "Aaron Yi" inside "Aaron Yip" by luck, missed "Aar Yip" entirely, and - worse - RETURNED
+     * EARLY whenever it found anything at all. With both "Aron Yip" and "Aaron Yip" on file, a
+     * search for the first showed only the first and the second was never looked for.
+     *
+     * <p>So discovery is this method, for everybody. Eligibility and publication still differ
+     * between a signed-in reader and an anonymous one; who exists does not.
+     */
+    public Future<JsonObject> discoverByName(String firstName, String lastName,
+                                            String company, String title, Long companyId,
+                                            int limit, int offset) {
+        return discoverByName(firstName, lastName, company, title, companyId, limit, offset, false, null);
+    }
+
+    /**
+     * @param completedSearch true when this is a SUBMITTED four-field search rather than discovery
+     *        while typing. A submission resolves-or-creates its company; typing never does.
+     *
+     * <p>That write used to be fired from the browser and not awaited, which is not a delivery
+     * guarantee: navigating away, closing the tab or a failed request lost it permanently, and
+     * "somebody will search that employer again" is a hope rather than a mechanism. Doing it here
+     * means the server completes the work whatever the browser does next.
+     *
+     * <p>It runs IN PARALLEL with the matcher rather than after it, so the company write costs the
+     * reader nothing beyond whichever of the two is slower - the tiles do not queue behind it.
+     * Existing resolution, normalisation, aliases, logos and the daily cap all still apply, because
+     * this calls the same {@code companyIdForCapture} every other capture path uses.
+     */
+    public Future<JsonObject> discoverByName(String firstName, String lastName,
+                                            String company, String title, Long companyId,
+                                            int limit, int offset,
+                                            boolean completedSearch, String clientIp) {
+        if (isBlank(firstName) || isBlank(lastName))
+            return Future.succeededFuture(new JsonObject()
+                .put("data", new JsonArray()).put("total", 0).put("hasMore", false));
+
+        Future<Long> safeId = companyId == null
+            ? Future.succeededFuture(null)
+            : companyRepo.isSelectedCompany(companyId, company).map(ok -> ok ? companyId : null);
+
+        return safeId.compose(id -> {
+            Future<MatchOutcome> matching = runMatcher(firstName, lastName,
+                                                       company == null ? "" : company,
+                                                       title   == null ? "" : title, id);
+            // A submitted search resolves its company; discovery while typing does not.
+            Future<Long> companyWrite = completedSearch && !isBlank(company)
+                ? companyIdForCapture(id, company, null, clientIp)
+                : Future.succeededFuture(id);
+            return Future.all(matching, companyWrite).map(both -> (MatchOutcome) both.resultAt(0));
+        })
+            .map(outcome -> {
+                /*
+                  PAGINATION AFTER CLASSIFICATION AND RANKING, never before.
+
+                  Cutting the list earlier is the mistake this whole area keeps making: a LIMIT
+                  applied to raw candidates drops people the matcher would have classified, and a
+                  LIMIT applied before ranking keeps whoever happened to sort first rather than
+                  whoever the reader asked for. So the full classified set is ranked, and only then
+                  does a page come off the front of it.
+
+                  total is the real number of matching public managers, not the size of this page,
+                  so the client can say "3 of 40" rather than implying it has seen everything.
+                */
+                JsonArray all = outcome.tiles();
+                int from = Math.max(0, Math.min(offset, all.size()));
+                int to   = Math.max(from, Math.min(from + Math.max(1, limit), all.size()));
+                JsonArray page = new JsonArray();
+                for (int i = from; i < to; i++) page.add(all.getJsonObject(i));
+                return new JsonObject()
+                    .put("data", page)
+                    .put("total", all.size())
+                    .put("hasMore", to < all.size())
+                    // true when more candidates existed than could be classified within budget:
+                    // the page is honest about being partial rather than presenting itself whole.
+                    .put("moreMatchesMayExist", outcome.incompleteEvidence());
+            });
+    }
+
+    /** Records a search that needs a human decision. Deduplicated by the normalised four fields. */
+    private Future<Void> queueReview(String firstName, String lastName, String company, String title,
+                                     Long resolvedCompanyId, java.util.List<Long> candidateIds,
+                                     ManagerMatcher.Decision d) {
+        return new org.werkpages.repository.ManagerSearchRequestRepository(db)
+            .record(firstName.trim(), lastName.trim(), company.trim(), title.trim(),
+                    ManagerMatcher.norm(firstName + " " + lastName),
+                    ManagerMatcher.normCompany(company),
+                    ManagerMatcher.normTitle(title),
+                    resolvedCompanyId, candidateIds,
+                    d.reason(), d.nameClass().name(),
+                    d.bestCompany() == null ? null : d.bestCompany().name(),
+                    d.bestTitle()   == null ? null : d.bestTitle().name())
+            .mapEmpty();
     }
 }

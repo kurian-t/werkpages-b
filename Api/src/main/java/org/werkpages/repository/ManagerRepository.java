@@ -1473,22 +1473,139 @@ public class ManagerRepository {
                 .map(rows -> rows.iterator().next()));
     }
 
+    /**
+     * The ghost INSERT, shared by the plain path and the serialised one below, so the column list
+     * exists once.
+     */
+    private static final String GHOST_INSERT_SQL = """
+            INSERT INTO managers
+            (name, company, title, status, approval_status, country, state, city,
+             overall_rating, reviews_count, category_averages, submitted_by,
+             company_logo_url, company_id, slug, created_at, updated_at)
+            VALUES ($1,$2,$3,'active','ghost',$4,$5,$6,
+                    0,0,'{}'::jsonb,$7,
+                    $8,$9,$10,now(),now())
+            RETURNING *
+            """;
+
     public Future<Row> createAutoApproved(String name, String company, String title,
                                           String country, String state, String city,
                                           UUID submittedBy, String logoUrl, Long companyId) {
         return generateUniqueSlug(name, company).compose(slug ->
-            db.preparedQuery("""
-                    INSERT INTO managers
-                    (name, company, title, status, approval_status, country, state, city,
-                     overall_rating, reviews_count, category_averages, submitted_by,
-                     company_logo_url, company_id, slug, created_at, updated_at)
-                    VALUES ($1,$2,$3,'active','ghost',$4,$5,$6,
-                            0,0,'{}'::jsonb,$7,
-                            $8,$9,$10,now(),now())
-                    RETURNING *
-                    """)
+            db.preparedQuery(GHOST_INSERT_SQL)
                 .execute(Tuple.of(name, company.trim(), title.trim(), country.trim(), state, city, submittedBy, logoUrl, companyId, slug))
                 .map(rows -> rows.iterator().next()));
+    }
+
+    /**
+     * A ghost insert's result: the row, and whether this call is what wrote it.
+     *
+     * <p>{@code created} is false when another request had already published this manager, so the
+     * row is theirs. The caller must then not seed a review onto it, and must not spend the
+     * searcher's one-time slot, because this call published nothing.
+     */
+    public record GhostInsert(Row row, boolean created) {}
+
+    /** Is there already a live manager under exactly this name at exactly this company? */
+    private static final String EXISTING_PUBLIC_GHOST_SQL = """
+            SELECT id FROM managers
+             WHERE lower(btrim(name)) = lower(btrim($1))
+               AND lower(btrim(company)) = lower(btrim($2))
+               AND approval_status IN ('approved', 'ghost')
+             ORDER BY id ASC
+             LIMIT 1
+            """;
+
+    /**
+     * Publishes a ghost, or returns the one another request published first.
+     *
+     * <p><b>The race.</b> Deciding to auto-create and then auto-creating were two separate
+     * database conversations with nothing holding between them. Six people searching the same
+     * unknown manager at the same instant all ran the matcher before any of them had inserted, so
+     * all six concluded the manager did not exist, and all six went on to create it.
+     *
+     * <p><b>Why the unique index was not enough.</b> {@code managers_slug_idx} caught only the
+     * narrowest version of this. Two racers collide there only if they compute the SAME slug,
+     * which happens when both read the slug namespace before either insert lands. If the second
+     * racer reads it just AFTER the first commits, the plain-name slug is taken,
+     * {@link #generateUniqueSlug} appends the company, the slug differs, and the duplicate inserts
+     * cleanly. A stress run of eight rounds of six simultaneous searches produced an exception in
+     * one round from the collision, and in another round two live rows for one person.
+     *
+     * <p><b>Why not a unique constraint on the table.</b> Two different people who share a name
+     * may both be managers at one company, and the directory has to be able to hold both. The
+     * duplicate here is not a schema violation, it is one decision taken six times, so what needs
+     * to be serialised is the decision.
+     *
+     * <p><b>How.</b> A transaction-scoped advisory lock keyed on this name and company, then the
+     * existence check re-run INSIDE that lock, then the insert. Whoever holds the lock either
+     * finds the manager already there and returns it, or creates it; the next caller through the
+     * lock finds it. The lock is released by the transaction ending, with no cleanup to get wrong,
+     * and it constrains nothing in the schema. A hash collision between two unrelated names costs
+     * one brief wait and nothing else.
+     *
+     * <p>Only this read-then-write is wrapped. The surrounding ghost flow stays composed rather
+     * than transactional, exactly as its own comments require: the slot claim, the seed review and
+     * the recalculation are separate writes with a deliberate order, and nothing here changes it.
+     *
+     * <p>The slug fallback below is kept as a second line of defence. The lock makes a collision
+     * between two racers for the SAME manager impossible, but two DIFFERENT names can still
+     * slugify to one string, and that insert should not surface as a raw driver error either.
+     */
+    public Future<GhostInsert> createAutoApprovedOrExisting(String name, String company, String title,
+                                                            String country, String state, String city,
+                                                            UUID submittedBy, String logoUrl, Long companyId) {
+        final String lockKey = (name == null ? "" : name.trim().toLowerCase())
+                             + "|" + (company == null ? "" : company.trim().toLowerCase());
+
+        return generateUniqueSlug(name, company).compose(slug ->
+            ((Pool) db).withTransaction(conn ->
+                conn.preparedQuery("SELECT pg_advisory_xact_lock(hashtext($1))")
+                    .execute(Tuple.of(lockKey))
+                    .compose(locked -> conn.preparedQuery(EXISTING_PUBLIC_GHOST_SQL)
+                        .execute(Tuple.of(name, company.trim())))
+                    .compose(existing -> {
+                        Iterator<Row> it = existing.iterator();
+                        if (it.hasNext()) {
+                            // Somebody else got here first. Their id now, their full row below.
+                            return Future.succeededFuture(
+                                new ExistingOrInserted(null, it.next().getLong("id")));
+                        }
+                        return conn.preparedQuery(GHOST_INSERT_SQL)
+                            .execute(Tuple.of(name, company.trim(), title.trim(), country.trim(),
+                                              state, city, submittedBy, logoUrl, companyId, slug))
+                            .map(rows -> new ExistingOrInserted(rows.iterator().next(), null));
+                    })))
+            .compose(outcome -> {
+                if (outcome.inserted() != null) {
+                    return Future.succeededFuture(new GhostInsert(outcome.inserted(), true));
+                }
+                // Re-read through findById so the row's shape matches the inserted one exactly.
+                return findById(outcome.existingId())
+                    .map(found -> new GhostInsert(found.orElseThrow(() ->
+                        new IllegalStateException(
+                            "manager " + outcome.existingId() + " vanished during ghost creation")),
+                        false));
+            })
+            .recover(err -> {
+                if (!isSlugCollision(err)) return Future.failedFuture(err);
+                return findByNameAndCompany(name, company).compose(rows -> {
+                    Iterator<Row> it = rows.iterator();
+                    if (!it.hasNext()) return Future.failedFuture(err);
+                    return findById(it.next().getLong("id"))
+                        .compose(winner -> winner.isPresent()
+                            ? Future.succeededFuture(new GhostInsert(winner.get(), false))
+                            : Future.failedFuture(err));
+                });
+            });
+    }
+
+    /** One of the two, never both: the row this call inserted, or the id of the one already there. */
+    private record ExistingOrInserted(Row inserted, Long existingId) {}
+
+    /** True when a write was rejected by the unique index on {@code managers.slug}. */
+    private static boolean isSlugCollision(Throwable err) {
+        return PgErrors.isUniqueViolationOn(err, "slug");
     }
 
     /**
@@ -2082,5 +2199,128 @@ public class ManagerRepository {
                 """)
             .execute(Tuple.of(name, name, name))
             .map(rows -> rows.iterator().next().getBoolean(0));
+    }
+
+    // ── Name-first candidate discovery (see ManagerMatcher and section 5a) ────
+
+    /**
+     * PHASE ONE: every public manager sharing a name token, id and name only.
+     *
+     * <p>Uncapped and never tiered. Running an exact-match query first and widening only when it
+     * returns nothing would hide real candidates: searching "Aron Yip" while both "Aron Yip" and
+     * "Aaron Yip" exist would find the first and never look for the second, and the rule is that
+     * every credible public candidate is discoverable.
+     *
+     * <p>Only two columns come back, so even a common surname costs little to fetch. Full rows and
+     * employment records are loaded afterwards, for the few that actually classified as a match.
+     *
+     * <p>{@code manager_name_tokens} is the SAME function the GIN index is built on, and agrees
+     * character for character with {@code ManagerMatcher.norm}. A contract test holds them together:
+     * if they drift, this query stops returning rows the matcher would have matched, and the search
+     * silently starts creating duplicates again.
+     */
+    public Future<RowSet<Row>> findNameCandidates(java.util.List<String> tokens) {
+        if (tokens == null || tokens.isEmpty()) return db.preparedQuery("SELECT 1 WHERE false").execute();
+        return db.preparedQuery("""
+                SELECT m.id, m.name
+                  FROM managers m
+                 WHERE m.approval_status IN ('approved', 'ghost')
+                   AND manager_name_tokens(m.name) && $1::text[]
+                """)
+            .execute(Tuple.tuple().addArrayOfString(tokens.toArray(new String[0])));
+    }
+
+    /**
+     * Every employment record for these managers: the CURRENT role unioned with career history.
+     *
+     * <p>The union is not optional. {@code createAutoApproved}, {@code createSearchPending} and
+     * {@code createCapturedDraft} write no career row at all, so a search-created manager's only
+     * employment is the one on {@code managers}. Reading career history alone would make every
+     * ghost look unemployed and every search look like a miss.
+     *
+     * <p>Company and title arrive together, per record, because they are only meaningful as a pair.
+     */
+    public Future<RowSet<Row>> findEmployments(java.util.List<Long> managerIds) {
+        if (managerIds == null || managerIds.isEmpty()) return db.preparedQuery("SELECT 1 WHERE false").execute();
+        return db.preparedQuery("""
+                SELECT m.id AS manager_id, m.company_id, m.company, m.title
+                  FROM managers m
+                 WHERE m.id = ANY($1)
+                UNION ALL
+                SELECT ch.manager_id, ch.company_id, ch.company, ch.title
+                  FROM career_history ch
+                 WHERE ch.manager_id = ANY($1)
+                """)
+            .execute(Tuple.tuple().addArrayOfLong(managerIds.toArray(new Long[0])));
+    }
+
+    /** Full rows for the managers that actually classified as candidates, ordered as given. */
+    public Future<RowSet<Row>> findByIdsOrdered(java.util.List<Long> ids) {
+        if (ids == null || ids.isEmpty()) return db.preparedQuery("SELECT 1 WHERE false").execute();
+        return db.preparedQuery(SELECT_BODY + """
+                WHERE m.id = ANY($1)
+                GROUP BY m.id, c.slug, c.industry, c.domain, c.brandfetch_icon_url
+                ORDER BY array_position($1, m.id)
+                """)
+            .execute(Tuple.tuple().addArrayOfLong(ids.toArray(new Long[0])));
+    }
+
+    /**
+     * EXISTENCE detection over rows that are NOT publicly visible.
+     *
+     * <p>Separate from {@link #findNameCandidates} on purpose. That one answers "what may we show?"
+     * and is restricted to approved and ghost so the tile invariant holds. This one answers a
+     * different question - "does this manager already exist in some form?" - and the answer must
+     * include rows nobody can see, or a search would publish a ghost duplicating a manager already
+     * sitting in the admin queue.
+     *
+     * <p>Nothing here is ever rendered. The statuses come back so the caller can apply the policy:
+     *
+     * <ul>
+     *   <li><b>pending_approval</b> - somebody submitted this person and an admin has not decided
+     *       yet. Publishing a ghost now would pre-empt that decision and create a duplicate, so the
+     *       search queues a review instead.</li>
+     *   <li><b>rejected</b> - an admin decided this record should not exist. Publishing a ghost
+     *       would silently overturn that, so the search queues a review instead. It is NOT a
+     *       permanent block: the request carries seen_since_review, so a person people keep
+     *       searching for comes back to the admin with evidence rather than being refused forever.
+     *       </li>
+     * </ul>
+     */
+    public Future<RowSet<Row>> findNonPublicNameCandidates(java.util.List<String> tokens) {
+        if (tokens == null || tokens.isEmpty()) return db.preparedQuery("SELECT 1 WHERE false").execute();
+        return db.preparedQuery("""
+                SELECT m.id, m.name, m.approval_status, m.search_created_by_user_id
+                  FROM managers m
+                 WHERE m.approval_status IN ('pending_approval', 'rejected')
+                   AND manager_name_tokens(m.name) && $1::text[]
+                """)
+            .execute(Tuple.tuple().addArrayOfString(tokens.toArray(new String[0])));
+    }
+
+    /**
+     * An admin judging a search request to describe a genuinely new person.
+     *
+     * <p>'approved' rather than 'ghost': a human decided this manager exists, which is a stronger
+     * statement than the automatic publication a ghost represents. {@code submitted_by} records
+     * WHICH admin, so the decision is attributable rather than appearing from nowhere; no
+     * {@code search_created_by_user_id} is written, because nobody's search created this - a review
+     * did, and notifications are keyed on that distinction.
+     */
+    public Future<Row> createApprovedFromRequest(String name, String company, String title,
+                                                 Long companyId, UUID adminId) {
+        return generateUniqueSlug(name, company).compose(slug ->
+            db.preparedQuery("""
+                    INSERT INTO managers
+                    (name, company, title, status, approval_status, country,
+                     overall_rating, reviews_count, category_averages, submitted_by,
+                     company_id, slug, created_at, updated_at)
+                    VALUES ($1,$2,$3,'active','approved','Canada',
+                            0,0,'{}'::jsonb,$4,
+                            $5,$6,now(),now())
+                    RETURNING *
+                    """)
+                .execute(Tuple.of(name, company.trim(), title.trim(), adminId, companyId, slug))
+                .map(rows -> rows.iterator().next()));
     }
 }

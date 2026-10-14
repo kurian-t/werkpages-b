@@ -530,7 +530,10 @@ public class CompanyRepository {
             .execute(Tuple.of(name.trim(), domain, logoUrl, status))
             .map(rows -> rows.iterator().next())
             .recover(err -> {
-                if (err.getMessage() != null && err.getMessage().contains("23505")) {
+                // SQLSTATE, not message text - see PgErrors. The previous check searched the
+                // message for "23505", which depends on how the driver happens to format it and
+                // which a company whose NAME contained those digits could trigger on its own.
+                if (PgErrors.isUniqueViolation(err)) {
                     return db.preparedQuery("""
                             SELECT * FROM companies
                             WHERE LOWER(TRIM(name)) = LOWER(TRIM($1))
@@ -1806,5 +1809,53 @@ public class CompanyRepository {
             .execute(Tuple.of(userId, hashAddress(clientIp), companyId))
             .map(rows -> (Void) null)
             .otherwise((Void) null);
+    }
+
+    /**
+     * The company ids that count as VERIFIED identity for a typed company.
+     *
+     * <p>Identity only: the id the client selected, an equal normalised name, an approved alias, or
+     * a merge survivor. Similar spelling is deliberately NOT here - it is a ranking signal handled
+     * in {@code ManagerMatcher}, and promoting it to identity would silently declare two different
+     * businesses to be one, which is the thing somebody adding a genuinely different company with a
+     * similar name must never be defeated by.
+     */
+    public Future<java.util.Set<Long>> resolveVerifiedCompanyIds(Long selectedId, String companyText) {
+        String typed = companyText == null ? "" : companyText.trim();
+        return db.preparedQuery("""
+                WITH q AS (SELECT normalize_company_name($2) AS nq)
+                SELECT c.id FROM companies c, q
+                 WHERE c.status <> 'merged' AND c.normalized_name = q.nq
+                UNION
+                SELECT a.company_id FROM company_aliases a, q
+                 WHERE a.normalized_alias = q.nq
+                UNION
+                -- a name that was merged away still identifies its survivor
+                SELECT cm.target_company_id FROM company_merges cm
+                  JOIN companies src ON src.id = cm.source_company_id, q
+                 WHERE src.normalized_name = q.nq
+                UNION
+                -- THE CLIENT'S ID IS VERIFIED, NOT TRUSTED.
+                --
+                -- It arrives in the request body, so accepting it as identity would let a
+                -- fabricated or stale id declare any company to be the one that was typed - and
+                -- company identity is what decides whether a ghost may be published. So the id
+                -- only counts when the row it names actually IS the typed company: same
+                -- normalised name, or an approved alias of it. A mismatch is treated as no
+                -- selection at all, exactly as isSelectedCompany already does for the
+                -- short-company guard.
+                SELECT c.id FROM companies c, q
+                 WHERE c.id = $1::bigint
+                   AND c.status <> 'merged'
+                   AND (c.normalized_name = q.nq
+                        OR EXISTS (SELECT 1 FROM company_aliases a
+                                    WHERE a.company_id = c.id AND a.normalized_alias = q.nq))
+                """)
+            .execute(Tuple.tuple().addLong(selectedId).addString(typed))
+            .map(rows -> {
+                java.util.Set<Long> ids = new java.util.LinkedHashSet<>();
+                for (Row r : rows) { Long id = r.getLong(0); if (id != null) ids.add(id); }
+                return ids;
+            });
     }
 }

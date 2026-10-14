@@ -1,6 +1,7 @@
 package org.werkpages.service;
 
 import io.vertx.core.Future;
+import org.werkpages.repository.ManagerSearchRequestRepository;
 import io.vertx.core.json.JsonArray;
 import io.vertx.core.json.JsonObject;
 import io.vertx.sqlclient.Row;
@@ -1823,5 +1824,157 @@ public class AdminService {
                 .put("maxPerDay",  org.werkpages.repository.AnonymousGhostSlotRepository.MAX_PER_DAY_SITE_WIDE)
                 .put("paused",     !rate.withinCeiling())
                 .put("trippedBy",  rate.trippedBy()));
+    }
+
+    // ── Manager search requests: the review queue ─────────────────────────────
+
+    /**
+     * The queue, most-searched first.
+     *
+     * <p>Ordered by weight of evidence rather than age: a manager fifty people have looked for
+     * matters more than one somebody typed once in March. {@code seen_count} is what carries that,
+     * and it exists because the unique constraint folds repeats into one row instead of letting
+     * the queue fill with copies.
+     */
+    public Future<JsonArray> listSearchRequests(String auth0Id, String status, int limit, int offset) {
+        return requireAdmin(auth0Id).compose(adminId -> {
+            ManagerSearchRequestRepository repo = new ManagerSearchRequestRepository(db);
+            Future<RowSet<Row>> rows = "dismissed".equals(status)
+                ? repo.findDismissedButRecurring(limit)
+                : repo.findOpen(limit, offset);
+            return rows.map(rs -> {
+                JsonArray out = new JsonArray();
+                for (Row r : rs) out.add(searchRequestToJson(r));
+                return out;
+            });
+        });
+    }
+
+    /**
+     * "This is a genuinely new person." Creates the manager from what was searched.
+     *
+     * <p>Publication is an admin act here, so the company IS resolved or created - the same rule
+     * every deliberate submission follows. The request keeps the resulting manager id, so the
+     * decision is auditable afterwards rather than vanishing into a status change.
+     */
+    public Future<JsonObject> createManagerFromRequest(String auth0Id, long requestId,
+                                                       String resolvedLogoUrl) {
+        ManagerSearchRequestRepository repo = new ManagerSearchRequestRepository(db);
+        return requireAdmin(auth0Id).compose(adminId ->
+            /*
+              CLAIMED BEFORE ANYTHING IS CREATED.
+
+              Reading the status and then checking it in Java let two admins act on one request at
+              the same time, and this is the action where that costs most: two managers published
+              for one person. The claim is a conditional UPDATE, so exactly one caller gets the
+              row and the other is told it has already been reviewed.
+            */
+            repo.claim(requestId, "resolved", "new_manager", adminId).compose(req -> {
+                if (req == null) return findRequestOrFail(repo, requestId);
+
+                String fullName = req.getString("first_name") + " " + req.getString("last_name");
+                String company  = req.getString("company_text");
+                String title    = req.getString("title_text");
+
+                return companyRepo.resolve(req.getLong("resolved_company_id"), company, null, resolvedLogoUrl)
+                    .compose(cRow -> managerRepo.createApprovedFromRequest(
+                        fullName, company, title, cRow.getLong("id"), adminId))
+                    .compose(created -> repo.setResolvedManager(requestId, created.getLong("id"))
+                        .map(v -> new JsonObject()
+                            .put("managerId", created.getLong("id"))
+                            .put("name", fullName)
+                            .put("resolution", "new_manager")))
+                    // The claim was taken on the promise of a manager. Without one, it goes back.
+                    .recover(err -> repo.reopen(requestId).compose(v -> Future.failedFuture(err)));
+            }));
+    }
+
+    /**
+     * "This is somebody we already have, in a job we did not know about."
+     *
+     * <p>Adds the searched employment to an EXISTING manager rather than creating a second one.
+     * Dates come from the admin, because a search tells us nothing about when somebody held a
+     * role, and guessing would write fiction into a career history people read.
+     *
+     * <p>Never automatic. A search is evidence that somebody typed a name, not that two records
+     * describe one person.
+     */
+    public Future<JsonObject> attachRequestToManager(String auth0Id, long requestId, long managerId,
+                                                     String startDate, String endDate) {
+        ManagerSearchRequestRepository repo = new ManagerSearchRequestRepository(db);
+        return requireAdmin(auth0Id).compose(adminId ->
+            // Claimed first, for the same reason as above: two admins attaching the same searched
+            // job would write it into one career history twice.
+            repo.claim(requestId, "resolved", "existing_role", adminId).compose(req -> {
+                if (req == null) return findRequestOrFail(repo, requestId);
+
+                // Reuses the ordinary career-entry path, so company resolution, validation and
+                // date handling behave exactly as they do when an admin adds a role by hand.
+                return adminCreateCareerEntry(auth0Id, managerId,
+                        req.getString("company_text"), req.getString("title_text"),
+                        startDate, endDate, req.getLong("resolved_company_id"), null)
+                    .compose(entry -> repo.setResolvedManager(requestId, managerId)
+                        .map(v -> new JsonObject()
+                            .put("managerId", managerId)
+                            .put("resolution", "existing_role")))
+                    .recover(err -> repo.reopen(requestId).compose(v -> Future.failedFuture(err)));
+            }));
+    }
+
+    /**
+     * "Not verifiable." The request stays, with the decision recorded.
+     *
+     * <p>Nothing is deleted, and {@code seen_since_review} resets to zero so the queue can show
+     * "dismissed, and searched eleven times since" later. That is deliberately not a cooldown: a
+     * timer is a guess about how long, whereas a count is a fact about how many, and only the
+     * second one tells an admin they may have been wrong.
+     */
+    public Future<JsonObject> dismissSearchRequest(String auth0Id, long requestId) {
+        ManagerSearchRequestRepository repo = new ManagerSearchRequestRepository(db);
+        return requireAdmin(auth0Id).compose(adminId ->
+            // Also claimed, so a second dismissal cannot reset seen_since_review and destroy the
+            // "dismissed, and searched eleven times since" signal the counter exists to carry.
+            repo.claim(requestId, "dismissed", "not_verifiable", adminId).compose(req ->
+                req == null
+                    ? findRequestOrFail(repo, requestId)
+                    : Future.succeededFuture(
+                        new JsonObject().put("id", requestId).put("status", "dismissed"))));
+    }
+
+    /**
+     * Why a claim failed: the request is gone, or somebody else decided it first.
+     *
+     * <p>Told apart so an admin whose click lost a race sees "already reviewed" rather than a
+     * "not found" that makes it look as though the row vanished.
+     */
+    private static <T> Future<T> findRequestOrFail(ManagerSearchRequestRepository repo, long requestId) {
+        return repo.findById(requestId).compose(existing -> Future.failedFuture(
+            existing == null
+                ? ServiceException.notFound("Request not found")
+                : ServiceException.badRequest("Request already reviewed")));
+    }
+
+    private static JsonObject searchRequestToJson(Row r) {
+        JsonArray candidates = new JsonArray();
+        Long[] ids = r.getArrayOfLongs("candidate_manager_ids");
+        if (ids != null) for (Long id : ids) candidates.add(id);
+        return new JsonObject()
+            .put("id", r.getLong("id"))
+            .put("firstName", r.getString("first_name"))
+            .put("lastName", r.getString("last_name"))
+            .put("company", r.getString("company_text"))
+            .put("title", r.getString("title_text"))
+            .put("resolvedCompanyId", r.getLong("resolved_company_id"))
+            .put("candidateManagerIds", candidates)
+            .put("reason", r.getString("reason"))
+            .put("nameMatchClass", r.getString("name_match_class"))
+            .put("companyClass", r.getString("best_company_class"))
+            .put("titleClass", r.getString("best_title_class"))
+            .put("status", r.getString("status"))
+            .put("resolution", r.getString("resolution"))
+            .put("seenCount", r.getInteger("seen_count"))
+            .put("seenSinceReview", r.getInteger("seen_since_review"))
+            .put("firstSeenAt", String.valueOf(r.getOffsetDateTime("first_seen_at")))
+            .put("lastSeenAt", String.valueOf(r.getOffsetDateTime("last_seen_at")));
     }
 }

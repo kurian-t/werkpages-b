@@ -208,6 +208,83 @@ class LocationCorpusRepositoryTest {
     }
 
     @Test
+    @DisplayName("a street suffix is a qualifier, because the corpus abbreviates it")
+    void aStreetSuffixIsDropped() {
+        /*
+          The bug this comes from, measured against the live corpus.
+
+          Elk Grove Subaru is stored with street "8581 Laguna Grove Dr". Somebody typing the
+          address in full writes "Drive", and every word is ANDed against search_text, so one
+          word nobody would think twice about turned a found dealership into nothing:
+
+            "8581 Laguna Grove Drive, Elk Grove, California"   13.7s   0 results
+            "8581 Laguna Grove Dr, Elk Grove, California"       1.0s   1 result
+            "8581 Laguna Grove, Elk Grove"                      1.0s   1 result
+
+          The miss also costs thirteen seconds, because a query that matches nothing reads the
+          whole 16.1M-row United States partition before it can say so. The more completely
+          somebody typed their address, the longer they waited to be told it does not exist.
+
+          Dropping the suffix is the same move already made for the country and the region, and
+          for the same reason: the corpus does not spell it the way people type it, and it carries
+          almost no discriminating power once the number, the street name and the city are there.
+        */
+        Set<String> none = Set.of();
+        assertEquals(List.of("8581", "laguna", "grove", "elk", "grove"),
+                     LocationCorpusRepository.withoutQualifiers(
+                         List.of("8581", "laguna", "grove", "drive", "elk", "grove"),
+                         "United States", none));
+        // The abbreviation is dropped too, so both spellings ask the same question.
+        assertEquals(List.of("8581", "laguna", "grove", "elk", "grove"),
+                     LocationCorpusRepository.withoutQualifiers(
+                         List.of("8581", "laguna", "grove", "dr", "elk", "grove"),
+                         "United States", none));
+    }
+
+    @Test
+    @DisplayName("a suffix word in a business name is NOT dropped")
+    void aSuffixWordInABusinessNameSurvives() {
+        /*
+          The regression this guards against was introduced by the fix above and caught in review.
+
+          Stripping street types unconditionally broke every business whose NAME ends in one.
+          Measured against the live corpus while it was wrong:
+
+            "Scotiabank Place"  -> Scotiabank, Scotiabank Theatre Chinook   (not the arena)
+            "Hudson Bay Place"  -> Hudson's Bay, Hudson Bay Mountain Resort (not the building)
+            "Union Square"      -> geography rows only
+
+          Place, Square, Way, Court and Terrace are ordinary words in names, so a list that drops
+          them everywhere trades one failure for a larger one.
+
+          A house number is what distinguishes the two readings. "8581 Laguna Grove Drive" is an
+          address and its suffix is a formatting detail the corpus may abbreviate; "Scotiabank
+          Place" is a name and every word of it is meant.
+        */
+        Set<String> none = Set.of();
+        assertEquals(List.of("scotiabank", "place"),
+                     LocationCorpusRepository.withoutQualifiers(
+                         List.of("scotiabank", "place"), "Canada", none));
+        assertEquals(List.of("union", "square"),
+                     LocationCorpusRepository.withoutQualifiers(
+                         List.of("union", "square"), "United States", none));
+        // With a street number present it reads as an address again, and the suffix goes.
+        assertEquals(List.of("100", "scotiabank"),
+                     LocationCorpusRepository.withoutQualifiers(
+                         List.of("100", "scotiabank", "place"), "Canada", none));
+    }
+
+    @Test
+    @DisplayName("a street name that IS a suffix word survives")
+    void aStreetNamedAfterASuffixSurvives() {
+        // "Street" in "Queen Street" is a suffix; in "The Street, Norwich" it is the whole name.
+        // Removing every word would ask for everything, so the existing guard keeps them.
+        assertEquals(List.of("street"),
+                     LocationCorpusRepository.withoutQualifiers(
+                         List.of("street"), "United Kingdom", Set.of()));
+    }
+
+    @Test
     @DisplayName("a query that is only a region still searches for it")
     void aBareRegionIsStillAQuery() {
         // Stripping every word would ask for everything. Somebody who typed "Ontario" means it.

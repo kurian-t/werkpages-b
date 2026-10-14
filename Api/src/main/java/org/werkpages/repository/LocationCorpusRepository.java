@@ -205,7 +205,8 @@ public class LocationCorpusRepository {
 
     private record CacheEntry(JsonArray value, long expiresAt) {}
 
-    private Future<JsonArray> cached(String key, java.util.function.Supplier<Future<JsonArray>> compute) {
+    // Package-private so the failure-is-not-cached rule can be tested without a corpus to break.
+    Future<JsonArray> cached(String key, java.util.function.Supplier<Future<JsonArray>> compute) {
         CacheEntry hit = cache.get(key);
         long now = System.currentTimeMillis();
         if (hit != null && hit.expiresAt() > now) return Future.succeededFuture(hit.value());
@@ -390,13 +391,34 @@ public class LocationCorpusRepository {
           which is the one thing this whole class is arranged to prevent. Both lambdas below
           execute on the worker, and the region names are memoised, so asking twice is free.
         */
-        java.util.function.Supplier<java.util.List<String>> words =
+        /*
+          TWO INTERPRETATIONS, RETRIEVED TOGETHER.
+
+          The query is never destroyed. "Texas Roadhouse" is both a name and, read another way, a
+          roadhouse in Texas, and only the corpus can say which. So both readings are put to it in
+          one scan and the literal one is preferred when it hits.
+
+          Stripping alone was not merely imprecise, it EXCLUDED the right answer. Texas Roadhouse
+          is in the corpus with confidence 0.92 and a search_text of
+          "texas roadhouse 101 conduit rd colonial heights". Dropping "texas" as a region word left
+          the anchored predicate as search_text LIKE 'roadhouse%', which that row cannot satisfy
+          because its text begins with "texas" - and anchoredThenContains then returned the other
+          roadhouses it did find, so the contains fallback that would have caught it never ran.
+          Three mechanisms, one unfindable restaurant chain.
+
+          A scoring pass cannot repair this. A candidate that retrieval never returned is not
+          available to rank, which is why both readings have to reach the WHERE clause rather than
+          being resolved afterwards.
+        */
+        java.util.function.Supplier<java.util.List<String>> literalWords = () -> tokens(needle);
+        java.util.function.Supplier<java.util.List<String>> strippedWords =
             () -> forPlaces(tokens(needle), country, iso);
 
         return cached("place|" + iso + "|" + brand + "|" + needle, () ->
-          anchoredThenContains(anchored ->
+          anchoredThenLiteralContains(anchored ->
             query(release -> """
-                SELECT source_place_id, name, brand_name, street, city, state_code, postal_code
+                SELECT source_place_id, name, brand_name, street, city, state_code, postal_code,
+                       literal_hit
                 FROM (
                     -- One row per BUILDING, not per street string. Overture lists the pharmacy,
                     -- photo centre, hair salon and grocery pickup inside a supermarket as separate
@@ -426,31 +448,93 @@ public class LocationCorpusRepository {
                     -- deliver here.
                     SELECT source_place_id, name, brand_name, street, city, state_code,
                            postal_code, confidence, operating_status,
+                           -- The query as ONE CONTIGUOUS PHRASE, not token by token.
+                           --
+                           -- Per-token was too weak to mean anything: "Northwest Face and Body"
+                           -- contains both words of "North Face" separately, so it counted as a
+                           -- literal match and convinced the fast path it had found the answer. A
+                           -- phrase match does not: "northwest face" does not contain the phrase
+                           -- "north face", while "the north face the north face ..." does.
+                           --
+                           -- No per-cent signs in this text block: it goes through String.formatted,
+                           -- which reads them as conversions and throws.
+                           CASE WHEN search_text LIKE ? THEN 0 ELSE 1 END AS literal_hit,
                            row_number() OVER (
-                               PARTITION BY coalesce(upper(replace(postal_code, ' ', '')), '?'),
-                                            coalesce(regexp_extract(street, '\\d+'), name)
+                               /*
+                                 ONE ROW PER BUSINESS, not one per building.
+
+                                 This grouped on postal code plus the first number in the street,
+                                 which is not an identity: 10 Main Street and 10 King Street can
+                                 share a postal code, and regexp_extract returns an EMPTY STRING
+                                 rather than NULL when a street has no digits, so coalesce never
+                                 reached the name fallback and every numberless address in a
+                                 postcode collapsed into one. The survivors of that collapse were
+                                 silently dropped.
+
+                                 A pharmacy, a supermarket and a hair salon in one building are
+                                 three employers with three sets of managers, so all three stay
+                                 separately selectable. The name joins the key to keep them, while
+                                 the same business listed twice at one address still collapses.
+                                 nullif() is what makes the fallback work at all.
+                               */
+                               -- source_place_id, so a distinct workplace is NEVER merged away.
+                               -- Keying on the name still merged two same-name branches that
+                               -- happened to share a postal code and street number, which is the
+                               -- identity question this was supposed to stop getting wrong.
+                               -- Duplicate reconciliation is a separate, deliberate job.
+                               PARTITION BY source_place_id
                                ORDER BY CASE WHEN brand_name IS NOT NULL THEN 0 ELSE 1 END,
                                         confidence DESC NULLS LAST) AS at_address
                     FROM read_parquet('s3://%s/processed/%s/places/country_code=%s/*.parquet')
-                    WHERE %s
+                    -- The outer parentheses matter: AND binds tighter than OR, so without them
+                    -- the closed-business filter would apply to the second reading only.
+                    WHERE ((%s) OR (%s))
                       AND coalesce(operating_status, 'open') <> 'closed'
                 )
                 WHERE at_address = 1
-                ORDER BY CASE WHEN ? IS NOT NULL AND lower(coalesce(brand_name,'')) = ? THEN 0
+                -- The literal reading first. Both are candidates; this decides which one the
+                -- reader most likely meant, and only among rows retrieval actually returned.
+                ORDER BY literal_hit,
+                         CASE WHEN ? IS NOT NULL AND lower(coalesce(brand_name,'')) = ? THEN 0
                               WHEN brand_name IS NOT NULL                                THEN 1
                               ELSE 2 END,
                          confidence DESC NULLS LAST
                 LIMIT %d
-                """.formatted(bucket, release, partition(iso), tokensClause(words.get().size(), anchored), LIMIT),
+                """.formatted(bucket, release, partition(iso),
+                              tokensClause(literalWords.get().size(), anchored),
+                              tokensClause(strippedWords.get().size(), anchored),
+                              LIMIT),
             statement -> {
                 int i = 1;
-                bindTokens(statement, words.get(), i, anchored);
-                i += words.get().size();
+                // Order follows the SQL text: the literal_hit phrase, then the two WHERE
+                // readings, then the brand preference.
+                /*
+                  The phrase is the FIRST comma segment, not the whole query.
+
+                  "New York Life, New York" is a name followed by where it is, and no search_text
+                  holds those as one run of words - so taking the whole string as the phrase meant
+                  the signal never fired, the contains scan ran every time, and the company still
+                  did not surface. Its first segment, "new york life", matches exactly.
+
+                  Commas inform the reading here; they do not decide it. A query with no comma
+                  simply uses all of itself, and a segment that matches nothing costs only the
+                  fallback that would have run anyway.
+                */
+                int comma = needle.indexOf(',');
+                String phrase = (comma > 0 ? needle.substring(0, comma) : needle).trim();
+                statement.setString(i++, "%" + phrase + "%");
+                bindTokens(statement, literalWords.get(), i, anchored);
+                i += literalWords.get().size();
+                bindTokens(statement, strippedWords.get(), i, anchored);
+                i += strippedWords.get().size();
                 statement.setString(i++, brand);
                 statement.setString(i, brand);
             },
             rs -> new JsonObject()
                 .put("kind", "place")
+                // Carried so the caller can tell a literal hit from a row that only matched the
+                // qualifier-stripped reading. See anchoredThenLiteralContains.
+                .put("literalHit", rs.getInt("literal_hit") == 0)
                 .put("sourcePlaceId", rs.getString("source_place_id"))
                 .put("name", rs.getString("name"))
                 .put("brandName", rs.getString("brand_name"))
@@ -493,11 +577,25 @@ public class LocationCorpusRepository {
                 }
                 promise.complete(out);
             } catch (Throwable err) {
-                // Soft failure by design, and Throwable rather than Exception because a native
-                // library problem arrives as an Error. No suggestions is worse than suggestions,
-                // and far better than a form that will not submit.
-                LOG.log(Level.WARNING, "location corpus query failed; returning no suggestions", err);
-                promise.complete(new JsonArray());
+                /*
+                  FAILS, rather than quietly succeeding with nothing.
+
+                  This used to complete with an empty array, which had two consequences and both
+                  bit. An outage became indistinguishable from "no such place", so a caller could
+                  not tell a broken bucket from a place that does not exist - and the empty result
+                  then went into the one-hour cache as a perfectly good answer, so one transient
+                  error made that query return nothing for the next sixty minutes.
+
+                  It also hid a programming error for an entire round of measurement: a stray
+                  per-cent sign in a SQL comment threw on every query, and ten benchmark cases
+                  reported as legitimate empty results rather than as the crash they were.
+
+                  Softening still happens, but at the boundary where somebody can decide what to
+                  tell the reader, not here where the evidence is thrown away. Throwable rather
+                  than Exception because a native library problem arrives as an Error.
+                */
+                LOG.log(Level.WARNING, "location corpus query failed", err);
+                promise.fail(err);
             }
         });
         return promise.future();
@@ -778,13 +876,19 @@ public class LocationCorpusRepository {
                   every query already runs on a duplicate. This download takes seconds and would
                   otherwise be holding the shared connection while requests use it.
 
-                  Its own memory limit too: the engine is capped at a few hundred megabytes so two
-                  of them fit on a 4GB box, and a COPY of five million rows under that cap spills
-                  or dies. It is a one-off read of a 54MB dataset, so it gets room to do it.
+                  NO MEMORY OVERRIDE. This used to raise the limit to 2GB here, on the reasoning
+                  that a duplicated connection has "its own memory limit". It does not: duplicate()
+                  shares the database instance and DuckDB's memory_limit is instance-wide, so the
+                  line quietly lifted the cap for every concurrent request on a 4GB box, and never
+                  put it back. The engine also allocates outside the buffer manager, so the cap was
+                  never the whole story anyway.
+
+                  If this COPY cannot run inside the configured limit, the answer is to publish the
+                  compact geography file during the corpus build and download it, rather than
+                  rebuilding it here with the engine's safety belt loosened.
                 */
                 try (Connection own = ((org.duckdb.DuckDBConnection) conn).duplicate();
                      Statement statement = own.createStatement()) {
-                    statement.execute("SET memory_limit='2GB'");
                     statement.execute("COPY (SELECT * FROM read_parquet('s3://" + bucket
                         + "/processed/" + release + "/geography/*/*.parquet', hive_partitioning=true))"
                         + " TO '" + tmp + "' (FORMAT parquet, COMPRESSION zstd)");
@@ -915,12 +1019,97 @@ public class LocationCorpusRepository {
     static java.util.List<String> withoutQualifiers(java.util.List<String> words, String country,
                                                     java.util.Set<String> regions) {
         java.util.List<String> withoutCountry = withoutCountryWord(words, country);
+        /*
+          A street type is only a formatting detail when this is an ADDRESS.
+
+          Dropping it unconditionally broke every business whose name ends in one: "Scotiabank
+          Place" searched for "scotiabank" and returned the bank and a cinema, "Union Square"
+          returned three states. Place, Square, Way, Court and Terrace are ordinary words in
+          names, and a list that eats them everywhere trades one failure for a bigger one.
+
+          A house number is the signal, and it is a reliable one: "8581 Laguna Grove Drive" is an
+          address whose suffix the corpus may abbreviate to "Dr", while "Scotiabank Place" is a
+          name in which every word is meant. Businesses that merely BEGIN with a number, "99 Ranch
+          Market", are unaffected, because they carry no street type to drop.
+        */
+        boolean looksLikeAddress = withoutCountry.stream().anyMatch(LocationCorpusRepository::isHouseNumber);
         java.util.List<String> kept = new java.util.ArrayList<>();
         for (String word : withoutCountry) {
-            if (!regions.contains(word)) kept.add(word);
+            if (regions.contains(word)) continue;
+            if (looksLikeAddress && STREET_SUFFIXES.contains(word)) continue;
+            kept.add(word);
         }
         return kept.isEmpty() ? withoutCountry : kept;
     }
+
+    /** Whether this token is a bare street number, which is what makes a query read as an address. */
+    private static boolean isHouseNumber(String word) {
+        if (word == null || word.isEmpty()) return false;
+        for (int i = 0; i < word.length(); i++) {
+            if (!Character.isDigit(word.charAt(i))) return false;
+        }
+        return true;
+    }
+
+    /**
+     * Street-type words, dropped from a places search for the same reason the country and the
+     * region are.
+     *
+     * <h2>The failure</h2>
+     *
+     * <p>Overture abbreviates. Elk Grove Subaru is stored with the street {@code "8581 Laguna
+     * Grove Dr"}, and somebody typing their workplace address in full writes "Drive". Every word
+     * is ANDed against {@code search_text}, so that one word decided the result. Measured against
+     * the live corpus:
+     *
+     * <pre>
+     *   "8581 Laguna Grove Drive, Elk Grove, California"   13.7s   0 results
+     *   "8581 Laguna Grove Dr, Elk Grove, California"       1.0s   1 result
+     *   "8581 Laguna Grove, Elk Grove"                      1.0s   1 result
+     * </pre>
+     *
+     * <p>The miss is also the slow one, and necessarily so: a query that matches nothing has to
+     * read the whole 16.1M-row United States partition before it can say nothing matched. So the
+     * more completely somebody typed their address, the longer they waited to be told it does not
+     * exist. That is the worst possible shape for a field that is trying to be helpful.
+     *
+     * <h2>Why dropping rather than expanding</h2>
+     *
+     * <p>Expanding the needle to {@code (… LIKE '%drive%' OR … LIKE '%dr%')} would need the
+     * alternation threaded through both the anchored and the contains clauses, and {@code '%dr%'}
+     * is a substring of enough words to be worth little. Normalising the corpus side instead would
+     * mean a rebuild, which is a multi-hour job over tens of millions of rows.
+     *
+     * <p>Dropping costs almost nothing in precision. By the time the number, the street name and
+     * the city are all present the building is already identified - "8581 Laguna Grove, Elk Grove"
+     * finds it on its own, as the measurement above shows - and ranking still orders what comes
+     * back. It also makes both spellings ask the same question, which is the real goal: nobody
+     * should have to guess whether a map wrote "Dr" or "Drive".
+     *
+     * <p>Both the long and the short form are listed, so "Dr" is dropped as readily as "Drive".
+     * The existing guard in {@link #withoutQualifiers} keeps them when removing everything would
+     * leave nothing, which is what saves a street genuinely named "The Street".
+     */
+    private static final java.util.Set<String> STREET_SUFFIXES = java.util.Set.of(
+        "street",    "st",
+        "road",      "rd",
+        "avenue",    "ave",   "av",
+        "drive",     "dr",
+        "boulevard", "blvd",
+        "lane",      "ln",
+        "court",     "ct",
+        "place",     "pl",
+        "crescent",  "cres",
+        "parkway",   "pkwy",
+        "highway",   "hwy",
+        "terrace",   "terr",
+        "circle",    "cir",
+        "square",    "sq",
+        "trail",     "trl",
+        "way",
+        "suite",     "ste",
+        "unit",
+        "floor",     "fl");
 
     /**
      * The text the ORDER BY compares a row's name against.
@@ -1026,6 +1215,59 @@ public class LocationCorpusRepository {
         if (!searchTextSorted) return run.apply(false);
         return run.apply(true).compose(found -> found.isEmpty() ? run.apply(false)
                                                                 : Future.succeededFuture(found));
+    }
+
+    /**
+     * The anchored fast path, but it may not SUPPRESS the answer it cannot reach.
+     *
+     * <h2>What went wrong with stopping on any hit</h2>
+     *
+     * <p>Anchoring matches the first token against the start of {@code search_text}, so it can only
+     * find a row whose text begins with what was typed. The North Face is stored as
+     * {@code "the north face the north face 1450 ala moana..."} - the article comes first - so
+     * {@code 'north%'} cannot reach it. "Northwest Face &amp; Body" and "Northface Resort" can, and
+     * finding those counted as success, so the contains pass that would have returned all 320 North
+     * Face rows never ran. An incidental prefix match hid the chain somebody was looking for.
+     *
+     * <p>So emptiness is the wrong test. The anchored pass is trusted only when it found a row
+     * matching the LITERAL reading of the query; anything else is a near miss that has to be
+     * checked properly. A query whose anchored hits are all qualifier-stripped matches pays for the
+     * contains scan, which is the cost of not hiding the answer.
+     *
+     * <p>The two result sets are merged rather than substituted, because an anchored hit is still a
+     * real match: somebody searching "Northwest" should keep finding Northwest Face &amp; Body.
+     */
+    private Future<JsonArray> anchoredThenLiteralContains(
+            java.util.function.Function<Boolean, Future<JsonArray>> run) {
+        if (!searchTextSorted) return run.apply(false);
+        return run.apply(true).compose(anchoredRows -> {
+            if (hasLiteralHit(anchoredRows)) return Future.succeededFuture(anchoredRows);
+            return run.apply(false).map(containsRows -> mergePlaces(anchoredRows, containsRows));
+        });
+    }
+
+    /** Whether any row matched the query as typed, rather than only its stripped reading. */
+    private static boolean hasLiteralHit(JsonArray rows) {
+        for (int i = 0; i < rows.size(); i++) {
+            JsonObject row = rows.getJsonObject(i);
+            if (row != null && Boolean.TRUE.equals(row.getBoolean("literalHit"))) return true;
+        }
+        return false;
+    }
+
+    /** Contains results first, since they are the ones the anchored pass could not reach. */
+    private static JsonArray mergePlaces(JsonArray anchoredRows, JsonArray containsRows) {
+        JsonArray out = containsRows.copy();
+        java.util.Set<String> seen = new java.util.HashSet<>();
+        for (int i = 0; i < out.size(); i++) {
+            JsonObject row = out.getJsonObject(i);
+            if (row != null) seen.add(String.valueOf(row.getValue("sourcePlaceId")));
+        }
+        for (int i = 0; i < anchoredRows.size(); i++) {
+            JsonObject row = anchoredRows.getJsonObject(i);
+            if (row != null && seen.add(String.valueOf(row.getValue("sourcePlaceId")))) out.add(row);
+        }
+        return out;
     }
 
     /**

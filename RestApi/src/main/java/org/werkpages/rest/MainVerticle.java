@@ -69,6 +69,54 @@ import io.vertx.ext.web.handler.StaticHandler;
 public class MainVerticle extends AbstractVerticle {
 
     // Loaded once at startup from AWS Secrets Manager
+    /**
+     * A VALIDATION-ONLY listener reporting what the location search actually did.
+     *
+     * <h2>Not reachable in production, on any port</h2>
+     *
+     * <p>It is not a route on {@code router}: the main server never learns of it. It is a separate
+     * HTTP server that is only CREATED when {@code LOCAL_CORPUS_DIAGNOSTICS_PORT} is set, so with
+     * that variable absent - which is every production deployment - the socket does not exist and
+     * there is nothing to reach. Binding is pinned to the loopback address inside the container as
+     * a second line of defence, but the real control is that the port is never published: a
+     * container started without {@code -p} for it is unreachable from outside regardless.
+     *
+     * <p>It serves counts and states only. No query text, no user data, nothing from the database.
+     *
+     * <p>Why it exists: "the pool opened" is not evidence that a single query ran against the
+     * index. A release can resolve and then every request still be served remotely, which looks
+     * like success with slightly worse latency. See {@code CorpusDiagnostics}.
+     */
+    private void startCorpusDiagnosticsListener(io.vertx.core.Vertx vertx) {
+        String configured = System.getenv("LOCAL_CORPUS_DIAGNOSTICS_PORT");
+        if (configured == null || configured.isBlank()) return;   // production: nothing is created
+
+        final int port;
+        try {
+            port = Integer.parseInt(configured.trim());
+        } catch (NumberFormatException bad) {
+            System.err.println("LOCAL_CORPUS_DIAGNOSTICS_PORT is not a number, diagnostics not started");
+            return;
+        }
+
+        vertx.createHttpServer().requestHandler(req -> {
+            if (!"/corpus-diagnostics".equals(req.path())) {
+                req.response().setStatusCode(404).end();
+                return;
+            }
+            if ("POST".equals(req.method().name())) {   // reset between validation phases
+                org.werkpages.repository.CorpusDiagnostics.reset();
+                req.response().putHeader("Content-Type", "application/json").end("{\"reset\":true}");
+                return;
+            }
+            req.response().putHeader("Content-Type", "application/json")
+               .end(org.werkpages.service.ManagerService.corpusDiagnostics().encode());
+        }).listen(port, "127.0.0.1")
+          .onSuccess(s -> System.out.println(
+              "⚠ corpus diagnostics listening on 127.0.0.1:" + port + " (validation builds only)"))
+          .onFailure(err -> System.err.println("corpus diagnostics did not start: " + err.getMessage()));
+    }
+
     private static SecretsConfig secrets;
 
     /**
@@ -329,6 +377,7 @@ public class MainVerticle extends AbstractVerticle {
                         managerService.setCompanyReviewRepo(companyReviewRepo);
 
                         routerFactory.addHandlerByOperationId("getManagers",           managersHandler::handleGetManagers);
+                        routerFactory.addHandlerByOperationId("searchManagers",        managersHandler::handleSearchManagers);
                         routerFactory.addHandlerByOperationId("getManagerById",        managersHandler::handleGetManagerById);
                         routerFactory.addHandlerByOperationId("createManager",         managersHandler::handleCreateManager);
                         routerFactory.addHandlerByOperationId("updateManager",         managersHandler::handleUpdateManager);
@@ -709,6 +758,8 @@ public class MainVerticle extends AbstractVerticle {
                             .listen(httpPort)
                             .onSuccess(server -> System.out.println("✓ HTTP server started on port " + httpPort))
                             .onFailure(err -> System.err.println("✗ Failed to start server: " + err.getMessage()));
+
+                        startCorpusDiagnosticsListener(vertx);
 
                         }); // end Database.init onReady
                     } else {

@@ -40,6 +40,46 @@ public class ManagersHandler {
         String company = ctx.queryParam("company").stream().findFirst().orElse(null);
         String sortBy  = ctx.queryParam("sortBy").stream().findFirst().orElse(null);
 
+        /*
+          firstName + lastName => DISCOVERY THROUGH THE SHARED MATCHER.
+
+          The directory keeps its free-text `search`, which is a substring query and right for
+          browsing. But a search FORM knows the given name and the surname separately, and that is
+          the question the matching policy answers: who do we already hold by this name, at any
+          employer. Routing it here means the anonymous journey and the signed-in one discover
+          through one definition of "same person" rather than two that disagree.
+
+          Read-only: nothing is created and no eligibility is spent. Publication decisions still
+          belong to find-or-create and the ghost endpoint.
+        */
+        String firstName = ctx.queryParam("firstName").stream().findFirst().orElse(null);
+        String lastName  = ctx.queryParam("lastName").stream().findFirst().orElse(null);
+        if (firstName != null && !firstName.isBlank() && lastName != null && !lastName.isBlank()) {
+            String title = ctx.queryParam("title").stream().findFirst().orElse(null);
+            Long   cid   = null;
+            String rawCid = ctx.queryParam("companyId").stream().findFirst().orElse(null);
+            if (rawCid != null && !rawCid.isBlank()) {
+                try { cid = Long.parseLong(rawCid); } catch (NumberFormatException ignored) {}
+            }
+            /*
+              READ-ONLY, WITHOUT EXCEPTION.
+
+              A completed search resolves-or-creates the company, and that used to be requested
+              here through `submitted=true` - a GET that wrote to the database. Anything that
+              replays a URL would then create companies: a crawler, a link prefetch, a browser
+              retry, somebody refreshing. The completed search is POST /api/managers/search now,
+              and this handler no longer reads the flag at all, so an old or hand-made URL that
+              still carries it simply gets the read.
+            */
+            service.discoverByName(firstName, lastName, company, title, cid, limit, offset,
+                                   false, RateLimitHandler.clientIpOf(ctx))
+                .onSuccess(result -> ctx.response()
+                    .putHeader("Content-Type", "application/json")
+                    .end(result.encode()))
+                .onFailure(err -> handleError(ctx, err));
+            return;
+        }
+
         int effectiveLimit  = Math.min(limit, 100);
         int effectiveOffset = Math.max(offset, 0);
 
@@ -366,6 +406,47 @@ public class ManagersHandler {
     public void handleGetStats(RoutingContext ctx) {
         service.getStats()
             .onSuccess(json -> ctx.response().putHeader("Content-Type", "application/json").end(json.encode()))
+            .onFailure(err -> handleError(ctx, err));
+    }
+
+
+    // ── POST /api/managers/search ────────────────────────────────────────────
+
+    /**
+     * A COMPLETED four-field search.
+     *
+     * <p>The same matching the GET performs, plus the one thing that makes this a write: the
+     * company is resolved, and created when we do not hold it. That runs alongside the matcher
+     * rather than before it, so the tiles do not queue behind a company insert.
+     *
+     * <p>Still publishes no manager. Deciding that somebody exists belongs to find-or-create and
+     * to the ghost endpoint, and nothing here changes which rows are servable.
+     */
+    public void handleSearchManagers(RoutingContext ctx) {
+        JsonObject body = ctx.getBodyAsJson();
+        if (body == null) {
+            respond(ctx, 400, new JsonObject().put("error", "Missing request body"));
+            return;
+        }
+        String firstName = body.getString("firstName");
+        String lastName  = body.getString("lastName");
+        if (firstName == null || firstName.isBlank() || lastName == null || lastName.isBlank()) {
+            respond(ctx, 400, new JsonObject().put("error", "firstName and lastName are required"));
+            return;
+        }
+        // Null-safe throughout: the client sends these as null when the person left them empty,
+        // and a search must not fail on an absent optional field.
+        String company = body.getString("company");
+        String title   = body.getString("title");
+        Long   cid     = body.getLong("companyId");
+        int limit  = body.getInteger("limit", 8);
+        int offset = body.getInteger("offset", 0);
+
+        service.discoverByName(firstName, lastName, company, title, cid, limit, offset,
+                               true, RateLimitHandler.clientIpOf(ctx))
+            .onSuccess(result -> ctx.response()
+                .putHeader("Content-Type", "application/json")
+                .end(result.encode()))
             .onFailure(err -> handleError(ctx, err));
     }
 

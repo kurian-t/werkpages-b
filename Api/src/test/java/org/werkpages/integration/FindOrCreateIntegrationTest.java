@@ -289,10 +289,27 @@ class FindOrCreateIntegrationTest {
         assertFalse(u1Result.getBoolean("created"));
         assertEquals(0, u1Result.getJsonArray("data").size());
 
-        // user2 searches same name/company — their slot is still free, creates ghost
+        /*
+          POLICY CHANGED 2026-10-14. This used to assert that user2 DOES get a ghost.
+
+          Pending rows were visible only to the user whose search created them, so a second person
+          searching the same manager could not see the first submission and published over it. That
+          is how one manager accumulated ten rows at a single company. Existence detection now spans
+          non-public rows: user1's pending David Lee at Beta Corp is an EQUIVALENT submission - same
+          name, same verified company - so user2's search is captured for review instead of
+          publishing a duplicate of a record already awaiting a decision.
+
+          Note what is NOT blocked. A David Lee at a different employer is a different submission
+          and may still be published, because distinct people share names. Nor does an abandoned
+          add-form draft block anything: this row blocks because a SEARCH created it
+          (search_created_by_user_id is set), which is somebody asserting the manager exists. A
+          half-typed form is not that, and treating it as one makes the manager unfindable - see
+          DropOffDraftIntegrationTest.
+        */
         JsonObject u2Result = await(service.findOrCreate(
             auth0Id2, "David", "Lee", "Manager", "Beta Corp", "US", null, null, null));
-        assertEquals("ghost", u2Result.getJsonArray("data").getJsonObject(0).getString("approvalStatus"));
+        assertFalse(u2Result.getBoolean("created", false),
+            "an equivalent submission is already queued; publishing now would duplicate it");
 
         // user1's second search created a pending; user2 created a ghost
         long pendingCount = await(pool.preparedQuery(
@@ -493,11 +510,26 @@ class FindOrCreateIntegrationTest {
             auth0Id, "Daniel", "Perovic", "Engineering Manager", "SiblingCo Works",
             "CA", null, null, null, sibling));
 
-        for (int i = 0; i < result.getJsonArray("data").size(); i++) {
-            assertNotEquals("ChildCo Labs",
-                result.getJsonArray("data").getJsonObject(i).getString("company"),
-                "a sibling's managers are not in this company's scope");
-        }
+        /*
+          POLICY CHANGED 2026-10-14. This assertion used to be the opposite.
+
+          It asserted that Daniel must NOT appear, because matching was scoped to the selected
+          company and its descendants. That scoping is exactly what let a manager be duplicated:
+          somebody at a company the search did not traverse was invisible, so the search created a
+          second row for a person already on file. Under the name-first policy, company never
+          filters discovery - it classifies and ranks.
+
+          The original worry was that a sibling's manager would be presented as if he worked here.
+          That is still guarded, by showing his real employer on the tile rather than by hiding
+          him: the reader sees Daniel Perovic at ChildCo Labs and can tell he is not theirs.
+        */
+        JsonArray data = result.getJsonArray("data");
+        assertFalse(data.isEmpty(), "Daniel Perovic exists and must be surfaced by name");
+        assertEquals("Daniel Perovic", data.getJsonObject(0).getString("name"));
+        assertEquals("ChildCo Labs", data.getJsonObject(0).getString("company"),
+            "his ACTUAL employer must be shown, so searching at SiblingCo cannot imply he works there");
+        assertFalse(result.getBoolean("created", false),
+            "and above all, no second Daniel Perovic is minted");
     }
 
     @Test
