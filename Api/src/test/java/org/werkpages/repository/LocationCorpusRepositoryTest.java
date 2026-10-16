@@ -491,4 +491,55 @@ class LocationCorpusRepositoryTest {
         assertEquals("montreal", LocationCorpusRepository.stripAccents("montreal"));
         assertNull(LocationCorpusRepository.stripAccents(null));
     }
+
+    // ── the country a query states after a comma ─────────────────────────────
+
+    @Test
+    @DisplayName("a country named after a comma is recognised and scopes the search")
+    void aStatedCountryIsRecognised() {
+        /*
+          REPORTED: "Washington, United States" returned nothing at all, and so did every other
+          "city, country" query. A locality's search_text is its name and its region, never the
+          country, so leaving the typed country in the token list required it to appear in a string
+          that cannot contain it.
+        */
+        assertEquals("US", LocationCorpusRepository.statedCountry("washington, united states"));
+        assertEquals("CA", LocationCorpusRepository.statedCountry("toronto, canada"));
+        assertEquals("FR", LocationCorpusRepository.statedCountry("paris, france"));
+        assertEquals("US", LocationCorpusRepository.statedCountry("austin, usa"));
+        assertEquals("US", LocationCorpusRepository.statedCountry("washington, dc, united states"),
+            "the LAST segment is the country, not the first one that parses");
+    }
+
+    @Test
+    @DisplayName("a region after a comma is not mistaken for a country")
+    void aStatedRegionIsNotACountry() {
+        /*
+          These must stay null or the region becomes a country scope and the search is confined to
+          the wrong place entirely.
+        */
+        assertNull(LocationCorpusRepository.statedCountry("paris, texas"));
+        assertNull(LocationCorpusRepository.statedCountry("london, england"));
+        assertNull(LocationCorpusRepository.statedCountry("cambridge, ontario"));
+        assertNull(LocationCorpusRepository.statedCountry("washington"));
+    }
+
+    @Test
+    @DisplayName("a bare two-letter region code is never read as a country")
+    void twoLetterCodesAreNotStatedCountries() {
+        /*
+          THE DANGEROUS CASE, and the reason this is deliberately conservative. The two-letter
+          codes people write after a comma are regions, and they collide with country codes almost
+          perfectly: CA is California and Canada, IN is Indiana and India, DE is Delaware and
+          Germany, LA is Louisiana and Laos.
+
+          Reading "Los Angeles, CA" as Canada would send every Californian search to the wrong
+          country while looking like it had understood - far worse than not scoping at all, which
+          merely searches worldwide and still finds the city.
+        */
+        assertNull(LocationCorpusRepository.statedCountry("los angeles, ca"));
+        assertNull(LocationCorpusRepository.statedCountry("indianapolis, in"));
+        assertNull(LocationCorpusRepository.statedCountry("wilmington, de"));
+        assertNull(LocationCorpusRepository.statedCountry("new orleans, la"));
+    }
 }

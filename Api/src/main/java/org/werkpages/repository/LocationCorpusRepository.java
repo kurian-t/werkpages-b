@@ -297,6 +297,29 @@ public class LocationCorpusRepository {
         String spokenCountry = Countries.displayName(needle);
         String spokenIso     = Countries.iso(needle);
 
+        /*
+          THE COUNTRY THE QUERY ITSELF STATES, after a comma: "Washington, United States".
+
+          Reported as returning nothing at all, and it returned nothing for every "city, country"
+          query - Toronto, Canada and Paris, France included. A locality's search_text is its name
+          and its region, "washington district of columbia", and NEVER the country. The country
+          word was stripped from the token list only when it arrived as a request PARAMETER, so a
+          country somebody typed was left in the tokens and required to appear in a string that
+          cannot contain it. Three tokens, no row with all three, zero rows.
+
+          A comma means the location is STATED rather than guessed, which is the convention this
+          field already follows, so the country it names SCOPES the read instead of being searched
+          for inside it.
+        */
+        final String statedIso = statedCountry(needle);
+        final String readIso   = statedIso != null ? statedIso : iso;
+        /*
+          Stripped of the stated country's words, exactly as the request parameter's country has
+          always been stripped. withoutCountryWord takes a code or a name and removes both forms.
+        */
+        final java.util.List<String> readWords =
+            statedIso != null ? withoutCountryWord(words, statedIso) : words;
+
         java.util.function.BiFunction<Boolean, Boolean, Future<JsonArray>> attempt =
             (anchored, folded) -> {
                 String nameExpr = folded ? "strip_accents(lower(name))" : "lower(name)";
@@ -305,7 +328,7 @@ public class LocationCorpusRepository {
                   with "united states" and the country row lands in tier 0.
                 */
                 String rankBase = spokenCountry != null ? Countries.collapse(spokenCountry)
-                                                        : rankingNeedle(needle, country);
+                                                        : String.join(" ", readWords);
                 String ranked   = folded ? stripAccents(rankBase) : rankBase;
                 return query(release -> """
                     -- EACH COUNTRY'S BEST MATCH COMPETES BEFORE ANY COUNTRY'S SECOND.
@@ -354,9 +377,9 @@ public class LocationCorpusRepository {
                     )
                     ORDER BY tier, per_country, population DESC NULLS LAST
                     LIMIT %d
-                    """.formatted(nameExpr, nameExpr, geographyFrom(release, iso),
-                                   tokensClause(words.size(), anchored, folded),
-                                   geographyCountryClause(iso), LIMIT),
+                    """.formatted(nameExpr, nameExpr, geographyFrom(release, readIso),
+                                   tokensClause(readWords.size(), anchored, folded),
+                                   geographyCountryClause(readIso), LIMIT),
                 statement -> {
                     // The ranking placeholders now sit in the SELECT list, so they bind BEFORE
                     // the token and state predicates rather than after them.
@@ -366,8 +389,8 @@ public class LocationCorpusRepository {
                     // The named country, for the tier test: null when none was named.
                     statement.setString(i++, spokenIso);
                     statement.setString(i++, spokenIso);
-                    bindTokens(statement, words, i, anchored, folded);
-                    i += words.size();
+                    bindTokens(statement, readWords, i, anchored, folded);
+                    i += readWords.size();
                     // The recognised country, twice: once to test for null, once to compare.
                     statement.setString(i++, spokenIso);
                     statement.setString(i++, spokenIso);
@@ -404,7 +427,7 @@ public class LocationCorpusRepository {
           this dataset is copied locally at all. The sorted release's real win was the places
           dataset over S3, which is untouched by this and still anchored.
         */
-        return cached("geo|" + iso + "|" + blankToNull(state) + "|" + needle,
+        return cached("geo|" + readIso + "|" + blankToNull(state) + "|" + needle,
                       () -> attempt.apply(false, true).compose(rows ->
                           rows.isEmpty() ? geographyForIntent(query) : Future.succeededFuture(rows)));
     }
@@ -1679,6 +1702,44 @@ public class LocationCorpusRepository {
         StringBuilder sql = new StringBuilder(column + " LIKE ?");
         for (int i = 1; i < count; i++) sql.append(" AND ").append(column).append(" LIKE ?");
         return sql.toString();
+    }
+
+    /**
+     * The country the QUERY ITSELF states, after a comma, or null when it states none.
+     *
+     * <p>"Washington, United States" states one; "Paris, Texas" does not, and "Washington" on its
+     * own does not either. A stated country scopes the search and its words leave the token list,
+     * because the corpus's {@code search_text} never contains a country name.
+     *
+     * <p><b>A bare two-letter code is deliberately not read as a country here.</b> The codes
+     * people write after a comma are regions, and they collide with country codes almost
+     * perfectly: CA is California and Canada, IN is Indiana and India, DE is Delaware and Germany,
+     * LA is Louisiana and Laos. Reading "Los Angeles, CA" as Canada would be worse than not
+     * reading it at all, so a stated country has to be spelled out or be a known alias of three
+     * characters or more. The consequence is that "London, UK" is not scoped by this - it is two
+     * characters - and that is the safe direction: it still searches worldwide and still finds
+     * London.
+     */
+    static String statedCountry(String needle) {
+        if (needle == null) return null;
+        int comma = needle.lastIndexOf(',');
+        if (comma < 0) return null;
+        String tail = needle.substring(comma + 1).trim();
+        if (tail.length() < 3) return null;
+        return Countries.iso(tail);
+    }
+
+    /**
+     * {@code query} with a trailing stated country removed, or unchanged when it states none.
+     *
+     * <p>Used by the tier decision, which asks whether a coarse row IS what was typed. A stated
+     * country scopes the search and is not part of the city's name, so it must not be required to
+     * appear in the label: the corpus calls it "Paris, &Icirc;le-de-France, France", and "paris
+     * france" is not a prefix of that.
+     */
+    public static String withoutStatedCountry(String query) {
+        if (query == null || statedCountry(query) == null) return query;
+        return query.substring(0, query.lastIndexOf(',')).trim();
     }
 
     private static String blankToNull(String value) {

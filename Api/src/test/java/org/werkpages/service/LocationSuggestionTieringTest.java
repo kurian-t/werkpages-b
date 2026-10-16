@@ -258,4 +258,27 @@ class LocationSuggestionTieringTest {
         // A business whose name merely begins with the alias is still an employer query.
         assertFalse(ManagerService.geographyAnswers(theNetherlands, "Holland College"));
     }
+
+    @Test
+    @DisplayName("a city named with its country is a city query, not an employer query")
+    void aStatedCountryIsNotPartOfTheCityName() {
+        /*
+          "Paris, France" led with "Salon France de Paris Coiffure".
+
+          The corpus label is "Paris, Ile-de-France, France" and the typed string is not a prefix
+          of it, so the query was classed as an employer one and a hairdresser took the first seat
+          ahead of the capital. A stated country scopes the search; it is not something the city's
+          label has to begin with.
+        */
+        JsonArray paris = new JsonArray().add(new JsonObject()
+            .put("kind", "geo").put("geoKind", "locality").put("name", "Paris")
+            .put("stateName", "Ile-de-France").put("countryCode", "FR")
+            .put("population", 2_138_551L));
+
+        assertTrue(ManagerService.geographyAnswers(paris, "Paris, France"));
+        assertTrue(ManagerService.geographyAnswers(paris, "Paris"));
+
+        // A region after the comma is still matched the ordinary way, against the label.
+        assertTrue(ManagerService.geographyAnswers(paris, "Paris, Ile-de-France"));
+    }
 }

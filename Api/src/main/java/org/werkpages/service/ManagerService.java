@@ -968,7 +968,17 @@ public class ManagerService {
         */
         String spoken    = org.werkpages.repository.Countries.displayName(query);
         String spokenIso = org.werkpages.repository.Countries.iso(query);
-        String needle    = collapse(spoken != null ? spoken : query);
+        /*
+          A STATED COUNTRY SCOPES THE SEARCH; IT IS NOT PART OF THE CITY'S NAME.
+
+          "Paris, France" led with Salon France de Paris Coiffure. The corpus label is "Paris,
+          Ile-de-France, France", and the typed string is not a prefix of it, so a query that
+          plainly named a city and its country was classified as an employer query. The country is
+          removed here for the same reason the corpus query removes it from the tokens: no label
+          has to start with it.
+        */
+        String asked  = org.werkpages.repository.LocationCorpusRepository.withoutStatedCountry(query);
+        String needle = collapse(spoken != null ? spoken : asked);
         if (needle.isEmpty()) return false;
         for (int i = 0; i < geography.size(); i++) {
             JsonObject row = geography.getJsonObject(i);
