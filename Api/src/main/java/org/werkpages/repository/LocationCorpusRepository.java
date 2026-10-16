@@ -280,24 +280,51 @@ public class LocationCorpusRepository {
                 String ranked   = folded ? stripAccents(rankingNeedle(needle, country))
                                          : rankingNeedle(needle, country);
                 return query(release -> """
-                    SELECT name, kind, state_name, state_code, country_code, population
-                    FROM %s
-                    WHERE %s%s
-                      AND (? IS NULL OR state_code = ? OR kind = 'country')
-                    ORDER BY CASE WHEN %s = ? OR %s LIKE ? THEN 0 ELSE 1 END,
-                             population DESC NULLS LAST
+                    -- EACH COUNTRY'S BEST MATCH COMPETES BEFORE ANY COUNTRY'S SECOND.
+                    --
+                    -- Ordering by prominence alone let one city's subdivisions take every slot:
+                    -- "Paris" returned eight rows and all eight were French, because the
+                    -- arrondissements - Paris 15 Vaugirard, Paris 20 Menilmontant and the rest -
+                    -- each outrank Paris, Texas (24,782) and Paris, Ontario (12,310) on
+                    -- population. They are all the same city, and between them they made every
+                    -- other Paris on earth unreachable.
+                    --
+                    -- That matters more now that the field no longer filters by country: the
+                    -- client can only reorder what it is given, so anything missing from these
+                    -- eight rows cannot be chosen at all. A limit that hides places is the same
+                    -- defect as a filter that excluded them.
+                    --
+                    -- Ranking within each country first and interleaving gives Paris, France;
+                    -- Paris, Texas; Paris, Ontario - most prominent still first, and the other
+                    -- Parises reachable.
+                    SELECT name, kind, state_name, state_code, country_code, population FROM (
+                      SELECT name, kind, state_name, state_code, country_code, population, tier,
+                             row_number() OVER (PARTITION BY country_code
+                                                ORDER BY tier, population DESC NULLS LAST)
+                               AS per_country
+                      FROM (
+                        SELECT name, kind, state_name, state_code, country_code, population,
+                               CASE WHEN %s = ? OR %s LIKE ? THEN 0 ELSE 1 END AS tier
+                        FROM %s
+                        WHERE %s%s
+                          AND (? IS NULL OR state_code = ? OR kind = 'country')
+                      )
+                    )
+                    ORDER BY tier, per_country, population DESC NULLS LAST
                     LIMIT %d
-                    """.formatted(geographyFrom(release, iso),
+                    """.formatted(nameExpr, nameExpr, geographyFrom(release, iso),
                                    tokensClause(words.size(), anchored, folded),
-                                   geographyCountryClause(iso), nameExpr, nameExpr, LIMIT),
+                                   geographyCountryClause(iso), LIMIT),
                 statement -> {
+                    // The ranking placeholders now sit in the SELECT list, so they bind BEFORE
+                    // the token and state predicates rather than after them.
                     int i = 1;
+                    statement.setString(i++, ranked);
+                    statement.setString(i++, ranked + "%");
                     bindTokens(statement, words, i, anchored, folded);
                     i += words.size();
                     statement.setString(i++, blankToNull(state));
-                    statement.setString(i++, blankToNull(state));
-                    statement.setString(i++, ranked);
-                    statement.setString(i, ranked + "%");
+                    statement.setString(i, blankToNull(state));
                 },
                 rs -> new JsonObject()
                     .put("kind", "geo")
