@@ -2225,7 +2225,7 @@ public class ManagerRepository {
                 SELECT m.id, m.name
                   FROM managers m
                  WHERE m.approval_status IN ('approved', 'ghost')
-                   AND manager_name_tokens(m.name) && $1::text[]
+                   AND public.manager_name_tokens(m.name) && $1::text[]
                 """)
             .execute(Tuple.tuple().addArrayOfString(tokens.toArray(new String[0])));
     }
@@ -2293,7 +2293,7 @@ public class ManagerRepository {
                 SELECT m.id, m.name, m.approval_status, m.search_created_by_user_id
                   FROM managers m
                  WHERE m.approval_status IN ('pending_approval', 'rejected')
-                   AND manager_name_tokens(m.name) && $1::text[]
+                   AND public.manager_name_tokens(m.name) && $1::text[]
                 """)
             .execute(Tuple.tuple().addArrayOfString(tokens.toArray(new String[0])));
     }

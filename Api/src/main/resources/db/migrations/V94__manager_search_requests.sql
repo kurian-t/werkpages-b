@@ -104,16 +104,33 @@ CREATE INDEX manager_search_requests_name
 -- unaccent() is STABLE rather than IMMUTABLE because it reads a dictionary, so it cannot be used
 -- in an index expression directly. The wrapper pins the dictionary, which is what makes it safe to
 -- index; if the dictionary is ever changed the index must be rebuilt.
-CREATE EXTENSION IF NOT EXISTS unaccent;
+CREATE EXTENSION IF NOT EXISTS unaccent WITH SCHEMA public;
 
-CREATE OR REPLACE FUNCTION immutable_unaccent(text)
+CREATE OR REPLACE FUNCTION public.immutable_unaccent(text)
 RETURNS text AS $$ SELECT public.unaccent('public.unaccent', $1) $$
 LANGUAGE sql IMMUTABLE STRICT PARALLEL SAFE;
 
 -- The ONE definition of a name token. Java's ManagerMatcher.norm() must agree with this exactly:
 -- NFKD, drop combining marks, lowercase, punctuation to spaces, keep Unicode letters and digits.
 -- A contract test asserts the two produce identical tokens for a list of international names.
-CREATE OR REPLACE FUNCTION manager_name_tokens(text)
+-- SCHEMA-QUALIFIED THROUGHOUT, and the reason is a production outage.
+--
+-- This script failed on deployment with:
+--
+--   ERROR: function immutable_unaccent(text) does not exist
+--   Where: SQL function "manager_name_tokens" during inlining
+--
+-- The inner unaccent call was already qualified; the call to immutable_unaccent below was not.
+-- An unqualified call inside an IMMUTABLE function is resolved through search_path, and creating
+-- the GIN index further down INLINES this function - so the resolution happened under a
+-- search_path that did not contain the schema the function had just been created in. It worked
+-- locally and failed in production for that reason alone, which is the worst kind of difference
+-- to leave to chance in a migration that runs on boot and blocks startup when it throws.
+--
+-- Every name here is now qualified: the extension's schema, both function declarations, the call
+-- between them, and the index expression. The Java query in ManagerRepository is qualified to
+-- match, so the planner still resolves the same function and keeps using this index.
+CREATE OR REPLACE FUNCTION public.manager_name_tokens(text)
 RETURNS text[] AS $$
     SELECT string_to_array(
              regexp_replace(
@@ -121,7 +138,7 @@ RETURNS text[] AS $$
                -- space, before every other non-alphanumeric becomes one. Java does the same, in
                -- the same order.
                regexp_replace(
-                 replace(replace(immutable_unaccent(lower($1)), '''', ''), '\u2019', ''),
+                 replace(replace(public.immutable_unaccent(lower($1)), '''', ''), '\u2019', ''),
                  '[^[:alnum:] ]', ' ', 'g'),
                '\s+', ' ', 'g'),
              ' ')
@@ -145,7 +162,7 @@ $$ LANGUAGE sql IMMUTABLE STRICT PARALLEL SAFE;
 -- The query looks for name TOKENS rather than a substring so that "Li" cannot match "Lithgow",
 -- and so compound names work from either side: a search for Mary Ann / De La Cruz retrieves
 -- "Mary Ann De La Cruz" on the token "mary" or the token "cruz".
-CREATE INDEX managers_name_tokens_gin ON managers USING GIN (manager_name_tokens(name));
+CREATE INDEX managers_name_tokens_gin ON managers USING GIN (public.manager_name_tokens(name));
 
 -- Supporting index for the RANKED, BOUNDED display queries.
 --
