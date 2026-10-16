@@ -181,6 +181,114 @@ public class CompanyRepository {
             .map(rows -> rows.iterator().hasNext());
     }
 
+    /** Who is writing a company's identity, which decides what it may overwrite. */
+    public enum BrandAuthority {
+        /** Somebody choosing from the picker on an ordinary form. May only improve. */
+        USER_PICK,
+        /** An admin editing deliberately. Overrides anything, and records human confirmation. */
+        ADMIN
+    }
+
+    /**
+     * Writes a picked company identity - domain AND logo together - subject to provenance.
+     *
+     * <h2>Why a pick may not simply win</h2>
+     *
+     * <p>A pick must be able to fill a company that has no identity, and to correct one whose
+     * domain was GUESSED from its name - that is the whole reason the dropdown's logo differed
+     * from the profile's. "Lime" guesses lime.com, a real and unrelated company, so the guess
+     * renders a stranger's mark; the picker resolves li.me and must be allowed to replace it.
+     *
+     * <p>But an ordinary submission must NOT flatten identity that is better than a guess. V85
+     * already grades this: GUESSED is legacy and never renders, a resolver or a consensus of
+     * resolvers is real evidence, {@code domain_verified_at} records a HUMAN confirming it, and
+     * ADMIN always wins. So the ladder is read from the data rather than invented here.
+     *
+     * <h2>One statement, so there is no race</h2>
+     *
+     * <p>The precedence lives in the WHERE clause rather than in a read-then-write, because two
+     * submissions for the same company arrive concurrently and a check-then-act would let the
+     * loser overwrite the winner. A write that is not permitted matches no row and changes
+     * nothing, which is also why this reports whether it wrote.
+     *
+     * <p>The no-op guard matters beyond tidiness: {@code companies_company_stats_upd} fires
+     * {@code company_stats_apply} whenever {@code logo_url} changes, so a pointless write would
+     * recompute statistics for that company. With the guard, writing the same identity twice
+     * costs nothing.
+     *
+     * @return true when this write landed, false when existing identity outranked it
+     */
+    public Future<Boolean> applyPickedBrand(long companyId, PickedBrand picked,
+                                            BrandAuthority authority) {
+        if (picked == null) return Future.succeededFuture(false);
+        boolean admin = authority == BrandAuthority.ADMIN;
+        return db.preparedQuery("""
+                UPDATE companies
+                   SET domain                  = $2,
+                       -- Kept in step with the domain. A logo the pick could not prove belongs to
+                       -- this domain arrives as NULL, and clearing it is deliberate: the reader
+                       -- derives the logo from the domain, so a stale URL from the old identity
+                       -- must not be left behind to win the candidate order.
+                       logo_url                = $3,
+                       domain_source           = $4,
+                       domain_resolution_state = 'RESOLVED',
+                       domain_resolved_at      = now(),
+                       domain_verified_at      = CASE WHEN $5 THEN now() ELSE domain_verified_at END,
+                       updated_at              = now()
+                 WHERE id = $1
+                   AND (domain IS DISTINCT FROM $2 OR logo_url IS DISTINCT FROM $3)
+                   AND ($5
+                        OR (domain_verified_at IS NULL
+                            AND (domain_source IS NULL OR domain_source = 'GUESSED')))
+                """)
+            .execute(Tuple.of(companyId, picked.domain(), picked.logoUrl(),
+                              admin ? "ADMIN" : "CLEARBIT", admin))
+            .map(rows -> rows.rowCount() > 0);
+    }
+
+    /**
+     * Applies a picked identity to a resolved company, and returns the row as it now stands.
+     *
+     * <p>Every creation path funnels through {@link #resolve} or {@link #findOrCreate}, so putting
+     * this here is what makes one rule hold everywhere - search, the ghost endpoint, the add form,
+     * a review submission - instead of each caller remembering to persist the pick. Section 19
+     * already requires that every path create its company through one mechanism; this keeps the
+     * company's IDENTITY on that same mechanism.
+     *
+     * <p>The row is re-read only when something was written, because callers copy the logo from it
+     * onto the manager snapshot, and handing back the pre-write row would store the old mark in
+     * the fallback while the company carried the new one - the two columns disagreeing is the
+     * original bug in another form.
+     */
+    private Future<Row> withPickedBrand(Row row, String domain, String logoUrl) {
+        if (row == null) return Future.succeededFuture(null);
+        /*
+          THE DOMAIN CAN BE READ OFF THE LOGO, when a caller has only the logo.
+
+          Several creation paths take flat parameters and carry a logo url but no domain. Rather
+          than widen half a dozen signatures, the domain is recovered from the url itself - an
+          `img.logo.dev/<domain>` url was BUILT from a resolved domain, so the domain is right
+          there in it. A url that encodes nothing recognisable yields nothing, and the pick is
+          simply ignored.
+        */
+        String resolvedDomain = (domain == null || domain.isBlank())
+                              ? PickedBrand.embeddedDomain(logoUrl == null ? "" : logoUrl)
+                              : domain;
+        var picked = PickedBrand.of(resolvedDomain, logoUrl);
+        if (picked.isEmpty()) return Future.succeededFuture(row);
+        long id = row.getLong("id");
+        return applyPickedBrand(id, picked.get(), BrandAuthority.USER_PICK)
+            .compose(wrote -> {
+                if (!wrote) return Future.succeededFuture(row);
+                return db.preparedQuery("SELECT * FROM companies WHERE id = $1")
+                    .execute(Tuple.of(id))
+                    .map(rs -> rs.iterator().hasNext() ? rs.iterator().next() : row);
+            })
+            // A logo is cosmetic; failing to persist it must never fail the submission that
+            // carried it. The company is still correctly resolved either way.
+            .otherwise(row);
+    }
+
     public Future<Row> resolve(Long companyId, String name, String domain, String logoUrl) {
         if (companyId == null) return findOrCreate(name, domain, logoUrl);
         return db.preparedQuery("SELECT * FROM companies WHERE id = $1")
@@ -188,9 +296,14 @@ public class CompanyRepository {
             .compose(rs -> {
                 if (!rs.iterator().hasNext()) return findOrCreate(name, domain, logoUrl);
                 Row row = rs.iterator().next();
-                if (!"merged".equals(row.getString("status"))) return Future.succeededFuture(row);
+                if (!"merged".equals(row.getString("status"))) {
+                    // A company picked by id is the strongest signal there is that the pick is
+                    // about THIS company, which is exactly when its identity should be improved.
+                    return withPickedBrand(row, domain, logoUrl);
+                }
                 return resolveMergeTarget(companyId)
-                    .compose(target -> target.<Future<Row>>map(Future::succeededFuture)
+                    .compose(target -> target
+                        .<Future<Row>>map(t -> withPickedBrand(t, domain, logoUrl))
                         .orElseGet(() -> findOrCreate(name, domain, logoUrl)));
             });
     }
@@ -501,11 +614,30 @@ public class CompanyRepository {
     }
 
     public Future<Row> findOrCreatePending(String name, String domain, String logoUrl) {
-        return findOrCreate(name, domain, logoUrl, "pending_approval");
+        return findOrCreateWithPick(name, domain, logoUrl, "pending_approval");
     }
 
     public Future<Row> findOrCreate(String name, String domain, String logoUrl) {
-        return findOrCreate(name, domain, logoUrl, "ghost");
+        return findOrCreateWithPick(name, domain, logoUrl, "ghost");
+    }
+
+    /**
+     * As {@link #findOrCreate(String, String, String, String)}, then applies the pick.
+     *
+     * <p>The INSERT's {@code ON CONFLICT} deliberately still touches only {@code updated_at}. It
+     * cannot be the place that writes identity, because it has no idea what the existing row's
+     * provenance is - and writing a picked logo over an admin-curated one is exactly what must not
+     * happen. So the conflict path resolves the row, and the pick is then offered to
+     * {@link #applyPickedBrand}, which knows the ladder.
+     *
+     * <p>This is why the bug survived so long: the INSERT looked like it handled the logo, and it
+     * does - on INSERT only. For the overwhelmingly common case of a company that already exists,
+     * the pick had nowhere to land.
+     */
+    public Future<Row> findOrCreateWithPick(String name, String domain, String logoUrl,
+                                            String status) {
+        return findOrCreate(name, domain, logoUrl, status)
+            .compose(row -> withPickedBrand(row, domain, logoUrl));
     }
 
     public Future<Row> findOrCreate(String name, String domain, String logoUrl, String status) {

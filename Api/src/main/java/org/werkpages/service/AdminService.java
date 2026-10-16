@@ -929,9 +929,44 @@ public class AdminService {
             });
     }
 
+    /**
+     * Applies an admin's logo to the manager snapshot AND, where it is real identity, to the
+     * company itself.
+     *
+     * <h2>Why the company row too</h2>
+     *
+     * <p>This wrote {@code managers.company_logo_url} only - the FALLBACK. Every profile reads
+     * the company row as the authority, so an admin picked the right mark, saved successfully, and
+     * the page went on showing the old one. Re-editing did nothing, because the pick had nowhere
+     * to land. That is the same defect {@code resolveCompanyForCareerEntry} was fixed for, on a
+     * path that never got the fix.
+     *
+     * <h2>Why not always</h2>
+     *
+     * <p>The url here is sometimes a GUESS built from the company name, and writing a guess with
+     * ADMIN authority would stamp it as human-confirmed - permanently outranking the resolvers
+     * that would otherwise have corrected it. So the company is only updated when the url
+     * actually encodes a domain, which is true exactly when it came from a real pick.
+     */
     public Future<Void> updateManagerLogo(long managerId, String logoUrl) {
         // updateLogoUrl writes managers.company_logo_url, and the managers trigger fires on it, so company_stats_live follows inside that same statement (V89).
-        return managerRepo.updateLogoUrl(managerId, logoUrl).mapEmpty();
+        Future<Void> snapshot = managerRepo.updateLogoUrl(managerId, logoUrl).mapEmpty();
+        String domain = org.werkpages.repository.PickedBrand.embeddedDomain(
+            logoUrl == null ? "" : logoUrl);
+        if (domain == null || companyRepo == null) return snapshot;
+        var picked = org.werkpages.repository.PickedBrand.of(domain, logoUrl);
+        if (picked.isEmpty()) return snapshot;
+        return snapshot.compose(v -> managerRepo.findById(managerId)
+            .compose(opt -> {
+                Long companyId = opt.map(r -> r.getLong("company_id")).orElse(null);
+                if (companyId == null) return Future.<Void>succeededFuture();
+                return companyRepo.applyPickedBrand(companyId, picked.get(),
+                        org.werkpages.repository.CompanyRepository.BrandAuthority.ADMIN)
+                    .<Void>mapEmpty();
+            })
+            // The manager snapshot is already written; a company update that fails must not undo
+            // the admin's action or fail their request.
+            .otherwise((Void) null));
     }
 
     public Future<JsonObject> rejectEdit(String auth0Id, UUID editId) {

@@ -205,6 +205,15 @@ public class CompanyLogoUtils {
         String key = company.toLowerCase().trim();
         String domain = DOMAIN_MAP.get(key);
         if (domain == null) domain = companyDomain(company);
-        return "https://img.logo.dev/" + domain + "?token=" + LOGO_DEV_TOKEN;
+        /*
+          fallback=404, so logo.dev refuses rather than inventing a letter image.
+
+          Measured against an unknown domain, the default reply is HTTP 202 with a 2,558-byte
+          generated monogram - a success as far as any <img> is concerned. The reader cannot tell
+          that from a real logo, so it renders the provider's placeholder for one company and our
+          own for the next, and the two look nothing alike. This url is STORED, so an unguarded
+          one keeps serving monograms long after the request that built it.
+        */
+        return "https://img.logo.dev/" + domain + "?token=" + LOGO_DEV_TOKEN + "&fallback=404";
     }
 }

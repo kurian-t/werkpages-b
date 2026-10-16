@@ -74,19 +74,34 @@ public final class GeoUtils {
      * the client did not already supply a value (client-provided values — e.g. a user-edited
      * country/state in the Add Manager form — always win).
      */
+    /**
+     * Defaults the COUNTRY from the request, and nothing else.
+     *
+     * <h2>Why city and region are no longer filled</h2>
+     *
+     * <p>They were, and the result was a privacy failure. /find asks for no location, so a search
+     * that created a ghost manager had its location invented from the SEARCHER: this method read
+     * Cloudflare's city and region headers and wrote them into the body, where they were stored as
+     * the manager's declared location and shown on the profile. Somebody looked up their boss and
+     * saw their own city on the resulting page - which reads as the site tracking them, and is the
+     * kind of thing that destroys trust in a product like this one.
+     *
+     * <p>A country is a defensible default: it is coarse, it is what the form now shows and lets
+     * the person change, and getting it wrong is visible and correctable. A city is not - nobody
+     * asked for it, nobody confirmed it, and it describes the reader rather than the manager.
+     *
+     * <p><b>The observed geography is not lost.</b> It still travels, in full, through
+     * {@link #observed} into the submission context, which is where abuse and admin signals
+     * belong. What changes is that it stops masquerading as something a human declared.
+     *
+     * <p>Fixing the caller alone could not work: with the body's city blank, this method put the
+     * searcher's city straight back.
+     */
     static void stampGeo(RoutingContext ctx, JsonObject body) {
         if (body == null) return;
         if (isBlank(body.getString("country"))) {
             String v = country(ctx);
             if (v != null) body.put("country", v);
-        }
-        if (isBlank(body.getString("state"))) {
-            String v = state(ctx);
-            if (v != null) body.put("state", v);
-        }
-        if (isBlank(body.getString("city"))) {
-            String v = city(ctx);
-            if (v != null) body.put("city", v);
         }
     }
 

@@ -289,15 +289,60 @@ public class ManagerService {
             });
     }
 
+    /**
+     * The logo the person CHOSE, falling back to the one guessed from the name.
+     *
+     * <p>The picker resolves a real domain and shows the logo built from it; the guess turns
+     * "Lime" into lime.com, a real and unrelated company. When somebody actually picked, their
+     * choice is the better answer and the guess is only there for when nobody did.
+     *
+     * <p>Neither is trusted on sight. Both travel to CompanyRepository, which validates the pair
+     * and applies it only where it improves the stored identity.
+     */
+    private static String pickedOrResolvedLogo(JsonObject body, String resolvedLogoUrl) {
+        String picked = body == null ? null : body.getString("companyLogoUrl");
+        return picked != null && !picked.isBlank() ? picked : resolvedLogoUrl;
+    }
+
     public Future<JsonObject> getCompanyProfile(String company) {
+        return getCompanyProfile(company, null, null);
+    }
+
+    /**
+     * @param pickedDomain  the domain of the company the reader CHOSE from the picker, or null
+     * @param pickedLogoUrl the logo shown beside that choice, or null
+     *
+     * <h2>Why a page view carries a pick at all</h2>
+     *
+     * <p>Choosing a company in the dropdown and landing on its page used to change its mark: the
+     * picker shows the logo built from a RESOLVED domain, while this method guesses one from the
+     * name - "Lime" becomes lime.com, a real and unrelated company - and stores that guess with no
+     * domain at all. So the reader clicked one logo and arrived at another, which is the complaint
+     * this answers.
+     *
+     * <p>The pick is not trusted on sight. It goes through the same writer and the same provenance
+     * ladder every other path uses, so it can fill an empty identity or correct a GUESSED one, and
+     * can never flatten a resolved, consensus or admin-set identity. A reader browsing cannot
+     * degrade a company's data; they can only improve it.
+     */
+    public Future<JsonObject> getCompanyProfile(String company, String pickedDomain,
+                                                String pickedLogoUrl) {
         if (company == null || company.isBlank())
             return Future.failedFuture(ServiceException.badRequest("company parameter is required"));
         final String companyName = company.trim();
-        String resolvedLogoUrl = logoResolver.apply(companyName);
+        /*
+          The guess is the FALLBACK, never the preference. It is what this page has always done
+          when nothing better is known, and it is why so many rows carry GUESSED identities.
+        */
+        String resolvedLogoUrl = pickedLogoUrl != null && !pickedLogoUrl.isBlank()
+                               ? pickedLogoUrl : logoResolver.apply(companyName);
         return companyRepo.findByName(companyName)
             .compose(opt -> opt.isPresent()
-                ? io.vertx.core.Future.succeededFuture(opt.get())
-                : companyRepo.findOrCreate(companyName, null, resolvedLogoUrl))
+                // An existing row still gets the pick offered to it: that is the whole point, and
+                // the writer decides whether it outranks what is already there.
+                ? companyRepo.resolve(opt.get().getLong("id"), companyName,
+                                      pickedDomain, pickedLogoUrl)
+                : companyRepo.findOrCreate(companyName, pickedDomain, resolvedLogoUrl))
             .compose(companyRow -> {
                 long companyId = companyRow.getLong("id");
                 String canonicalName = companyRow.getString("name");
@@ -2419,7 +2464,7 @@ public class ManagerService {
                                 OffsetDateTime startDt = fStartDate.atStartOfDay(ZoneOffset.UTC).toOffsetDateTime();
                                 OffsetDateTime endDt   = fEndDate != null ? fEndDate.atStartOfDay(ZoneOffset.UTC).toOffsetDateTime() : null;
                                 final String fCompany = company;
-                                return companyRepo.resolve(body.getLong("companyId"), company, null, resolvedLogoUrl)
+                                return companyRepo.resolve(body.getLong("companyId"), company, body.getString("companyDomain"), pickedOrResolvedLogo(body, resolvedLogoUrl))
                                     .compose(companyRow -> {
                                 long companyId = companyRow.getLong("id");
                                 return managerRepo.generateUniqueSlug(name, company)
@@ -4897,7 +4942,7 @@ public class ManagerService {
                         fragment had its own, pointing at a company that only exists because
                         somebody paused while typing.
                     */
-                    return companyRepo.resolve(body.getLong("companyId"), company, null, resolvedLogoUrl)
+                    return companyRepo.resolve(body.getLong("companyId"), company, body.getString("companyDomain"), pickedOrResolvedLogo(body, resolvedLogoUrl))
                         .compose(companyRow -> managerRepo.refineCapturedCompany(
                             existingId, company, companyRow.getLong("id")))
                         .recover(err -> {
@@ -4967,7 +5012,7 @@ public class ManagerService {
                 */
                 return mayPublish.compose(publish ->
                     (publish
-                        ? companyRepo.resolve(body.getLong("companyId"), company, null, resolvedLogoUrl)
+                        ? companyRepo.resolve(body.getLong("companyId"), company, body.getString("companyDomain"), pickedOrResolvedLogo(body, resolvedLogoUrl))
                               .map(companyRow -> companyRow.getLong("id"))
                         : companyIdForCapture(body.getLong("companyId"), company, resolvedLogoUrl, clientIp))
                     .compose(resolvedCompanyId -> publish

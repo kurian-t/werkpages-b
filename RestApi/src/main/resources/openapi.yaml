@@ -753,6 +753,17 @@ paths:
                   type: integer
                   format: int64
                   nullable: true
+                # The logo and domain shown beside the company the person CHOSE. Optional and
+                # untrusted: the server validates the pair and applies it only where it improves
+                # the stored identity, so a reader can correct a guessed mark but never flatten a
+                # resolved or admin-set one. Without these the pick was discarded in the browser
+                # and the profile kept whatever the first person to type that name produced.
+                companyLogoUrl:
+                  type: string
+                  nullable: true
+                companyDomain:
+                  type: string
+                  nullable: true
                 note:
                   type: string
                   nullable: true
@@ -1164,6 +1175,21 @@ paths:
           required: true
           schema:
             type: string
+        # The identity the reader CHOSE in the picker, so the page can render the logo they
+        # clicked rather than one guessed from the name. Optional, and never trusted on sight:
+        # the server validates it and applies it only where it improves what is stored.
+        - in: query
+          name: pickedDomain
+          required: false
+          schema:
+            type: string
+            nullable: true
+        - in: query
+          name: pickedLogoUrl
+          required: false
+          schema:
+            type: string
+            nullable: true
       responses:
         '200':
           description: Company profile
@@ -1446,6 +1472,17 @@ paths:
                   type: integer
                   format: int64
                   nullable: true
+                # The logo and domain shown beside the company the person CHOSE. Optional and
+                # untrusted: the server validates the pair and applies it only where it improves
+                # the stored identity, so a reader can correct a guessed mark but never flatten a
+                # resolved or admin-set one. Without these the pick was discarded in the browser
+                # and the profile kept whatever the first person to type that name produced.
+                companyLogoUrl:
+                  type: string
+                  nullable: true
+                companyDomain:
+                  type: string
+                  nullable: true
                 country:
                   type: string
                 state:
@@ -1498,6 +1535,17 @@ paths:
                 companyId:
                   type: integer
                   format: int64
+                  nullable: true
+                # The logo and domain shown beside the company the person CHOSE. Optional and
+                # untrusted: the server validates the pair and applies it only where it improves
+                # the stored identity, so a reader can correct a guessed mark but never flatten a
+                # resolved or admin-set one. Without these the pick was discarded in the browser
+                # and the profile kept whatever the first person to type that name produced.
+                companyLogoUrl:
+                  type: string
+                  nullable: true
+                companyDomain:
+                  type: string
                   nullable: true
                 title:
                   type: string
@@ -1611,6 +1659,17 @@ paths:
                 companyId:
                   type: integer
                   format: int64
+                  nullable: true
+                # The logo and domain shown beside the company the person CHOSE. Optional and
+                # untrusted: the server validates the pair and applies it only where it improves
+                # the stored identity, so a reader can correct a guessed mark but never flatten a
+                # resolved or admin-set one. Without these the pick was discarded in the browser
+                # and the profile kept whatever the first person to type that name produced.
+                companyLogoUrl:
+                  type: string
+                  nullable: true
+                companyDomain:
+                  type: string
                   nullable: true
                 title:
                   type: string
@@ -1726,6 +1785,17 @@ paths:
                   type: integer
                   format: int64
                   nullable: true
+                # The logo and domain shown beside the company the person CHOSE. Optional and
+                # untrusted: the server validates the pair and applies it only where it improves
+                # the stored identity, so a reader can correct a guessed mark but never flatten a
+                # resolved or admin-set one. Without these the pick was discarded in the browser
+                # and the profile kept whatever the first person to type that name produced.
+                companyLogoUrl:
+                  type: string
+                  nullable: true
+                companyDomain:
+                  type: string
+                  nullable: true
                   description: A company the person PICKED from suggestions, if any. Validated server-side.
                 limit:
                   type: integer
@@ -1833,6 +1903,17 @@ paths:
                 companyId:
                   type: integer
                   format: int64
+                  nullable: true
+                # The logo and domain shown beside the company the person CHOSE. Optional and
+                # untrusted: the server validates the pair and applies it only where it improves
+                # the stored identity, so a reader can correct a guessed mark but never flatten a
+                # resolved or admin-set one. Without these the pick was discarded in the browser
+                # and the profile kept whatever the first person to type that name produced.
+                companyLogoUrl:
+                  type: string
+                  nullable: true
+                companyDomain:
+                  type: string
                   nullable: true
                 title:
                   type: string
@@ -1955,6 +2036,17 @@ paths:
                 companyId:
                   type: integer
                   format: int64
+                  nullable: true
+                # The logo and domain shown beside the company the person CHOSE. Optional and
+                # untrusted: the server validates the pair and applies it only where it improves
+                # the stored identity, so a reader can correct a guessed mark but never flatten a
+                # resolved or admin-set one. Without these the pick was discarded in the browser
+                # and the profile kept whatever the first person to type that name produced.
+                companyLogoUrl:
+                  type: string
+                  nullable: true
+                companyDomain:
+                  type: string
                   nullable: true
                 title:
                   type: string
@@ -2317,6 +2409,17 @@ paths:
                 companyId:
                   type: integer
                   format: int64
+                  nullable: true
+                # The logo and domain shown beside the company the person CHOSE. Optional and
+                # untrusted: the server validates the pair and applies it only where it improves
+                # the stored identity, so a reader can correct a guessed mark but never flatten a
+                # resolved or admin-set one. Without these the pick was discarded in the browser
+                # and the profile kept whatever the first person to type that name produced.
+                companyLogoUrl:
+                  type: string
+                  nullable: true
+                companyDomain:
+                  type: string
                   nullable: true
                 title:
                   type: string
@@ -2994,6 +3097,17 @@ paths:
                 companyId:
                   type: integer
                   format: int64
+                  nullable: true
+                # The logo and domain shown beside the company the person CHOSE. Optional and
+                # untrusted: the server validates the pair and applies it only where it improves
+                # the stored identity, so a reader can correct a guessed mark but never flatten a
+                # resolved or admin-set one. Without these the pick was discarded in the browser
+                # and the profile kept whatever the first person to type that name produced.
+                companyLogoUrl:
+                  type: string
+                  nullable: true
+                companyDomain:
+                  type: string
                   nullable: true
                 linkedinUrl:
                   type: string

@@ -249,8 +249,12 @@ public class ManagersHandler {
 
     public void handleGetCompanyProfile(RoutingContext ctx) {
         String company = ctx.queryParam("company").stream().findFirst().orElse(null);
+        // What the reader clicked in the picker, when they arrived that way. Optional, untrusted,
+        // and applied only where it improves the stored identity - see getCompanyProfile.
+        String pickedDomain  = ctx.queryParam("pickedDomain").stream().findFirst().orElse(null);
+        String pickedLogoUrl = ctx.queryParam("pickedLogoUrl").stream().findFirst().orElse(null);
         AuthTokenUtils.verifiedAuth0Id(ctx, jwtAuth).compose(auth0Id -> io.vertx.core.Future.all(
-            service.getCompanyProfile(company),
+            service.getCompanyProfile(company, pickedDomain, pickedLogoUrl),
             service.isContributor(auth0Id)
         )).onSuccess(cf -> {
             JsonObject json = cf.resultAt(0);
@@ -551,7 +555,7 @@ public class ManagersHandler {
         String missingLocation = missingLocation(body);
         if (missingLocation != null) { respond(ctx, 400, new JsonObject().put("error", missingLocation)); return; }
         String company = body != null ? body.getString("company") : null;
-        String logoUrl = CompanyLogoUtils.resolveLogoUrl(company);
+        String logoUrl = pickedLogoOr(body, company);
 
         service.createManager(auth0Id, body, logoUrl, SubmissionContext.of(GeoUtils.observed(ctx), body))
             .onSuccess(row -> {
@@ -819,11 +823,28 @@ public class ManagersHandler {
 
     // ── Ghost capture (no auth) ───────────────────────────────────────────────
 
+    /**
+     * The logo the person CHOSE in the picker, falling back to one guessed from the name.
+     *
+     * <p>The picker builds its logo from a RESOLVED domain; the guess turns "Lime" into lime.com,
+     * a real and unrelated company, which is where wrong marks come from. When somebody actually
+     * picked, their choice is the better answer - and the domain travels inside the url, so the
+     * repository can recover it without every signature growing a parameter.
+     *
+     * <p>Neither value is trusted here. Both go to CompanyRepository, which validates the pair and
+     * writes it only where it improves the stored identity.
+     */
+    static String pickedLogoOr(JsonObject body, String company) {
+        String picked = body == null ? null : body.getString("companyLogoUrl");
+        if (picked != null && !picked.isBlank()) return picked;
+        return CompanyLogoUtils.resolveLogoUrl(company);
+    }
+
     public void handleCreateGhostManager(RoutingContext ctx) {
         JsonObject body = ctx.getBodyAsJson();
         GeoUtils.stampGeo(ctx, body);
         String company = body != null ? body.getString("company") : null;
-        String logoUrl = CompanyLogoUtils.resolveLogoUrl(company);
+        String logoUrl = pickedLogoOr(body, company);
         service.createGhostManager(body, logoUrl,
                                    SubmissionContext.of(GeoUtils.observed(ctx), body,
                                                         RateLimitHandler.clientIpOf(ctx)))
