@@ -1825,7 +1825,23 @@ public class ManagerService {
               it. Typing a city still costs 0.76s rather than 4.82s, which is what the optimisation
               was for.
             */
-            boolean needPlaces = withPlaces && !geographyAnswers(geography, query);
+            /*
+              THE SKIP IS AN S3 OPTIMISATION, AND ONLY APPLIES WHERE S3 IS INVOLVED.
+
+              Skipping buildings when the query looks like a city name was worth it when the
+              buildings file meant a multi-second scan of an S3 partition. Against a LOCAL index it
+              costs milliseconds, and the gate's cost is wrong answers: there is a populated
+              locality in Gujarat called "Reliance Complex", so a search for "Reliance" in India
+              was answered with that township and NO businesses, while the index held 12,967
+              matching postings. "McDonalds" matched a hamlet in Papua New Guinea the same way.
+              The gate cannot reliably tell a city from a company, because plenty of places are
+              named after companies.
+
+              So where the country is served locally, the buildings are always read and the ranking
+              decides. The gate survives only for the remote path, where the saving is real.
+            */
+            boolean needPlaces = withPlaces
+                && (coveredByLocalIndex(country) || !geographyAnswers(geography, query));
             return (needPlaces ? placesTier(companyName, query, country)
                                : Future.succeededFuture(new JsonArray()))
                 .map(places -> {
