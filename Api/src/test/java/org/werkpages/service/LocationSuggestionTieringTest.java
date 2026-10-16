@@ -170,4 +170,92 @@ class LocationSuggestionTieringTest {
         assertEquals("toronto ontario", ManagerService.collapse("  Toronto,  ONTARIO "));
         assertEquals("", ManagerService.collapse(null));
     }
+
+    // ── a country named by an alias still leads with the country ─────────────
+
+    @Test
+    @DisplayName("an alias is a country query, so the country leads instead of businesses")
+    void anAliasLeadsWithTheCountry() {
+        /*
+          THE REPORTED FAILURE, at the tier that caused the visible half of it.
+
+          This method decides which tier takes the seats at the top. Compared literally, "usa" is
+          not a prefix of "United States", so a query naming the country was classed as an
+          EMPLOYER query - and the eight seats went to Canadian businesses containing those
+          letters: USANA Health Sciences, Usang Kitchenware, usagisushi.ca. The country row was
+          present and unreachable.
+
+          Resolved through the same Countries table the corpus query uses, so the two halves of
+          the feature cannot disagree about what was typed.
+        */
+        JsonArray unitedStates = new JsonArray().add(new JsonObject()
+            .put("kind", "geo").put("name", "United States").put("population", 327_167_434L));
+
+        assertTrue(ManagerService.geographyAnswers(unitedStates, "USA"));
+        assertTrue(ManagerService.geographyAnswers(unitedStates, "usa"));
+        assertTrue(ManagerService.geographyAnswers(unitedStates, "U.S.A."));
+        assertTrue(ManagerService.geographyAnswers(unitedStates, "US"));
+        assertTrue(ManagerService.geographyAnswers(unitedStates, "America"));
+        assertTrue(ManagerService.geographyAnswers(unitedStates, "United States"));
+    }
+
+    @Test
+    @DisplayName("UK leads with the United Kingdom, not with a place called Kingdom")
+    void ukLeadsWithTheCountry() {
+        /*
+          "United Kingdom" previously returned Kingdom, Illinois; Kingdom City, Missouri; and
+          Kingdom Come, Kentucky. That happened because an old process fell back to a CA/US/GB
+          shortlist and, searching under the United States, stripped the country's own words from
+          the query - leaving "kingdom". These assertions pin the tier decision for both the alias
+          and the full name so the country is what leads either way.
+        */
+        JsonArray unitedKingdom = new JsonArray().add(new JsonObject()
+            .put("kind", "geo").put("name", "United Kingdom").put("population", 66_488_991L));
+
+        assertTrue(ManagerService.geographyAnswers(unitedKingdom, "UK"));
+        assertTrue(ManagerService.geographyAnswers(unitedKingdom, "Britain"));
+        assertTrue(ManagerService.geographyAnswers(unitedKingdom, "United Kingdom"));
+    }
+
+    @Test
+    @DisplayName("a business whose name merely starts with an alias is still an employer query")
+    void anEmployerNamedAfterACountryIsNotACountryQuery() {
+        /*
+          The other direction, and the one that would break employer search if alias resolution
+          were loosened to substrings. "USA Today" is a newspaper and somebody typing it wants the
+          newspaper; resolution is therefore all-or-nothing on the whole string.
+        */
+        JsonArray unitedStates = new JsonArray().add(new JsonObject()
+            .put("kind", "geo").put("name", "United States").put("population", 327_167_434L));
+
+        assertFalse(ManagerService.geographyAnswers(unitedStates, "USA Today"));
+        assertFalse(ManagerService.geographyAnswers(unitedStates, "Bank of America"));
+    }
+
+    @Test
+    @DisplayName("the corpus's own spelling of a country still counts as that country")
+    void aCountryIsMatchedByIdentityNotSpelling() {
+        /*
+          The two datasets do not agree on names, and this is the bug that revealed it.
+
+          The corpus calls NL "The Netherlands"; the JDK calls it "Netherlands". So resolving
+          "Holland" to the JDK spelling prefix-matched nothing, and the suggestions led with
+          Holland College - a real place in Prince Edward Island - while the country itself sat
+          below a hamlet in Singapore called Holland Drive.
+
+          The ISO code is what a corpus row and a typed query actually agree on, so that is what
+          decides. Fixing this by editing the corpus would have been the wrong repair: the data is
+          not wrong, the two names are just different.
+        */
+        JsonArray theNetherlands = new JsonArray().add(new JsonObject()
+            .put("kind", "geo").put("geoKind", "country").put("name", "The Netherlands")
+            .put("countryCode", "NL").put("population", 17_231_017L));
+
+        assertTrue(ManagerService.geographyAnswers(theNetherlands, "Holland"));
+        assertTrue(ManagerService.geographyAnswers(theNetherlands, "Netherlands"));
+        assertTrue(ManagerService.geographyAnswers(theNetherlands, "NL"));
+
+        // A business whose name merely begins with the alias is still an employer query.
+        assertFalse(ManagerService.geographyAnswers(theNetherlands, "Holland College"));
+    }
 }

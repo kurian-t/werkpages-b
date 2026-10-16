@@ -274,11 +274,39 @@ public class LocationCorpusRepository {
           ranking expression folds with the WHERE clause, or "montreal" would match Montréal and
           then be ranked as though it had not.
         */
+        /*
+          A QUERY THAT NAMES A COUNTRY IS ASKING FOR THAT COUNTRY.
+
+          "USA" used to match nothing in this file. The corpus holds a United States row with a
+          population of 327 million, but its search_text is "united states", so no token of "usa"
+          appeared in it - and the field answered with eight Canadian businesses whose names
+          contain those letters, offering no way to pick the country at all.
+
+          Countries resolves the name, the ISO code and the common aliases in ONE table, and both
+          of the things needed here come from it:
+
+            - the country's own name, which the corpus uses, so the exact-match tier below ranks
+              the country row FIRST rather than leaving it to compete on population;
+            - the ISO code, which adds the country row to the result set even though the typed
+              text appears nowhere in its search_text.
+
+          Nothing is removed by this. The token predicate still runs exactly as before, so a query
+          that is also a place name - "India" is a country and a locality in several countries -
+          keeps every row it used to return and simply gains the country at the top.
+        */
+        String spokenCountry = Countries.displayName(needle);
+        String spokenIso     = Countries.iso(needle);
+
         java.util.function.BiFunction<Boolean, Boolean, Future<JsonArray>> attempt =
             (anchored, folded) -> {
                 String nameExpr = folded ? "strip_accents(lower(name))" : "lower(name)";
-                String ranked   = folded ? stripAccents(rankingNeedle(needle, country))
-                                         : rankingNeedle(needle, country);
+                /*
+                  Ranked against the COUNTRY'S name when the query named one, so "usa" is compared
+                  with "united states" and the country row lands in tier 0.
+                */
+                String rankBase = spokenCountry != null ? Countries.collapse(spokenCountry)
+                                                        : rankingNeedle(needle, country);
+                String ranked   = folded ? stripAccents(rankBase) : rankBase;
                 return query(release -> """
                     -- EACH COUNTRY'S BEST MATCH COMPETES BEFORE ANY COUNTRY'S SECOND.
                     --
@@ -304,9 +332,23 @@ public class LocationCorpusRepository {
                                AS per_country
                       FROM (
                         SELECT name, kind, state_name, state_code, country_code, population,
-                               CASE WHEN %s = ? OR %s LIKE ? THEN 0 ELSE 1 END AS tier
+                               -- ... or the country the query NAMED, matched by IDENTITY
+                               -- rather than by spelling. The corpus calls NL "The Netherlands",
+                               -- so "Holland" resolved to the JDK's "Netherlands" prefix-matched
+                               -- nothing: the country ranked below a hamlet in Singapore called
+                               -- Holland Drive, and the suggestions led with Holland College.
+                               -- The ISO code is the country's identity; the name is a label, and
+                               -- the two datasets do not have to agree on it.
+                               CASE WHEN %s = ? OR %s LIKE ?
+                                      OR (? IS NOT NULL AND kind = 'country' AND country_code = ?)
+                                    THEN 0 ELSE 1 END AS tier
                         FROM %s
-                        WHERE %s%s
+                        -- The second branch is the named country itself. Its search_text holds
+                        -- "united states", which no token of "USA" or "US" can match, so the
+                        -- row is admitted by its CODE once Countries has recognised the alias.
+                        -- Both placeholders take the same code; a null makes the branch false
+                        -- and this is exactly the previous predicate.
+                        WHERE (%s OR (? IS NOT NULL AND kind = 'country' AND country_code = ?))%s
                           AND (? IS NULL OR state_code = ? OR kind = 'country')
                       )
                     )
@@ -321,8 +363,14 @@ public class LocationCorpusRepository {
                     int i = 1;
                     statement.setString(i++, ranked);
                     statement.setString(i++, ranked + "%");
+                    // The named country, for the tier test: null when none was named.
+                    statement.setString(i++, spokenIso);
+                    statement.setString(i++, spokenIso);
                     bindTokens(statement, words, i, anchored, folded);
                     i += words.size();
+                    // The recognised country, twice: once to test for null, once to compare.
+                    statement.setString(i++, spokenIso);
+                    statement.setString(i++, spokenIso);
                     statement.setString(i++, blankToNull(state));
                     statement.setString(i, blankToNull(state));
                 },
@@ -1649,29 +1697,24 @@ public class LocationCorpusRepository {
      * caller then offers no corpus suggestions — the same soft failure as an unreachable bucket,
      * rather than an error on a form that is otherwise fine.
      */
-    /** The English display name for a country given its code or its name, or null. */
+    /** The English display name for a country given its code, its name or an alias, or null. */
     private static String displayCountry(String country) {
-        String code = iso(country);
-        if (code == null) return null;
-        String name = java.util.Locale.of("", code).getDisplayCountry(java.util.Locale.ENGLISH);
-        return (name == null || name.isBlank() || name.equalsIgnoreCase(code)) ? null : name;
+        return Countries.displayName(country);
     }
 
+    /**
+     * Delegated to {@link Countries}, which is the one table that knows what a country is called.
+     *
+     * <p>This method used to decide for itself, and got two things wrong. It accepted ANY two
+     * letters as a code without checking the code exists, so "UK" became the partition {@code UK}
+     * - not an ISO country, since the United Kingdom is {@code GB} - and the lookup reported
+     * success while addressing a country absent from the data. And it compared the text only with
+     * JDK display names, so "USA", "UAE", "Britain" and "Holland" resolved to nothing.
+     *
+     * <p>Kept as a method because its callers are many and it reads better where they are.
+     */
     public static String iso(String country) {
-        if (country == null) return null;
-        String value = country.trim();
-        if (value.isEmpty()) return null;
-
-        if (value.length() == 2 && value.matches("[A-Za-z]{2}")) {
-            return value.toUpperCase();
-        }
-        for (String code : java.util.Locale.getISOCountries()) {
-            if (java.util.Locale.of("", code).getDisplayCountry(java.util.Locale.ENGLISH)
-                    .equalsIgnoreCase(value)) {
-                return code;
-            }
-        }
-        return null;
+        return Countries.iso(country);
     }
 
     /**

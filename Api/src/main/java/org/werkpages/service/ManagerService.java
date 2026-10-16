@@ -955,7 +955,20 @@ public class ManagerService {
      */
     static boolean geographyAnswers(JsonArray geography, String query) {
         if (geography == null || geography.isEmpty()) return false;
-        String needle = collapse(query);
+        /*
+          A COUNTRY NAMED BY AN ALIAS IS STILL A COUNTRY QUERY.
+
+          This decides which tier LEADS the suggestions. Compared literally, "usa" is not a prefix
+          of "United States", so a query that plainly named the country was classified as an
+          employer query and eight businesses took the seats above it - which is the complaint
+          this exists to answer.
+
+          Resolved through the same Countries table the corpus query uses, so the two halves of
+          this feature cannot disagree about what was typed.
+        */
+        String spoken    = org.werkpages.repository.Countries.displayName(query);
+        String spokenIso = org.werkpages.repository.Countries.iso(query);
+        String needle    = collapse(spoken != null ? spoken : query);
         if (needle.isEmpty()) return false;
         for (int i = 0; i < geography.size(); i++) {
             JsonObject row = geography.getJsonObject(i);
@@ -983,6 +996,19 @@ public class ManagerService {
               corpus gives no population counts as no evidence, so the gate does not fire and the
               buildings file is read - the safe direction, costing work rather than results.
             */
+            /*
+              THE COUNTRY SOMEBODY NAMED, MATCHED BY IDENTITY.
+
+              Checked before the population gate and before any spelling comparison, because the
+              two datasets do not name countries identically: the corpus calls NL "The
+              Netherlands" while the JDK calls it "Netherlands", so "Holland" resolved to a name
+              that prefix-matched nothing and the suggestions led with Holland College. The ISO
+              code is what the row and the query actually agree on.
+            */
+            if (spokenIso != null && "country".equals(row.getString("geoKind"))
+                    && spokenIso.equals(row.getString("countryCode"))) {
+                return true;
+            }
             if (row.getLong("population", 0L) <= 0L) continue;
             String name  = row.getString("name");
             String state = row.getString("stateName");
