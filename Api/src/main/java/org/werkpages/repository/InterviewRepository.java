@@ -63,9 +63,9 @@ public class InterviewRepository {
                      difficulty, outcome, rounds, process_length, role_category, country, city,
                      interview_year, author, interviewed_from, interviewed_until,
                      declared_country, declared_state, declared_city, declared_precision,
-                     company_location_id)
+                     company_location_id, declared_source, declared_text)
                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,
-                        $21,$22,$23,$24,$25)
+                        $21,$22,$23,$24,$25,$26,$27)
                 RETURNING *
                 """)
             .execute(Tuple.of(companyId, userId, overall, communication, respectForTime,
@@ -73,7 +73,11 @@ public class InterviewRepository {
                               difficulty, outcome, rounds, processLength, roleCategory, country, city, interviewYear,
                               author, interviewedFrom, interviewedUntil,
                               declared.country(), declared.state(), declared.city(),
-                              declared.precision(), declared.companyLocationId()))
+                              declared.precision(), declared.companyLocationId(),
+                              // Kept so an answer somebody typed - because the corpus had no such
+                              // place, or could not be reached - survives the insert as their own
+                              // unverified words rather than vanishing.
+                              declared.source(), declared.text()))
             .map(rs -> rs.iterator().next());
     }
 
@@ -415,11 +419,17 @@ public class InterviewRepository {
                     -- erase it; one that declares something replaces the lot, because coarsening
                     -- an exact pick sends a precision with no id and keeping the old id would
                     -- leave the row pointing at a building it no longer claims.
-                    declared_country    = CASE WHEN $23::text IS NULL THEN declared_country    ELSE $20 END,
-                    declared_state      = CASE WHEN $23::text IS NULL THEN declared_state      ELSE $21 END,
-                    declared_city       = CASE WHEN $23::text IS NULL THEN declared_city       ELSE $22 END,
-                    company_location_id = CASE WHEN $23::text IS NULL THEN company_location_id ELSE $24 END,
-                    declared_precision  = COALESCE($23, declared_precision),
+                    -- $25 is the source. A MANUAL answer carries no precision, because a typed
+                    -- string corroborates no rung of the ladder, so testing $23 alone read it as
+                    -- "declared nothing" and kept the old row - losing a location the person
+                    -- entered and watched the form accept.
+                    declared_country    = CASE WHEN $23::text IS NULL AND $25::text IS DISTINCT FROM 'manual' THEN declared_country    ELSE $20 END,
+                    declared_state      = CASE WHEN $23::text IS NULL AND $25::text IS DISTINCT FROM 'manual' THEN declared_state      ELSE $21 END,
+                    declared_city       = CASE WHEN $23::text IS NULL AND $25::text IS DISTINCT FROM 'manual' THEN declared_city       ELSE $22 END,
+                    company_location_id = CASE WHEN $23::text IS NULL AND $25::text IS DISTINCT FROM 'manual' THEN company_location_id ELSE $24 END,
+                    declared_precision  = CASE WHEN $23::text IS NULL AND $25::text IS DISTINCT FROM 'manual' THEN declared_precision  ELSE $23 END,
+                    declared_source     = CASE WHEN $23::text IS NULL AND $25::text IS DISTINCT FROM 'manual' THEN declared_source     ELSE $25 END,
+                    declared_text       = CASE WHEN $23::text IS NULL AND $25::text IS DISTINCT FROM 'manual' THEN declared_text       ELSE $26 END,
                     updated_at = now()
                 WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL
                 RETURNING *
@@ -429,7 +439,8 @@ public class InterviewRepository {
                               difficulty, outcome, rounds, processLength, roleCategory, country,
                               city, interviewYear, interviewedFrom, interviewedUntil,
                               loc.country(), loc.state(), loc.city(),
-                              loc.precision(), loc.companyLocationId()))
+                              loc.precision(), loc.companyLocationId(),
+                              loc.source(), loc.text()))
             .map(rs -> rs.iterator().hasNext() ? Optional.of(rs.iterator().next()) : Optional.empty());
     }
 

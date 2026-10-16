@@ -179,90 +179,200 @@ public final class LocalPlaceIndex {
     }
 
     /**
-     * A region name resolved to the code the corpus stores, or null.
+     * Folded EXACTLY as {@code geo_align.sql} folded the names it indexed: NFC, lowercased,
+     * accents removed, and every run of non-letter non-digit characters collapsed to one space.
      *
-     * <p>Places carry {@code state_code}, so a person typing "Ontario" or "California" matches
-     * nothing while "on" and "ca" match everything. The alias table is built from the corpus's own
-     * geography data rather than kept by hand here, so it covers whatever regions the corpus knows
-     * and does not drift when it changes.
+     * <p>Any divergence from the build's fold is invisible here and matches nothing there, so the
+     * build carries a {@code cities_unreachable} validation that fails if a single city the index
+     * holds cannot be reached by its own folded name.
+     *
+     * <p>Accents are folded because the two datasets disagree about them: the places index spells
+     * Montreal "montréal" for 55,654 places and "montreal" for 8,720, so matching the typed form
+     * literally found one seventh of the city. Punctuation is folded because the reader asks about
+     * "chicago heights il" while the index stores "chicago heights, il".
+     *
+     * <p>The character classes are Unicode and never {@code [a-z0-9]}: this index is built for
+     * every country, and stripping to ASCII would erase every non-Latin name in it.
+     */
+    public static String fold(String text) {
+        if (text == null) return "";
+        String lower = Normalizer.normalize(text, Normalizer.Form.NFC).toLowerCase(Locale.ROOT);
+        String bare  = Normalizer.normalize(lower, Normalizer.Form.NFD).replaceAll("\\p{M}+", "");
+        return bare.replaceAll("[^\\p{L}\\p{N}]+", " ").trim();
+    }
+
+    /**
+     * Every region code a region name resolves to, most-used first.
+     *
+     * <p>Places carry a region code, so a person typing "Ontario" or "California" matches nothing
+     * while "on" and "ca" match everything. The alias table is built from the corpus's own data
+     * rather than kept by hand, so it covers whatever regions the corpus knows.
+     *
+     * <p>This used to return ONE code read from an unordered {@code SELECT}, which was wrong twice
+     * over. The table was derived from the geography corpus's own region codes, correct for the
+     * United States by coincidence - geography says US.NY and places say "ny" - and wrong for most
+     * of the world: Canada's geography codes are numeric, so "ontario" resolved to "08" while
+     * every Canadian row stores "on", and naming a province filtered to ZERO rows. It is now voted
+     * out of the data at build time. The list is returned whole because the index holds dirty
+     * region values beside clean ones (566,404 Ontario rows say "on" and 356 say "ontario"), and
+     * both are real places somebody can be looking for.
      *
      * <p>Missing table means no aliases, not an error: a release built before this existed still
      * works, it simply cannot resolve region names.
      */
-    private String regionCode(String name) {
-        try (PreparedStatement ps = conn.prepareStatement(
-                 "SELECT code FROM region_alias WHERE name = ?")) {
-            ps.setString(1, name);
-            try (ResultSet rs = ps.executeQuery()) { if (rs.next()) return rs.getString(1); }
-        } catch (Exception ignored) {
-            // No region_alias table in this release.
-        }
-        return null;
-    }
-
-    /**
-     * The phrase the person meant as a place, or null when they named none.
-     *
-     * <p>Taken from the text after the first comma when there is one, because that is where people
-     * put it, and otherwise from the trailing run of words the corpus knows only as places. The
-     * comma is a strong hint, never the only one: "Starbucks Toronto" names a city too.
-     *
-     * <p>Returned as a phrase rather than as words, because "New York" and "Los Angeles" are single
-     * names. Treating them as independent tokens let a search for York match New York.
-     */
-    /**
-     * The places the person named, one per comma component, in the order typed.
-     *
-     * <p>A component keeps its words together: "New York" and "Los Angeles" are single names, and
-     * splitting them let a search for York match New York. Components are kept apart because
-     * "London, Ontario" is a city and a region, and matching the pair as one phrase found nothing.
-     *
-     * <p>With no comma, the trailing run of words the corpus knows only as places is taken, so
-     * "Starbucks Toronto" still names a city.
-     */
-    /** Whether the corpus knows this phrase as a place, so a comma is geography and not a name. */
-    private boolean isKnownPlace(String phrase) {
-        if (phrase.isEmpty()) return false;
-        if (regionCode(phrase) != null) return true;
-        try (PreparedStatement ps = conn.prepareStatement("SELECT 1 FROM geo_name WHERE name = ?")) {
-            ps.setString(1, phrase);
-            try (ResultSet rs = ps.executeQuery()) { return rs.next(); }
-        } catch (Exception ignored) {
-            return false;   // no geo_name table in this release
-        }
-    }
-
-    private List<String> geographicComponents(String query, List<TokenInfo> geoTokens) {
+    private List<String> regionCodes(String name) {
         List<String> out = new ArrayList<>();
+        try (PreparedStatement ps = conn.prepareStatement(
+                 "SELECT code FROM region_alias WHERE name = ? ORDER BY places DESC")) {
+            ps.setString(1, name);
+            try (ResultSet rs = ps.executeQuery()) { while (rs.next()) out.add(rs.getString(1)); }
+        } catch (Exception ignored) {
+            // No region_alias table, or one built before it carried a support count.
+        }
+        return out;
+    }
+
+    /**
+     * The city spellings a folded phrase actually denotes, commonest first.
+     *
+     * <p>This is the step that was missing, and the reason a correctly recognised place could
+     * still match almost nothing. Recognising "New York City" is not the same as finding it: the
+     * geography corpus uses that name, and the places index spells the city "new york" for 245,580
+     * places and "new york city" for 225, so filtering on the phrase as typed returned 0.09% of
+     * the city. The alias table is built by folding spellings together and by linking a name to
+     * an unclaimed longer or shorter form of itself, both decided from the data. See
+     * {@code geo_align.sql} for how, and for the guard that keeps Springfield Gardens out of
+     * Springfield.
+     */
+    private List<String> cityValues(String foldedPhrase, boolean prefix) {
+        List<String> out = new ArrayList<>();
+        /*
+          A PARTIAL LAST WORD STILL NAMES A PLACE, which exact lookup alone cannot see.
+
+          Somebody typing "walmart new yor" has named New York; they have simply not finished. With
+          only the exact reading the phrase resolved to nothing, no geography was applied, and the
+          words fell through to the identity constraints where "new" and "yor" matched any field -
+          which is how a Walmart on "S New York Ave" in Alamogordo answered a search for New York.
+
+          Bounded deliberately. The match is capped, and ordered by how many places each spelling
+          carries, so one keystroke cannot expand into every city on the continent: "n" would
+          otherwise name thousands. Two characters are required for the same reason.
+        */
+        if (prefix && foldedPhrase.length() < 2) return out;
+        String sql = prefix
+            ? "SELECT city_norm FROM city_alias WHERE alias LIKE ? || '%' "
+            + "GROUP BY city_norm ORDER BY max(places) DESC LIMIT 40"
+            : "SELECT city_norm FROM city_alias WHERE alias = ? "
+            + "GROUP BY city_norm ORDER BY max(places) DESC";
+        try (PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setString(1, foldedPhrase);
+            try (ResultSet rs = ps.executeQuery()) { while (rs.next()) out.add(rs.getString(1)); }
+        } catch (Exception ignored) {
+            return List.of();   // no city_alias table in this release
+        }
+        return out;
+    }
+
+    /**
+     * How prominent a place of this name is, from the corpus's population figure, or 0.
+     *
+     * <p>Used only to order places that a query names ambiguously. Nothing is invented: a locality
+     * the corpus gives no population keeps 0 and sorts below any it does.
+     */
+    private long population(String foldedPhrase, boolean prefix) {
+        try (PreparedStatement ps = conn.prepareStatement(prefix
+                 ? "SELECT max(population) FROM geo_place WHERE name LIKE ? || '%'"
+                 : "SELECT max(population) FROM geo_place WHERE name = ?")) {
+            ps.setString(1, foldedPhrase);
+            try (ResultSet rs = ps.executeQuery()) { if (rs.next()) return rs.getLong(1); }
+        } catch (Exception ignored) {
+            // no geo_place table in this release
+        }
+        return 0L;
+    }
+
+    /**
+     * A place the query named: how it was written, and what the index calls it.
+     *
+     */
+    private record Place(String phrase, List<String> cityValues, List<String> regionCodes,
+                         long population) {}
+
+    /**
+     * The place this phrase names, or null when the corpus knows no such place.
+     *
+     * @param partial whether the phrase ends in a word still being typed, in which case an exact
+     *                reading is tried first and a prefix reading only if that finds nothing.
+     */
+    private Place resolvePlace(String phrase, boolean partial) {
+        String key = fold(phrase);
+        if (key.isEmpty()) return null;
+        List<String> cities = cityValues(key, false);
+        List<String> codes  = regionCodes(key);
+        if (!cities.isEmpty() || !codes.isEmpty()) {
+            return new Place(key, cities, codes, population(key, false));
+        }
+        if (!partial) return null;
+        cities = cityValues(key, true);
+        if (cities.isEmpty()) return null;
+        return new Place(key, cities, List.of(), population(key, true));
+    }
+
+    /**
+     * A geographic reading of the query: the places it named, and the words left over.
+     *
+     * <p>{@code head} holds the words that are NOT the place, BY POSITION. That distinction is the
+     * whole point of this record. Roles used to be decided per distinct token, so
+     * "New York Life, New York" collapsed both occurrences into one classification and left
+     * "life" as the only identity constraint: the search returned New Life Baptist Church and
+     * Life Pharmacy, and New York Life itself was absent. The same words can be a business name in
+     * one position and a place in another, and nothing except position can tell them apart.
+     */
+    private record GeoRead(List<Place> places, List<String> head, boolean explicit) {}
+
+    /**
+     * Reads the query as "something, somewhere", without insisting that it is.
+     *
+     * <p>A comma is a strong hint and never the only one: "Starbucks Toronto" names a city too.
+     * But treating everything after the first comma as a place turned "Smith, Jones &amp;
+     * Associates" into a search for Smith in a city called Jones, and "Riverside Clinic, 123 Main
+     * Street" into a search in a city called 123 Main Street, so a component counts as geography
+     * only when the corpus actually holds it. A component that does not is handed back to the
+     * query as ordinary words rather than dropped.
+     *
+     * <p>Without a comma, the LONGEST trailing run of words that names a place is taken, and the
+     * whole query is tried first. Trying shorter runs first was wrong in a way worth recording:
+     * "new york" would match the trailing "york" (a real city in Pennsylvania) and search for
+     * "new" in York. The longest reading is the specific one.
+     *
+     * <p>This decides nothing on its own. A geographic reading is only ever an ADDITIONAL
+     * interpretation here: the caller searches the literal reading alongside it and ranks them,
+     * because "Hotel California" and "Paris Baguette" are business names that merely end in a
+     * place, and a trailing place name is not proof of geographic intent.
+     */
+    private GeoRead readGeography(String query, List<String> toks, boolean partial) {
         int comma = query.indexOf(',');
         if (comma >= 0) {
-            /*
-              A COMMA IS A HINT, AND THE CORPUS DECIDES.
-
-              Treating everything after the first comma as a place turned "Smith, Jones &
-              Associates" into a search for Smith in a city called Jones, and "Riverside Clinic,
-              123 Main Street" into a search in a city called 123 Main Street. Both returned
-              nothing. A component counts as geography only when the corpus actually holds it as a
-              city or resolves it as a region; otherwise its words are part of the query.
-            */
-            List<String> parts = new ArrayList<>();
-            for (String part : query.substring(comma + 1).split(",")) {
-                String phrase = String.join(" ", tokens(part));
-                if (!phrase.isEmpty()) parts.add(phrase);
+            List<String> head = new ArrayList<>(tokens(query.substring(0, comma)));
+            List<Place> places = new ArrayList<>();
+            String[] parts = query.substring(comma + 1).split(",");
+            for (int i = 0; i < parts.length; i++) {
+                List<String> words = tokens(parts[i]);
+                if (words.isEmpty()) continue;
+                // Only the LAST component can hold a word still being typed.
+                Place p = resolvePlace(String.join(" ", words), partial && i == parts.length - 1);
+                if (p != null) places.add(p);
+                else head.addAll(words);
             }
-            for (String phrase : parts) if (isKnownPlace(phrase)) out.add(phrase);
-            return out;
+            return new GeoRead(places, head, !places.isEmpty());
         }
-        if (geoTokens.isEmpty()) return out;
-        List<String> all = tokens(query);
-        List<String> trailing = new ArrayList<>();
-        for (int i = all.size() - 1; i >= 0; i--) {
-            String t = all.get(i);
-            if (geoTokens.stream().noneMatch(g -> g.token().equals(t))) break;
-            trailing.add(0, t);
+        for (int start = 0; start < toks.size(); start++) {
+            Place p = resolvePlace(String.join(" ", toks.subList(start, toks.size())), partial);
+            if (p != null) {
+                return new GeoRead(List.of(p), new ArrayList<>(toks.subList(0, start)), false);
+            }
         }
-        if (!trailing.isEmpty()) out.add(String.join(" ", trailing));
-        return out;
+        return new GeoRead(List.of(), new ArrayList<>(toks), false);
     }
 
     /** A bare number anywhere means the query is an address, which relaxes street-type words. */
@@ -323,17 +433,28 @@ public final class LocalPlaceIndex {
         boolean address = addressShaped(toks);
 
         java.util.Map<String, TokenInfo> known = describeAll(toks, last);
-        /*
-          Which words sit in a geographic slot. Computed BEFORE the tokens are described, because
-          a region NAME in such a slot has to be matched as its CODE and that decision cannot be
-          made from the postings alone - see the alias note below.
-        */
-        Set<String> afterComma = new LinkedHashSet<>();
-        for (String comp : geographicComponents(query, List.of())) afterComma.addAll(tokens(comp));
 
-        // Tokens rewritten from a region name to its code, which belong with geography however
-        // their postings happen to be distributed.
-        Set<String> aliasedToCode = new LinkedHashSet<>();
+        /*
+          THE GEOGRAPHIC READING IS COMPUTED FIRST, because it decides which words are identity
+          constraints at all, and it is kept as an ALTERNATIVE rather than imposed.
+
+          Both halves of that matter, and each fixes a reported failure:
+
+            * Deciding roles per DISTINCT TOKEN collapsed the two occurrences in "New York Life,
+              New York" into one classification and left "life" as the only identity constraint.
+              The search returned New Life Baptist Church and Life Pharmacy; New York Life was
+              absent. Roles now come from POSITION, so the same words constrain identity in the
+              head and place in the tail.
+
+            * Imposing the geographic reading would break every business whose name ends in a
+              place. "Hotel California", "Paris Baguette" and "London Drugs" are names, not
+              requests to search California, Paris or London. So the literal reading is searched
+              ALONGSIDE the geographic one and the two are ranked, which is also why a wrong
+              trailing-place guess is survivable rather than fatal.
+        */
+        GeoRead geoRead = readGeography(query, toks, completion == Completion.PARTIAL);
+        List<Place> places = geoRead.places();
+        List<String> head = geoRead.head();
 
         List<TokenInfo> infos = new ArrayList<>();
         for (String t : toks) {
@@ -356,10 +477,8 @@ public final class LocalPlaceIndex {
             }
             /*
               A word with no postings of its own may still be a word the corpus knows under another
-              spelling, and dropping it silently removed the constraint entirely. Two failures came
-              from exactly that: "45 S Street" dropped "S" and then matched 45 North Street as
-              readily as 45 South Street, and "London, Ontario" dropped "Ontario", because the
-              corpus stores the region code "on", and returned the London in England.
+              spelling, and dropping it silently removed the constraint entirely: "45 S Street"
+              dropped "S" and then matched 45 North Street as readily as 45 South Street.
             */
             if (info.count() == 0) {
                 for (String form : STREET_EQUIV.getOrDefault(t, List.of())) {
@@ -367,174 +486,287 @@ public final class LocalPlaceIndex {
                     if (alt.count() > 0) { info = new TokenInfo(t, alt.count(), alt.fields(), false); break; }
                 }
             }
-            /*
-              A REGION NAME IN A GEOGRAPHIC SLOT IS ITS CODE, even when the name is also a common
-              business word.
-
-              This translation only ran when the token had NO postings of its own, which made it
-              useless for exactly the states people actually type. "california" has 19,377 name
-              postings, 14,865 street and 1,802 city, so it looked like a perfectly good identity
-              token and stayed one - a required constraint that no row in California can satisfy,
-              because a place stores the code "ca" and never the word "california".
-
-              The result was that the user's own address returned NOTHING:
-              "8581 Laguna Grove Drive, Elk Grove, California" -> 0 rows, while the same query
-              without the state found the dealership immediately. The fixture could not catch it:
-              in 27 rows "california" appears nowhere else, so the old condition was satisfied and
-              the alias was translated.
-
-              Position decides. A word after the comma that names a region is a region, and the
-              code is what the corpus stores.
-            */
-            String code = regionCode(t);
-            if (code != null && (afterComma.contains(t) || info.count() == 0)) {
-                TokenInfo alt = describe(code, false);
-                if (alt.count() > 0) {
-                    info = new TokenInfo(code, alt.count(), alt.fields(), false);
-                    aliasedToCode.add(code);
-                }
-            }
-            /*
-              A word the corpus has never seen is a CONSTRAINT THAT CANNOT BE SATISFIED, not a
-              word to ignore. Dropping it turned "Starbucks Fakecity" into a plain Starbucks search
-              and returned a convincing list of branches in cities nobody asked about, which is
-              worse than returning nothing because it looks like an answer.
-
-              The exception is the final token: somebody mid-word has not yet typed something
-              unknown, they have typed part of something. That case is handled by the prefix
-              reading above, and only falls through to here if even the prefix matches nothing.
-            */
-            if (info.count() == 0) return List.of();
             infos.add(info);
         }
-        if (infos.isEmpty()) return List.of();
 
-        // Geographic tokens constrain place; the rest constrain identity. A token that is both
-        // (Toronto the city, Toronto the company) stays unconstrained so neither reading is lost.
         /*
-          A token is geographic when the corpus only ever uses it as a place, OR when the person
-          put it where geography goes. "New York" is both a city and part of "New York Life", so
-          classifying purely by field left "New York Life, New York" unconstrained and a San Jose
-          office won on confidence. The comma is a hint about intent, not the whole test: a word
-          after it that the corpus knows as a place is treated as one.
+          A word the corpus has never seen is a CONSTRAINT THAT CANNOT BE SATISFIED, not a word to
+          ignore. Dropping it turned "Starbucks Fakecity" into a plain Starbucks search and
+          returned a convincing list of branches in cities nobody asked about, which is worse than
+          returning nothing because it looks like an answer.
+
+          It no longer kills the whole query outright, because a word can now be unknown AS A TOKEN
+          while naming a place perfectly well. "Walmart New York City" returned nothing for exactly
+          that reason: "city" became a required identity token, and no Walmart has it in any field.
+          An unknown word in the HEAD still refuses the query - that is the Fakecity guard, and the
+          head is what both readings require - while an unknown word the corpus resolved as part of
+          a place name simply rules out the literal reading.
         */
-        // afterComma is computed above, before the tokens are described.
-        List<TokenInfo> geo = new ArrayList<>(), ident = new ArrayList<>();
-        for (TokenInfo i : infos) {
-            boolean onlyGeo  = !i.fields().isEmpty() && GEO_FIELDS.containsAll(i.fields());
-            boolean placedAsGeo = afterComma.contains(i.token())
-                               && i.fields().stream().anyMatch(GEO_FIELDS::contains);
-            // A token rewritten from a region name no longer matches afterComma, which holds the
-            // name rather than the code, so it is carried across explicitly.
-            if (onlyGeo || placedAsGeo || aliasedToCode.contains(i.token())) geo.add(i);
-            else ident.add(i);
+        java.util.Map<String, TokenInfo> byToken = new java.util.LinkedHashMap<>();
+        for (TokenInfo i : infos) byToken.put(i.token(), i);
+
+        List<TokenInfo> headInfos = new ArrayList<>();
+        for (String t : head) {
+            TokenInfo i = byToken.get(t);
+            if (i == null || i.count() == 0) return List.of();
+            headInfos.add(i);
         }
         /*
-          A street type still GATES the query; it is only its spelling that is relaxed.
+          WHETHER THE LITERAL READING IS KEPT DEPENDS ON HOW THE GEOGRAPHY WAS ARRIVED AT.
 
-          Dropping these outright was wrong and the fixtures caught it: with "45 North Street" also
-          in Halifax, "45 South Street" discarded "south" and returned the northern one on
-          confidence. The word is required, but satisfied by any of its forms, so "South" and "S"
-          select the same street and neither selects the other one.
+          A place written AFTER A COMMA is stated, not guessed, and it filters: "York Roasters,
+          York" must not offer the branch in New York at all, and "Pacific Imports, Toronto" must
+          not offer the one in San Jose. Ranking the wrong region lower is not enough, because the
+          person has already told us where they mean.
+
+          A trailing place with no comma IS a guess, and there the literal reading must survive:
+          "Hotel California", "Paris Baguette", "London Drugs" and "New York Life" are business
+          names that merely end in a place, and filtering on that guess would delete the only
+          answer anybody wanted. Both readings are searched and ranked, so a wrong guess costs
+          position rather than the result.
         */
-        List<TokenInfo> required = new ArrayList<>(ident);
-        if (required.isEmpty() && !geo.isEmpty()) required = geo;   // a pure city search is valid
-        if (required.isEmpty()) return List.of();
+        boolean geographic = !places.isEmpty();
+        boolean literal = infos.stream().allMatch(i -> i.count() > 0)
+                       && !(geographic && geoRead.explicit());
+        if (!literal && !geographic) return List.of();
+        if (!geographic && headInfos.isEmpty()) return List.of();
+
+        /*
+          WHAT THE INDEX CALLS THE PLACES THAT WERE NAMED.
+
+          cityValues comes from the alias table, so a recognised place is matched by every spelling
+          the index actually uses for it rather than by the one that was typed. Recognising the
+          place and finding it are different problems: "new york city" is a name the geography
+          corpus uses and the places index spells "new york" for 245,580 rows and "new york city"
+          for 225, so the phrase as typed reached 0.09% of the city.
+        */
+        List<String> cityFilter = new ArrayList<>(), regionFilter = new ArrayList<>();
+        Set<String> placeTokens = new LinkedHashSet<>();
+        for (Place p : places) {
+            cityFilter.addAll(p.cityValues());
+            regionFilter.addAll(p.regionCodes());
+            for (String v : p.cityValues()) placeTokens.addAll(tokens(v));
+            placeTokens.addAll(p.regionCodes());
+        }
 
         StringBuilder sql = new StringBuilder();
         List<Object> binds = new ArrayList<>();
+
         /*
           ELIGIBILITY AND RANKING COME FROM THE POSTINGS; ONLY THE WINNERS ARE HYDRATED.
 
           The previous shape joined a 16.1M-row Parquet file to rank, and that join measured 105ms
-          however small the candidate set was, because the whole file is scanned. It was the single
-          largest part of a 361ms search. The postings now carry conf, brand and open_ok, so
-          candidates are filtered and ordered without touching anything large, and `meta` is an
-          in-index table rather than an external file: 0.04s against 0.09s for the same join.
+          however small the candidate set was, because the whole file is scanned. The postings now
+          carry conf, brand and open_ok, so candidates are filtered and ordered without touching
+          anything large, and `meta` is an in-index table rather than an external file.
 
-          Ranking order is unchanged from the slower version, deliberately:
-            1. the exact phrase, on the name or the brand;
-            2. how much of the query landed in the NAME rather than scattered across address and
-               city fields, which is what separates "The North Face" from a place that merely
-               contains both words somewhere;
-            3. a branded place over an unbranded one;
-            4. confidence;
-            5. place_id, so the order is stable.
+          Ranking order, in full:
+            1. phr      - the literal reading first: the WHOLE query as a name or brand, then the
+                          head of it, then neither. This is what keeps "Hotel California" the
+                          hotel of that name ahead of hotels in California.
+            2. geofit   - a place that satisfies the geography the query named, ahead of one that
+                          does not. Below phr deliberately, and above everything else.
+            3. brandfit - this company's brand, then any brand, then neither.
+            4. name_hits- how much of the query landed in the NAME rather than scattered across
+                          address and city fields.
+            5. geopop   - the corpus's population, which settles a place the query named
+                          ambiguously: "Paris" is Paris, Texas before Paris, Tennessee.
+            6. brand, conf, place_id - as before, place_id last so the order is stable.
         */
         sql.append("WITH ");
-        for (int i = 0; i < required.size(); i++) {
-            TokenInfo t = required.get(i);
-            List<String> forms = address ? STREET_EQUIV.get(t.token()) : null;
-            sql.append("p").append(i).append(" AS (SELECT DISTINCT place_id FROM tok WHERE open_ok AND ");
-            if (forms != null) {
-                sql.append("token IN (");
-                for (int f = 0; f < forms.size(); f++) { sql.append(f == 0 ? "?" : ", ?"); binds.add(forms.get(f)); }
-                sql.append(")");
-            } else {
-                sql.append("token ").append(t.prefix() ? "LIKE ? || '%'" : "= ?");
-                binds.add(t.token());
+
+        // The literal reading: every word the person typed, in any field. Any field matters, and
+        // is what lets an ADDRESS be searched at all - "123 Main Street Toronto" has nothing in a
+        // name or a brand, and restricting identity words to those fields would refuse it.
+        /*
+          ONE CTE PER DISTINCT WORD, referenced by whichever branch needs it.
+
+          The two readings overlap by construction - the head words are a subset of all the words -
+          so emitting a posting lookup per branch scanned the same word twice. For
+          "starbucks brooklyn" that was the 35,265 "starbucks" postings read once for the literal
+          reading and again for the geographic one, and the duplicate was invisible because the two
+          had different aliases. CPU per query is what bounds sustained throughput on this host, so
+          a scan nobody needed is the thing worth removing first.
+        */
+        java.util.Map<String, String> cteFor = new java.util.LinkedHashMap<>();
+        java.util.List<TokenInfo> needed = new ArrayList<>();
+        if (literal) needed.addAll(infos);
+        if (geographic) needed.addAll(headInfos);
+        for (TokenInfo t : needed) {
+            String key = t.token() + "|" + t.prefix();
+            if (cteFor.containsKey(key)) continue;
+            String name = "t" + cteFor.size();
+            cteFor.put(key, name);
+            appendTokenCte(sql, binds, name, t, address);
+        }
+        // The geographic reading: the head words, narrowed to the places that were named.
+        if (geographic) {
+            /*
+              RETRIEVAL IS NARROWED BY THE RESOLVED PLACE NAMES, AS A UNION, and made exact
+              afterwards against meta.
+
+              Requiring every typed geographic word to be a city or state posting is what made
+              "Walmart New York City" return nothing: no Walmart in New York carries the posting
+              "city", so intersecting new AND york AND city eliminated the whole city. These are
+              the words of the names the index itself uses, combined with OR, so the set is a
+              superset of the answer and the exact filter below removes the rest.
+            */
+            sql.append("gc AS (SELECT DISTINCT place_id FROM tok WHERE open_ok")
+               .append(" AND field IN ('city','state') AND token IN (");
+            int n = 0;
+            for (String t : placeTokens) { sql.append(n++ == 0 ? "?" : ", ?"); binds.add(t); }
+            sql.append(")), ");
+        }
+
+        if (literal) {
+            sql.append("lit AS (");
+            for (int i = 0; i < infos.size(); i++) {
+                if (i > 0) sql.append(" INTERSECT ");
+                sql.append("SELECT place_id FROM ")
+                   .append(cteFor.get(infos.get(i).token() + "|" + infos.get(i).prefix()));
             }
             sql.append("), ");
         }
-        for (int i = 0; i < geo.size(); i++) {
-            TokenInfo t = geo.get(i);
-            sql.append("g").append(i).append(" AS (SELECT DISTINCT place_id FROM tok WHERE open_ok")
-               .append(" AND field IN ('city','state') AND token ")
-               .append(t.prefix() ? "LIKE ? || '%'" : "= ?").append("), ");
-            binds.add(t.token());
+        if (geographic) {
+            sql.append("geo AS (SELECT c.place_id FROM (SELECT place_id FROM gc");
+            for (TokenInfo t : headInfos) {
+                sql.append(" INTERSECT SELECT place_id FROM ")
+                   .append(cteFor.get(t.token() + "|" + t.prefix()));
+            }
+            sql.append(") c JOIN meta m ON m.place_id = c.place_id WHERE ").append(placePredicate(cityFilter, regionFilter));
+            binds.addAll(cityFilter);
+            binds.addAll(regionFilter);
+            sql.append("), ");
         }
-        sql.append("cand AS (SELECT place_id FROM p0");
-        for (int i = 1; i < required.size(); i++) sql.append(" INTERSECT SELECT place_id FROM p").append(i);
-        for (int i = 0; i < geo.size(); i++) sql.append(" INTERSECT SELECT place_id FROM g").append(i);
+
+        sql.append("cand AS (");
+        if (literal)                sql.append("SELECT place_id FROM lit");
+        if (literal && geographic)  sql.append(" UNION ");
+        if (geographic)             sql.append("SELECT place_id FROM geo");
         sql.append("), ");
 
         // How much of the query landed in the name, plus the ranking fields, from the postings.
         sql.append("hits AS (SELECT c.place_id, max(t.conf) AS conf, bool_or(t.brand) AS brand, ")
            .append("sum(CASE WHEN t.field IN ('name','brand') THEN 1 ELSE 0 END) AS name_hits ")
            .append("FROM cand c JOIN tok t ON t.place_id = c.place_id AND t.token IN (");
-        List<String> allTokens = new ArrayList<>();
-        for (TokenInfo t : required) allTokens.add(t.token());
-        for (TokenInfo t : geo) allTokens.add(t.token());
-        for (int i = 0; i < allTokens.size(); i++) { sql.append(i == 0 ? "?" : ", ?"); binds.add(allTokens.get(i)); }
+        /*
+          NAME RELEVANCE IS MEASURED OVER THE IDENTITY WORDS ONLY.
+
+          Counting the geographic words too let a place be rewarded for containing them, which is
+          not evidence that it is the business being looked for. "Walgreens, New York" ranked New
+          York Presbyterian Hospital above every actual Walgreens: the hospital has a Walgreens
+          pharmacy counter, so it carried the brand posting, and then "new" and "york" in its own
+          NAME counted twice more. Three name hits against the two a shop called Walgreens can
+          have, and the hospital won a search for a pharmacy chain.
+
+          When the query named no place, the identity words are the whole query and this is the
+          behaviour it always had.
+        */
+        List<String> nameTokens = new ArrayList<>();
+        for (TokenInfo t : (geographic && !headInfos.isEmpty() ? headInfos : infos)) nameTokens.add(t.token());
+        for (int i = 0; i < nameTokens.size(); i++) { sql.append(i == 0 ? "?" : ", ?"); binds.add(nameTokens.get(i)); }
         sql.append(") GROUP BY c.place_id), ");
 
-        List<String> components = geographicComponents(query, geo);
-        StringBuilder geoFilter = new StringBuilder();
-        List<String> geoBinds = new ArrayList<>();
-        for (String comp : components) {
-            String code = regionCode(comp);
-            if (code != null) { geoFilter.append(" AND (m.state_norm = ? OR m.city_norm = ?)"); geoBinds.add(code); geoBinds.add(comp); }
-            else { geoFilter.append(" AND m.city_norm = ?"); geoBinds.add(comp); }
-        }
-        String phrase = String.join(" ", toks);
+        String fullPhrase = String.join(" ", toks);
+        String headPhrase = String.join(" ", head);
         sql.append("ranked AS (SELECT h.place_id, h.name_hits, h.brand, h.conf, ")
-           .append("CASE WHEN m.name_norm LIKE '%' || ? || '%' OR m.brand_norm LIKE '%' || ? || '%' ")
-           .append("THEN 0 ELSE 1 END AS phr, ")
-           // Mirrors the remote ORDER BY: this company's brand, then any brand, then neither.
-           // brand_norm is coalesce(brand_name,''), so an unbranded place is the EMPTY STRING
-           // and never NULL. "IS NOT NULL" here would be true for every row and flatten two of
-           // these three ranks into one.
-           .append("CASE WHEN ? <> '' AND m.brand_norm = ? THEN 0 ")
-           .append("WHEN m.brand_norm <> '' THEN 1 ELSE 2 END AS brandfit ")
-           .append("FROM hits h JOIN meta m ON m.place_id = h.place_id")
-           .append(geoFilter).append("), ");
-        binds.add(phrase); binds.add(phrase);
-        // Bound where the placeholders sit in the TEXT: after the two phrase binds, before the
-        // geographic ones, because the brandfit CASE is written between them.
-        String bias = (brandBias == null || brandBias.isBlank()) ? ""
-                    : java.text.Normalizer.normalize(brandBias.trim().toLowerCase(),
-                                                     java.text.Normalizer.Form.NFC);
-        binds.add(bias); binds.add(bias);
-        binds.addAll(geoBinds);
+           .append("CASE WHEN m.name_norm LIKE '%' || ? || '%' OR m.brand_norm LIKE '%' || ? || '%' THEN 0 ")
+           .append("WHEN ? <> '' AND (m.name_norm LIKE '%' || ? || '%' OR m.brand_norm LIKE '%' || ? || '%') THEN 1 ")
+           .append("ELSE 2 END AS phr, ");
+        binds.add(fullPhrase); binds.add(fullPhrase);
+        binds.add(headPhrase); binds.add(headPhrase); binds.add(headPhrase);
 
-        sql.append("top AS (SELECT place_id, row_number() OVER (ORDER BY phr, brandfit, name_hits DESC, ")
-           .append("brand DESC, conf DESC NULLS LAST, place_id) AS pos FROM ranked ")
-           .append("ORDER BY phr, brandfit, name_hits DESC, brand DESC, conf DESC NULLS LAST, place_id LIMIT ")
-           .append(limit).append(") ")
+        /*
+          A CITY MATCH OUTRANKS A REGION MATCH, because a name can be both.
+
+          "New York" is a city and a state, and matching them as one flat OR made the state win on
+          volume: a search for Walmart in New York returned Greece, Springville and Ogdensburg -
+          all genuinely in New York State, none of them what was asked for. Three levels keep both
+          readings available and put the specific one first, rather than discarding the region
+          reading that "Starbucks Ontario" depends on.
+        */
+        /*
+          FOUR TIERS, because a name can denote a city, a region, or a city in some other region,
+          and collapsing them loses the answer.
+
+            0  the city of that name INSIDE the region of that name - the namesake
+            1  anywhere in the region of that name
+            2  a city of that name in a DIFFERENT region - a coincidental namesake
+            3  neither
+
+          Every tier is still searched; only the order changes. Two failures came from having
+          fewer tiers. Matching city and region as one flat OR let the region win on volume, so
+          Walmart in New York returned Greece, Springville and Ogdensburg - all in New York State,
+          none of them New York. Then ranking any city above the region sent a search for Starbucks
+          in California to a town of 11,857 in MARYLAND, ahead of the state of thirty-nine million.
+
+          Asking whether the city is in its own region separates them with no threshold and no list
+          of exceptions: New York City is in New York, and California, Maryland is not.
+        */
+        if (geographic) {
+            boolean c = !cityFilter.isEmpty(), r = !regionFilter.isEmpty();
+            sql.append("CASE ");
+            if (c && r) {
+                sql.append("WHEN ").append(in("m.city_norm", cityFilter))
+                   .append(" AND ").append(in("m.state_norm", regionFilter)).append(" THEN 0 ");
+                binds.addAll(cityFilter); binds.addAll(regionFilter);
+            }
+            if (r) {
+                sql.append("WHEN ").append(in("m.state_norm", regionFilter)).append(" THEN 1 ");
+                binds.addAll(regionFilter);
+            }
+            if (c) {
+                sql.append("WHEN ").append(in("m.city_norm", cityFilter)).append(" THEN 2 ");
+                binds.addAll(cityFilter);
+            }
+            sql.append("ELSE 3 END AS geofit, ");
+        } else {
+            sql.append("0 AS geofit, ");
+        }
+
+        // Mirrors the remote ORDER BY: this company's brand, then any brand, then neither.
+        // brand_norm is coalesce(brand_name,''), so an unbranded place is the EMPTY STRING and
+        // never NULL. "IS NOT NULL" here would be true for every row and flatten two of these
+        // three ranks into one.
+        sql.append("CASE WHEN ? <> '' AND m.brand_norm = ? THEN 0 ")
+           .append("WHEN m.brand_norm <> '' THEN 1 ELSE 2 END AS brandfit");
+        /*
+          NORMALISED EXACTLY AS THE BUILD NORMALISED brand_norm, or this never matches.
+
+          Two differences from the build were here, and both are silent. toLowerCase() without a
+          locale uses the JVM's default: on a Turkish-locale host "I" lowercases to the dotless
+          "ı", so every brand containing an I stops equalling its indexed form and brand
+          ranking quietly dies for them. The build uses DuckDB's lower(), which has no locale.
+
+          The order was inverted too. The build is lower(nfc_normalize(x)) - compose, then
+          lowercase. Doing it the other way round is not guaranteed to agree, because lowercasing
+          can yield sequences NFC then composes differently.
+        */
+        String bias = (brandBias == null || brandBias.isBlank()) ? ""
+                    : java.text.Normalizer.normalize(brandBias.trim(), java.text.Normalizer.Form.NFC)
+                          .toLowerCase(java.util.Locale.ROOT);
+        binds.add(bias); binds.add(bias);
+
+        // PROMINENCE, FROM THE CORPUS'S OWN POPULATION FIGURE. Only ever a tie-break among places
+        // the query named ambiguously, and never a substitute for the geography it did name: it
+        // sits BELOW geofit, so an explicitly named place always outranks a more famous one.
+        if (geographic) {
+            sql.append(", coalesce(gp.population, 0) AS geopop ")
+               .append("FROM hits h JOIN meta m ON m.place_id = h.place_id ")
+               .append("LEFT JOIN geo_place gp ON gp.name = ? AND gp.region = m.state_norm), ");
+            binds.add(places.get(0).phrase());
+        } else {
+            sql.append(", 0 AS geopop FROM hits h JOIN meta m ON m.place_id = h.place_id), ");
+        }
+
+        String order = "phr, geofit, brandfit, name_hits DESC, geopop DESC, "
+                     + "brand DESC, conf DESC NULLS LAST, place_id";
+        sql.append("top AS (SELECT place_id, row_number() OVER (ORDER BY ").append(order)
+           .append(") AS pos FROM ranked ORDER BY ").append(order).append(" LIMIT ").append(limit).append(") ")
            .append("SELECT t.pos, p.source_place_id, p.name, p.brand_name, p.street, p.city, ")
            .append("p.state_code, p.postal_code FROM top t JOIN read_parquet(?) p ")
            .append("ON p.place_id = t.place_id ORDER BY t.pos");
-        binds.add(release.payloadPath().toString());
+        binds.add(release.payloadLocation());
 
         List<Hit> hits = new ArrayList<>();
         try (PreparedStatement ps = conn.prepareStatement(sql.toString())) {
@@ -547,5 +779,59 @@ public final class LocalPlaceIndex {
             }
         }
         return hits;
+    }
+
+    /**
+     * One required word as a posting lookup.
+     *
+     * <p>A street type still GATES the query; it is only its spelling that is relaxed. Dropping
+     * these outright was wrong and the fixtures caught it: with "45 North Street" also in Halifax,
+     * "45 South Street" discarded "south" and returned the northern one on confidence. The word is
+     * required, but satisfied by any of its forms, so "South" and "S" select the same street and
+     * neither selects the other one.
+     */
+    private static void appendTokenCte(StringBuilder sql, List<Object> binds, String name,
+                                       TokenInfo t, boolean address) {
+        List<String> forms = address ? STREET_EQUIV.get(t.token()) : null;
+        sql.append(name).append(" AS (SELECT DISTINCT place_id FROM tok WHERE open_ok AND ");
+        if (forms != null) {
+            sql.append("token IN (");
+            for (int f = 0; f < forms.size(); f++) { sql.append(f == 0 ? "?" : ", ?"); binds.add(forms.get(f)); }
+            sql.append(")");
+        } else {
+            sql.append("token ").append(t.prefix() ? "LIKE ? || '%'" : "= ?");
+            binds.add(t.token());
+        }
+        sql.append("), ");
+    }
+
+    /**
+     * Whether a row sits in one of the places the query named.
+     *
+     * <p>A city OR a region, because a place can be either and "London, Ontario" names one of
+     * each. Written once and used twice, for retrieval and for ranking, so the two can never
+     * disagree about what satisfying the geography means.
+     */
+    /** An IN list with one placeholder per value; the caller binds them in the same order. */
+    private static String in(String column, List<String> values) {
+        StringBuilder b = new StringBuilder(column).append(" IN (");
+        for (int i = 0; i < values.size(); i++) b.append(i == 0 ? "?" : ", ?");
+        return b.append(")").toString();
+    }
+
+    private static String placePredicate(List<String> cities, List<String> regions) {
+        StringBuilder p = new StringBuilder("(");
+        if (!cities.isEmpty()) {
+            p.append("m.city_norm IN (");
+            for (int i = 0; i < cities.size(); i++) p.append(i == 0 ? "?" : ", ?");
+            p.append(")");
+        }
+        if (!cities.isEmpty() && !regions.isEmpty()) p.append(" OR ");
+        if (!regions.isEmpty()) {
+            p.append("m.state_norm IN (");
+            for (int i = 0; i < regions.size(); i++) p.append(i == 0 ? "?" : ", ?");
+            p.append(")");
+        }
+        return p.append(")").toString();
     }
 }

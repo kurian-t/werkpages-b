@@ -56,7 +56,8 @@ public class CompanyReviewRepository {
     private static final String COLUMNS =
         "id, company_id, user_id, overall_rating, " + String.join(", ", CATEGORIES)
         + ", worked_from, worked_until, dates_hidden, author, created_at, updated_at, "
-        + "declared_country, declared_state, declared_city, declared_precision, company_location_id";
+        + "declared_country, declared_state, declared_city, declared_precision, company_location_id, "
+        + "declared_source, declared_text";
 
     /**
      * Inserts, or replaces this person's existing rating of this company.
@@ -91,6 +92,8 @@ public class CompanyReviewRepository {
         tuple.addValue(loc.city());
         tuple.addValue(loc.precision());
         tuple.addValue(loc.companyLocationId());
+        tuple.addValue(loc.source());
+        tuple.addValue(loc.text());
         // Appended last so the computed indices below stay readable; see datesHiddenParam.
         tuple.addBoolean(datesHidden);
 
@@ -101,13 +104,16 @@ public class CompanyReviewRepository {
         int cityParam        = stateParam + 1;
         int precisionParam   = cityParam + 1;
         int locationIdParam  = precisionParam + 1;
-        int datesHiddenParam = locationIdParam + 1;
+        int sourceParam      = locationIdParam + 1;
+        int textParam        = sourceParam + 1;
+        int datesHiddenParam = textParam + 1;
 
         return db.preparedQuery("""
                 INSERT INTO company_reviews (company_id, user_id, overall_rating, worked_from, %s, worked_until, author,
                                              declared_country, declared_state, declared_city,
-                                             declared_precision, company_location_id, dates_hidden)
-                VALUES ($1, $2, $3, $4%s, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d)
+                                             declared_precision, company_location_id,
+                                             declared_source, declared_text, dates_hidden)
+                VALUES ($1, $2, $3, $4%s, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d)
                 ON CONFLICT (user_id, company_id) WHERE deleted_at IS NULL
                 DO UPDATE SET overall_rating = EXCLUDED.overall_rating,
                               %s
@@ -120,7 +126,15 @@ public class CompanyReviewRepository {
                               -- identity a reader already saw on this rating, and silently
                               -- replacing it on an edit would make one person look like two.
                               author       = COALESCE(EXCLUDED.author, company_reviews.author),
-                              -- All five move together, or none of them do.
+                              -- All of them move together, or none of them do.
+                              --
+                              -- "Did this submission declare a location" cannot be
+                              -- `declared_precision IS NULL`. A MANUAL answer - somebody's own
+                              -- words, because the corpus had no such place or could not be
+                              -- reached - carries no precision at all, since a typed string
+                              -- corroborates no rung of the ladder. Testing precision alone read
+                              -- that as "declared nothing" and kept the old row, so a location the
+                              -- person entered and watched the form accept vanished on save.
                               --
                               -- Not COALESCE per column: coarsening an exact pick to a city sends
                               -- a precision with no location id, and keeping the old id column by
@@ -129,19 +143,31 @@ public class CompanyReviewRepository {
                               -- so an older client cannot silently erase a location it never knew
                               -- to send.
                               declared_country    = CASE WHEN EXCLUDED.declared_precision IS NULL
+                                                     AND EXCLUDED.declared_source IS DISTINCT FROM 'manual'
                                                     THEN company_reviews.declared_country    ELSE EXCLUDED.declared_country    END,
                               declared_state      = CASE WHEN EXCLUDED.declared_precision IS NULL
+                                                     AND EXCLUDED.declared_source IS DISTINCT FROM 'manual'
                                                     THEN company_reviews.declared_state      ELSE EXCLUDED.declared_state      END,
                               declared_city       = CASE WHEN EXCLUDED.declared_precision IS NULL
+                                                     AND EXCLUDED.declared_source IS DISTINCT FROM 'manual'
                                                     THEN company_reviews.declared_city       ELSE EXCLUDED.declared_city       END,
                               company_location_id = CASE WHEN EXCLUDED.declared_precision IS NULL
+                                                     AND EXCLUDED.declared_source IS DISTINCT FROM 'manual'
                                                     THEN company_reviews.company_location_id ELSE EXCLUDED.company_location_id END,
-                              declared_precision  = COALESCE(EXCLUDED.declared_precision, company_reviews.declared_precision),
+                              declared_precision  = CASE WHEN EXCLUDED.declared_precision IS NULL
+                                                     AND EXCLUDED.declared_source IS DISTINCT FROM 'manual'
+                                                    THEN company_reviews.declared_precision  ELSE EXCLUDED.declared_precision  END,
+                              declared_source     = CASE WHEN EXCLUDED.declared_precision IS NULL
+                                                     AND EXCLUDED.declared_source IS DISTINCT FROM 'manual'
+                                                    THEN company_reviews.declared_source     ELSE EXCLUDED.declared_source     END,
+                              declared_text       = CASE WHEN EXCLUDED.declared_precision IS NULL
+                                                     AND EXCLUDED.declared_source IS DISTINCT FROM 'manual'
+                                                    THEN company_reviews.declared_text       ELSE EXCLUDED.declared_text       END,
                               updated_at   = now()
                 RETURNING %s
                 """.formatted(cols, placeholders, workedUntilParam, authorParam,
                               countryParam, stateParam, cityParam, precisionParam, locationIdParam,
-                              datesHiddenParam,
+                              sourceParam, textParam, datesHiddenParam,
                               updates, COLUMNS))
             .execute(tuple)
             .map(rs -> rs.iterator().next());

@@ -29,7 +29,20 @@ class LocationSuggestionTieringTest {
         for (int i = 0; i < nameThenState.length; i += 2) {
             out.add(new JsonObject().put("kind", "geo")
                 .put("name", nameThenState[i])
-                .put("stateName", nameThenState[i + 1]));
+                .put("stateName", nameThenState[i + 1])
+                /*
+                  A POPULATION, because a real corpus row carries one and the gate now reads it.
+
+                  Worldwide geography made the gate unsafe without it: there is a hamlet somewhere
+                  on earth beginning with almost any brand name, so "McDonalds" matched McDonalds
+                  Corner in Papua New Guinea - population 0 - and business search was skipped
+                  entirely. The corpus's population is the evidence that somebody typed a CITY.
+
+                  These fixtures are inhabited places, so they carry a figure. The assertions below
+                  are unchanged; a row without one would now represent something the corpus does not
+                  return.
+                */
+                .put("population", 100_000L));
         }
         return out;
     }
@@ -88,7 +101,8 @@ class LocationSuggestionTieringTest {
     @Test
     @DisplayName("a missing region does not throw")
     void aRowWithNoRegionIsHandled() {
-        JsonArray countryRow = new JsonArray().add(new JsonObject().put("kind", "geo").put("name", "Canada"));
+        JsonArray countryRow = new JsonArray().add(new JsonObject()
+            .put("kind", "geo").put("name", "Canada").put("population", 38_000_000L));
         assertTrue(ManagerService.geographyAnswers(countryRow, "Canada"));
         assertFalse(ManagerService.geographyAnswers(countryRow, "Canada Goose"));
     }

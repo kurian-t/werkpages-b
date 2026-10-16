@@ -707,6 +707,64 @@ class CompanyReviewIntegrationTest {
 
     // ── fixtures ──────────────────────────────────────────────────────────────
 
+
+    @Test
+    @DisplayName("a typed location on a workplace rating survives the save")
+    void manualLocation_survivesOnACompanyRating() throws Exception {
+        /*
+          The same gap as the manager form, on a form that shares the same control.
+
+          Every surface using LocationField can now produce an answer somebody typed, because the
+          corpus had no such place or could not be reached. The upsert decided "did this submission
+          declare a location" by looking at declared_precision alone - and a typed answer has none,
+          since a string corroborates no rung of the ladder - so it read as "declared nothing",
+          kept whatever was already stored, and the person's location quietly disappeared.
+        */
+        insertCompany("Red Hat", "red-hat");
+        String auth = insertUser("auth0|cr-manual", "CrManual");
+        String typed = "Gorsebrook Mill, Antigonish";
+
+        JsonObject body = validBody(4.0)
+            .put("declaredSource", DeclaredLocation.MANUAL)
+            .put("declaredText", typed);
+        await(service.submit(auth, "red-hat", body));
+
+        Row row = await(pool.preparedQuery("""
+                SELECT declared_source, declared_text, declared_precision,
+                       declared_city, company_location_id
+                  FROM company_reviews WHERE deleted_at IS NULL ORDER BY created_at DESC LIMIT 1
+                """).execute()).iterator().next();
+
+        assertEquals("manual", row.getString("declared_source"));
+        assertEquals(typed,    row.getString("declared_text"));
+        // And nothing conjured from the string.
+        assertNull(row.getString("declared_city"));
+        assertNull(row.getString("declared_precision"));
+        assertNull(row.getLong("company_location_id"));
+    }
+
+    @Test
+    @DisplayName("editing a rating does not quietly drop the typed location")
+    void manualLocation_survivesAnEdit() throws Exception {
+        // The upsert path specifically: a second submission is an edit, and the guard that decides
+        // whether to keep or replace the stored location has to count a manual answer as one.
+        insertCompany("Red Hat", "red-hat");
+        String auth = insertUser("auth0|cr-manual2", "CrManual2");
+        await(service.submit(auth, "red-hat", validBody(4.0)
+            .put("declaredSource", DeclaredLocation.MANUAL).put("declaredText", "First Mill")));
+
+        await(service.submit(auth, "red-hat", validBody(5.0)
+            .put("declaredSource", DeclaredLocation.MANUAL).put("declaredText", "Second Mill")));
+
+        Row row = await(pool.preparedQuery("""
+                SELECT declared_source, declared_text, overall_rating
+                  FROM company_reviews WHERE deleted_at IS NULL ORDER BY updated_at DESC LIMIT 1
+                """).execute()).iterator().next();
+        assertEquals("manual",      row.getString("declared_source"));
+        assertEquals("Second Mill", row.getString("declared_text"),
+            "the edited location must replace the old one, not be discarded as 'declared nothing'");
+    }
+
     private static JsonObject validBody(double overall) {
         JsonObject ratings = new JsonObject();
         for (String c : CompanyReviewRepository.CATEGORIES) ratings.put(c, overall);

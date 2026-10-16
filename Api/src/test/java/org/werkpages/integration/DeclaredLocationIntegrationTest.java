@@ -13,6 +13,7 @@ import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.DisplayName;
 import org.testcontainers.containers.PostgreSQLContainer;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
@@ -132,6 +133,39 @@ class DeclaredLocationIntegrationTest {
 
         Future<Row> attempt = service.createManager("auth0|dl-bad", body, null, submission(body));
         assertThrows(Exception.class, () -> await(attempt));
+    }
+
+
+    @Test
+    @DisplayName("claiming a precision with nothing behind it does not get past the door")
+    void aClaimedPrecisionWithNoLocation_isRejected() throws Exception {
+        /*
+          THE BYPASS THE HTTP GUARD DOES NOT CLOSE, AND MUST NOT NEED TO.
+
+          The add-manager endpoint refuses a submission carrying no location at all. It decides
+          that by asking whether a precision was claimed - which is a claim, not a location. A
+          client posting {"declaredPrecision": "city"} and nothing else satisfies the guard while
+          supplying no geography whatsoever.
+
+          That is deliberate: the guard answers "did they answer the question", and whether the
+          answer is CONSISTENT is the parser's job, where the rule already lives and is shared by
+          every path. This test is here to prove the two halves actually meet, so an empty
+          location cannot be smuggled in behind a claimed rung.
+        */
+        insertUser("auth0|dl-hollow", "DlHollow");
+        for (String precision : new String[]{ DeclaredLocation.CITY, DeclaredLocation.STATE,
+                                              DeclaredLocation.COUNTRY, DeclaredLocation.EXACT }) {
+            JsonObject body = validCreateManagerBody("Hollow Claim", "HollowCo", "Manager")
+                .put("declaredPrecision", precision);   // and nothing underneath it
+
+            assertThrows(Exception.class,
+                () -> await(service.createManager("auth0|dl-hollow", body, null, submission(body))),
+                "precision '" + precision + "' with no location behind it must be refused");
+        }
+
+        assertEquals(0L, await(pool.query("SELECT count(*) AS n FROM managers").execute())
+            .iterator().next().getLong("n"),
+            "and nothing may have been created along the way");
     }
 
     // ── Exact precision ───────────────────────────────────────────────────────
@@ -449,7 +483,10 @@ class DeclaredLocationIntegrationTest {
     private static Row manager(long id) throws Exception {
         return await(pool.preparedQuery("""
                 SELECT city, status, declared_country, declared_state, declared_city,
-                       declared_precision, company_location_id
+                       declared_precision, company_location_id,
+                       -- Where the answer came from, and the words themselves when nothing
+                       -- corroborated it. See V95.
+                       declared_source, declared_text
                 FROM managers WHERE id = $1
                 """).execute(Tuple.of(id)).map(rs -> rs.iterator().next()));
     }
@@ -576,6 +613,91 @@ class DeclaredLocationIntegrationTest {
 
         assertEquals("retired", manager(managerId).getString("status"),
             "a review that declared nothing about the status left it as it was");
+    }
+
+
+    @Test
+    @DisplayName("a location somebody TYPED is saved, and reads back as they wrote it")
+    void manualLocation_survivesSaveAndReload() throws Exception {
+        /*
+          THE ANSWER THE CORPUS COULD NOT SUPPLY.
+
+          Location is mandatory on the form; choosing a suggestion is not. A workplace the corpus
+          has never held, a query it answers with nothing, or a corpus that cannot be reached must
+          never be the reason somebody cannot say where they worked.
+
+          This used to be dropped in silence. DeclaredLocation.fromBody returned NONE whenever
+          declaredPrecision was absent, and a typed answer has no precision - it corroborates no
+          rung of the ladder - so the form showed the person their location accepted and the row
+          saved without one.
+
+          Two things are asserted, and the second matters as much as the first: the words survive
+          exactly, and NOTHING was invented to go with them. No city parsed out of the string, no
+          workplace attached, no precision claimed. Accepting an answer is not the same as
+          corroborating it, and only the second was ever forbidden.
+        */
+        insertUser("auth0|dl-manual", "DlManual");
+        String typed = "Gorsebrook Mill, Antigonish, Nova Scotia";
+        JsonObject body = validCreateManagerBody("Dana Typed", "DeclCo", "Operations Lead")
+            .put("declaredSource", DeclaredLocation.MANUAL)
+            .put("declaredText", typed);
+
+        Row created = await(service.createManager("auth0|dl-manual", body, null, submission(body)));
+
+        Row m = manager(created.getLong("id"));
+        assertEquals("manual", m.getString("declared_source"),
+            "the row must say the answer was typed, not picked");
+        assertEquals(typed, m.getString("declared_text"),
+            "and keep the words exactly as they were written");
+
+        // Nothing conjured out of the string.
+        assertNull(m.getString("declared_city"),   "no city may be parsed from free text");
+        assertNull(m.getString("declared_state"),  "nor a state");
+        assertNull(m.getString("declared_precision"),
+            "a typed answer corroborates no rung of the precision ladder");
+        assertNull(m.getLong("company_location_id"),
+            "and it must never be promoted into a real workplace row");
+    }
+
+    @Test
+    @DisplayName("a typed answer may carry coarse fields that were confirmed another way")
+    void manualLocation_keepsIndependentlyConfirmedFields() throws Exception {
+        // The country is known from the visitor's own geography, which the typed text did not have
+        // to supply. Keeping it is not inventing it - the distinction the whole source flag exists
+        // to record.
+        insertUser("auth0|dl-manual2", "DlManual2");
+        JsonObject body = validCreateManagerBody("Rea Typed", "DeclCo", "Analyst")
+            .put("declaredCountry", "Canada")
+            .put("declaredPrecision", DeclaredLocation.COUNTRY)
+            .put("declaredSource", DeclaredLocation.MANUAL)
+            .put("declaredText", "Gorsebrook Mill");
+
+        Row created = await(service.createManager("auth0|dl-manual2", body, null, submission(body)));
+
+        Row m = manager(created.getLong("id"));
+        assertEquals("Canada",          m.getString("declared_country"));
+        assertEquals("country",         m.getString("declared_precision"));
+        assertEquals("manual",          m.getString("declared_source"));
+        assertEquals("Gorsebrook Mill", m.getString("declared_text"));
+        assertNull(m.getString("declared_city"), "still nothing invented below the rung given");
+    }
+
+    @Test
+    @DisplayName("a typed answer cannot claim a workplace it never picked")
+    void manualLocation_cannotClaimExact() throws Exception {
+        // The one thing a manual entry must not be allowed to do: present itself as a corroborated
+        // building. Promotion requires a structured place, and there is none behind free text.
+        insertUser("auth0|dl-manual3", "DlManual3");
+        JsonObject body = validCreateManagerBody("Mal Typed", "DeclCo", "Analyst")
+            .put("declaredPrecision", DeclaredLocation.EXACT)
+            .put("declaredSource", DeclaredLocation.MANUAL)
+            .put("declaredText", "somewhere I typed");
+
+        Future<Row> attempt = service.createManager("auth0|dl-manual3", body, null, submission(body));
+
+        Exception failure = assertThrows(Exception.class, () -> await(attempt));
+        assertTrue(String.valueOf(failure.getMessage()).toLowerCase().contains("exact"),
+            "the refusal should name the problem: " + failure.getMessage());
     }
 
     @Test

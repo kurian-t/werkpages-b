@@ -15,6 +15,7 @@ import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.DisplayName;
 import org.testcontainers.containers.PostgreSQLContainer;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
@@ -137,6 +138,44 @@ class InterviewReviewIntegrationTest {
         assertNull(created.getValue("communication"));
         assertNull(created.getValue("difficulty"));
         assertNull(created.getValue("roleCategory"));
+    }
+
+
+    @Test
+    @DisplayName("a typed location on an interview experience survives the save")
+    void manualLocation_survivesOnAnInterviewReview() throws Exception {
+        /*
+          The third surface sharing LocationField, and the same gap.
+
+          A typed answer carries no precision, because a string corroborates no rung of the
+          precision ladder. Both the insert and the update guard read that as "this submission
+          declared nothing", so a location the person entered and watched the form accept was
+          dropped on the way to the database.
+        */
+        String auth0Id = insertUser("manualloc");
+        insertCompany("Typed Co", "typed-co");
+        String typed = "Gorsebrook Mill, Antigonish";
+
+        await(service.createReview(auth0Id, "typed-co", new JsonObject()
+            .put("overallRating", 4.0)
+            .put("outcome", "offer")
+            .put("interviewYear", YEAR)
+            .put("declaredSource", "manual")
+            .put("declaredText", typed)));
+
+        Row row = await(pool.preparedQuery("""
+                SELECT declared_source, declared_text, declared_precision,
+                       declared_city, company_location_id
+                  FROM interview_reviews WHERE deleted_at IS NULL
+                 ORDER BY created_at DESC LIMIT 1
+                """).execute()).iterator().next();
+
+        assertEquals("manual", row.getString("declared_source"));
+        assertEquals(typed,    row.getString("declared_text"));
+        // Nothing invented to accompany it.
+        assertNull(row.getString("declared_city"));
+        assertNull(row.getString("declared_precision"));
+        assertNull(row.getLong("company_location_id"));
     }
 
     @Test

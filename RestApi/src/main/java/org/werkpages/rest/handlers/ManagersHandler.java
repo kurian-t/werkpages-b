@@ -512,11 +512,44 @@ public class ManagersHandler {
 
     // ── POST /api/managers ────────────────────────────────────────────────────
 
+
+    /**
+     * Why this submission has no location, or null when it has one.
+     *
+     * <p>The form shows the location as required and will not advance without it. That is a good
+     * prompt and no kind of guarantee: a client posting to this endpoint directly bypasses every
+     * line of it, and the rule that matters - a published manager says where the work happened -
+     * has to hold wherever the request came from.
+     *
+     * <p><b>A manual answer satisfies this.</b> The requirement is that the question was ANSWERED,
+     * never that the corpus was able to answer it, so somebody whose workplace is missing from the
+     * corpus, or who submitted while it was unreachable, passes here exactly as a picked
+     * suggestion does. Requiring a corroborated place would make an unavailable corpus the reason
+     * nobody can contribute, which is the failure this whole path was reworked to remove.
+     *
+     * <p>Checked HERE rather than in the service because the service is also how the search paths
+     * build managers, and those legitimately have no location at all. This is the add-manager
+     * endpoint, where somebody filled a form in.
+     */
+    private static String missingLocation(JsonObject body) {
+        if (body == null) return "Missing request body";
+        String precision = body.getString("declaredPrecision");
+        String source    = body.getString("declaredSource");
+        String text      = body.getString("declaredText");
+        boolean manual   = "manual".equals(source) && text != null && !text.isBlank();
+        if (manual) return null;
+        // Whitespace is not an answer, and neither is a precision with nothing underneath it.
+        if (precision != null && !precision.isBlank()) return null;
+        return "A location is required";
+    }
+
     public void handleCreateManager(RoutingContext ctx) {
         String auth0Id = ctx.get("auth0Id");
         if (auth0Id == null) { respond(ctx, 401, new JsonObject().put("error", "Unauthorized")); return; }
         JsonObject body = ctx.getBodyAsJson();
         GeoUtils.stampGeo(ctx, body);
+        String missingLocation = missingLocation(body);
+        if (missingLocation != null) { respond(ctx, 400, new JsonObject().put("error", missingLocation)); return; }
         String company = body != null ? body.getString("company") : null;
         String logoUrl = CompanyLogoUtils.resolveLogoUrl(company);
 

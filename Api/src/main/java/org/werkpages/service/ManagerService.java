@@ -924,6 +924,21 @@ public class ManagerService {
               The instrumentation added alongside it is what caught this: the decision column said
               a number on every single query and "skipped" on none.
             */
+            /*
+              AN INHABITED PLACE ONLY.
+
+              This gate skips the expensive buildings file when somebody is plainly typing a city
+              name. Worldwide geography broke that reasoning: there is a hamlet somewhere on earth
+              beginning with almost any brand name, so "McDonalds" matched McDonalds Corner in
+              Papua New Guinea - population 0 - and business search was skipped entirely. Measured
+              through the endpoint, the query returned eight geography rows and no McDonald's.
+
+              The corpus's population figure is the evidence. "Paris" is a city and skipping
+              buildings for it is right; "McDonalds Corner" is not what anybody meant. A place the
+              corpus gives no population counts as no evidence, so the gate does not fire and the
+              buildings file is read - the safe direction, costing work rather than results.
+            */
+            if (row.getLong("population", 0L) <= 0L) continue;
             String name  = row.getString("name");
             String state = row.getString("stateName");
             String text  = collapse(name + " " + (state == null ? "" : state));
@@ -974,32 +989,63 @@ public class ManagerService {
       environment variable, so the whole local path - including the defect where it REPLACED the
       Postgres tiers - was unreachable by the test suite and had to be verified by hand.
     */
-    private static volatile org.werkpages.repository.LocalCorpusPool localPool;
+    private static volatile org.werkpages.repository.LocalCorpusRegistry localRegistry;
     private static volatile boolean localPoolResolved;
 
-    private static org.werkpages.repository.LocalCorpusPool localPool() {
+    private static org.werkpages.repository.LocalCorpusRegistry localRegistry() {
         if (!localPoolResolved) {
             synchronized (ManagerService.class) {
                 if (!localPoolResolved) {
-                    localPool = openLocalPool();
+                    localRegistry = openLocalPool();
                     localPoolResolved = true;
                 }
             }
         }
-        return localPool;
+        return localRegistry;
     }
 
-    private static org.werkpages.repository.LocalCorpusPool openLocalPool() {
+    /** The pool for one country, or null when no local index can answer for it. */
+    private static org.werkpages.repository.LocalCorpusPool localPool(String country) {
+        org.werkpages.repository.LocalCorpusRegistry r = localRegistry();
+        return r == null ? null
+             : r.poolFor(org.werkpages.repository.LocationCorpusRepository.iso(country));
+    }
+
+    private static org.werkpages.repository.LocalCorpusRegistry openLocalPool() {
         org.werkpages.repository.OffloadedSearch.configure(intEnv("LOCAL_CORPUS_POOL", 3));
         // Off unless explicitly enabled, so the new path can be switched off without a deploy.
         if (!"true".equalsIgnoreCase(setting("LOCATION_LOCAL_SEARCH", "false"))) return null;
         String root = setting("LOCAL_CORPUS_ROOT", "/var/lib/location-corpus");
         int pool    = intEnv("LOCAL_CORPUS_POOL", 3);
-        int threads = intEnv("LOCAL_CORPUS_THREADS", 2);
+        /*
+          ONE THREAD PER QUERY, which is the configuration that was actually validated.
+
+          DuckDB's `threads` is INSTANCE-wide, not per connection, so a pool of 3 at 2 threads each
+          is not 6 workers politely sharing - it is one engine told to use 2 while three callers
+          drive it. Concurrent search under that arrangement segfaulted the API outright on the
+          older driver, and taking it to 1 is what stopped it.
+
+          The default matters more than the env var here. The local path is off unless
+          LOCATION_LOCAL_SEARCH is set, so whoever turns it on is reaching for one switch, and if
+          this default disagrees with the approved candidate config they get an untested engine
+          configuration at the same moment they expose it to traffic. Approved candidate: pool 3,
+          one thread, 384MB DuckDB, 384MB heap, inside 2 GiB per API.
+        */
+        int threads = intEnv("LOCAL_CORPUS_THREADS", 1);
         String mem  = setting("LOCAL_CORPUS_MEMORY", "384MB");
         long waitMs = intEnv("LOCAL_CORPUS_ACQUIRE_MS", 120);
-        return org.werkpages.repository.LocalCorpusPool.openCurrent(
-            java.nio.file.Path.of(root), pool, threads, mem, java.time.Duration.ofMillis(waitMs));
+        /*
+          HOW MANY COUNTRIES MAY BE OPEN AT ONCE.
+
+          Each one is three DuckDB connections over a memory-mapped index, allocated outside the
+          JVM heap, so this is the bound that keeps two backends inside the host's memory rather
+          than the heap ceiling. Two is the measured default; the registry closes the least
+          recently used beyond it, and closing drains rather than interrupting.
+        */
+        int countries = intEnv("LOCAL_CORPUS_COUNTRIES", 2);
+        return org.werkpages.repository.LocalCorpusRegistry.open(
+            java.nio.file.Path.of(root), pool, threads, mem,
+            java.time.Duration.ofMillis(waitMs), countries);
     }
 
     /**
@@ -1023,7 +1069,8 @@ public class ManagerService {
 
     /** Health and metrics for the local corpus, or null when it is not in use. */
     public static org.werkpages.repository.LocalCorpusPool.Stats localCorpusStats() {
-        return localPool() == null ? null : localPool().stats();
+        var r = localRegistry();
+        return r == null || r.current() == null ? null : r.current().stats();
     }
 
     /**
@@ -1039,9 +1086,61 @@ public class ManagerService {
      * <p>Substituted HERE rather than ahead of the whole pipeline, so the Postgres tiers and every
      * filter around this call keep applying. See the note in suggestCompanyLocations.
      */
+    /**
+     * The configured shortlist, used only while the worldwide geography file is still unavailable.
+     *
+     * <p>Extracted so the readiness wait above has something to fall back TO. It searches CA, US
+     * and GB in order and reads buildings from the first country only, which is what it always
+     * did; the comments inside explain why each of those choices is the way it is.
+     */
+    private Future<JsonArray> shortlistSuggestions(JsonArray confirmed, String companyName,
+                                                   String query, String state) {
+        Future<JsonArray> chain = Future.succeededFuture(confirmed);
+        boolean first = true;
+        for (String fallback : DEFAULT_SEARCH_COUNTRIES) {
+            // The DISPLAY name, not the code. This string is not only a search scope: it ends
+            // up in the suggestion's label and in the country stored when somebody picks it,
+            // so passing "CA" through would offer "Toronto, Ontario, CA" and then save a
+            // manager's country as "CA" while every other row says "Canada".
+            String named = displayNameOf(fallback);
+            /*
+              BUILDINGS ONLY FROM THE FIRST COUNTRY.
+
+              Widening exists so somebody whose country we cannot read can still name their
+              city. Geography answers that and is cheap; the buildings file is six times the
+              cost and is not what "Palo Alto" is asking for. Reading it once per fallback
+              country is what made an unmatched query take ten seconds: Canada found too few
+              rows to fill the list, so the search moved to the United States and paid 4.8s
+              for buildings nobody had asked about.
+
+              Once a suggestion is picked the country is known, and the building search runs
+              normally against it.
+            */
+            boolean places = first;
+            first = false;
+            chain = chain.compose(soFar -> soFar.size() >= SUGGESTION_LIMIT
+                ? Future.succeededFuture(soFar)
+                : appendCorpusSuggestions(soFar, companyName, query, named, null, places));
+        }
+    return chain;
+    }
+
     private Future<JsonArray> placesTier(String companyName, String query, String country) {
+        /*
+          A BLANK COUNTRY STILL HAS TO FIND BUSINESSES.
+
+          This regressed when worldwide geography went in: with no country, placesTier fell to
+          remotePlaces(.., null), suggestPlaces refused a null country, and the buildings file was
+          never read. Measured through the endpoint, "Walmart", "Starbucks" and "Tim Hortons"
+          returned ZERO rows and "McDonalds" returned only McDonalds Corner, Papua New Guinea.
+
+          That is the DEFAULT state of the location field - it opens with no country selected - so
+          it was the most common first keystroke in the product that broke. Worldwide geography is
+          additional discovery; it does not replace business search.
+        */
+        if (country == null || country.isBlank()) return placesWithoutCountry(companyName, query);
         if (coveredByLocalIndex(country)) {
-            return localSuggestions(query, companyName, SUGGESTION_LIMIT).compose(local -> {
+            return localSuggestions(query, companyName, SUGGESTION_LIMIT, country).compose(local -> {
                 if (local != null) org.werkpages.repository.CorpusDiagnostics.servedLocally(local.size());
                 // null means the index could not answer (disabled, saturated, or failed). An EMPTY
                 // list IS an answer and is returned: falling through on a genuine miss is what made
@@ -1057,36 +1156,272 @@ public class ManagerService {
         return remotePlaces(companyName, query, country);
     }
 
+    /**
+     * Buildings when the caller named no country.
+     *
+     * <p>Candidates, in the order the agreed precedence requires:
+     *
+     * <ol>
+     *   <li>the country the QUERY names, when it names one confidently - "Starbucks Paris" means
+     *       France even with nothing selected, which is the case the configured list could never
+     *       serve;</li>
+     *   <li>the configured default countries, which are a deliberate choice rather than a guess.
+     *       Nothing here infers a country from a business NAME - "Paris Baguette" is a bakery -
+     *       and nothing restricts the search to whichever pools happen to be open, which would
+     *       make the answer depend on what somebody else searched a moment ago.</li>
+     * </ol>
+     *
+     * <p>Locally indexed candidates are read first because a local read costs milliseconds. A
+     * candidate without a local index is NOT dropped: it is read remotely, but only while the
+     * local ones have left the list short, because the buildings file is six times the cost of
+     * geography over S3 and reading it per candidate is what made an unmatched query take ten
+     * seconds.
+     *
+     * <p>Results are INTERLEAVED and DEDUPLICATED before the limit is applied. Taking a share each
+     * and then topping up from the same countries added rows that were already present: three
+     * candidates could return two each, and the top-up then re-added the first country's first two,
+     * filling eight slots with six distinct places. Identity is the source place id, which is
+     * stable across both the local and the remote path.
+     */
+    private Future<JsonArray> placesWithoutCountry(String companyName, String query) {
+        return locationCorpus.intendedPlace(query).compose(intended -> {
+            String intendedCountry = intended == null ? null : intended.getString("country_code");
+            String intendedCity    = intended == null ? null : intended.getString("name");
+
+            java.util.List<String> local = new java.util.ArrayList<>();
+            java.util.List<String> remote = new java.util.ArrayList<>();
+            String intendedNamed = intendedCountry == null ? null : displayNameOf(intendedCountry);
+            if (intendedNamed != null && !intendedNamed.isBlank()) {
+                if (coveredByLocalIndex(intendedNamed)) local.add(intendedNamed);
+                else remote.add(intendedNamed);
+            }
+            for (String configured : DEFAULT_SEARCH_COUNTRIES) {
+                String named = displayNameOf(configured);
+                if (named == null || named.equals(intendedNamed)) continue;
+                if (coveredByLocalIndex(named)) local.add(named); else remote.add(named);
+            }
+            /*
+              A COUNTRY THE QUERY NAMED IS SEARCHED FIRST, EVEN WITH NO LOCAL INDEX FOR IT.
+
+              Ordering by cost alone was wrong here. "McDonalds Tokyo" names Japan, which has no
+              local release, so a cost-ordered list put Canada and the United States first, they
+              filled the eight slots between them, and Japan was never reached - the inferred
+              country was resolved and then thrown away. Stated intent outranks a configured
+              default whichever storage happens to back it.
+            */
+            boolean intendedIsRemote = intendedNamed != null && remote.contains(intendedNamed)
+                                    && !remote.isEmpty() && remote.get(0).equals(intendedNamed);
+            /*
+              THE ROUTING DECISION, RECORDED. Without this a first request that answered
+              differently from the second could only be guessed at: the same typed query returned
+              Canada once and France afterwards, and the geography-readiness warning did not fire,
+              so the latch was not the explanation and there was nothing else to read.
+            */
+            System.err.println("location-route q=\"" + query + "\""
+                + " intent=" + (intendedCountry == null ? "none" : intendedCountry)
+                + " city=" + (intendedCity == null ? "none" : intendedCity)
+                + " geographyReady=" + locationCorpus.geographyIsWorldwide()
+                + " local=" + local + " remote=" + remote
+                + " reason=" + (intendedCountry != null ? "query-geography" : "configured-default"));
+            return gatherPlaces(companyName, query, local, remote, intendedCity, intendedIsRemote);
+        });
+    }
+
+    /** Reads each candidate, then interleaves them so no one country takes the whole list. */
+    private Future<JsonArray> gatherPlaces(String companyName, String query,
+                                           java.util.List<String> local,
+                                           java.util.List<String> remote,
+                                           String city, boolean remoteFirst) {
+        java.util.List<JsonArray> perCountry = java.util.Collections.synchronizedList(
+            new java.util.ArrayList<>());
+        Future<Void> chain = Future.succeededFuture();
+        // The named country leads even when only S3 can serve it; see placesWithoutCountry.
+        if (remoteFirst && !remote.isEmpty()) {
+            String named = remote.get(0);
+            chain = chain.compose(ignored ->
+                remotePlaces(companyName, query, named, city).map(rows -> {
+                    JsonArray verified = verifyCity(rows, city, named);
+                    if (verified != null && !verified.isEmpty()) {
+                        perCountry.add(stampAll(verified, named));
+                    }
+                    return null;
+                }));
+        }
+        for (String named : local) {
+            chain = chain.compose(ignored ->
+                localSuggestions(query, companyName, SUGGESTION_LIMIT, named).map(rows -> {
+                    // null means the index could not answer for that country - saturated, or no
+                    // release for it. The other candidates still can.
+                    if (rows != null && !rows.isEmpty()) perCountry.add(stampAll(rows, named));
+                    return null;
+                }));
+        }
+        return chain.compose(ignored -> {
+            JsonArray merged = interleave(perCountry);
+            /*
+              AT MOST ONE REMOTE SCAN PER REQUEST, EVER.
+
+              The buildings file over S3 is the most expensive read in the system, and reading it
+              once per candidate country is what made an unmatched query take ten seconds. Running
+              the named country remotely AND then topping up remotely did it again, measured: a
+              country-free "McDonalds Tokyo" took 8.9 seconds across a Japanese scan, two local
+              searches and a British scan.
+
+              So if the named country was already fetched remotely, that was the one remote read
+              this request is allowed. A configured country with no local index is still not
+              silently omitted - it gets the slot whenever intent did not claim it.
+            */
+            if (merged.size() >= SUGGESTION_LIMIT || remote.isEmpty() || remoteFirst) {
+                return Future.succeededFuture(merged);
+            }
+            String named = remote.get(0);
+            return remotePlaces(companyName, query, named, city).map(rows -> {
+                JsonArray verified = verifyCity(rows, city, named);
+                if (verified != null && !verified.isEmpty()) {
+                    perCountry.add(stampAll(verified, named));
+                }
+                return interleave(perCountry);
+            });
+        });
+    }
+
+    /**
+     * One row from each country in turn, skipping places already taken.
+     *
+     * <p>Round robin rather than share-then-top-up, so the budget is spent on DISTINCT places and
+     * every candidate country is represented while results last.
+     */
+    // Package-private so the deduplication and fairness rules can be asserted directly.
+    static JsonArray interleave(java.util.List<JsonArray> perCountry) {
+        JsonArray out = new JsonArray();
+        java.util.Set<String> seen = new java.util.HashSet<>();
+        int[] at = new int[perCountry.size()];
+        boolean progressed = true;
+        while (out.size() < SUGGESTION_LIMIT && progressed) {
+            progressed = false;
+            for (int i = 0; i < perCountry.size() && out.size() < SUGGESTION_LIMIT; i++) {
+                JsonArray rows = perCountry.get(i);
+                while (at[i] < rows.size()) {
+                    Object row = rows.getValue(at[i]++);
+                    String id = row instanceof JsonObject object
+                        ? object.getString("sourcePlaceId") : null;
+                    if (id != null && !seen.add(id)) continue;   // already taken from elsewhere
+                    out.add(row);
+                    progressed = true;
+                    break;
+                }
+            }
+        }
+        return out;
+    }
+
+    /**
+     * Keeps only the places whose city is CONFIRMED to be the one the query named.
+     *
+     * <p>A country match is not a city match, and presenting one as the other is the failure this
+     * exists to stop: "McDonalds Tokyo" resolved Japan correctly and then offered a McDonald's in
+     * KASUKABE, which satisfies nothing anybody asked for. Ordering the scan by city helps only
+     * where the two datasets spell a city alike; Overture stores Japanese city names while the
+     * geography corpus supplies romanised ones, so for Japan nothing matches and the ordering
+     * changes nothing.
+     *
+     * <p>So when the city cannot be confirmed, the buildings are DROPPED rather than offered. That
+     * is not a worse answer than Kasukabe - it is an honest one, and the worldwide geography row
+     * for Tokyo is still returned, so the reader is offered the city itself and can pick it. An
+     * unverifiable city match is reported in the log rather than disguised as a result.
+     *
+     * <p>Folded with LocalPlaceIndex.fold, the same rule the index uses, so "montreal" confirms
+     * "Montreal" spelled with its accent and this does not reject on one.
+     */
+    // Package-private so the confirmed-city rule can be asserted directly.
+    static JsonArray verifyCity(JsonArray rows, String city, String country) {
+        if (rows == null || city == null || city.isBlank()) return rows;
+        String want = org.werkpages.repository.LocalPlaceIndex.fold(city);
+        JsonArray kept = new JsonArray();
+        for (Object row : rows) {
+            if (!(row instanceof JsonObject place)) continue;
+            if (want.equals(org.werkpages.repository.LocalPlaceIndex.fold(place.getString("city")))) {
+                kept.add(place);
+            }
+        }
+        if (kept.isEmpty() && !rows.isEmpty()) {
+            System.err.println("location-suggest: " + rows.size() + " place(s) in " + country
+                + " could not be confirmed as " + city
+                + "; dropped rather than offered as a match for it");
+        }
+        return kept;
+    }
+
+    private static JsonArray stampAll(JsonArray rows, String country) {
+        for (Object row : rows) stamp(row, country);
+        return rows;
+    }
+
+    /**
+     * Records which country a raw corpus row was found in.
+     *
+     * <p>The local index carries a state code and no country, and until now the country came from
+     * the REQUEST - which is empty on the first keystroke. A row with no country is not cosmetic:
+     * findOrCreate stores it, and this very query filters on
+     * {@code l.country IS NOT DISTINCT FROM $3}, so a building promoted without one became
+     * invisible to the Postgres tier that should have found it next time. That defect has been
+     * fixed once already; searching several candidate countries would have reintroduced it.
+     *
+     * <p>The country is known here because this row came from that country's index, by name.
+     */
+    private static Object stamp(Object row, String country) {
+        if (row instanceof JsonObject object && object.getString("country") == null) {
+            object.put("country", country);
+        }
+        return row;
+    }
+
     private Future<JsonArray> remotePlaces(String companyName, String query, String country) {
+        return remotePlaces(companyName, query, country, null);
+    }
+
+    /** @param city the city the query named, so the remote scan is not merely country-wide. */
+    private Future<JsonArray> remotePlaces(String companyName, String query, String country,
+                                           String city) {
         org.werkpages.repository.CorpusDiagnostics.remoteCall();
         return guarded(PLACES_BREAKER,
-            () -> locationCorpus.suggestPlaces(companyName, query, country),
+            () -> locationCorpus.suggestPlaces(companyName, query, country, city),
             "places", PLACES_DEADLINE_MS);
     }
 
     /**
-     * Whether the local index holds this country at all.
+     * Whether a local index holds this country at all.
      *
-     * <p><b>The release is UNITED STATES ONLY.</b> It is built from
-     * {@code places/country_code=US}, so answering a Canadian or British search from it would
-     * return nothing and, because an empty local answer is deliberately final, would REPLACE the
-     * remote answer that does cover those countries with silence. A narrower index must never
-     * shadow a wider one.
+     * <p>This used to be a hardcoded list of names for the United States, because that was the
+     * only country ever built. It is now whatever is published under the corpus root, so adding a
+     * country is a matter of publishing its release rather than changing this code.
+     *
+     * <p>The reason the gate exists has not changed. A narrower index must never shadow a wider
+     * one: answering a French query from the American index would return nothing, and because an
+     * empty local answer is deliberately final it would REPLACE the remote answer that does cover
+     * France with silence.
+     *
+     * <p>AN UNKNOWN OR ABSENT COUNTRY IS NOT COVERED, and is not guessed at. It is not taken to be
+     * the country of whichever index happens to be open, nor inferred from the business name - a
+     * name containing a place is not a request to search that place. Those requests go to the
+     * remote corpus, which covers the world.
      *
      * <p>Matched on the display name because that is what this pipeline passes around - see the
-     * note on displayNameOf - with the ISO code accepted too for callers that pass one.
+     * note on displayNameOf - with the ISO code accepted too, both via
+     * {@code LocationCorpusRepository.iso}.
      */
-    // Package-private so the US-only gate can be asserted directly; see LocationGateTest.
+    // Package-private so the gate can be asserted directly; see LocationGateTest.
     static boolean coveredByLocalIndex(String country) {
         if (country == null || country.isBlank()) return false;   // widening handles this
-        String c = country.trim().toLowerCase();
-        return c.equals("united states") || c.equals("us") || c.equals("usa")
-            || c.equals("united states of america");
+        org.werkpages.repository.LocalCorpusRegistry r = localRegistry();
+        return r != null && r.covers(org.werkpages.repository.LocationCorpusRepository.iso(country));
     }
 
     /** For the validation-only diagnostics listener; see CorpusDiagnostics. */
     public static JsonObject corpusDiagnostics() {
-        return org.werkpages.repository.CorpusDiagnostics.snapshot(localPool(), corpusBreakerState());
+        var r = localRegistry();
+        return org.werkpages.repository.CorpusDiagnostics.snapshot(
+            r == null ? null : r.current(), corpusBreakerState());
     }
 
     /** Bounds a corpus read, so a slow one degrades to fewer suggestions rather than a hung form. */
@@ -1207,10 +1542,27 @@ public class ManagerService {
      * it means "no answer from the index", which is what makes the caller fall back to the remote
      * corpus rather than treat an outage as an empty result.
      */
-    private Future<JsonArray> localSuggestions(String query, String companyName, int limit) {
-        if (localPool() == null) return Future.succeededFuture(null);
+    private Future<JsonArray> localSuggestions(String query, String companyName, int limit,
+                                               String country) {
+        // Decided by COVERAGE, which opens nothing. Fetching a pool here and again inside the
+        // blocking task left a window in which it could be evicted between the two; the registry
+        // now reserves the country across the whole call. See LocalCorpusRegistry#withCountry.
+        if (localRegistry() == null || !coveredByLocalIndex(country)) {
+            return Future.succeededFuture(null);
+        }
+        /*
+          THE CACHE IS CONSULTED HERE AND POPULATED WHERE THE QUERY RUNS, never around this call.
+
+          Wrapping the whole call cached whatever came back, and what comes back is one of three
+          things: an answer, an EMPTY array when the search executor sheds, or null when the index
+          cannot answer. Caching a shed turned a momentary saturation into an hour of "no results"
+          for that query.
+        */
+        String key = localCacheKey(query, companyName, limit, country);
+        JsonArray hit = key == null ? null : locationCorpus.localSearchHit(key);
+        if (hit != null) return Future.succeededFuture(hit);
         return org.werkpages.repository.OffloadedSearch.run(
-            () -> localSuggestionsBlocking(query, companyName, limit),
+            () -> localSuggestionsBlocking(query, companyName, limit, country),
             // Saturated: no suggestions for THIS keystroke. Never the remote scan, which would
             // amplify a local burst onto the metered path.
             new JsonArray(),
@@ -1218,11 +1570,37 @@ public class ManagerService {
             null);
     }
 
-    private JsonArray localSuggestionsBlocking(String query, String companyName, int limit) {
-        if (localPool() == null) { org.werkpages.repository.CorpusDiagnostics.fallbackDisabled(); return null; }
+    /**
+     * The key a local result is cached under, or null when it must not be cached at all.
+     *
+     * <p>Everything that can change the answer is in it: the words, the country, the company whose
+     * brand biases the ranking, how many rows were asked for, and THE RELEASE that answered. The
+     * release matters because immutability is what makes memoising safe in the first place - a new
+     * release makes the old answers wrong, and without it they would be served until the hour ran
+     * out.
+     *
+     * <p>Null before any pool has opened for that country, because the release is not yet known
+     * and a key that cannot name it would collide across releases.
+     */
+    private static String localCacheKey(String query, String companyName, int limit,
+                                        String country) {
+        var registry = localRegistry();
+        if (registry == null) return null;
+        String iso = org.werkpages.repository.LocationCorpusRepository.iso(country);
+        String release = registry.releaseIdFor(iso);
+        if (iso == null || release == null) return null;
+        return release + "|" + iso + "|" + (companyName == null ? "" : companyName)
+             + "|" + limit + "|" + query;
+    }
+
+    private JsonArray localSuggestionsBlocking(String query, String companyName, int limit,
+                                               String country) {
+        org.werkpages.repository.LocalCorpusRegistry registry = localRegistry();
+        if (registry == null) { org.werkpages.repository.CorpusDiagnostics.fallbackDisabled(); return null; }
         try {
             java.util.List<org.werkpages.repository.LocalPlaceIndex.Hit> hits =
-                localPool().withIndex(idx -> idx.search(query, limit,
+                registry.withCountry(org.werkpages.repository.LocationCorpusRepository.iso(country),
+                                     idx -> idx.search(query, limit,
                     org.werkpages.repository.LocalPlaceIndex.Completion.PARTIAL, companyName));
             /*
               RAW ROWS, in the shape suggestPlaces returns.
@@ -1251,6 +1629,12 @@ public class ManagerService {
                     .put("stateCode", h.stateCode())
                     .put("postalCode", h.postalCode()));
             }
+            /*
+              CACHED HERE, where a query demonstrably ran. A shed never reaches this line, and
+              neither does a failure: both leave by the catch blocks below.
+            */
+            String key = localCacheKey(query, companyName, limit, country);
+            if (key != null) locationCorpus.putLocalSearch(key, out);
             // The proof that a query really ran against the index, and what it returned.
             org.werkpages.repository.CorpusDiagnostics.localQuery(out.size());
             return out;
@@ -1352,35 +1736,36 @@ public class ManagerService {
           usually answers, and firing three corpus reads per keystroke to discard two is the cost
           this whole area has been trying to remove.
         */
-        if (country == null || country.isBlank()) {
-            Future<JsonArray> chain = Future.succeededFuture(confirmed);
-            boolean first = true;
-            for (String fallback : DEFAULT_SEARCH_COUNTRIES) {
-                // The DISPLAY name, not the code. This string is not only a search scope: it ends
-                // up in the suggestion's label and in the country stored when somebody picks it,
-                // so passing "CA" through would offer "Toronto, Ontario, CA" and then save a
-                // manager's country as "CA" while every other row says "Canada".
-                String named = displayNameOf(fallback);
-                /*
-                  BUILDINGS ONLY FROM THE FIRST COUNTRY.
+        /*
+          ONE WORLDWIDE READ, when the geography file is local.
 
-                  Widening exists so somebody whose country we cannot read can still name their
-                  city. Geography answers that and is cheap; the buildings file is six times the
-                  cost and is not what "Palo Alto" is asking for. Reading it once per fallback
-                  country is what made an unmatched query take ten seconds: Canada found too few
-                  rows to fill the list, so the search moved to the United States and paid 4.8s
-                  for buildings nobody had asked about.
+          The shortlist below exists because the S3 layout addresses one country partition per
+          read, so searching everywhere meant 258 reads. The local file holds every country in
+          54MB and answers in one, which makes the shortlist both unnecessary and wrong: a
+          shortlist of CA, US and GB silently excludes the other 255 countries, so somebody in
+          Dublin or Lagos got nothing back until they typed their country's name, and the first
+          country on the list was read on every keystroke regardless.
 
-                  Once a suggestion is picked the country is known, and the building search runs
-                  normally against it.
-                */
-                boolean places = first;
-                first = false;
-                chain = chain.compose(soFar -> soFar.size() >= SUGGESTION_LIMIT
-                    ? Future.succeededFuture(soFar)
-                    : appendCorpusSuggestions(soFar, companyName, query, named, null, places));
-            }
-            return chain;
+          Nothing is guessed here. No country is assumed, none is inferred from the business name,
+          and the answer is ranked by the corpus's own population figures so that the Paris with
+          two million people comes before the one with 25,000.
+
+          So the shortlist below runs ONLY while the file is still remote. Otherwise this falls
+          through to the ordinary read with no country, which is now a worldwide one. The buildings
+          file is not read without a country: it is addressed per country partition and has no
+          worldwide form, and suggestPlaces returns nothing rather than guessing one.
+        */
+        if ((country == null || country.isBlank()) && !locationCorpus.geographyIsWorldwide()) {
+            /*
+              ONE BOUNDED WAIT BEFORE FALLING BACK, for the same reason the places tier waits: the
+              file is usually already on disk and arrives within moments of the first request, and
+              taking the shortlist instead means the FIRST search of a process answers differently
+              from every one after it. That was observed and could not be explained until both
+              tiers were instrumented.
+            */
+            return locationCorpus.awaitGeography().compose(ready -> ready
+                ? appendCorpusSuggestions(confirmed, companyName, query, country, state, withPlaces)
+                : shortlistSuggestions(confirmed, companyName, query, state));
         }
 
         java.util.Set<String> seen = new java.util.HashSet<>();
@@ -1564,7 +1949,11 @@ public class ManagerService {
                 .put("kind", "place")
                 .put("label", label)
                 .put("detail", detail)
-                .put("country", country)
+                // The ROW's country when the request named none: see stamp(). A corpus row
+                // promoted with a null country is written to Postgres with a null country and
+                // then cannot be found by the tier that filters on it.
+                .put("country", place.getString("country") != null
+                                ? place.getString("country") : country)
                 .put("city", place.getString("city"))
                 .put("precision", DeclaredLocation.EXACT)
                 // No companyLocationId: this building is not in the database yet. The client sends
@@ -1601,15 +1990,37 @@ public class ManagerService {
             if (name == null) continue;
 
             String stateName = geo.getString("stateName");
+            /*
+              THE COUNTRY COMES FROM THE ROW when the request did not name one.
+
+              A worldwide search has no country to stamp on its results, and this used to stamp
+              the request's - which was null. The country is not decoration: it goes into the
+              label, and it is STORED when somebody picks the suggestion, so a null here would
+              file a manager with no country while every other row has one. The row knows which
+              country it is in; the request does not have to.
+            */
+            /*
+              THE ROW'S OWN COUNTRY WINS whenever it has one.
+
+              Reading the request's first was wrong as soon as a row could come from somewhere the
+              request had not named. The geography fallback that offers the city a query named
+              returns Tokyo, in JAPAN, and when the caller happened to be scanning its configured
+              shortlist that row was labelled "Tokyo, Tokyo, Canada" and then "Tokyo, Tokyo,
+              United States" - the same city, relabelled once per country searched. A row that
+              knows where it is should never be told otherwise.
+            */
+            String rowCountry = geo.getString("countryCode") != null
+                ? displayNameOf(geo.getString("countryCode"))
+                : country;
             String label = "country".equals(kind) ? name
-                         : "region".equals(kind)  ? join(", ", name, country)
-                         : join(", ", name, stateName, country);
+                         : "region".equals(kind)  ? join(", ", name, rowCountry)
+                         : join(", ", name, stateName, rowCountry);
             if (!seen.add(label.toLowerCase())) continue;
 
             JsonObject item = new JsonObject()
                 .put("kind", "geo")
                 .put("label", label)
-                .put("country", country);
+                .put("country", rowCountry);
 
             switch (kind == null ? "" : kind) {
                 case "country" -> item.put("precision", DeclaredLocation.COUNTRY);
@@ -2008,13 +2419,18 @@ public class ManagerService {
                                         INSERT INTO managers
                                         (name, company, title, image, bio, status, approval_status, country, state, city, linkedin_url,
                                          company_logo_url, company_id, slug, overall_rating, reviews_count, category_averages, created_at, submitted_by,
-                                         declared_country, declared_state, declared_city, declared_precision, company_location_id)
+                                         declared_country, declared_state, declared_city, declared_precision, company_location_id,
+                                         declared_source, declared_text)
                                         VALUES ($1,$2,$3,$4,$5,$6,'pending_approval',$7,$8,$9,$10,$11,$12,$13,0,0,'{}'::jsonb,now(),$14,
-                                                $15,$16,$17,$18,$19)
+                                                $15,$16,$17,$18,$19,$20,$21)
                                         RETURNING *
                                         """)
                                         .execute(Tuple.of(name, fCompany, title, image, fBio, fStatus, fCountry, fState, fCity, fLinkedinUrl, resolvedLogoUrl, companyId, slug, userId,
-                                                          loc.country(), loc.state(), loc.city(), loc.precision(), loc.companyLocationId()))
+                                                          loc.country(), loc.state(), loc.city(), loc.precision(), loc.companyLocationId(),
+                                                          // Carried so a location somebody TYPED survives the insert. Without
+                                                          // these the row keeps the words nowhere and reads as though it came
+                                                          // from the corpus, which is the claim a manual answer may not make.
+                                                          loc.source(), loc.text()))
                                         .compose(managerResult -> {
                                             Row managerRow = managerResult.iterator().next();
                                             long managerId = managerRow.getLong("id");

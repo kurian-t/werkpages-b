@@ -21,17 +21,45 @@ import io.vertx.core.json.JsonObject;
  * one it is looking at.
  */
 public record DeclaredLocation(String country, String state, String city,
-                               String precision, Long companyLocationId) {
+                               String precision, Long companyLocationId,
+                               String source, String text) {
 
     public static final String COUNTRY = "country";
     public static final String STATE   = "state";
     public static final String CITY    = "city";
     public static final String EXACT   = "exact";
 
-    /** Nothing was declared — the form carried no location, or this is a path that never accepts one. */
-    public static final DeclaredLocation NONE = new DeclaredLocation(null, null, null, null, null);
+    /** Chosen from the corpus, so the coarse fields are corroborated. */
+    public static final String CORPUS = "corpus";
+    /** Typed, because the corpus had no such place or could not be reached. Nothing corroborates it. */
+    public static final String MANUAL = "manual";
 
-    public boolean isEmpty() { return precision == null; }
+    /** Nothing was declared — the form carried no location, or this is a path that never accepts one. */
+    public static final DeclaredLocation NONE =
+        new DeclaredLocation(null, null, null, null, null, null, null);
+
+    /** The old five-field shape, for the many callers that never had a source to give. */
+    public DeclaredLocation(String country, String state, String city,
+                            String precision, Long companyLocationId) {
+        this(country, state, city, precision, companyLocationId, null, null);
+    }
+
+    /**
+     * Whether anything was said at all.
+     *
+     * <p>A MANUAL ANSWER HAS NO PRECISION, and that is not the same as having no answer. The rungs
+     * describe what was corroborated, and a typed string corroborates none of them - so testing
+     * {@code precision == null} alone discarded exactly the answers this type was extended to
+     * carry, silently, after the form had shown the person it was accepted.
+     */
+    public boolean isEmpty() {
+        return precision == null && !isManual();
+    }
+
+    /** True when this is somebody's own words rather than a place we hold. */
+    public boolean isManual() {
+        return MANUAL.equals(source) && text != null && !text.isBlank();
+    }
 
     /**
      * Reads the declared keys, and only those.
@@ -43,13 +71,22 @@ public record DeclaredLocation(String country, String state, String city,
     public static DeclaredLocation fromBody(JsonObject body) {
         if (body == null) return NONE;
         String precision = trimToNull(body.getString("declaredPrecision"));
-        if (precision == null) return NONE;
+        String source    = trimToNull(body.getString("declaredSource"));
+        String text      = trimToNull(body.getString("declaredText"));
+        /*
+          A manual answer arrives with text and no precision, so returning NONE on a missing
+          precision threw it away. The form had already shown the person their location accepted;
+          the row then saved without one and nothing reported it.
+        */
+        if (precision == null && !(MANUAL.equals(source) && text != null)) return NONE;
         return new DeclaredLocation(
             trimToNull(body.getString("declaredCountry")),
             trimToNull(body.getString("declaredState")),
             trimToNull(body.getString("declaredCity")),
             precision,
-            body.getLong("companyLocationId"));
+            body.getLong("companyLocationId"),
+            source,
+            text);
     }
 
     /**
@@ -59,6 +96,29 @@ public record DeclaredLocation(String country, String state, String city,
      */
     public String validate() {
         if (isEmpty()) return null;
+        /*
+          A MANUAL ANSWER IS NOT MEASURED AGAINST THE LADDER.
+
+          The rungs below check that the parts present match the specificity claimed - a city
+          declaration must carry a city, and so on. A typed answer claims no rung, so there is
+          nothing to be consistent with. It must not be forced through promotion either: that path
+          requires a structured city, which is the very thing a manual entry does not have and must
+          never be given one of.
+
+          What IS checked is that it carries words, since a manual row without them is a location
+          nobody can read, and that any coarse fields alongside it are of a sane length.
+        */
+        if (isManual()) {
+            if (companyLocationId != null)
+                return "A manually entered location cannot also claim a workplace";
+            if (EXACT.equals(precision))
+                return "A manually entered location cannot claim exact precision";
+            return Fields.firstProblem(
+                Fields.maxLength(text,    "Declared location"),
+                Fields.maxLength(country, "Declared country"),
+                Fields.maxLength(state,   "Declared state"),
+                Fields.maxLength(city,    "Declared city"));
+        }
         switch (precision) {
             case COUNTRY -> {
                 if (Fields.isBlank(country)) return "A declared country is required at country precision";

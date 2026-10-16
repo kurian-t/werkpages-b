@@ -447,14 +447,15 @@ public class ReviewRepository {
         // what coarsening an exact pick has to do. Two statements, one intent each.
         String locationSql = declared == null ? "" : """
                     , declared_country = $23, declared_state = $24, declared_city = $25,
-                      declared_precision = $26, company_location_id = $27
+                      declared_precision = $26, company_location_id = $27,
+                      declared_source = $28, declared_text = $29
                 """;
         /*
           Appended last, so its index depends on whether the optional location block claimed
           $23-$27 before it. Computed rather than hard-coded, because getting it wrong writes
           somebody's city into a boolean column and the compiler cannot see it.
         */
-        int datesHiddenIndex = declared == null ? 23 : 28;
+        int datesHiddenIndex = declared == null ? 23 : 30;
         Tuple params = Tuple.of(
             overallRating, communicationStyle, perceivedApproachability,
             perceivedClarityOfExpectations, feedbackStyle, perceivedSupportiveness,
@@ -466,7 +467,11 @@ public class ReviewRepository {
         if (declared != null) {
             params.addString(declared.country()).addString(declared.state())
                   .addString(declared.city()).addString(declared.precision())
-                  .addValue(declared.companyLocationId());
+                  .addValue(declared.companyLocationId())
+                  // Where the answer came from, and the words themselves when nothing
+                  // corroborated it. Written here so a manual location survives an edit rather
+                  // than quietly reverting to "picked from the corpus".
+                  .addString(declared.source()).addString(declared.text());
         }
         // Last, so it lines up with datesHiddenIndex whichever branch ran above.
         params.addBoolean(datesHidden);

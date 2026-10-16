@@ -85,9 +85,24 @@ public final class LocalCorpusPool implements AutoCloseable {
 
     private static Connection open(CorpusRelease r, int threads, String memoryLimit) throws Exception {
         Properties props = new Properties();
-        props.setProperty("duckdb.read_only", "true");
+        /*
+          A local release opens the file read-only. A REMOTE one opens an in-memory database and
+          attaches the object-store file to it, so the connection itself must not be read-only -
+          the attach would have nowhere to record itself.
+        */
+        if (!r.isRemote()) props.setProperty("duckdb.read_only", "true");
         Connection c = DriverManager.getConnection(r.jdbcUrl(), props);
         try (Statement s = c.createStatement()) {
+            if (r.isRemote()) {
+                s.execute("INSTALL httpfs");
+                s.execute("LOAD httpfs");
+                // The instance role in production, ~/.aws/credentials locally. Identical to how
+                // the remote places path authenticates; this never needs write access.
+                s.execute("CREATE OR REPLACE SECRET corpus_idx (TYPE s3, PROVIDER credential_chain, "
+                        + "REGION '" + System.getenv().getOrDefault("LOCATION_CORPUS_REGION", "ca-central-1") + "')");
+                s.execute("ATTACH '" + r.indexLocation() + "' AS corpus_idx (READ_ONLY)");
+                s.execute("USE corpus_idx");
+            }
             // Per connection, so the pool as a whole cannot exceed what the container allows.
             s.execute("SET threads=" + threads);
             s.execute("SET memory_limit='" + memoryLimit + "'");
@@ -132,7 +147,14 @@ public final class LocalCorpusPool implements AutoCloseable {
             return null;
         }
 
-        CorpusRelease r = CorpusRelease.resolve(root);
+        /*
+          An s3:// root is read in place rather than from disk. Same validations above, same pool
+          below; only where the bytes live differs, which is exactly what is being measured.
+        */
+        String rootText = root.toString();
+        CorpusRelease r = rootText.startsWith("s3:/")
+            ? CorpusRelease.remote(rootText.replaceFirst("^s3:/+", "s3://"))
+            : CorpusRelease.resolve(root);
         if (r == null) return null;
         try {
             LocalCorpusPool pool = new LocalCorpusPool(r, poolSize, duckdbThreads, memoryLimit, acquireTimeout);

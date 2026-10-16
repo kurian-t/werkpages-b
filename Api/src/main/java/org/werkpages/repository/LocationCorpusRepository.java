@@ -217,6 +217,32 @@ public class LocationCorpusRepository {
     }
 
     /**
+     * A memoised LOCAL index result, or null when there is none to serve.
+     *
+     * <p>Split into a lookup and a store, deliberately, rather than wrapping the whole call. The
+     * wrapped form cached whatever the future produced, and the local path produces three
+     * different things: a real answer, an EMPTY array when the search executor is saturated and
+     * sheds, and null when the index cannot answer at all. Caching the shed value turned one
+     * saturated moment into an hour of "no results" for that query, which is a far worse outcome
+     * than the momentary shed it came from. Only {@link #putLocalSearch} is ever called, and only
+     * from the point where a query actually ran.
+     *
+     * <p>Bounded by the same store as every other entry: 4,096 entries, least-recently-used
+     * eviction, one hour. Immutability justifies the TTL; it does not justify unbounded growth, and
+     * the bound is on the map rather than on the reasoning.
+     */
+    public JsonArray localSearchHit(String key) {
+        CacheEntry hit = cache.get("local|" + key);
+        return hit != null && hit.expiresAt() > System.currentTimeMillis() ? hit.value() : null;
+    }
+
+    /** Stores a result that a real query produced. Never called for a shed or a failure. */
+    public void putLocalSearch(String key, JsonArray value) {
+        if (value == null) return;
+        cache.put("local|" + key, new CacheEntry(value, System.currentTimeMillis() + CACHE_TTL_MS));
+    }
+
+    /**
      * Localities, regions and countries matching {@code query}.
      *
      * <p>Ranked exact name, then prefix, then contains, with population breaking ties — so
@@ -228,7 +254,17 @@ public class LocationCorpusRepository {
     public Future<JsonArray> suggestGeography(String query, String country, String state) {
         String needle = normalise(query);
         String iso = iso(country);
-        if (needle == null || iso == null) return Future.succeededFuture(new JsonArray());
+        /*
+          A COUNTRY IS NO LONGER REQUIRED, when the whole-world file is local.
+
+          It used to be, and the cost was paid by the caller: with no country it searched a
+          configured shortlist of CA, US and GB one after another, so somebody in any of the other
+          255 countries got nothing until they typed the country's name themselves, and the first
+          country on the list was read on every keystroke. One worldwide read over 54MB replaces
+          all of that, and ranks by population so the city somebody meant comes first.
+        */
+        if (needle == null) return Future.succeededFuture(new JsonArray());
+        if (iso == null && !geographyIsWorldwide()) return Future.succeededFuture(new JsonArray());
 
         // The partition already guarantees the country, and neither search_text contains it.
         java.util.List<String> words = withoutCountryWord(tokens(needle), country);
@@ -244,13 +280,11 @@ public class LocationCorpusRepository {
                 String ranked   = folded ? stripAccents(rankingNeedle(needle, country))
                                          : rankingNeedle(needle, country);
                 return query(release -> """
-                    SELECT name, kind, state_name, state_code
+                    SELECT name, kind, state_name, state_code, country_code, population
                     FROM %s
                     WHERE %s%s
                       AND (? IS NULL OR state_code = ? OR kind = 'country')
-                    ORDER BY CASE WHEN %s = ?      THEN 0
-                                  WHEN %s LIKE ? THEN 1
-                                  ELSE 2 END,
+                    ORDER BY CASE WHEN %s = ? OR %s LIKE ? THEN 0 ELSE 1 END,
                              population DESC NULLS LAST
                     LIMIT %d
                     """.formatted(geographyFrom(release, iso),
@@ -270,7 +304,14 @@ public class LocationCorpusRepository {
                     .put("name", rs.getString("name"))
                     .put("geoKind", rs.getString("kind"))
                     .put("stateName", rs.getString("state_name"))
-                    .put("stateCode", rs.getString("state_code")));
+                    .put("stateCode", rs.getString("state_code"))
+                    // WHICH COUNTRY THIS ROW IS IN, which the caller can no longer assume it
+                    // already knows: a worldwide search is not scoped to one, and the country is
+                    // not merely a label - it is stored when somebody picks the suggestion.
+                    .put("countryCode", rs.getString("country_code"))
+                    // HOW MANY PEOPLE LIVE THERE, which decides whether this row is evidence that
+                    // the person is typing a CITY rather than a business. See geographyAnswers.
+                    .put("population", rs.getLong("population")));
             };
 
         /*
@@ -289,7 +330,8 @@ public class LocationCorpusRepository {
           dataset over S3, which is untouched by this and still anchored.
         */
         return cached("geo|" + iso + "|" + blankToNull(state) + "|" + needle,
-                      () -> attempt.apply(false, true));
+                      () -> attempt.apply(false, true).compose(rows ->
+                          rows.isEmpty() ? geographyForIntent(query) : Future.succeededFuture(rows)));
     }
 
     /**
@@ -307,7 +349,27 @@ public class LocationCorpusRepository {
      * returns eight entries for three actual stores.
      */
     public Future<JsonArray> suggestPlaces(String companyName, String query, String country) {
-        return placesFor(companyName, query, country);
+        return suggestPlaces(companyName, query, country, null);
+    }
+
+    /**
+     * @param city the city the query named, or null. It ORDERS the result rather than filtering
+     *        it, in ONE scan.
+     *
+     *        <p>Filtering was the obvious reading and it was wrong twice over. The two datasets do
+     *        not always spell a city alike, so a predicate that matches nothing turns a usable list
+     *        into an empty one - "McDonalds Tokyo" went from a McDonald's in Kasukabe to no
+     *        buildings at all. Retrying without the predicate fixed that and introduced something
+     *        worse: two scans of an S3 partition on the slowest path in the system, which then
+     *        exceeded the places deadline and returned empty anyway.
+     *
+     *        <p>Ordering gets both. The named city comes first when the spellings agree, anything
+     *        else in that country follows rather than vanishing, and it costs one scan.
+     */
+    public Future<JsonArray> suggestPlaces(String companyName, String query, String country,
+                                           String city) {
+        return placesFor(companyName, query, country,
+                         city == null || city.isBlank() ? null : city);
     }
 
     /**
@@ -376,7 +438,8 @@ public class LocationCorpusRepository {
         return (!dropped || kept.length() < 2) ? null : kept.toString();
     }
 
-    private Future<JsonArray> placesFor(String companyName, String query, String country) {
+    private Future<JsonArray> placesFor(String companyName, String query, String country,
+                                        String city) {
         String needle = normalise(query);
         String iso = iso(country);
         if (needle == null || iso == null) return Future.succeededFuture(new JsonArray());
@@ -414,7 +477,8 @@ public class LocationCorpusRepository {
         java.util.function.Supplier<java.util.List<String>> strippedWords =
             () -> forPlaces(tokens(needle), country, iso);
 
-        return cached("place|" + iso + "|" + brand + "|" + needle, () ->
+        // The city belongs in the key: the same query with and without it has different answers.
+        return cached("place|" + iso + "|" + brand + "|" + needle + "|" + (city == null ? "" : city), () ->
           anchoredThenLiteralContains(anchored ->
             query(release -> """
                 SELECT source_place_id, name, brand_name, street, city, state_code, postal_code,
@@ -494,7 +558,9 @@ public class LocationCorpusRepository {
                 WHERE at_address = 1
                 -- The literal reading first. Both are candidates; this decides which one the
                 -- reader most likely meant, and only among rows retrieval actually returned.
-                ORDER BY literal_hit,
+                -- THE CITY THE QUERY NAMED FIRST, ahead of the brand preference: a branded place
+                -- in the wrong city is still the wrong city.
+                ORDER BY %s literal_hit,
                          CASE WHEN ? IS NOT NULL AND lower(coalesce(brand_name,'')) = ? THEN 0
                               WHEN brand_name IS NOT NULL                                THEN 1
                               ELSE 2 END,
@@ -503,6 +569,9 @@ public class LocationCorpusRepository {
                 """.formatted(bucket, release, partition(iso),
                               tokensClause(literalWords.get().size(), anchored),
                               tokensClause(strippedWords.get().size(), anchored),
+                              city == null ? ""
+                                : "CASE WHEN strip_accents(lower(coalesce(city,''))) = ? "
+                                  + "THEN 0 ELSE 1 END,",
                               LIMIT),
             statement -> {
                 int i = 1;
@@ -527,6 +596,7 @@ public class LocationCorpusRepository {
                 i += literalWords.get().size();
                 bindTokens(statement, strippedWords.get(), i, anchored);
                 i += strippedWords.get().size();
+                if (city != null) statement.setString(i++, stripAccents(city.toLowerCase()));
                 statement.setString(i++, brand);
                 statement.setString(i, brand);
             },
@@ -833,6 +903,28 @@ public class LocationCorpusRepository {
      */
     private volatile String localGeography = null;
 
+    /**
+     * Counted down once the geography file is either local or known not to be coming.
+     *
+     * <p>There was a window at startup in which the file was still arriving, so
+     * {@code geographyIsWorldwide()} was false and the SAME query was interpreted differently from
+     * how it would be a second later: "Starbucks Paris" resolved no intent, fell back to the
+     * configured countries and answered with Paris, Ontario, then answered with Paris, France once
+     * the file landed. A first request that silently means something else is worse than a slightly
+     * slower one.
+     */
+    private final java.util.concurrent.CountDownLatch geographyReady =
+        new java.util.concurrent.CountDownLatch(1);
+
+    /**
+     * How long a request will wait for geography before giving up on intent.
+     *
+     * <p>Bounded, because the alternative to a short wait is a hung keystroke. On a machine that
+     * already has the file this is not reached at all; it only applies to the first requests after
+     * a cold start on a host with an empty temporary directory.
+     */
+    private static final long GEOGRAPHY_WAIT_MS = 2_000;
+
     /** The FROM clause for geography, and the country predicate that goes with it. */
     private String geographyFrom(String release, String iso) {
         String local = localGeography;
@@ -842,9 +934,169 @@ public class LocationCorpusRepository {
               + "/geography/country_code=" + partition(iso) + "/*.parquet')";
     }
 
-    /** Restricts a local read to one country; the S3 path already does that by partition. */
+    /**
+     * Restricts a local read to one country; the S3 path already does that by partition.
+     *
+     * <p>A NULL country means every country, which only the local file can serve: it holds all
+     * 258 of them in 54MB, while the S3 layout addresses one partition per read. This is what
+     * lets a search with no country settled find the city anyway, instead of guessing at a short
+     * list of countries and missing everybody outside it.
+     */
     private String geographyCountryClause(String iso) {
-        return localGeography != null ? " AND country_code = '" + partition(iso) + "'" : "";
+        if (localGeography == null) return "";
+        return iso == null ? "" : " AND country_code = '" + partition(iso) + "'";
+    }
+
+    /**
+     * The ISO country the QUERY ITSELF names, or null when it names none.
+     *
+     * <p>This is how a request with no country still reaches the right index. The agreed precedence
+     * is: an explicitly selected location, then clear geographic intent in the query, then the
+     * visitor's detected country, then general prominence. Without this, intent was skipped
+     * entirely and the configured CA/US/GB list decided everything, so "Starbucks Paris" with no
+     * country selected searched Canada and the United States and never France - while the very
+     * same query with {@code country=France} worked perfectly. Those are not the same thing, and
+     * the frontend sends the first one.
+     *
+     * <p>The LONGEST trailing phrase wins, because a shorter one is less specific: "new york" must
+     * not be read as the trailing "york". Among places of that name the most POPULOUS wins, which
+     * is how Paris means France rather than Texas and Tokyo means Japan rather than Papua New
+     * Guinea. A phrase the corpus gives no population is not intent at all - it is a hamlet that
+     * happens to share a word with a brand - so "Paris Baguette" and "London Drugs" resolve to
+     * nothing here and leave the candidate list alone.
+     *
+     * <p>Worldwide only, and only off the local file: one read of 54MB, on a path that previously
+     * did none.
+     */
+    public Future<String> intendedCountry(String query) {
+        return intendedPlace(query).map(p -> p == null ? null : p.getString("country_code"));
+    }
+
+    /**
+     * The place the query itself names: its country AND the corpus's name for the city.
+     *
+     * <p>The country alone is not enough, and believing it was produced a wrong answer that looked
+     * right: "McDonalds Tokyo" with no country resolved to Japan, and then the remote places query
+     * - which constrains only by country PARTITION and has no city predicate at all - returned a
+     * McDonald's in Kasukabe. Worse, forPlaces strips region words from the needle, and Tokyo is a
+     * region in Japan, so the one word carrying the location was removed before the scan. Right
+     * country, wrong city, and nothing in the query left to object.
+     */
+    public Future<JsonObject> intendedPlace(String query) {
+        if (!geographyIsWorldwide()) {
+            /*
+              WAIT, BRIEFLY, RATHER THAN ANSWER DIFFERENTLY.
+
+              The wait happens on the worker, never on the event loop. If it expires the fallback
+              is the same as before, but it is LOGGED rather than silent, so a first-request
+              anomaly is attributable instead of looking like a ranking bug.
+            */
+            return awaitGeography().compose(ok -> {
+                if (ok) return intendedPlace(query);
+                LOG.warning("location corpus geography not ready after " + GEOGRAPHY_WAIT_MS
+                    + "ms; this request cannot resolve geographic intent and will use the "
+                    + "configured default countries");
+                return Future.succeededFuture(null);
+            });
+        }
+        String needle = normalise(query);
+        if (needle == null) return Future.succeededFuture(null);
+        java.util.List<String> words = tokens(needle);
+        if (words.size() < 2) return Future.succeededFuture(null);   // a bare city is not a business query
+        // Longest trailing run first, stopping before the whole query so something names the business.
+        java.util.List<String> phrases = new java.util.ArrayList<>();
+        for (int start = 1; start < words.size(); start++) {
+            phrases.add(String.join(" ", words.subList(start, words.size())));
+        }
+        return intendedPlace(phrases, 0);
+    }
+
+    private Future<JsonObject> intendedPlace(java.util.List<String> phrases, int at) {
+        if (at >= phrases.size()) return Future.succeededFuture(null);
+        String phrase = phrases.get(at);
+        return query(release -> """
+                SELECT country_code, name, state_name, state_code, population
+                FROM %s
+                WHERE kind = 'locality' AND population > 0
+                  AND strip_accents(lower(name)) = ?
+                ORDER BY population DESC
+                LIMIT 1
+                """.formatted(geographyFrom(release, null)),
+            statement -> statement.setString(1, stripAccents(phrase)),
+            rs -> new JsonObject().put("country_code", rs.getString("country_code"))
+                                  .put("name", rs.getString("name"))
+                                  .put("state_name", rs.getString("state_name"))
+                                  .put("state_code", rs.getString("state_code"))
+                                  .put("population", rs.getLong("population")))
+            .compose(rows -> rows.isEmpty()
+                ? intendedPlace(phrases, at + 1)
+                : Future.succeededFuture(rows.getJsonObject(0)));
+    }
+
+    /**
+     * The PLACE the query named, as a geography suggestion, when nothing else matched.
+     *
+     * <p>Geography matches every word of the query, so "McDonalds Tokyo" matches no locality - no
+     * place on earth has "mcdonalds" in its search text - and the buildings half cannot help
+     * either once an unconfirmable city is correctly refused. The reader was left with an empty
+     * list for a query that names a real city perfectly clearly.
+     *
+     * <p>So the city itself is offered. It is the honest answer to a query whose geography is
+     * understood and whose BUSINESS cannot be matched in that country's data: Tokyo is right
+     * there to be picked, and once it is picked the country is known and the ordinary search runs
+     * against it. Nothing here invents a business.
+     */
+    private Future<JsonArray> geographyForIntent(String query) {
+        return intendedPlace(query).map(place -> {
+            JsonArray out = new JsonArray();
+            if (place == null) return out;
+            return out.add(new JsonObject()
+                .put("kind", "geo")
+                .put("name", place.getString("name"))
+                .put("geoKind", "locality")
+                .put("stateName", place.getString("state_name"))
+                .put("stateCode", place.getString("state_code"))
+                .put("countryCode", place.getString("country_code"))
+                .put("population", place.getLong("population", 0L)));
+        });
+    }
+
+    /**
+     * Waits, briefly, for the worldwide geography file, and reports whether it arrived.
+     *
+     * <p>Shared by both tiers that depend on it, because a first request that answered differently
+     * from the second was observed and neither tier could explain it alone: the places tier
+     * resolved geographic intent while the geography tier had already fallen back to its
+     * configured shortlist, so one typed query produced the right country from one half and the
+     * wrong one from the other.
+     *
+     * <p>The wait runs on the worker, NEVER on the event loop, and is capped: the alternative to a
+     * short wait is a hung keystroke. On a host that already has the file this returns immediately.
+     */
+    public Future<Boolean> awaitGeography() {
+        if (geographyIsWorldwide()) return Future.succeededFuture(true);
+        Promise<Boolean> ready = Promise.promise();
+        worker.submit(() -> {
+            try {
+                ready.complete(geographyReady.await(GEOGRAPHY_WAIT_MS,
+                                   java.util.concurrent.TimeUnit.MILLISECONDS)
+                               && geographyIsWorldwide());
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+                ready.complete(false);
+            }
+        });
+        return ready.future();
+    }
+
+    /**
+     * Whether geography can be searched worldwide in one read.
+     *
+     * <p>True once the whole-world file is on local disk. Until then the only addressable form is
+     * one S3 partition per country, so the caller falls back to its configured shortlist.
+     */
+    public boolean geographyIsWorldwide() {
+        return localGeography != null;
     }
 
     /**
@@ -865,6 +1117,8 @@ public class LocationCorpusRepository {
 
                 if (java.nio.file.Files.exists(final_)) {
                     localGeography = final_.toString();
+                geographyReady.countDown();
+                    geographyReady.countDown();
                     LOG.info("location corpus geography already local: " + final_);
                     return;
                 }
