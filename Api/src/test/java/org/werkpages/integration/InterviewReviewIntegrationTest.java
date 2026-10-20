@@ -179,6 +179,80 @@ class InterviewReviewIntegrationTest {
     }
 
     @Test
+    @DisplayName("an interview can be filed against a workplace chosen from the corpus")
+    void corpusPlace_survivesOnAnInterviewReview() throws Exception {
+        /*
+          THE DEFECT THIS EXISTS FOR.
+
+          An interview at a branch is filed against that branch. A branch the database has never
+          seen arrives as the whole corpusPlace object and is promoted on submit, which is how
+          exact precision works for anything chosen from the search corpus - the row only exists
+          once somebody picks it.
+
+          createReview read
+
+              CorpusPlace.fromBody(body.getJsonObject("corpusPlace"))
+
+          and fromBody takes the WHOLE body and reads "corpusPlace" out of it itself, so it was
+          handed the inner object and asked for a "corpusPlace" inside it. Null, every time.
+
+          Observed symptom: the submission is REFUSED, with "A workplace must be selected at
+          exact precision". The body said exact and, with the place lost, carried nothing to
+          resolve. So an interview filed at a branch chosen from the corpus could not be submitted
+          at all.
+
+          updateReview, five dozen lines below, passed the body correctly - so the same choice
+          worked when editing an interview and failed when creating one. That is how the two
+          drifted apart without either looking broken on its own.
+        */
+        String auth0Id = insertUser("corpusloc");
+        long companyId = insertCompany("Gould Street Coffee", "gould-street-coffee");
+
+        JsonObject corpusPlace = new JsonObject()
+            .put("sourcePlaceId", "0981f7d2-e580-478d-88af-c2dd1d19c771")
+            .put("name", "55 Gould St")
+            .put("street", "55 Gould St")
+            .put("city", "Toronto")
+            .put("stateCode", "ON")
+            .put("countryCode", "CA")
+            .put("country", "Canada");
+
+        await(service.createReview(auth0Id, "gould-street-coffee", new JsonObject()
+            .put("overallRating", 4.0)
+            .put("outcome", "offer")
+            .put("interviewYear", YEAR)
+            .put("declaredPrecision", "exact")
+            .put("declaredSource", "corpus")
+            .put("corpusPlace", corpusPlace)));
+
+        Row row = await(pool.preparedQuery("""
+                SELECT declared_precision, declared_city, company_location_id
+                  FROM interview_reviews WHERE deleted_at IS NULL
+                 ORDER BY created_at DESC LIMIT 1
+                """).execute()).iterator().next();
+
+        Long locationId = row.getLong("company_location_id");
+        assertNotNull(locationId,
+            "the interview was filed at no branch: the corpusPlace never reached fromBody, so a "
+            + "submission that looked successful lost the workplace it named");
+        assertEquals("exact", row.getString("declared_precision"));
+        assertEquals("Toronto", row.getString("declared_city"),
+            "the coarse values come from the promoted building, not from the form");
+
+        Row stored = await(pool.preparedQuery("""
+                SELECT company_id, source, source_place_id, city
+                  FROM company_locations WHERE id = $1
+                """).execute(Tuple.of(locationId))).iterator().next();
+        assertEquals(companyId, stored.getLong("company_id"),
+            "the branch must be promoted against the company the interview was at");
+        assertEquals("overture", stored.getString("source"));
+        assertEquals("0981f7d2-e580-478d-88af-c2dd1d19c771", stored.getString("source_place_id"),
+            "without the source identity the next candidate interviewing at this branch creates a "
+            + "second row, and the branch's figures split across the two");
+        assertEquals("Toronto", stored.getString("city"));
+    }
+
+    @Test
     void createReview_roundsRatingToOneDecimal_soTheEchoMatchesWhatWasStored() throws Exception {
         String auth0Id = insertUser("rounder");
         insertCompany("Precision Inc", "precision-inc");
@@ -469,6 +543,58 @@ class InterviewReviewIntegrationTest {
 
         assertNull(await(service.getCompanyInterviews("mine-co", null, null, stranger)).getValue("myInterview"));
         assertNull(await(service.getCompanyInterviews("mine-co", null, null, null)).getValue("myInterview"));
+    }
+
+    @Test
+    @DisplayName("editing an interview can move it to a workplace chosen from the corpus")
+    void editingCanPickACorpusPlace() throws Exception {
+        /*
+          The other half of the create case above.
+
+          updateReview already passed the whole body to CorpusPlace.fromBody while createReview
+          passed the inner object, so for a while the same choice worked on an edit and was
+          refused on a create. This pins the half that was right, because the pair drifting apart
+          again is exactly how the defect arrived: nothing about either call site looks wrong on
+          its own, and only a test on each side notices they disagree.
+        */
+        long companyId = insertCompany("Branch Move Co", "branch-move-co");
+        String auth0Id = insertUser("branchmover");
+        JsonObject created = await(service.createReview(auth0Id, "branch-move-co", base()));
+        assertNull(interviewRow().getLong("company_location_id"),
+            "created with no workplace, so the edit is the only thing under test");
+
+        await(service.updateReview(auth0Id, created.getString("id"), base()
+            .put("declaredPrecision", "exact")
+            .put("declaredSource", "corpus")
+            .put("corpusPlace", new JsonObject()
+                .put("sourcePlaceId", "d5933ba7-ca99-4898-84a6-c19a829b5294")
+                .put("name", "55 Gould St Suite 201")
+                .put("street", "55 Gould St Suite 201")
+                .put("city", "Toronto")
+                .put("stateCode", "ON")
+                .put("countryCode", "CA")
+                .put("country", "Canada"))));
+
+        Row row = interviewRow();
+        Long locationId = row.getLong("company_location_id");
+        assertNotNull(locationId, "the edit lost the chosen branch");
+        assertEquals("exact", row.getString("declared_precision"));
+
+        Row stored = await(pool.preparedQuery("""
+                SELECT company_id, source, source_place_id FROM company_locations WHERE id = $1
+                """).execute(Tuple.of(locationId))).iterator().next();
+        assertEquals(companyId, stored.getLong("company_id"));
+        assertEquals("d5933ba7-ca99-4898-84a6-c19a829b5294", stored.getString("source_place_id"),
+            "the source identity must survive an edit, or the branch cannot be deduplicated");
+    }
+
+    /** The most recent live interview review, for the location assertions. */
+    private static Row interviewRow() throws Exception {
+        return await(pool.preparedQuery("""
+                SELECT declared_precision, declared_city, company_location_id
+                  FROM interview_reviews WHERE deleted_at IS NULL
+                 ORDER BY created_at DESC LIMIT 1
+                """).execute()).iterator().next();
     }
 
     @Test

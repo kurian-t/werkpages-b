@@ -153,12 +153,334 @@ public class LocationCorpusRepository {
     }
 
     public LocationCorpusRepository(String bucket, String region, String memoryLimit) {
+        this(bucket, region, memoryLimit, env("LOCATION_GEOGRAPHY_INDEX", ""));
+    }
+
+    /**
+     * @param geographyIndexPath the published SQLite geography index, or blank for none.
+     *
+     * <p>Explicit rather than read from the environment here, so a test can exercise the indexed
+     * path without the process having been started with it set.
+     */
+    public LocationCorpusRepository(String bucket, String region, String memoryLimit,
+                                    String geographyIndexPath) {
+        this(bucket, region, memoryLimit, geographyIndexPath,
+             env("LOCATION_ROUTING_INDEX", ""), env("LOCATION_ADDRESS_INDEX_DIR", ""));
+    }
+
+    /** Every index path explicit, so a test can exercise the wired paths without the environment. */
+    public LocationCorpusRepository(String bucket, String region, String memoryLimit,
+                                    String geographyIndexPath, String routingIndexPath,
+                                    String addressIndexDir) {
         this.bucket      = bucket;
         this.region      = region;
         this.memoryLimit = memoryLimit;
+
+        /*
+          THE SQLITE INDEXES, when a release has been published to this host.
+
+          Optional on purpose. Absent, every lookup falls through to the DuckDB path exactly as
+          before, so a host without the artifacts keeps working rather than returning nothing -
+          an index that is missing and a place that does not exist must never look the same.
+
+          Sized from the SAME three-thread worker this class already uses for blocking work, so
+          no second execution model is introduced and the connection ceiling matches the number of
+          threads that can actually be inside a query.
+        */
+        String geoPath = geographyIndexPath == null ? "" : geographyIndexPath;
+        if (!geoPath.isBlank() && java.nio.file.Files.exists(java.nio.file.Path.of(geoPath))) {
+            this.indexPool    = ConnectionPool.forWorkerPool(WORKER_THREADS);
+            this.geographyIdx = new GeographyIndex(geoPath);
+            LOG.info("geography index active: " + geoPath);
+        } else {
+            this.indexPool    = null;
+            this.geographyIdx = null;
+            if (!geoPath.isBlank()) LOG.warning("LOCATION_GEOGRAPHY_INDEX set but missing: " + geoPath);
+        }
+
+
+        /*
+          ROUTING decides which country partitions are worth opening. Optional: without it the
+          existing behaviour is unchanged.
+        */
+        String routePath = routingIndexPath == null ? "" : routingIndexPath;
+        this.routingIdx = (!routePath.isBlank() && indexPool != null
+                           && java.nio.file.Files.exists(java.nio.file.Path.of(routePath)))
+            ? new RoutingIndex(routePath, indexPool) : null;
+        if (routingIdx != null) LOG.info("routing index active: " + routePath);
+
+        /*
+          ADDRESSES are per country, named <CC>.sqlite in one directory.
+
+          Only the countries whose artifact is actually present are loaded, and the map is the
+          single source of truth for coverage: routing may well choose a country we hold no
+          address index for, and that is a documented gap rather than a failure. V1 ships Canada.
+        */
+        java.util.Map<String, AddressIndex> addrs = new java.util.HashMap<>();
+        String addrDir = addressIndexDir == null ? "" : addressIndexDir;
+        if (!addrDir.isBlank() && indexPool != null) {
+            java.nio.file.Path dir = java.nio.file.Path.of(addrDir);
+            if (java.nio.file.Files.isDirectory(dir)) {
+                try (java.util.stream.Stream<java.nio.file.Path> files = java.nio.file.Files.list(dir)) {
+                    files.filter(f -> f.getFileName().toString().endsWith(".sqlite")).forEach(f -> {
+                        String cc = f.getFileName().toString().replace(".sqlite", "").toUpperCase();
+                        addrs.put(cc, new AddressIndex(f.toString(), cc, indexPool));
+                    });
+                } catch (java.io.IOException err) {
+                    LOG.log(Level.WARNING, "listing address indexes", err);
+                }
+            }
+        }
+        this.addressIdx = java.util.Map.copyOf(addrs);
+        if (!addrs.isEmpty()) LOG.info("address indexes active: " + addrs.keySet());
     }
 
+    /**
+     * Geography from the SQLite index, on the existing worker.
+     *
+     * <p>Runs on {@code worker}, never on an event loop: SQLite calls block, and a blocked event
+     * loop stalls every request on that thread rather than only this one.
+     *
+     * <p>Alias and prefix are both consulted, because a reader types either. The country scope is
+     * applied only when the QUERY named one - a visitor's own country is a ranking preference
+     * upstream, never a filter here, which is the defect that once made a field holding "London,
+     * Ontario" unable to reach the United Kingdom.
+     */
+    /**
+     * How much an exact name match is worth against a guess, in units of prominence.
+     *
+     * <p>0.25 on the 0-1 importance scale is roughly the gap between a village and a small town:
+     * enough that a real match always beats a guess of similar standing, not so much that a
+     * hamlet outranks a capital.
+     */
+    private static final double EXACT_MATCH_BONUS = 0.25;
+
+    /** Prominence, plus explicit credit for having actually matched what was typed. */
+    private static double rank(GeographyIndex.Hit h, String needle) {
+        boolean exact = h.editDistance() == 0 && needle.equals(h.norm());
+        return h.importance() + (exact ? EXACT_MATCH_BONUS : 0.0);
+    }
+
+    /** Set by the lookup so a test can prove it ran off the caller's thread. */
+    volatile String lastIndexLookupThread;
+
+    private Future<JsonArray> geographyFromIndex(String rawQuery, String iso, String state) {
+        /*
+          THE SHARED FOLD, not this class's own normalise().
+
+          normalise() only trims and lowercases, so "U.S.A." stayed "u.s.a." and never reached the
+          alias "usa". The index was built with the fold in GeographyIndex, and a query that
+          normalises differently from its index cannot match it - which is the entire class of bug
+          the equivalence test exists to catch.
+        */
+        final String needle = GeographyIndex.fold(rawQuery);
+        Promise<JsonArray> promise = Promise.promise();
+        worker.execute(() -> {
+            lastIndexLookupThread = Thread.currentThread().getName();
+            try {
+                java.util.List<GeographyIndex.Hit> hits = geographyIdx.byAlias(needle, iso, 10);
+                /*
+                  An initialism written with separators is the same word: "U.S.A." folds to
+                  "u s a", which is a different key from "usa". Joining a run of single letters
+                  covers U.K. and U.A.E. too, without an entry each.
+                */
+                if (hits.isEmpty() && needle.matches("(?:[a-z0-9] )+[a-z0-9]")) {
+                    hits = geographyIdx.byAlias(needle.replace(" ", ""), iso, 10);
+                }
+                if (hits.isEmpty()) hits = geographyIdx.byPrefix(needle, iso, state, LIMIT);
+                /*
+                  Typo recovery runs unless something SIGNIFICANT already matched the spelling as
+                  typed. Gating it on an empty result meant two hamlets called Melborne suppressed
+                  the correction to Melbourne, Australia: a misspelling that happens to be
+                  somebody's place name switches the feature off.
+                */
+                boolean significant = hits.stream().anyMatch(h -> h.importance() >= 0.35);
+                if (!significant) {
+                    java.util.List<GeographyIndex.Hit> fuzzy =
+                        geographyIdx.byTypo(needle, iso, state, 6);
+                    if (!fuzzy.isEmpty()) {
+                        /*
+                          EXACT-MATCH EVIDENCE IS SCORED, NOT LEFT TO SORT STABILITY.
+
+                          Appending and sorting by prominence alone does NOT keep an exact match
+                          ahead of a guess: a stable sort only preserves order when the keys are
+                          equal, so a more prominent fuzzy candidate could still displace a real
+                          one. The match itself has to carry weight.
+
+                          The bonus is deliberate rather than absolute. Making exact matches win
+                          outright would defeat the feature: "Melborne" IS the exact name of two
+                          hamlets, and the reader almost certainly meant Melbourne, Australia. So
+                          an exact match outranks any guess of comparable standing, and only a far
+                          more prominent destination can lead instead.
+                        */
+                        java.util.List<GeographyIndex.Hit> merged = new java.util.ArrayList<>(hits);
+                        merged.addAll(fuzzy);
+                        merged.sort((a, b) -> Double.compare(rank(b, needle), rank(a, needle)));
+                        hits = merged;
+                    }
+                }
+                JsonArray out = new JsonArray();
+                for (GeographyIndex.Hit h : hits) {
+                    out.add(new JsonObject()
+                        .put("kind", "geo")
+                        .put("name", h.name())
+                        .put("geoKind", h.kind())
+                        .put("stateName", h.stateName())
+                        .put("stateCode", h.stateCode())
+                        .put("countryCode", h.countryCode())
+                        .put("population", h.population()));
+                }
+                promise.complete(out);
+            } catch (Throwable err) {
+                /*
+                  Reported as a failure, never as an empty list. "The index is broken" and "no
+                  such place" must not look the same to the caller, which is the mistake this
+                  area has made repeatedly.
+                */
+                LOG.log(Level.WARNING, "geography index lookup failed", err);
+                promise.fail(err);
+            }
+        });
+        return promise.future();
+    }
+
+    private final RoutingIndex routingIdx;
+    private final java.util.Map<String, AddressIndex> addressIdx;
+
+    /** Countries with a published address index. Everything else is a documented coverage gap. */
+    public java.util.Set<String> addressCoverage() { return addressIdx.keySet(); }
+
+    public boolean routingIndexActive() { return routingIdx != null; }
+
+    /**
+     * Which country partitions to open, best first.
+     *
+     * <p>Falls back to the visitor's own country when no routing index is published, which is the
+     * previous behaviour rather than an empty answer.
+     */
+    public java.util.List<String> routeCountries(String query, String visitor, int k) {
+        if (routingIdx == null) {
+            return visitor == null ? java.util.List.of() : java.util.List.of(visitor);
+        }
+        java.util.List<String> toks = new java.util.ArrayList<>();
+        for (String t : GeographyIndex.fold(query).split(" ")) if (!t.isBlank()) toks.add(t);
+        return routingIdx.route(toks, visitor, k);
+    }
+
+    /**
+     * Street addresses for a query that carries a house number.
+     *
+     * <p>Emitted in the same RAW shape the corpus places path uses - name, street, city, country -
+     * so they merge into the existing suggestion pipeline and render through the control the
+     * frontend already has. No new suggestion kind, no client change.
+     */
+    public Future<JsonArray> suggestAddresses(String query, String visitor, int limit) {
+        if (addressIdx.isEmpty() || query == null || query.isBlank()) {
+            return Future.succeededFuture(new JsonArray());
+        }
+        Promise<JsonArray> promise = Promise.promise();
+        worker.execute(() -> {
+            lastAddressLookupThread = Thread.currentThread().getName();
+            try {
+                JsonArray out = new JsonArray();
+                for (String cc : addressOrder(query, visitor)) {
+                    AddressIndex idx = addressIdx.get(cc);
+                    if (idx == null) continue;          // routed somewhere we hold no addresses
+                    for (AddressIndex.Address a : idx.byAddress(query, limit)) {
+                        /*
+                          THE SHAPE THE PLACES PIPELINE ALREADY CONSUMES, exactly.
+
+                          addCorpusPlaces reads "stateCode", and CorpusPlace.fromBody promotes a
+                          chosen row only when it carries "sourcePlaceId" and "name". Emitting
+                          "state" and "placeId" instead would have rendered a perfectly good
+                          address tile that silently refused to promote on submit, and dropped the
+                          region from its detail line. Different key, same value, no error.
+
+                          No "street": the detail line is street + city, so repeating the address
+                          there would print "55 Gould Street - 55 Gould Street, Toronto". The
+                          address IS the street line, and it travels as the display name.
+                        */
+                        out.add(new JsonObject()
+                            .put("kind", "place")
+                            .put("name", a.display())
+                            .put("city", a.city())
+                            .put("stateCode", a.state())
+                            .put("country", a.country())
+                            .put("sourcePlaceId", a.placeId()));
+                    }
+                    if (!out.isEmpty()) break;
+                }
+                promise.complete(out);
+            } catch (Throwable err) {
+                LOG.log(Level.WARNING, "address index lookup failed", err);
+                promise.fail(err);
+            }
+        });
+        return promise.future();
+    }
+
+    /** Explicit country first, then routing, then the visitor - never the visitor alone. */
+    private java.util.List<String> addressOrder(String query, String visitor) {
+        java.util.LinkedHashSet<String> order = new java.util.LinkedHashSet<>();
+        java.util.List<String> routed = routeCountries(query, visitor, 3);
+        order.addAll(routed);
+        if (visitor != null) order.add(visitor);
+        order.addAll(addressIdx.keySet());   // anything we actually hold, as a last resort
+        return new java.util.ArrayList<>(order);
+    }
+
+    /** Set by the address lookup so a test can prove it was invoked and ran off the caller. */
+    volatile String lastAddressLookupThread;
+
+    /** Matches the worker pool below; the two must not drift apart. */
+    private static final int WORKER_THREADS = 3;
+
+    private final ConnectionPool indexPool;
+    private final GeographyIndex geographyIdx;
+
+    /** Whether geography is served from the local SQLite index rather than the corpus files. */
+    public boolean geographyIndexActive() { return geographyIdx != null; }
+
+    /**
+     * Releases the index connections and stops the worker.
+     *
+     * <p>Called on shutdown and whenever an index is REPLACED: a new release is a new file, and
+     * handles left open against a swapped path keep serving the bytes of the old one. The worker
+     * threads are daemons so they cannot hold the JVM open, but leaving SQLite handles open would
+     * still pin memory-mapped pages for the life of the process.
+     */
+    public void close() {
+        if (geographyIdx != null) {
+            try { geographyIdx.close(); } catch (RuntimeException err) {
+                LOG.log(Level.FINE, "closing geography index", err);
+            }
+        }
+        if (routingIdx != null) {
+            try { routingIdx.close(); } catch (RuntimeException err) {
+                LOG.log(Level.FINE, "closing routing index", err);
+            }
+        }
+        for (AddressIndex idx : addressIdx.values()) {
+            try { idx.close(); } catch (RuntimeException err) {
+                LOG.log(Level.FINE, "closing address index", err);
+            }
+        }
+        if (indexPool != null) indexPool.close();
+        worker.shutdown();
+    }
+
+    /**
+     * A setting, from a system property first and then the environment.
+     *
+     * <p>Property first for the same reason {@code ManagerService.setting} does it: a test cannot
+     * set an environment variable for the JVM it is already running in, so an environment-only
+     * read means the index paths can never be pointed at a fixture and the wired path can only be
+     * exercised by hand. Production passes these as environment variables and is unaffected,
+     * because nothing sets the properties there.
+     */
     private static String env(String key, String fallback) {
+        String property = System.getProperty(key);
+        if (property != null && !property.isBlank()) return property;
         String value = System.getenv(key);
         return (value == null || value.isBlank()) ? fallback : value;
     }
@@ -264,6 +586,15 @@ public class LocationCorpusRepository {
           all of that, and ranks by population so the city somebody meant comes first.
         */
         if (needle == null) return Future.succeededFuture(new JsonArray());
+
+        /*
+          SERVED FROM THE SQLITE INDEX WHEN ONE IS PUBLISHED.
+
+          Same contract: same arguments, same JSON shape, same worker. What changes is only where
+          the rows come from.
+        */
+        if (geographyIdx != null) return geographyFromIndex(query, iso, blankToNull(state));
+
         if (iso == null && !geographyIsWorldwide()) return Future.succeededFuture(new JsonArray());
 
         // The partition already guarantees the country, and neither search_text contains it.

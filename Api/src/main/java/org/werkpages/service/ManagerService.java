@@ -1923,8 +1923,31 @@ public class ManagerService {
             */
             boolean needPlaces = withPlaces
                 && (coveredByLocalIndex(country) || !geographyAnswers(geography, query));
-            return (needPlaces ? placesTier(companyName, query, country)
-                               : Future.succeededFuture(new JsonArray()))
+            /*
+              ADDRESSES JOIN THE SAME TIER AS BUILDINGS.
+
+              A query carrying a house number - "55 Gould Street, Toronto" - is answered from the
+              address index and emitted in the raw shape addCorpusPlaces already consumes, so it
+              renders through the control the frontend has today and persists with the same
+              precision. No new suggestion kind, no client change.
+
+              Returns nothing for a query with no house number, and nothing for a country whose
+              address artifact is not published: V1 ships Canada, and routing may legitimately
+              choose elsewhere. That is coverage, reported through addressCoverage(), not failure.
+            */
+            Future<JsonArray> addressesF = withPlaces
+                ? guarded(GEO_BREAKER, () -> locationCorpus.suggestAddresses(query, country, 5),
+                          "addresses", GEOGRAPHY_DEADLINE_MS)
+                : Future.succeededFuture(new JsonArray());
+            return addressesF.compose(addressRows ->
+                (needPlaces ? placesTier(companyName, query, country)
+                            : Future.succeededFuture(new JsonArray()))
+                .map(placesOnly -> {
+            JsonArray places = new JsonArray();
+            for (Object a : addressRows) places.add(a);   // exact addresses lead the building tier
+            for (Object b : placesOnly)  places.add(b);
+            return places;
+                })
                 .map(places -> {
             JsonArray merged = confirmed.copy();
 
@@ -2024,7 +2047,8 @@ public class ManagerService {
                         addCorpusGeography(out, cities, new java.util.HashSet<>(), country, SUGGESTION_LIMIT);
                         return out;
                     });
-                });
+                })
+            );   // addressesF.compose
         });
     }
 
@@ -3644,7 +3668,24 @@ public class ManagerService {
                         */
                         DeclaredLocation declared = DeclaredLocation.fromBody(body);
                         boolean restatesLocation = !declared.isEmpty();
-                        CorpusPlace corpusPlace  = CorpusPlace.fromBody(body.getJsonObject("corpusPlace"));
+                        /*
+                          THE WHOLE BODY, not the inner object.
+
+                          fromBody takes the request body and reads "corpusPlace" out of it
+                          itself. Handing it the inner object asked for a "corpusPlace" inside
+                          the corpusPlace, so it returned null for every edit that picked a
+                          building the database did not already hold - which is every building
+                          chosen from the search corpus, because the row only exists once
+                          somebody picks it.
+
+                          Nothing threw at the call. The refusal arrived further on, as
+                          "A workplace must be selected at exact precision", because the body
+                          said exact and carried neither a companyLocationId nor, now, a place.
+                          So editing a review and choosing your workplace failed outright, while
+                          choosing one already in the database worked - which is why it looked
+                          like an occasional glitch rather than a broken path.
+                        */
+                        CorpusPlace corpusPlace  = CorpusPlace.fromBody(body);
 
                         return ((Pool) db).withTransaction(conn ->
                             reviewRepo.findForProjection(conn, reviewId).compose(beforeOpt ->

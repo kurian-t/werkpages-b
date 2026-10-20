@@ -495,4 +495,77 @@ class CompanyAdminIntegrationTest {
     private static <T> T await(Future<T> future) throws Exception {
         return future.toCompletionStage().toCompletableFuture().get(10, TimeUnit.SECONDS);
     }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // the admin's own choice of brand
+    // ══════════════════════════════════════════════════════════════════════════
+
+    @Test
+    void adminSetsBrand_recordsAdminAuthority() throws Exception {
+        /*
+          REPORTED: "Knotts Berry Farm" showed the Six Flags logo and "Knotts Berry Farm Foods"
+          showed Smucker's.
+
+          Neither was a name guess. The suggestion endpoint resolved knotts.com and
+          knottsberryfarmfoods.com correctly, and logo.dev answered those domains with the OWNER's
+          mark: Cedar Fair, which owns Knott's Berry Farm, merged into Six Flags, and the foods
+          brand belongs to Smucker. No domain we resolve produces the right image, so a person has
+          to decide - which is what domain_source = 'ADMIN' is for.
+        */
+        String adminAuth = insertUser("auth0|co-admin90", "CoAdmin90", "admin");
+        long companyId   = insertCompany("Knotts Berry Farm");
+
+        await(service.adminRenameCompany(adminAuth, companyId, "Knott's Berry Farm",
+                                         "knotts.com", "https://cdn.example/knotts.png"));
+
+        var row = await(pool.preparedQuery(
+                "SELECT name, domain, logo_url, domain_source FROM companies WHERE id = $1")
+            .execute(io.vertx.sqlclient.Tuple.of(companyId))).iterator().next();
+        assertEquals("Knott's Berry Farm", row.getString("name"));
+        assertEquals("knotts.com", row.getString("domain"));
+        assertEquals("https://cdn.example/knotts.png", row.getString("logo_url"));
+        assertEquals("ADMIN", row.getString("domain_source"),
+            "an admin decision must be recorded as one, or the resolvers will overwrite it");
+    }
+
+    @Test
+    void adminBrand_isNotClearedByAnOrdinaryRename() throws Exception {
+        /*
+          A rename must never remove a logo as a side effect. The brand fields are optional and
+          absent means "leave it alone", which is the difference between correcting a brand and
+          wiping one.
+        */
+        String adminAuth = insertUser("auth0|co-admin91", "CoAdmin91", "admin");
+        long companyId   = insertCompany("Knotts Berry Farm");
+        await(service.adminRenameCompany(adminAuth, companyId, "Knotts Berry Farm",
+                                         "knotts.com", "https://cdn.example/knotts.png"));
+
+        await(service.adminRenameCompany(adminAuth, companyId, "Knott's Berry Farm Inc"));
+
+        var row = await(pool.preparedQuery(
+                "SELECT domain, logo_url, domain_source FROM companies WHERE id = $1")
+            .execute(io.vertx.sqlclient.Tuple.of(companyId))).iterator().next();
+        assertEquals("knotts.com", row.getString("domain"));
+        assertEquals("https://cdn.example/knotts.png", row.getString("logo_url"));
+        assertEquals("ADMIN", row.getString("domain_source"));
+    }
+
+    @Test
+    void adminBrand_rejectsSomethingThatIsNotADomain() throws Exception {
+        String adminAuth = insertUser("auth0|co-admin92", "CoAdmin92", "admin");
+        long companyId   = insertCompany("Acme Corp");
+        ServiceException ex = assertServiceException(service.adminRenameCompany(
+            adminAuth, companyId, "Acme Corp", "not a domain", null));
+        assertEquals(400, ex.getStatusCode());
+    }
+
+    @Test
+    void adminBrand_rejectsANonHttpsLogo() throws Exception {
+        // A logo URL ends up in an img tag on a public page; http would break it on an https site.
+        String adminAuth = insertUser("auth0|co-admin93", "CoAdmin93", "admin");
+        long companyId   = insertCompany("Acme Corp");
+        ServiceException ex = assertServiceException(service.adminRenameCompany(
+            adminAuth, companyId, "Acme Corp", "acme.com", "http://cdn.example/acme.png"));
+        assertEquals(400, ex.getStatusCode());
+    }
 }

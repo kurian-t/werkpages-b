@@ -137,7 +137,14 @@ public class InterviewService {
                         */
                         return declaredLocations.resolve(interviewRepo.client(),
                                 DeclaredLocation.fromBody(body),
-                                CorpusPlace.fromBody(body.getJsonObject("corpusPlace")), companyId)
+                                // The WHOLE body: fromBody reads "corpusPlace" out of it itself, so
+                                // passing the inner object returned null and the submission was
+                                // then refused outright - "A workplace must be selected at exact
+                                // precision" - because the body said exact and carried nothing to
+                                // resolve. updateReview below was already correct, so the same
+                                // choice worked when EDITING an interview and failed when creating
+                                // one, which is how the two drifted apart unnoticed.
+                                CorpusPlace.fromBody(body), companyId)
                             .compose(declared ->
                         interviewRepo.create(companyId, userId, draft.overall, draft.communication,
                             draft.respectForTime, draft.roleClarity, draft.processFairness,

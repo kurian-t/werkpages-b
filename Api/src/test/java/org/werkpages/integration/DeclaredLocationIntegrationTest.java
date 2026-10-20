@@ -462,6 +462,78 @@ class DeclaredLocationIntegrationTest {
         return ghost.getLong("id");
     }
 
+    @Test
+    @DisplayName("an edit can pick a workplace the database does not hold yet")
+    void editCanPickACorpusPlace() throws Exception {
+        /*
+          THE DEFECT THIS EXISTS FOR.
+
+          Every other edit case here passes a companyLocationId, a building already in
+          company_locations. A building the database has never seen arrives differently: the
+          client sends the whole corpusPlace object and the server promotes it on submit. That is
+          how exact precision works for anything chosen from the search corpus, which is the
+          common case - the row only exists once somebody picks it.
+
+          On the EDIT path it did not work at all. The call read
+
+              CorpusPlace.fromBody(body.getJsonObject("corpusPlace"))
+
+          and fromBody takes the WHOLE body and reads "corpusPlace" out of it itself, so it was
+          handed the inner object and asked for a "corpusPlace" inside it. Null, every time.
+
+          Nothing threw at the call. The refusal arrived further on as "A workplace must be
+          selected at exact precision", because the body said exact and carried neither a
+          companyLocationId nor, now, a place. So editing a review and choosing your workplace
+          failed outright, while choosing one already in the database worked - which is why it
+          looked like an intermittent glitch rather than a broken path.
+        */
+        insertUser("auth0|dl-corpus", "DlCorpus");
+        long companyId = insertCompany("Corpus Pick Co");
+        long managerId = ghostManagerAt(companyId, "Hana Corpus", "Corpus Pick Co");
+
+        long original = insertLocation(companyId, "1 Original St", "Toronto", "Ontario", "Canada");
+        UUID reviewId = reviewIdOf(await(service.createReview("auth0|dl-corpus", managerId,
+            reviewWithLocation("Corpus Pick Co", original), null,
+            submission(reviewWithLocation("Corpus Pick Co", original)))));
+
+        // No id, the whole object, exactly as the client sends it for a building nobody has
+        // chosen before.
+        JsonObject corpusPlace = new JsonObject()
+            .put("sourcePlaceId", "0981f7d2-e580-478d-88af-c2dd1d19c771")
+            .put("name", "55 Gould St")
+            .put("street", "55 Gould St")
+            .put("city", "Toronto")
+            .put("stateCode", "ON")
+            .put("countryCode", "CA")
+            .put("country", "Canada");
+        await(service.updateReview("auth0|dl-corpus", managerId, reviewId,
+            validReviewBody("Corpus Pick Co", "Store Manager")
+                .put("declaredPrecision", DeclaredLocation.EXACT)
+                .put("declaredSource", "corpus")
+                .put("corpusPlace", corpusPlace)));
+
+        Row after = review(reviewId);
+        Long moved = after.getLong("company_location_id");
+        assertNotNull(moved,
+            "the edit dropped the chosen workplace: the corpusPlace never reached fromBody");
+        assertNotEquals(original, moved.longValue(),
+            "the edit kept the old building, so the new choice was ignored");
+
+        Row stored = await(pool.preparedQuery("""
+                SELECT company_id, source, source_place_id, city
+                  FROM company_locations WHERE id = $1
+                """).execute(Tuple.of(moved)).map(rs -> rs.iterator().next()));
+        assertEquals(companyId, stored.getLong("company_id"),
+            "a workplace must be promoted against the company the review is about");
+        assertEquals("overture", stored.getString("source"));
+        assertEquals("0981f7d2-e580-478d-88af-c2dd1d19c771", stored.getString("source_place_id"),
+            "without the source identity, the next person to pick this building creates a second "
+            + "row and the two split its ratings");
+        assertEquals("Toronto", stored.getString("city"));
+        assertEquals("Toronto", after.getString("declared_city"));
+        assertEquals("exact", after.getString("declared_precision"));
+    }
+
     private static JsonObject reviewWithLocation(String company, long locationId) {
         return validReviewBody(company, "Store Manager")
             .put("companyLocationId", locationId)

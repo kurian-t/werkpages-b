@@ -10,6 +10,7 @@ import io.vertx.sqlclient.SqlClient;
 import io.vertx.sqlclient.Tuple;
 import org.werkpages.repository.CapturedDraftRepository;
 import org.werkpages.repository.CompanyRepository;
+import org.werkpages.repository.PickedBrand;
 import org.werkpages.repository.ConfidenceRepository;
 import org.werkpages.repository.EditRepository;
 import org.werkpages.repository.ManagerRepository;
@@ -1206,6 +1207,27 @@ public class AdminService {
     }
 
     public Future<JsonObject> adminRenameCompany(String auth0Id, long companyId, String newName) {
+        return adminRenameCompany(auth0Id, companyId, newName, null, null);
+    }
+
+    /**
+     * Renames a company and, when the admin supplied one, records their choice of brand.
+     *
+     * <p><b>Why an admin can set a logo at all.</b> logo.dev answers a correctly resolved domain
+     * with the OWNER's mark: knotts.com returns Six Flags, because Knott's Berry Farm's owner
+     * Cedar Fair merged into it, and knottsberryfarmfoods.com returns Smucker's. No domain we
+     * resolve produces the right image, so resolution cannot fix it and a person has to decide.
+     * {@code domain_source = 'ADMIN'} already exists for exactly that, and every automated writer
+     * in CompanyRepository refuses to overwrite it.
+     *
+     * <p><b>Why the client validation does not apply here.</b> {@link PickedBrand#of} requires a
+     * logo URL to structurally encode its own domain, because it is given untrusted input from a
+     * browser. That rule would defeat this: correcting Knott's means keeping knotts.com and
+     * choosing a different image. An authenticated admin is the authority the ladder defers to,
+     * so the record is built directly, with the domain still shape-checked.
+     */
+    public Future<JsonObject> adminRenameCompany(String auth0Id, long companyId, String newName,
+                                                 String domain, String logoUrl) {
         if (newName == null || newName.isBlank())
             return Future.failedFuture(ServiceException.badRequest("Company name is required"));
         return requireAdmin(auth0Id)
@@ -1220,11 +1242,35 @@ public class AdminService {
                 return companyRepo.pinCurrentLogo(companyId)
                     .compose(v -> companyRepo.renameCompany(companyId, newName));
             })
+            .compose(v -> applyAdminBrand(companyId, domain, logoUrl))
             /*
               No stats write: a rename touches companies.name, and nothing in company_stats_live
               is derived from the name.
             */
             .map(v -> new JsonObject().put("success", true));
+    }
+
+    /**
+     * The admin's chosen brand, or nothing at all when they supplied none.
+     *
+     * <p>Absent means leave it: a rename must never clear a logo as a side effect of touching the
+     * name. A blank domain is rejected rather than treated as a clear, because clearing a brand
+     * and correcting one are different intentions and only one of them was asked for here.
+     */
+    private Future<Void> applyAdminBrand(long companyId, String domain, String logoUrl) {
+        if (domain == null || domain.isBlank()) return Future.succeededFuture();
+        String host = domain.trim().toLowerCase();
+        if (!host.matches("[a-z0-9]([a-z0-9-]*[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+")) {
+            return Future.failedFuture(ServiceException.badRequest(
+                "\"" + domain + "\" is not a domain"));
+        }
+        String url = (logoUrl == null || logoUrl.isBlank()) ? null : logoUrl.trim();
+        if (url != null && !url.startsWith("https://")) {
+            return Future.failedFuture(ServiceException.badRequest("A logo URL must be https"));
+        }
+        return companyRepo.applyPickedBrand(companyId, new PickedBrand(host, url),
+                                            CompanyRepository.BrandAuthority.ADMIN)
+            .mapEmpty();
     }
 
     /**

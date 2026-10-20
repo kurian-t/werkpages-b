@@ -543,7 +543,10 @@ public class AdminHandler {
         JsonObject body = ctx.body().asJsonObject();
         if (body == null) { bad(ctx, "Request body required"); return; }
         String newName = body.getString("name");
-        service.adminRenameCompany(auth0Id, companyId, newName)
+        // Optional, and null means "leave the brand as it is". See the operation in openapi.yaml.
+        String domain  = body.getString("domain");
+        String logoUrl = body.getString("logoUrl");
+        service.adminRenameCompany(auth0Id, companyId, newName, domain, logoUrl)
             .onSuccess(json -> ok(ctx, json))
             .onFailure(err -> ManagersHandler.handleError(ctx, err));
     }

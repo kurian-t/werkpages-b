@@ -3199,7 +3199,7 @@ paths:
   /api/admin/companies/{companyId}:
     put:
       operationId: adminRenameCompany
-      summary: Rename a company and cascade to all linked records (admin only)
+      summary: Rename a company, and optionally correct its brand, cascading to linked records (admin only)
       tags:
         - Admin
       parameters:
@@ -3219,6 +3219,19 @@ paths:
               properties:
                 name:
                   type: string
+                # The admin's own choice of brand. Optional, and absent means "leave it alone":
+                # a rename must not clear a logo as a side effect.
+                #
+                # logo.dev answers a correct domain with the OWNER's mark - knotts.com returns
+                # Six Flags, because Cedar Fair merged into it - so no domain we resolve can fix
+                # some logos. A person deciding is the only remaining authority, which is what
+                # domain_source = 'ADMIN' already means in the companies table.
+                domain:
+                  type: string
+                  nullable: true
+                logoUrl:
+                  type: string
+                  nullable: true
       responses:
         '200':
           description: Rename successful
