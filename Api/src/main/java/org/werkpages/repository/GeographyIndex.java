@@ -8,6 +8,9 @@ import java.sql.SQLException;
 import java.text.Normalizer;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
+import java.util.HashMap;
+import java.util.Optional;
 import java.util.Locale;
 import java.util.logging.Level;
 import java.util.logging.Logger;
@@ -211,6 +214,61 @@ public final class GeographyIndex implements AutoCloseable {
     }
 
     /** Rows reached through an alias: ISO codes, "USA", "UK", a region's own abbreviation. */
+    /**
+     * One country's own row, by ISO code, with no scope applied.
+     *
+     * <h2>Why unscoped is the point</h2>
+     *
+     * <p>This exists for the country a QUERY names rather than the country a form holds. Somebody
+     * in Canada typing "USA" has named the United States, and scoping that lookup to Canada
+     * returns nothing: the United States row is not in Canada. Every other lookup here is
+     * deliberately scoped, and this one deliberately is not.
+     *
+     * <p>Without it the index was strictly worse than the DuckDB path it replaces. That path
+     * admits the named country by its CODE, in its own branch of the predicate, precisely because
+     * the corpus stores the country's search text as "united states" and no token of "usa" can
+     * reach it. Omitting the equivalent here made a Canadian visitor unable to select the United
+     * States at all - a preference turned into a prison.
+     */
+    public Optional<Hit> country(String countryCode) {
+        if (countryCode == null || countryCode.isBlank()) return Optional.empty();
+        return Optional.ofNullable(countries().get(countryCode.toUpperCase(Locale.ROOT)));
+    }
+
+    /**
+     * Every country row, read once and kept.
+     *
+     * <h2>Why cached rather than queried</h2>
+     *
+     * <p>There is no index on {@code (kind, country_code)}, so looking one country up scanned the
+     * 5.2 million row entity table. Measured through the HTTP endpoint, that put every
+     * country-alias query - "USA", "UK", "United States", the most common things anybody types
+     * into a location field - at 149-274ms while an ordinary prefix lookup took 0-1ms.
+     *
+     * <p>There are 252 of them and they are immutable for the life of the published index, so the
+     * whole set costs one scan at first use and nothing afterwards. An index on the table would
+     * work too and would make the artifact larger for a lookup that is better off not touching
+     * disk at all.
+     */
+    private Map<String, Hit> countries() {
+        Map<String, Hit> cached = countryCache;
+        if (cached != null) return cached;
+        synchronized (this) {
+            if (countryCache == null) {
+                Map<String, Hit> loaded = new HashMap<>();
+                for (Hit h : query("SELECT " + COLS + " FROM entity WHERE kind = 'country'",
+                                   ps -> { }, false, 0)) {
+                    if (h.countryCode() != null) loaded.put(h.countryCode().toUpperCase(Locale.ROOT), h);
+                }
+                countryCache = Map.copyOf(loaded);
+                LOG.info("geography index: " + countryCache.size() + " country rows cached");
+            }
+            return countryCache;
+        }
+    }
+
+    private volatile Map<String, Hit> countryCache;
+
     public List<Hit> byAlias(String alias, String countryScope, int limit) {
         if (alias == null || alias.isEmpty()) return List.of();
         StringBuilder sql = new StringBuilder(

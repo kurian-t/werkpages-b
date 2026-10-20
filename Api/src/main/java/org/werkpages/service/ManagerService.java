@@ -912,8 +912,20 @@ public class ManagerService {
 
     private Future<JsonArray> localSearchable(Long companyId, String companyName, String query,
                                               String country, String state) {
+        /*
+          THE POSTGRES TIER'S OWN DURATION, and the whole call's.
+
+          Instrumenting only geography and places left a two-second response whose named tiers
+          accounted for two hundred milliseconds, so the measurement pointed at nothing. Every
+          stage is timed now, and the total is measured rather than added up: the stages do not
+          run strictly in sequence and a sum would quietly disagree with what the reader waits.
+        */
+        long pgStarted    = System.nanoTime();
+        long totalStarted = pgStarted;
         return new org.werkpages.repository.CompanyLocationRepository(db)
             .suggest(companyId, companyName, query, country, state)
+            .onComplete(r -> System.err.println("location-suggest-pg q=\"" + query
+                + "\" pgMs=" + (System.nanoTime() - pgStarted) / 1_000_000))
             .map(rows -> {
                 JsonArray out = new JsonArray();
                 for (Row row : rows) {
@@ -940,7 +952,10 @@ public class ManagerService {
                 }
                 return out;
             })
-            .compose(confirmed -> appendCorpusSuggestions(confirmed, companyName, query, country, state));
+            .compose(confirmed -> appendCorpusSuggestions(confirmed, companyName, query, country, state))
+            .onComplete(r -> System.err.println("location-suggest-total q=\"" + query
+                + "\" country=" + country
+                + " totalMs=" + (System.nanoTime() - totalStarted) / 1_000_000));
     }
 
     /**
@@ -1265,6 +1280,15 @@ public class ManagerService {
      * stable across both the local and the remote path.
      */
     private Future<JsonArray> placesWithoutCountry(String companyName, String query) {
+        /*
+          THE UNINSTRUMENTED STEP, and the one the reader was actually waiting for.
+
+          With no country this reads the configured default countries one partition at a time, and
+          a partition the local index does not hold is read from S3. The geography and places
+          timers both sat inside the per-country read, so a two-second response reported two
+          hundred milliseconds of tiers and the measurement pointed at nothing.
+        */
+        long withoutCountryStarted = System.nanoTime();
         return locationCorpus.intendedPlace(query).compose(intended -> {
             String intendedCountry = intended == null ? null : intended.getString("country_code");
             String intendedCity    = intended == null ? null : intended.getString("name");
@@ -1298,6 +1322,8 @@ public class ManagerService {
               Canada once and France afterwards, and the geography-readiness warning did not fire,
               so the latch was not the explanation and there was nothing else to read.
             */
+            System.err.println("location-route-ms q=\"" + query + "\" routeMs="
+                + (System.nanoTime() - withoutCountryStarted) / 1_000_000);
             System.err.println("location-route q=\"" + query + "\""
                 + " intent=" + (intendedCountry == null ? "none" : intendedCountry)
                 + " city=" + (intendedCity == null ? "none" : intendedCity)
@@ -1884,9 +1910,20 @@ public class ManagerService {
           reader still gets whatever Postgres confirmed, which is the part that must keep working:
           a form that cannot be submitted is worse than a form with fewer suggestions.
         */
+        /*
+          PER-TIER DURATIONS, not just the response total.
+
+          Counting rows told us WHICH tiers ran and nothing about what they cost, so a two-second
+          response could be blamed on any of three reads. Measured here rather than inferred from
+          the total, because the tiers do not run strictly one after another and the total hides
+          which one the reader is actually waiting for.
+        */
+        long geoStarted = System.nanoTime();
+        long[] tierMs = new long[3];   // 0 geography, 1 places, 2 postgres-confirmed
         Future<JsonArray> geographyF =
             guarded(GEO_BREAKER, () -> locationCorpus.suggestGeography(query, country, null),
-                    "geography", GEOGRAPHY_DEADLINE_MS);
+                    "geography", GEOGRAPHY_DEADLINE_MS)
+                .onComplete(r -> tierMs[0] = (System.nanoTime() - geoStarted) / 1_000_000);
 
         return geographyF.compose(geography -> {
             /*
@@ -1939,9 +1976,11 @@ public class ManagerService {
                 ? guarded(GEO_BREAKER, () -> locationCorpus.suggestAddresses(query, country, 5),
                           "addresses", GEOGRAPHY_DEADLINE_MS)
                 : Future.succeededFuture(new JsonArray());
+            long placesStarted = System.nanoTime();
             return addressesF.compose(addressRows ->
                 (needPlaces ? placesTier(companyName, query, country)
                             : Future.succeededFuture(new JsonArray()))
+                .onComplete(r -> tierMs[1] = (System.nanoTime() - placesStarted) / 1_000_000)
                 .map(placesOnly -> {
             JsonArray places = new JsonArray();
             for (Object a : addressRows) places.add(a);   // exact addresses lead the building tier
@@ -1964,6 +2003,8 @@ public class ManagerService {
               empty one are different events and have to look different.
             */
             System.err.println("location-suggest q=\"" + query + "\" country=" + country
+                + " geoMs=" + tierMs[0]
+                + " placesMs=" + (needPlaces ? String.valueOf(tierMs[1]) : "skipped")
                 + " geo=" + geography.size()
                 + " places=" + (needPlaces ? String.valueOf(places.size()) : "skipped")
                 + " lead=" + (geographyAnswers(geography, query) ? "city"

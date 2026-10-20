@@ -196,6 +196,107 @@ class LocationSearchIntegrationTest {
     }
 
     @Test
+    @DisplayName("the index counts as worldwide geography, or every request waits two seconds")
+    void theIndexSatisfiesTheReadinessPredicate() {
+        /*
+          THE TWO SECONDS, and it was not a query.
+
+          geographyIsWorldwide() answered "has the geography PARQUET been copied here", because
+          that was once the only worldwide source. With the index active the parquet is never
+          materialised, so it returned false, and the service's no-country branch waited out the
+          whole GEOGRAPHY_WAIT_MS before carrying on.
+
+          Measured through the HTTP endpoint in the production configuration: 2,207ms total
+          against 201ms of actual tier work. Pure waiting, invisible to every per-query timer.
+        */
+        assertTrue(repo.geographyIsWorldwide(),
+            "a published geography index IS worldwide geography; saying otherwise costs the "
+            + "caller the full readiness timeout on every request that names no country");
+    }
+
+    @Test
+    @DisplayName("a country named by the QUERY outranks the country held by the form")
+    void aNamedCountryIsNotScopedAway() throws Exception {
+        /*
+          THE PRODUCTION DEFECT, exactly.
+
+          Somebody in Canada typing "USA" has named the United States, and the United States is
+          not in Canada - so a scoped lookup returns nothing and they cannot select it at all. The
+          DuckDB path this replaces never had that hole: it admits the named country by its ISO
+          code in its own branch, because the corpus stores that row's search text as "united
+          states" and no token of "usa" reaches it either.
+
+          Observed in production as "USA" returning Jerusalem and Rusagonis - "Jer-usa-lem",
+          "R-usa-gonis" - with United States ranked below them or missing.
+        */
+        for (String typed : new String[]{"USA", "U.S.A.", "United States"}) {
+            JsonArray scoped = search(typed, "Canada", null);
+            assertFalse(scoped.isEmpty(), typed + " returned nothing under a Canadian scope");
+            assertEquals("US", scoped.getJsonObject(0).getString("countryCode"),
+                typed + " names the United States; a form holding Canada must not hide it: "
+                + names(scoped));
+        }
+        assertEquals("GB", search("UK", "Canada", null).getJsonObject(0).getString("countryCode"));
+    }
+
+    @Test
+    @DisplayName("a country scope ranks results without excluding the rest of the world")
+    void aScopeIsAPreferenceNotAPrison() throws Exception {
+        /*
+          "Tokyo" with Canada on the form returned NO geography at all, so the suggestion list led
+          with a Canadian restaurant called Tokyo Express and the city of 14 million was never
+          offered. Somebody recording a job in Tokyo could not say where it was.
+
+          The scope still decides the ORDER - that part is wanted, and the next assertion pins it.
+        */
+        assertTrue(names(search("Tokyo", "Canada", null)).stream().anyMatch(n -> n.startsWith("Tokyo")),
+            "a Canadian scope must not hide Tokyo");
+        assertTrue(names(search("Osaka", "Canada", null)).stream().anyMatch(n -> n.startsWith("Osaka")),
+            "nor Osaka");
+    }
+
+    @Test
+    @DisplayName("and the preferred country still leads where it has a match")
+    void thePreferredCountryStillLeads() throws Exception {
+        /*
+          The other half, and the reason widening appends rather than replaces: London, Ontario
+          must still come first for somebody whose form says Canada. Widening that broke this
+          would be a worse bug than the one it fixed.
+        */
+        JsonObject top = search("London", "Canada", null).getJsonObject(0);
+        assertEquals("CA", top.getString("countryCode"),
+            "the country on the form must still rank first where it has a match");
+        assertEquals("London", top.getString("name"));
+    }
+
+    @Test
+    @DisplayName("geography answers in single-digit milliseconds, which is the point of the index")
+    void geographyIsFast() throws Exception {
+        /*
+          A LATENCY ASSERTION, because correctness alone let a two-second regression ship.
+
+          The DuckDB parquet scan this replaces was measured at 2,100-2,600ms per keystroke
+          against the live production host. The budget here is deliberately loose - 250ms covers a
+          cold page cache and a loaded CI machine - and still fails by an order of magnitude if the
+          index is bypassed or the readiness predicate regresses.
+        */
+        for (String q : new String[]{"Toronto", "Pen", "London", "Tokyo", "USA"}) {
+            search(q, null, null);                       // warm the cache the first call pays for
+        }
+        long worst = 0;
+        String worstQuery = null;
+        for (String q : new String[]{"Toronto", "Pen", "London", "Tokyo", "USA", "Montréal"}) {
+            long started = System.nanoTime();
+            search(q, "Canada", null);
+            long ms = (System.nanoTime() - started) / 1_000_000;
+            if (ms > worst) { worst = ms; worstQuery = q; }
+        }
+        assertTrue(worst < 250,
+            "geography took " + worst + "ms for " + worstQuery + "; the index exists to keep this "
+            + "in single digits, and the path it replaced took over two seconds");
+    }
+
+    @Test
     @DisplayName("a missing index degrades to the corpus path rather than to nothing")
     void missingIndexIsNotAnEmptyResult() {
         /*

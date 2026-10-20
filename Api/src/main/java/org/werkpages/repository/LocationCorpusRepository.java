@@ -288,6 +288,38 @@ public class LocationCorpusRepository {
                     hits = geographyIdx.byAlias(needle.replace(" ", ""), iso, 10);
                 }
                 if (hits.isEmpty()) hits = geographyIdx.byPrefix(needle, iso, state, LIMIT);
+
+                /*
+                  A COUNTRY IS A PREFERENCE, NEVER A PRISON.
+
+                  The scoped lookup above is right about ranking: a form holding Canada and a query
+                  of "London" means London, Ontario, and it should lead. It is wrong as a wall.
+                  "Tokyo" with Canada on the form returned NOTHING from geography, so the list led
+                  with a Canadian restaurant called Tokyo Express and the city of 14 million was
+                  not offered at all. Somebody recording a job in Tokyo could not say where it was.
+
+                  So the scope orders the results instead of deciding them: whatever the country
+                  held, first, and then the rest of the world fills the remaining seats. Nothing
+                  that used to be offered stops being offered, and nothing that used to lead stops
+                  leading - the list simply stops ending early.
+
+                  Only when a scope was actually applied; an unscoped lookup has already seen
+                  everything.
+                */
+                if (iso != null && hits.size() < LIMIT) {
+                    java.util.List<GeographyIndex.Hit> worldwide =
+                        geographyIdx.byPrefix(needle, null, blankToNull(state), LIMIT);
+                    if (!worldwide.isEmpty()) {
+                        java.util.Set<Long> already = new java.util.HashSet<>();
+                        for (GeographyIndex.Hit h : hits) already.add(h.id());
+                        java.util.List<GeographyIndex.Hit> widened = new java.util.ArrayList<>(hits);
+                        for (GeographyIndex.Hit h : worldwide) {
+                            if (widened.size() >= LIMIT) break;
+                            if (already.add(h.id())) widened.add(h);
+                        }
+                        hits = widened;
+                    }
+                }
                 /*
                   Typo recovery runs unless something SIGNIFICANT already matched the spelling as
                   typed. Gating it on an empty result meant two hamlets called Melborne suppressed
@@ -319,6 +351,40 @@ public class LocationCorpusRepository {
                         hits = merged;
                     }
                 }
+                /*
+                  THE COUNTRY THE QUERY NAMED, ahead of everything and never scoped away.
+
+                  Every lookup above applies the country as a filter, which is right for a place
+                  name: somebody whose form says Canada and types "London" means London, Ontario.
+                  It is wrong for a country NAME. "USA" names the United States, and the United
+                  States is not in Canada, so the scoped lookups return nothing and a Canadian
+                  visitor could not select it at all.
+
+                  The DuckDB path this replaces never had that hole: it admits the named country by
+                  its ISO CODE in a separate branch, because the corpus stores that row's search
+                  text as "united states" and no token of "usa" can reach it either. Leaving the
+                  equivalent out made the index strictly worse than what it replaced, on the single
+                  most common country query there is.
+
+                  Matched by identity rather than spelling, via the same Countries table the other
+                  path uses, so "USA", "U.S.A.", "US" and "United States" all arrive at US - and
+                  the row is deduplicated in case a scoped lookup already found it.
+                */
+                String spokenIso = Countries.iso(needle);
+                if (spokenIso != null) {
+                    java.util.Optional<GeographyIndex.Hit> named = geographyIdx.country(spokenIso);
+                    if (named.isPresent()) {
+                        java.util.List<GeographyIndex.Hit> withCountry = new java.util.ArrayList<>();
+                        withCountry.add(named.get());
+                        for (GeographyIndex.Hit h : hits) {
+                            if (!("country".equals(h.kind()) && spokenIso.equals(h.countryCode()))) {
+                                withCountry.add(h);
+                            }
+                        }
+                        hits = withCountry;
+                    }
+                }
+
                 JsonArray out = new JsonArray();
                 for (GeographyIndex.Hit h : hits) {
                     out.add(new JsonObject()
@@ -1525,7 +1591,21 @@ public class LocationCorpusRepository {
      * one S3 partition per country, so the caller falls back to its configured shortlist.
      */
     public boolean geographyIsWorldwide() {
-        return localGeography != null;
+        /*
+          THE SQLITE INDEX IS WORLDWIDE GEOGRAPHY TOO, and saying otherwise cost two seconds a
+          keystroke.
+
+          This answered "has the geography PARQUET been copied to this host", because for a long
+          time that was the only worldwide source. With the index active the parquet is never
+          materialised - the index answers first and nothing asks for it - so localGeography stayed
+          null, this returned false, and every request without a country waited out the whole
+          GEOGRAPHY_WAIT_MS before falling back. Measured: 2,207ms total against 201ms of actual
+          tier work, and the 2,000ms was pure waiting.
+
+          The question being asked is whether worldwide geography can be answered RIGHT NOW. The
+          index answers it for 252 countries and 5.2 million places, so it has to count.
+        */
+        return geographyIdx != null || localGeography != null;
     }
 
     /**
