@@ -207,7 +207,22 @@ public class LocationCorpusRepository {
         this.routingIdx = (!routePath.isBlank() && indexPool != null
                            && java.nio.file.Files.exists(java.nio.file.Path.of(routePath)))
             ? new RoutingIndex(routePath, indexPool) : null;
-        if (routingIdx != null) LOG.info("routing index active: " + routePath);
+        if (routingIdx != null) {
+            LOG.info("routing index active: " + routePath);
+        } else if (!routePath.isBlank()) {
+            /*
+              CONFIGURED AND ABSENT IS AN ERROR, not a silent downgrade.
+
+              A blank path means "not using one" and stays quiet. A path that was set and does not
+              resolve means somebody intended to publish this index and the file is not there -
+              a failed copy, a moved symlink, a replaced instance. That degrades address search to
+              nothing while the application looks healthy, so it is reported at SEVERE with the
+              path and the consequence spelled out.
+            */
+            LOG.severe("LOCATION_ROUTING_INDEX is set to " + routePath + " but no file is there. "
+                + "Address search cannot route and will return nothing. Run "
+                + "scripts/location-index/verify_indexes.sh against the release directory.");
+        }
 
         /*
           ADDRESSES are per country, named <CC>.sqlite in one directory.
@@ -232,7 +247,23 @@ public class LocationCorpusRepository {
             }
         }
         this.addressIdx = java.util.Map.copyOf(addrs);
-        if (!addrs.isEmpty()) LOG.info("address indexes active: " + addrs.keySet());
+        if (!addrs.isEmpty()) {
+            LOG.info("address indexes active: " + addrs.keySet());
+        } else if (!addrDir.isBlank()) {
+            LOG.severe("LOCATION_ADDRESS_INDEX_DIR is set to " + addrDir + " but it holds no "
+                + "<CC>.sqlite files. Street-address suggestions are disabled. Run "
+                + "scripts/location-index/verify_indexes.sh against the release directory.");
+        }
+
+        /*
+          ONE LINE SAYING WHAT THIS PROCESS WILL ACTUALLY DO, so the answer is in the log rather
+          than inferred from which other lines happen to be present. Coverage is named explicitly:
+          addresses are CANADA ONLY in this release, and a log that implies otherwise invites
+          somebody to debug a Japanese address that was never built.
+        */
+        LOG.info("location index status: geography=" + (geographyIdx != null ? "active" : "off")
+            + " routing=" + (routingIdx != null ? "active" : "off")
+            + " addresses=" + (addressIdx.isEmpty() ? "off" : addressIdx.keySet().toString()));
     }
 
     /**
