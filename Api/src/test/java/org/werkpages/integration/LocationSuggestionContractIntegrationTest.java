@@ -340,6 +340,177 @@ class LocationSuggestionContractIntegrationTest {
             + "promoted a fresh corpus place instead of reusing it: " + again.encode());
     }
 
+    @Test
+    @DisplayName("typing any country's own name offers that country, not the places inside it")
+    void aCountryNameOffersTheCountry() throws Exception {
+        /*
+          REPORTED FROM THE BROWSER, with the country already selected on the form.
+
+          Typing "United States" returned Alabama, Arizona, British Columbia, California, Colorado,
+          Connecticut, England, Florida - alphabetical, eight of them, every one labelled
+          "<state>, United States" - and the United States itself was nowhere in the list.
+
+          Cause: this tier matched declared_country on EVERY row, so a country name matched every
+          location confirmed inside that country. The tier ranks ahead of the corpus, so those rows
+          filled the list and pushed the country off the end.
+
+          Tested as a CLASS rather than for the one country reported: the defect is in the
+          predicate, so every country with confirmed locations inside it had it.
+        */
+        long companyId = insertCompany("Continental Corp");
+        /*
+          NINE PER COUNTRY, deliberately more than the suggestion limit of eight.
+
+          The list is scoped to the country being typed, so only that country's confirmed rows
+          compete for the eight seats. With three or four of them the country row still fits and
+          the test passes whether or not the bug is present - which an earlier version of this
+          test did, silently. Filling the limit is what reproduces the report.
+        */
+        String[][] confirmed = {
+            {"Canada", "Ontario", "Toronto"},
+            {"Canada", "Ontario", "Montreal"},
+            {"Canada", "Ontario", "Calgary"},
+            {"Canada", "Ontario", "Halifax"},
+            {"Canada", "Ontario", "Regina"},
+            {"Canada", "Ontario", "Victoria"},
+            {"Canada", "Ontario", "Windsor"},
+            {"Canada", "Ontario", "Kelowna"},
+            {"Canada", "Ontario", "Guelph"},
+            {"United States", "Alabama", "Birmingham"},
+            {"United States", "Alabama", "Phoenix"},
+            {"United States", "Alabama", "Fresno"},
+            {"United States", "Alabama", "Denver"},
+            {"United States", "Alabama", "Tampa"},
+            {"United States", "Alabama", "Atlanta"},
+            {"United States", "Alabama", "Boise"},
+            {"United States", "Alabama", "Peoria"},
+            {"United States", "Alabama", "Akron"},
+            {"United Kingdom", "England", "Leeds"},
+            {"United Kingdom", "England", "Glasgow"},
+            {"United Kingdom", "England", "Cardiff"},
+            {"United Kingdom", "England", "Bristol"},
+            {"United Kingdom", "England", "Norwich"},
+            {"United Kingdom", "England", "Dundee"},
+            {"United Kingdom", "England", "Swansea"},
+            {"United Kingdom", "England", "Exeter"},
+            {"United Kingdom", "England", "Hull"},
+            {"India", "Maharashtra", "Pune"},
+            {"India", "Maharashtra", "Mysore"},
+            {"India", "Maharashtra", "Surat"},
+            {"India", "Maharashtra", "Indore"},
+            {"India", "Maharashtra", "Kochi"},
+            {"India", "Maharashtra", "Nagpur"},
+            {"India", "Maharashtra", "Patna"},
+            {"India", "Maharashtra", "Bhopal"},
+            {"India", "Maharashtra", "Rajkot"},
+            {"Australia", "Victoria", "Geelong"},
+            {"Australia", "Victoria", "Cairns"},
+            {"Australia", "Victoria", "Hobart"},
+            {"Australia", "Victoria", "Darwin"},
+            {"Australia", "Victoria", "Newcastle"},
+            {"Australia", "Victoria", "Ballarat"},
+            {"Australia", "Victoria", "Bendigo"},
+            {"Australia", "Victoria", "Mackay"},
+            {"Australia", "Victoria", "Albury"},
+            {"Germany", "Bavaria", "Augsburg"},
+            {"Germany", "Bavaria", "Darmstadt"},
+            {"Germany", "Bavaria", "Leipzig"},
+            {"Germany", "Bavaria", "Bonn"},
+            {"Germany", "Bavaria", "Kassel"},
+            {"Germany", "Bavaria", "Erfurt"},
+            {"Germany", "Bavaria", "Mainz"},
+            {"Germany", "Bavaria", "Trier"},
+            {"Germany", "Bavaria", "Jena"},
+        };
+        for (String[] where : confirmed) insertManagerDeclaring(companyId, where[0], where[1], where[2]);
+
+        for (String country : new String[]{
+                "Canada", "United States", "United Kingdom", "India", "Australia", "Germany"}) {
+            JsonArray out = await(service.suggestCompanyLocations(
+                companyId, "Continental Corp", country, country, null));
+            boolean offered = false;
+            for (int i = 0; i < out.size(); i++) {
+                if (country.equalsIgnoreCase(out.getJsonObject(i).getString("label"))) offered = true;
+            }
+            assertTrue(offered,
+                "typing \"" + country + "\" did not offer " + country + " itself; the confirmed "
+                + "locations inside it crowded the list out: " + out.encode());
+        }
+    }
+
+    @Test
+    @DisplayName("a country-precision row with EMPTY STRING city and state still matches")
+    void emptyStringsCountAsAbsent() throws Exception {
+        /*
+          The same bug in the opposite direction, and the reason the predicate does not test
+          IS NULL.
+
+          At country precision the validator requires a country and checks nothing about state and
+          city, and no constraint forbids an empty string, so a client sending "" stores "". Such a
+          row IS a country-level answer somebody confirmed, and an IS NULL test would silently stop
+          offering it.
+        */
+        long companyId = insertCompany("Blankfield Ltd");
+        await(pool.preparedQuery("""
+                INSERT INTO managers (name, company, title, image, country, status, approval_status,
+                                      company_id, slug, declared_country, declared_state,
+                                      declared_city, declared_precision)
+                VALUES ('Blank Coarse', 'Blankfield Ltd', 'Manager', 'img', 'Japan', 'active',
+                        'approved', $1, 'm-blank-coarse', 'Japan', '', '   ', 'country')
+                """).execute(Tuple.of(companyId)));
+
+        JsonArray out = await(service.suggestCompanyLocations(
+            companyId, "Blankfield Ltd", "Japan", "Japan", null));
+        boolean offered = false;
+        for (int i = 0; i < out.size(); i++) {
+            if ("Japan".equalsIgnoreCase(out.getJsonObject(i).getString("label"))) offered = true;
+        }
+        assertTrue(offered,
+            "a country-precision row whose city and state are empty strings rather than NULL "
+            + "stopped being offered: " + out.encode());
+    }
+
+    @Test
+    @DisplayName("and searching a state or a city still finds the confirmed rows inside it")
+    void stateAndCitySearchStillWork() throws Exception {
+        /*
+          The guard against over-correcting. Narrowing the country match must not narrow the city
+          and state matches, which are the ones this tier exists for - they are how a location
+          somebody already confirmed gets reused instead of recreated.
+        */
+        long companyId = insertCompany("Continental Corp");
+        insertManagerDeclaring(companyId, "Canada", "Ontario", "Toronto");
+        insertManagerDeclaring(companyId, "Canada", "Quebec", "Montreal");
+
+        JsonArray byCity = await(service.suggestCompanyLocations(
+            companyId, "Continental Corp", "Toronto", "Canada", null));
+        assertTrue(countryLabels(byCity).stream().anyMatch(l -> l != null && l.startsWith("Toronto, Ontario")),
+            "a city search no longer finds the confirmed row: " + byCity.encode());
+
+        JsonArray byState = await(service.suggestCompanyLocations(
+            companyId, "Continental Corp", "Quebec", "Canada", null));
+        assertTrue(countryLabels(byState).stream().anyMatch(l -> l != null && l.contains("Quebec")),
+            "a state search no longer finds the confirmed row: " + byState.encode());
+    }
+
+    private static java.util.List<String> countryLabels(JsonArray out) {
+        java.util.List<String> names = new java.util.ArrayList<>();
+        for (int i = 0; i < out.size(); i++) names.add(out.getJsonObject(i).getString("label"));
+        return names;
+    }
+
+    private static void insertManagerDeclaring(long companyId, String country, String state,
+                                               String city) throws Exception {
+        await(pool.preparedQuery("""
+                INSERT INTO managers (name, company, title, image, country, status, approval_status,
+                                      company_id, slug, declared_country, declared_state,
+                                      declared_city, declared_precision)
+                VALUES ($1, 'Continental Corp', 'Manager', 'img', $2, 'active', 'approved',
+                        $3, $4, $5, $6, $7, 'city')
+                """).execute(Tuple.of("M " + city, country, companyId,
+                    "m-" + city.toLowerCase() + "-" + country.hashCode(), country, state, city)));
+    }
+
     private static JsonObject validCreateManagerBody(String name, String company, String title) {
         return new JsonObject()
             .put("name", name).put("company", company).put("title", title)

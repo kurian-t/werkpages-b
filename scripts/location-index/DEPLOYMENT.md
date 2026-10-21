@@ -62,9 +62,10 @@ anything older is rebuilt from source if it is ever wanted again.
 
 ## 3. Configuration
 
-Three environment variables per backend. All three are optional: with none of them set, every
-lookup falls through to the existing DuckDB path exactly as it does today, which is what makes the
-rollout safe to stage.
+### The index paths
+
+Three variables per backend, all optional. With none of them set every lookup falls through to the
+DuckDB path, which is what makes the rollout safe to stage and the rollback a variable deletion.
 
 ```
 LOCATION_GEOGRAPHY_INDEX=/var/lib/location-index/current/geography.sqlite
@@ -72,17 +73,59 @@ LOCATION_ROUTING_INDEX=/var/lib/location-index/current/routing.sqlite
 LOCATION_ADDRESS_INDEX_DIR=/var/lib/location-index/current/addresses
 ```
 
-Measured against the production candidate JVM and corpus settings:
+They require the release to be visible INSIDE the container, so the service also needs:
 
-```
-JAVA_TOOL_OPTIONS=-Xmx384m
-LOCAL_CORPUS_POOL=3
-LOCAL_CORPUS_THREADS=1
-LOCAL_CORPUS_MEMORY=384MB
+```yaml
+    volumes:
+      - /var/lib/location-index/current:/var/lib/location-index/current:ro
 ```
 
-A path that is set but missing is logged as a warning and the index is left inactive. A path that
-is absent is silent. Neither is ever reported to the reader as "this place does not exist".
+**Address coverage is Canada only.** `geography.sqlite` and `routing.sqlite` are worldwide;
+`addresses/` contains `CA.sqlite` and nothing else. A query naming a street in any other country
+returns no address suggestion, by construction, and that is reported through
+`addressCoverage()` rather than looking like a failure.
+
+### What production actually runs
+
+Taken from the live containers, not from a candidate plan:
+
+```
+APP_ENV=production
+USE_AWS_SECRETS=true
+JAVA_TOOL_OPTIONS=-XX:MaxRAMPercentage=50 -XX:MaxDirectMemorySize=192m -Xmx384m
+LOCATION_CORPUS_THREADS=4
+LOCATION_LOCAL_SEARCH=true
+LOCAL_CORPUS_COUNTRIES=2
+mem_limit=2g        (frontends 128m)
+```
+
+Two of these are easy to get wrong:
+
+* `LOCATION_CORPUS_THREADS` and `LOCAL_CORPUS_THREADS` are **different variables**. Production sets
+  the former to 4 and does not set the latter at all. An earlier version of this document named the
+  latter with a value of 1, which configures nothing production uses.
+* `LOCATION_LOCAL_SEARCH=true` with `LOCAL_CORPUS_COUNTRIES=2` materially changes which code path
+  serves a search. Any measurement taken without both set is not measuring production. That mistake
+  cost a release: 5ms measured locally, 2.3 seconds in production, because the configuration under
+  test did not exist on the host.
+
+### When an index is missing
+
+A path that is **blank** means "not using one" and is silent.
+
+A path that is **set and does not resolve** is logged at SEVERE, naming the path, the consequence,
+and this directory's `verify_indexes.sh`. That case means somebody intended to publish the index
+and the file is not there - a failed copy, a moved symlink, a replaced instance - and it degrades
+search while the application otherwise looks healthy.
+
+Startup always emits one summary line:
+
+```
+location index status: geography=active routing=active addresses=[CA]
+```
+
+Neither a missing index nor an unreachable one is ever reported to the reader as "this place does
+not exist".
 
 ---
 
@@ -96,7 +139,7 @@ REL=$(date -u +%Y-%m-%d)-v1
 OUT=/path/to/staging/$REL
 
 ./build_address_index.sh CA \
-    /home/noragrats/loc-corpus/CA/releases/20261015T141112Z-CA-1454538/payload.parquet \
+    <corpus-root>/CA/releases/<release>/payload.parquet \
     "$OUT/addresses"
 
 # geography.sqlite and routing.sqlite carry over unchanged when only addresses are rebuilt.

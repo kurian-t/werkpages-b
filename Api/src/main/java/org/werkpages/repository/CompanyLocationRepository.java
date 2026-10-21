@@ -90,9 +90,24 @@ public class CompanyLocationRepository {
                  WHERE m.declared_country IS NOT NULL
                    AND ($1::bigint IS NULL OR m.company_id = $1)
                    AND ($3::text IS NULL OR m.declared_country IS NOT DISTINCT FROM $3)
+                   -- A COUNTRY MATCH ONLY COUNTS FOR A COUNTRY-PRECISION ROW.
+                   --
+                   -- Matching declared_country on any row meant typing a country name matched
+                   -- EVERY location confirmed inside it. Typing "United States" returned Alabama,
+                   -- Arizona, California, Colorado, Connecticut, Florida - alphabetical, eight of
+                   -- them, all labelled "<state>, United States" - and because this tier ranks
+                   -- ahead of the corpus, the United States itself was pushed off the end of the
+                   -- list. The country could not be selected by typing its own name.
+                   --
+                   -- A row whose city or state matches is genuine evidence it answers the query.
+                   -- A row that merely sits in the country is not. A row that IS the country -
+                   -- no city, no state - still matches, so a coarse location somebody already
+                   -- confirmed keeps being offered.
                    AND (LOWER(COALESCE(m.declared_city,''))  LIKE $2
                         OR LOWER(COALESCE(m.declared_state,'')) LIKE $2
-                        OR LOWER(COALESCE(m.declared_country,'')) LIKE $2)
+                        OR (NULLIF(TRIM(COALESCE(m.declared_city,  '')), '') IS NULL
+                            AND NULLIF(TRIM(COALESCE(m.declared_state, '')), '') IS NULL
+                            AND LOWER(COALESCE(m.declared_country,'')) LIKE $2))
 
                 -- The corpus tiers that used to sit here - real-world places and the geography
                 -- distilled from them - are gone from this query on purpose. They are not Postgres
