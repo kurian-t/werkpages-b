@@ -56,16 +56,40 @@ public class InterviewRepository {
                               String author,
                               LocalDate interviewedFrom, LocalDate interviewedUntil,
                               DeclaredLocation declared) {
-        return db.preparedQuery("""
+        return create(db, companyId, userId, overall, communication, respectForTime, roleClarity,
+                      processFairness, nextStepTransparency, jobRelevance, difficulty, outcome,
+                      rounds, processLength, roleCategory, country, city, interviewYear, author,
+                      interviewedFrom, interviewedUntil, declared, null);
+    }
+
+    /**
+     * The same insert, on a caller's connection, and able to mark the captured form it came from.
+     *
+     * <p>{@code draftToken} is set only on an anonymous publication from the admin queue, never on
+     * somebody's own signed-in submission: it is the identity of a publication, and the author's
+     * later return finds and removes the row holding it.
+     */
+    public Future<Row> create(SqlClient executor,
+                              long companyId, UUID userId, BigDecimal overall,
+                              BigDecimal communication, BigDecimal respectForTime,
+                              BigDecimal roleClarity, BigDecimal processFairness,
+                              BigDecimal nextStepTransparency, BigDecimal jobRelevance,
+                              Integer difficulty,
+                              String outcome, Integer rounds, String processLength,
+                              String roleCategory, String country, String city, int interviewYear,
+                              String author,
+                              LocalDate interviewedFrom, LocalDate interviewedUntil,
+                              DeclaredLocation declared, UUID draftToken) {
+        return executor.preparedQuery("""
                 INSERT INTO interview_reviews
                     (company_id, user_id, overall_rating, communication, respect_for_time,
                      role_clarity, process_fairness, next_step_transparency, job_relevance,
                      difficulty, outcome, rounds, process_length, role_category, country, city,
                      interview_year, author, interviewed_from, interviewed_until,
                      declared_country, declared_state, declared_city, declared_precision,
-                     company_location_id, declared_source, declared_text)
+                     company_location_id, declared_source, declared_text, draft_token)
                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,
-                        $21,$22,$23,$24,$25,$26,$27)
+                        $21,$22,$23,$24,$25,$26,$27,$28)
                 RETURNING *
                 """)
             .execute(Tuple.of(companyId, userId, overall, communication, respectForTime,
@@ -77,7 +101,7 @@ public class InterviewRepository {
                               // Kept so an answer somebody typed - because the corpus had no such
                               // place, or could not be reached - survives the insert as their own
                               // unverified words rather than vanishing.
-                              declared.source(), declared.text()))
+                              declared.source(), declared.text(), draftToken))
             .map(rs -> rs.iterator().next());
     }
 
@@ -114,13 +138,18 @@ public class InterviewRepository {
     }
 
     public Future<Void> insertRounds(UUID reviewId, List<String> roundTypes) {
+        return insertRounds(db, reviewId, roundTypes);
+    }
+
+    /** The same batch, on a caller's connection, so a publication writes its rounds atomically. */
+    public Future<Void> insertRounds(SqlClient executor, UUID reviewId, List<String> roundTypes) {
         if (roundTypes == null || roundTypes.isEmpty()) return Future.succeededFuture();
 
         List<Tuple> batch = new ArrayList<>();
         for (int i = 0; i < roundTypes.size(); i++) {
             batch.add(Tuple.of(reviewId, i + 1, roundTypes.get(i)));
         }
-        return db.preparedQuery("""
+        return executor.preparedQuery("""
                 INSERT INTO interview_review_rounds (interview_review_id, round_number, round_type)
                 VALUES ($1, $2, $3)
                 """)
@@ -198,6 +227,32 @@ public class InterviewRepository {
                 : Optional.empty());
     }
 
+    /**
+     * Removes the anonymous publication of a captured form, because its author has just written
+     * the real one.
+     *
+     * <p>A hard delete, matching the manager path: this is not a withdrawal, it is the same
+     * experience being replaced by the signed-in version of itself. A soft delete would hold the
+     * token for three days and then have the restore sweep bring a duplicate back.
+     *
+     * <p>Only a live anonymous row, so a real person's review can never be destroyed by a token
+     * collision and a publication a moderator removed stays removed.
+     *
+     * @return the company whose averages changed, if anything was removed
+     */
+    public Future<Optional<Long>> deleteAnonymousByToken(SqlClient conn, UUID draftToken) {
+        if (draftToken == null) return Future.succeededFuture(Optional.empty());
+        return conn.preparedQuery("""
+                DELETE FROM interview_reviews
+                 WHERE draft_token = $1 AND user_id IS NULL AND deleted_at IS NULL
+                RETURNING company_id
+                """)
+            .execute(Tuple.of(draftToken))
+            .map(rs -> rs.iterator().hasNext()
+                ? Optional.of(rs.iterator().next().getLong("company_id"))
+                : Optional.empty());
+    }
+
     /** Records a deletion so the same person cannot immediately replace what will come back. */
     public Future<Void> recordDeletion(UUID userId, long companyId) {
         return db.preparedQuery(
@@ -212,11 +267,24 @@ public class InterviewRepository {
      * <p>Three days, the same window manager reviews use: long enough that a deletion made in
      * anger is genuinely gone from the page, short enough that a company cannot rely on pressure
      * to permanently remove feedback.
+     *
+     * <p><b>A moderator's deletion is never restored</b>, which is what {@code deleted_reason}
+     * distinguishes: a reason means somebody decided, no reason means the author withdrew. This
+     * method existed for a long time with nothing calling it, so a withdrawn interview experience
+     * never actually came back. Wiring it into the sweep without this test would have been worse
+     * than leaving it dead: it would resurrect whatever an admin had removed, live and counting
+     * toward the company's averages, with nothing on the page to show it had been actioned.
+     *
+     * <p>Returns a count rather than the companies it touched, unlike the workplace-rating
+     * equivalent. Nothing needs the ids: the projection follows this UPDATE through V89's trigger,
+     * so there is no recompute for a caller to drive, and the sweep only reports how many came
+     * back.
      */
     public Future<Integer> restoreExpiredDeletions() {
         return db.preparedQuery("""
                 UPDATE interview_reviews SET deleted_at = NULL
                 WHERE deleted_at IS NOT NULL AND deleted_at < now() - INTERVAL '3 days'
+                  AND deleted_reason IS NULL
                 """)
             .execute()
             .map(RowSet::rowCount);

@@ -36,6 +36,17 @@ public class AdminService {
     /* Stateless, and constructed in place like the other collaborators here. */
     private final ReviewDisposition reviewDisposition = new ReviewDisposition();
     private final CapturedDraftRepository capturedDrafts;
+    /**
+     * The two services that own the tables a captured draft can become.
+     *
+     * <p>Publishing one writes a real rating, and the rules for a real rating live with the form
+     * that normally produces it. Reimplementing them here is how an admin path ends up accepting
+     * something the public path would refuse, which for these tables means public data nothing can
+     * repair. Guarded like the repositories below: several constructors are used by unit tests
+     * with no client at all.
+     */
+    private final CompanyReviewService companyRatings;
+    private final InterviewService     interviewReviews;
 
     private final UserRepository              userRepo;
     private final ManagerRepository           managerRepo;
@@ -88,6 +99,11 @@ public class AdminService {
         this.confidenceRepo = db == null ? null : new ConfidenceRepository(db);
         // Guarded for the same reason as the two above.
         this.capturedDrafts = db == null ? null : new CapturedDraftRepository(db);
+        boolean canPublish = db != null && companyRepo != null && userRepo != null;
+        this.companyRatings = !canPublish ? null : new CompanyReviewService(
+            new org.werkpages.repository.CompanyReviewRepository(db), companyRepo, userRepo);
+        this.interviewReviews = !canPublish ? null : new InterviewService(
+            new org.werkpages.repository.InterviewRepository(db), companyRepo, userRepo);
     }
 
     // ── Guard: verify admin ───────────────────────────────────────────────────
@@ -1679,8 +1695,35 @@ public class AdminService {
                 Future<Long> companyIdFuture = resolveCompanyForCareerEntry(
                     pickedCompanyId, company, pickedLogoUrl);
                 return companyIdFuture.compose(companyId ->
-                    managerRepo.updateCareerEntry(entryId, managerId, company.trim(), title.trim(),
-                                                  finalStart, finalEnd, companyId)
+                    /*
+                      THE RATINGS FOLLOW THE CORRECTION.
+
+                      A rating snapshots the company and title it was written about, and the career
+                      trajectory groups by that pair. Updating career_history alone therefore split
+                      the trajectory in two - the corrected entry with no ratings, and the ratings
+                      still filed under the old wording - which reads as "the edit did not save",
+                      and no amount of re-editing fixed it.
+
+                      Read FIRST, because the old pair is what identifies the ratings to move and
+                      the update is about to overwrite it. An entry that has vanished between the
+                      two calls simply moves nothing: the update below will report zero rows and
+                      the caller learns the truth either way.
+                    */
+                    managerRepo.findCareerEntry(entryId, managerId).compose(before ->
+                        managerRepo.updateCareerEntry(entryId, managerId, company.trim(), title.trim(),
+                                                      finalStart, finalEnd, companyId)
+                            .compose(count -> {
+                                if (before.isEmpty()) return Future.succeededFuture(count);
+                                String wasCompany = before.get().getString("company");
+                                String wasTitle   = before.get().getString("title");
+                                if (wasCompany == null || wasTitle == null) {
+                                    return Future.succeededFuture(count);
+                                }
+                                return managerRepo.moveReviewsBetweenRoles(
+                                        managerId, wasCompany, wasTitle,
+                                        company.trim(), title.trim())
+                                    .map(moved -> count);
+                            }))
                         /*
                           The headline follows the roles. This wrote career_history and stopped, so
                           the Edit button on the career trajectory could move a manager's current
@@ -1813,6 +1856,9 @@ public class AdminService {
             .map(cf -> {
                 JsonArray out = new JsonArray();
                 for (Row row : cf.<RowSet<Row>>resultAt(0)) {
+                    // Decided once per row: the validator is pure, but running it twice to answer
+                    // the same question invites the two answers to disagree.
+                    Optional<String> blocked = publicationBlocker(row);
                     out.add(new JsonObject()
                         .put("id",          row.getLong("id"))
                         .put("kind",        row.getString("kind"))
@@ -1823,7 +1869,16 @@ public class AdminService {
                         .put("managerId",   row.getLong("manager_id"))
                         .put("managerName", row.getString("manager_name"))
                         .put("author",      row.getString("author_username"))
-                        .put("createdAt",   row.getOffsetDateTime("created_at").toString()));
+                        .put("createdAt",   row.getOffsetDateTime("created_at").toString())
+                        /*
+                          Whether this one could be published, decided by the SAME validator the
+                          public form runs, so the panel cannot offer a button that then fails or
+                          withhold one from a draft that would have worked. The reason travels too:
+                          an admin looking at a half-finished rating should be able to see which
+                          answer is missing without opening the payload.
+                        */
+                        .put("publishable", blocked.isEmpty())
+                        .put("blockedReason", blocked.orElse(null)));
                 }
                 return new JsonObject()
                     .put("data", out)
@@ -1832,11 +1887,127 @@ public class AdminService {
             });
     }
 
-    /** Marks one draft dealt with. Kept rather than deleted, so the queue can be audited. */
+    /** Marks one draft read and not published. Kept rather than deleted, so it can be audited. */
     public Future<JsonObject> markDraftReviewed(String auth0Id, long draftId) {
         return requireAdmin(auth0Id)
-            .compose(adminId -> capturedDrafts.markReviewed(draftId))
+            .compose(adminId -> capturedDrafts.dismiss(draftId, adminId))
             .map(done -> new JsonObject().put("success", done));
+    }
+
+    /**
+     * Why a captured draft cannot be published, or empty when it can be.
+     *
+     * <p>Delegates to the owning form's own validator. A draft of a kind nothing can publish
+     * reports that plainly rather than appearing publishable and failing later.
+     */
+    private static Optional<String> publicationBlocker(Row draftRow) {
+        JsonObject payload = draftRow.getJsonObject("payload");
+        if (payload == null) return Optional.of("This draft holds no answers.");
+        if (draftRow.getLong("company_id") == null) {
+            /*
+              A capture can arrive with no company: the form names one that does not exist yet,
+              and the daily company-creation cap deliberately lets the capture through with
+              company_id null rather than losing the answers. There is nothing to attach a rating
+              to, and creating the company here would be an admin walking around that cap.
+            */
+            return Optional.of("The company this was about was never created.");
+        }
+        return switch (draftRow.getString("kind")) {
+            case CapturedDraftRepository.COMPANY_RATING -> CompanyReviewService.publicationBlocker(payload);
+            case CapturedDraftRepository.INTERVIEW      -> InterviewService.publicationBlocker(payload);
+            default -> Optional.of("This kind of draft cannot be published.");
+        };
+    }
+
+    /**
+     * Turns a complete captured form into a real, anonymous rating.
+     *
+     * <p>The ending the manager forms have always had. A manager rating dropped off at the
+     * sign-in wall becomes a real {@code reviews} row with {@code user_id} null straight away, and
+     * an admin publishes it by approving the manager it is about. A workplace rating or an
+     * interview experience had no equivalent: it sat in this queue, readable and unpublishable,
+     * however complete it was.
+     *
+     * <h2>One transaction, and what each part of it is for</h2>
+     *
+     * <ol>
+     *   <li><b>the draft row is locked</b>, which is what serialises this against its author
+     *       returning to submit the same form while an admin is looking at it. Both writers decide
+     *       the same question and share no other row;
+     *   <li><b>the completeness check runs the public validator</b>, so nothing reaches a public
+     *       aggregate that the form itself would have refused;
+     *   <li><b>the rating is written</b> with no user attached;
+     *   <li><b>the draft is resolved</b> as published, naming the rating it became, so a second
+     *       admin cannot publish it again and the queue can account for what it created;
+     *   <li><b>siblings are retired.</b> The capture path inserts a fresh row every time somebody
+     *       is bounced, so one form can hold several drafts. Without this the duplicates stay in
+     *       the queue and the next publish attempt is refused by the unique index rather than by
+     *       anything an admin can understand.
+     * </ol>
+     *
+     * <p>Any failure rolls back all of it. A published rating whose draft is still queued is the
+     * one state that produces a duplicate, so it cannot be a state this method can end in.
+     */
+    public Future<JsonObject> publishCapturedDraft(String auth0Id, long draftId) {
+        if (db == null || companyRatings == null || interviewReviews == null) {
+            return Future.failedFuture(ServiceException.forbidden("DB not configured"));
+        }
+        return requireAdmin(auth0Id).compose(adminId ->
+            ((io.vertx.sqlclient.Pool) db).withTransaction(conn ->
+                capturedDrafts.findForPublication(conn, draftId).compose(opt -> {
+                    if (opt.isEmpty()) {
+                        return Future.failedFuture(ServiceException.notFound("Draft not found"));
+                    }
+                    Row draft = opt.get();
+                    if (draft.getOffsetDateTime("reviewed_at") != null) {
+                        /*
+                          Already dealt with, by another admin or by its author coming back. A
+                          conflict rather than a 404: the draft exists, and saying so is how the
+                          panel can refresh and show what happened to it instead of claiming the
+                          row is gone.
+                        */
+                        return Future.failedFuture(ServiceException.conflict("draft_already_resolved"));
+                    }
+                    Optional<String> blocked = publicationBlocker(draft);
+                    if (blocked.isPresent()) {
+                        return Future.failedFuture(ServiceException.badRequest(blocked.get()));
+                    }
+
+                    long companyId   = draft.getLong("company_id");
+                    JsonObject payload = draft.getJsonObject("payload");
+                    UUID draftToken  = draft.getUUID("draft_token");
+                    String kind      = draft.getString("kind");
+
+                    /*
+                      Dispatched on the kind explicitly, with no fallback. The blocker above
+                      already refuses any other kind, so this is the second lock on the same door:
+                      a future edit that loosens the blocker must not quietly start publishing an
+                      unknown kind of draft as a workplace rating.
+                    */
+                    Future<Row> written = switch (kind) {
+                        case CapturedDraftRepository.COMPANY_RATING ->
+                            companyRatings.publishAnonymously(conn, companyId, payload, draftToken);
+                        case CapturedDraftRepository.INTERVIEW ->
+                            interviewReviews.publishAnonymously(conn, companyId, payload, draftToken);
+                        default -> Future.failedFuture(
+                            ServiceException.badRequest("This kind of draft cannot be published."));
+                    };
+
+                    return written.compose(row -> {
+                        UUID ratingId = row.getUUID("id");
+                        return capturedDrafts.resolve(conn, draftId,
+                                    CapturedDraftRepository.PUBLISHED, ratingId, adminId)
+                            .compose(done -> done
+                                ? Future.succeededFuture()
+                                : Future.failedFuture(ServiceException.conflict("draft_already_resolved")))
+                            .compose(v -> capturedDrafts.supersedeSiblings(conn, draftToken, draftId, ratingId))
+                            .map(v -> new JsonObject()
+                                .put("success", true)
+                                .put("kind", kind)
+                                .put("ratingId", ratingId.toString())
+                                .put("companyId", companyId));
+                    });
+                })));
     }
 
     public Future<JsonObject> getCountryStats(String auth0Id) {

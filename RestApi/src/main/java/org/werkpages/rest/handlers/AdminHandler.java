@@ -149,6 +149,30 @@ public class AdminHandler {
             .onFailure(err -> ManagersHandler.handleError(ctx, err));
     }
 
+    // ── POST /api/admin/captured-drafts/:draftId/publish ─────────────────────
+
+    /**
+     * Publishes a complete captured draft as a real rating belonging to nobody.
+     *
+     * <p>Error handling is the shared one, so the service's own message reaches the panel: a
+     * refusal here says which answer the form is missing, and replacing that with a generic 400
+     * would leave an admin looking at a button that does not work and no way to find out why.
+     */
+    public void handlePublishDraft(RoutingContext ctx) {
+        String auth0Id = ctx.get("auth0Id");
+        long draftId;
+        try {
+            draftId = Long.parseLong(ctx.pathParam("draftId"));
+        } catch (NumberFormatException e) {
+            ctx.response().setStatusCode(400).putHeader("Content-Type", "application/json")
+               .end(new JsonObject().put("error", "Invalid draft id").encode());
+            return;
+        }
+        service.publishCapturedDraft(auth0Id, draftId)
+            .onSuccess(json -> ok(ctx, json))
+            .onFailure(err -> ManagersHandler.handleError(ctx, err));
+    }
+
     // ── GET /api/admin/ghost-managers ────────────────────────────────────────
 
     /**

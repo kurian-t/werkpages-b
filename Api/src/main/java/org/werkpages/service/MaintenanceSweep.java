@@ -9,6 +9,7 @@ import org.werkpages.repository.ConfidenceRepository;
 import org.werkpages.repository.ManagerRepository;
 import org.werkpages.repository.ProofChallengeRepository;
 import org.werkpages.repository.ReviewRepository;
+import java.util.List;
 
 /**
  * The once-a-day housekeeping, in one callable place.
@@ -51,6 +52,8 @@ public class MaintenanceSweep {
      * step uses. Null simply means that step does not run.
      */
     private CompanyReviewRepository companyReviewRepo;
+    /** Optional, set after construction, for the same reason as {@link #companyReviewRepo}. */
+    private org.werkpages.repository.InterviewRepository interviewRepo;
     private final ProofChallengeRepository proofChallengeRepo;
     private final ConfidenceRepository     confidenceRepo;
 
@@ -130,14 +133,23 @@ public class MaintenanceSweep {
         return this;
     }
 
+    /** Wires in the interview restore. Chainable, like {@code withCompanyReviews}. */
+    public MaintenanceSweep withInterviews(org.werkpages.repository.InterviewRepository repo) {
+        this.interviewRepo = repo;
+        return this;
+    }
+
     public Future<Void> runOnce() {
-        return Future.join(
+        // A List rather than the varargs form: Future.join tops out at six, and the seventh step
+        // is a compile error that reads as though the method does not exist.
+        return Future.join(List.of(
                 restoreExpiredDeletions(),
                 restoreExpiredCompanyDeletions(),
+                restoreExpiredInterviewDeletions(),
                 ageOutAbandonedChallenges(),
                 awardStandingCredit(),
                 refreshExpiredPlaceholders(),
-                resolveBrands())
+                resolveBrands()))
             .mapEmpty();
     }
 
@@ -458,6 +470,33 @@ public class MaintenanceSweep {
                 return Future.<Void>succeededFuture();
             })
             .onFailure(err -> System.err.println("⚠ Workplace rating restore job failed: " + err.getMessage()))
+            .otherwiseEmpty()
+            .mapEmpty();
+    }
+
+    /**
+     * Withdrawn interview experiences resurface as anonymous once their window has passed.
+     *
+     * <p><b>This step did not exist.</b> {@code InterviewRepository.restoreExpiredDeletions} was
+     * written, documented and never called, so for every release since V52 a withdrawn interview
+     * experience was gone permanently while a withdrawn manager rating and a withdrawn workplace
+     * rating both came back after three days. The three forms are meant to behave identically on
+     * deletion and two of them did.
+     *
+     * <p>Only safe alongside V96, which gave the table {@code deleted_reason}. A sweep that cannot
+     * tell an author's withdrawal from a moderator's removal would resurrect whatever an admin had
+     * taken down, counting toward the company's averages again, which is worse than not sweeping.
+     *
+     * <p>No stats pass needed: clearing {@code deleted_at} is triggered, so each company was
+     * recomputed as its rows came back (V89, V93).
+     */
+    private Future<Void> restoreExpiredInterviewDeletions() {
+        if (interviewRepo == null) return Future.succeededFuture();
+        return interviewRepo.restoreExpiredDeletions()
+            .onSuccess(n -> {
+                if (n > 0) System.out.println("\u2713 Restored " + n + " anonymised interview experience(s)");
+            })
+            .onFailure(err -> System.err.println("\u26a0 Interview restore job failed: " + err.getMessage()))
             .otherwiseEmpty()
             .mapEmpty();
     }

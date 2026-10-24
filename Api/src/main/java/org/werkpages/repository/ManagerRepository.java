@@ -897,6 +897,63 @@ public class ManagerRepository {
      * COALESCE so a caller that could not resolve an id leaves the existing one alone rather than
      * nulling it.
      */
+    /**
+     * One career entry's current company and title, read before it is changed.
+     *
+     * <p>Needed because the ratings that belong to a role are found by matching their snapshotted
+     * company and title against it. Once the row is updated the old pair is gone, so there is
+     * nothing left to match and the ratings are stranded under a title nobody can reach.
+     */
+    public Future<java.util.Optional<Row>> findCareerEntry(long entryId, long managerId) {
+        return db.preparedQuery(
+                "SELECT company, title FROM career_history WHERE id = $1 AND manager_id = $2")
+            .execute(Tuple.of(entryId, managerId))
+            .map(rows -> rows.size() == 0
+                ? java.util.Optional.<Row>empty()
+                : java.util.Optional.of(rows.iterator().next()));
+    }
+
+    /**
+     * Moves the ratings recorded under one role name to another, for one manager.
+     *
+     * <h2>Why this is needed at all</h2>
+     *
+     * <p>A rating snapshots the company and title it was written about, and the career trajectory
+     * groups by that pair. So correcting a role's title in {@code career_history} alone splits the
+     * trajectory in two: the corrected entry with no ratings, and the ratings still filed under
+     * the old wording. To an admin it looks as though the edit did not save.
+     *
+     * <h2>Why rewriting a snapshot is right HERE and nowhere else</h2>
+     *
+     * <p>Snapshots exist so that a manager later changing jobs never rewrites where an opinion was
+     * formed. This is not that: an administrator editing the role is asserting what the role was
+     * actually called, which is the one case where the stored wording is the thing being
+     * corrected. It is driven by an explicit human decision about one entry, not by a side effect
+     * of the manager moving.
+     *
+     * <p>Matched on the same normalisation the trajectory groups by - whitespace stripped from the
+     * company, collapsed in the title, both lower-cased - so exactly the ratings that were showing
+     * under the old name are the ones that move, and no more.
+     *
+     * <p>Soft-deleted ratings move too. They are invisible today, but one that is later restored
+     * would otherwise reappear under a title that no longer exists anywhere.
+     */
+    public Future<Integer> moveReviewsBetweenRoles(long managerId,
+                                                   String fromCompany, String fromTitle,
+                                                   String toCompany, String toTitle) {
+        return db.preparedQuery("""
+                UPDATE reviews
+                   SET manager_company = $4, manager_title = $5
+                 WHERE manager_id = $1
+                   AND REGEXP_REPLACE(LOWER(TRIM(manager_company)), '\\s+', '', 'g')
+                     = REGEXP_REPLACE(LOWER(TRIM($2::text)), '\\s+', '', 'g')
+                   AND REGEXP_REPLACE(LOWER(TRIM(manager_title)), '\\s+', ' ', 'g')
+                     = REGEXP_REPLACE(LOWER(TRIM($3::text)), '\\s+', ' ', 'g')
+                """)
+            .execute(Tuple.of(managerId, fromCompany, fromTitle, toCompany, toTitle))
+            .map(RowSet::rowCount);
+    }
+
     public Future<Integer> updateCareerEntry(long entryId, long managerId, String company, String title,
                                               OffsetDateTime startDate, OffsetDateTime endDate,
                                               Long companyId) {

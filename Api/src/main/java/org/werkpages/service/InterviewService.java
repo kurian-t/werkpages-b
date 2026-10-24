@@ -104,6 +104,94 @@ public class InterviewService {
                 .map(v -> new JsonObject().put("captured", true)));
     }
 
+    /**
+     * Writes this person's own interview experience, and retires the captured form it came from.
+     *
+     * <p>One transaction, because four things have to agree about one submission: the review, its
+     * rounds, the anonymous publication of the same form if an admin published it from the queue
+     * while this person was away, and the captured draft itself.
+     *
+     * <p><b>The lock comes first.</b> An admin publishing the draft is a concurrent transaction
+     * deciding the same question, and the two share no other row, so without it both can read
+     * "nothing published yet" and the company ends up holding the same experience twice. Delete
+     * and insert together also mean the anonymous row cannot be removed unless the replacement
+     * commits.
+     *
+     * <p>The rounds moved inside the transaction with everything else. They were written on the
+     * pool after the review, so a failure between the two left a review claiming a process shape
+     * that no rounds described.
+     */
+    private Future<Row> writeOwnReview(long companyId, UUID userId, Draft draft,
+                                       DeclaredLocation declared, UUID draftToken) {
+        return ((io.vertx.sqlclient.Pool) interviewRepo.client()).withTransaction(conn ->
+            drafts.lockByToken(conn, draftToken)
+                .compose(v -> interviewRepo.create(conn, companyId, userId,
+                        draft.overall, draft.communication, draft.respectForTime, draft.roleClarity,
+                        draft.processFairness, draft.nextStepTransparency, draft.jobRelevance,
+                        draft.difficulty, draft.outcome, draft.roundCount(), draft.processLength,
+                        draft.roleCategory, draft.country, draft.city, draft.interviewYear,
+                        draft.author, draft.interviewedFrom, draft.interviewedUntil, declared, null))
+                .compose(row -> interviewRepo.insertRounds(conn, row.getUUID("id"), draft.rounds)
+                    .map(ignored -> row))
+                .compose(row -> interviewRepo.deleteAnonymousByToken(conn, draftToken).map(v -> row))
+                .compose(row -> drafts.clear(conn, draftToken).map(v -> row))
+                .compose(row -> drafts.repointPublished(conn, draftToken, row.getUUID("id"))
+                    .map(v -> row)));
+    }
+
+    /**
+     * Publishes a captured form as a real interview experience belonging to nobody.
+     *
+     * <p>Called by the admin queue, inside a transaction that also resolves the draft, so a review
+     * can never exist with its draft still queued for somebody else to publish again.
+     *
+     * <p><b>user_id null, by design</b>, the same shape a manager rating dropped off at the
+     * sign-in wall has always had and the same shape every withdrawn review takes after three
+     * days: the experience survives, the link to a person does not.
+     *
+     * <p>The account-scoped rules are not applied and cannot be. One experience per person per
+     * company per year, the daily cap and the cooldown are all questions about an account, and
+     * there is no account here. The unique index on {@code draft_token} stands in their place and
+     * enforces the rule that still means something: one published review per captured form.
+     */
+    public Future<Row> publishAnonymously(io.vertx.sqlclient.SqlClient conn, long companyId,
+                                          JsonObject payload, UUID draftToken) {
+        Draft draft;
+        try {
+            draft = parseDraft(payload);
+        } catch (RuntimeException e) {
+            return Future.failedFuture(e);
+        }
+        return declaredLocations.resolve(conn,
+                DeclaredLocation.fromBody(payload),
+                CorpusPlace.fromBody(payload), companyId)
+            .compose(declared -> interviewRepo.create(conn, companyId, null,
+                    draft.overall, draft.communication, draft.respectForTime, draft.roleClarity,
+                    draft.processFairness, draft.nextStepTransparency, draft.jobRelevance,
+                    draft.difficulty, draft.outcome, draft.roundCount(), draft.processLength,
+                    draft.roleCategory, draft.country, draft.city, draft.interviewYear,
+                    draft.author, draft.interviewedFrom, draft.interviewedUntil, declared, draftToken))
+            .compose(row -> interviewRepo.insertRounds(conn, row.getUUID("id"), draft.rounds)
+                .map(ignored -> row));
+    }
+
+    /**
+     * Why this captured form cannot be published, or empty when it can be.
+     *
+     * <p>Runs the real parser rather than a lookalike, so the queue cannot offer a Publish button
+     * that then fails, and cannot withhold one from a draft that would have worked.
+     */
+    public static java.util.Optional<String> publicationBlocker(JsonObject payload) {
+        try {
+            parseDraft(payload);
+            return java.util.Optional.empty();
+        } catch (RuntimeException e) {
+            String message = e.getMessage();
+            return java.util.Optional.of(message == null || message.isBlank()
+                ? "This draft is incomplete." : message);
+        }
+    }
+
     private static UUID parseDraftToken(String raw) {
         if (raw == null || raw.isBlank()) return null;
         try { return UUID.fromString(raw.trim()); } catch (IllegalArgumentException e) { return null; }
@@ -145,22 +233,9 @@ public class InterviewService {
                                 // choice worked when EDITING an interview and failed when creating
                                 // one, which is how the two drifted apart unnoticed.
                                 CorpusPlace.fromBody(body), companyId)
-                            .compose(declared ->
-                        interviewRepo.create(companyId, userId, draft.overall, draft.communication,
-                            draft.respectForTime, draft.roleClarity, draft.processFairness,
-                            draft.nextStepTransparency, draft.jobRelevance, draft.difficulty, draft.outcome,
-                            draft.roundCount(), draft.processLength, draft.roleCategory,
-                            draft.country, draft.city, draft.interviewYear, draft.author,
-                            draft.interviewedFrom, draft.interviewedUntil, declared));
+                            .compose(declared -> writeOwnReview(companyId, userId, draft, declared,
+                                    parseDraftToken(body.getString("draftToken"))));
                     })
-                    .compose(row -> interviewRepo
-                        .insertRounds(row.getUUID("id"), draft.rounds)
-                        .map(ignored -> row))
-                    // The draft this came from is finished work now, not a queue item. Clearing it
-                    // here means an admin never opens one whose author came back and completed it.
-                    .compose(row -> drafts.clear(interviewRepo.client(),
-                                                 parseDraftToken(body.getString("draftToken")))
-                        .map(v -> row))
                     /*
                       The company's read-model row is recomputed as part of this write.
 

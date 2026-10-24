@@ -2769,6 +2769,13 @@ paths:
                         managerName: { type: string, nullable: true }
                         author:      { type: string, nullable: true }
                         createdAt:   { type: string }
+                        publishable: { type: boolean }
+                        blockedReason:
+                          type: string
+                          nullable: true
+                          description: >-
+                            Why this draft cannot be published, from the same validator the public
+                            form runs. Null when it can be.
                   total:  { type: integer }
                   limit:  { type: integer }
                   offset: { type: integer }
@@ -2798,6 +2805,43 @@ paths:
                   success: { type: boolean }
         '403':
           description: Not an admin
+
+  /api/admin/captured-drafts/{draftId}/publish:
+    post:
+      operationId: publishCapturedDraft
+      summary: Publish a complete captured draft as a real anonymous rating
+      description: >-
+        Writes the draft as an ordinary rating with no user attached, which is the ending a manager
+        rating dropped off at the sign-in wall has always had. Refused when the draft is already
+        resolved, or when the form it holds would not pass the validation the public submit path
+        applies.
+      tags:
+        - Admin
+      parameters:
+        - in: path
+          name: draftId
+          required: true
+          schema: { type: integer, format: int64 }
+      responses:
+        '200':
+          description: Published
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:   { type: boolean }
+                  kind:      { type: string }
+                  ratingId:  { type: string, format: uuid }
+                  companyId: { type: integer, format: int64 }
+        '400':
+          description: The draft is incomplete, and the message says what is missing
+        '403':
+          description: Not an admin
+        '404':
+          description: No such draft
+        '409':
+          description: Already published, dismissed, or submitted by its author
 
   /api/admin/ghost-managers:
     get:

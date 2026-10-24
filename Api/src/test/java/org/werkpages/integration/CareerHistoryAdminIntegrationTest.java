@@ -13,6 +13,7 @@ import org.flywaydb.core.Flyway;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.werkpages.repository.CompanyRepository;
 import org.werkpages.repository.EditRepository;
@@ -550,6 +551,52 @@ class CareerHistoryAdminIntegrationTest {
         assertNotNull(segment, "the past role must still appear on the trajectory");
         assertEquals("https://logo.test/lime-picked.png", segment.getString("logo_url"),
             "the logo the admin picked must reach the tile - a past company is not an exception");
+    }
+
+    @Test
+    @DisplayName("correcting a role's title keeps its ratings attached to it")
+    void correctingATitleCarriesItsRatings() throws Exception {
+        /*
+          REPORTED FROM THE ADMIN UI: "I click edit, change the title, and the new title does not
+          stick."
+
+          It did stick - in career_history. What the reader saw was the career trajectory, which
+          groups a role by the company and title SNAPSHOTTED ON EACH RATING. Updating
+          career_history alone broke that match, so the trajectory split in two: the corrected
+          entry with no ratings, and the rating still filed under the old wording next to it. The
+          old title was still on screen beside the only rating, so the edit looked ignored.
+
+          An administrator editing a role is asserting what the role was actually called, which is
+          the one case where the stored wording is the thing being corrected - so the ratings move
+          with it. That is deliberately narrow: nothing else rewrites a snapshot, because a manager
+          later changing jobs must never rewrite where an opinion was formed.
+        */
+        String adminAuth = insertUser("auth0|ch-retitle", "ChRetitle", "admin");
+        long managerId   = insertManager("Dana Retitle", "Best Buy", "Manager, CDS Operations");
+        long entryId     = insertCareerEntry(managerId, "Best Buy", "Manager, CDS Operations", "2014");
+        await(pool.preparedQuery(
+                "INSERT INTO reviews(manager_id, author, overall_rating, manager_company, manager_title, "
+              + "worked_from, worked_until, created_at, updated_at) "
+              + "VALUES ($1,'Someone',3.4,'Best Buy','Manager, CDS Operations','2014-01-01','2022-01-01',now(),now())")
+            .execute(Tuple.of(managerId)).mapEmpty());
+
+        await(service.adminUpdateCareerEntry(adminAuth, managerId, entryId,
+                                             "Best Buy", "Senior Manager, CDS Operations", "2014", "2022"));
+
+        // The rating is under the corrected title...
+        Row seg = segmentFor(managerId, "Best Buy");
+        assertEquals("Senior Manager, CDS Operations", seg.getString("role"),
+            "the corrected title is not what the trajectory shows");
+        assertTrue(seg.getLong("review_count") >= 1,
+            "the rating did not come with the correction, so the role shows as unrated: " + seg.deepToString());
+
+        // ...and NOT left behind under the old one, which would show as a second, stale role.
+        Long stranded = await(pool.preparedQuery(
+                "SELECT count(*) AS n FROM reviews WHERE manager_id = $1 "
+              + "AND manager_title = 'Manager, CDS Operations'")
+            .execute(Tuple.of(managerId)).map(rs -> rs.iterator().next().getLong("n")));
+        assertEquals(0L, stranded,
+            "a rating was left under the old title and will appear as a separate, unrated role");
     }
 
     private Row segmentFor(long managerId, String company) throws Exception {

@@ -3,7 +3,9 @@ package org.werkpages.service;
 import io.vertx.core.Future;
 import io.vertx.core.json.JsonArray;
 import io.vertx.core.json.JsonObject;
+import io.vertx.sqlclient.Pool;
 import io.vertx.sqlclient.Row;
+import io.vertx.sqlclient.SqlClient;
 import org.werkpages.repository.CompanyRepository;
 import org.werkpages.repository.CapturedDraftRepository;
 import org.werkpages.repository.CompanyReviewRepository;
@@ -68,96 +70,25 @@ public class CompanyReviewService {
             resolveCompany(companySlug, newCompanyName).compose(company -> {
                 long companyId = company.getLong("id");
 
-                Double overall = body.getDouble("overallRating");
-                if (overall == null) {
-                    return Future.failedFuture(ServiceException.badRequest(
-                        "Give the workplace an overall rating."));
-                }
-                if (overall < 0 || overall > 5) {
-                    return Future.failedFuture(ServiceException.badRequest("Rating must be between 0 and 5."));
-                }
+                return parseRating(body).compose(input ->
+                    /*
+                      Where the work happened, resolved against the company being rated.
 
-                JsonObject ratings = body.getJsonObject("ratings");
-                if (ratings == null) {
-                    return Future.failedFuture(ServiceException.badRequest("Missing ratings."));
-                }
-                List<Double> values = new ArrayList<>();
-                for (String category : CompanyReviewRepository.CATEGORIES) {
-                    Double v = ratings.getDouble(category);
-                    if (v == null) {
-                        return Future.failedFuture(ServiceException.badRequest(
-                            "Rate every category before submitting."));
-                    }
-                    if (v < 0 || v > 5) {
-                        return Future.failedFuture(ServiceException.badRequest(
-                            "Ratings must be between 0 and 5."));
-                    }
-                    values.add(v);
-                }
+                      company_reviews has carried the ladder since V68 and nothing wrote to it, so a
+                      workplace rating could only ever be filed against the company as a whole - while
+                      a manager review or an interview at the same company could name the branch. Ten
+                      Walmarts in one city can be ten different places to work, which is the entire
+                      reason the ladder exists.
 
-                LocalDate from  = parseDate(body.getString("workedFrom"));
-                LocalDate until = parseDate(body.getString("workedUntil"));
-                /*
-                  Whether to publish the period. Opt-in: absent means show, which is what every
-                  rating written before this existed does. The dates stay required and stored -
-                  the form reopens on them and the tenure arithmetic reads them - so only the
-                  DISPLAY is withheld.
-                */
-                boolean datesHidden = body.getBoolean("datesHidden", false);
-                LocalDate today = LocalDate.now();
-                if (from == null) {
-                    return Future.failedFuture(ServiceException.badRequest("When did you start working here?"));
-                }
-                if (from.isAfter(today)) {
-                    return Future.failedFuture(ServiceException.badRequest("Your start date cannot be in the future."));
-                }
-                if (until != null && until.isAfter(today)) {
-                    return Future.failedFuture(ServiceException.badRequest("Your end date cannot be in the future."));
-                }
-                if (until != null && until.isBefore(from)) {
-                    return Future.failedFuture(ServiceException.badRequest(
-                        "Your end date cannot be before your start date."));
-                }
-
-                /*
-                  The handle the author picked. Trimmed and capped, and blank means none - an
-                  empty string would put a nameless byline on the rating rather than leaving it
-                  anonymous, which is a different thing.
-                */
-                String author = body.getString("author");
-                if (author != null) {
-                    author = author.trim();
-                    if (author.isEmpty()) author = null;
-                    else if (author.length() > 60) {
-                        return Future.failedFuture(ServiceException.badRequest("That name is too long."));
-                    }
-                }
-
-                /*
-                  Where the work happened, resolved against the company being rated.
-
-                  company_reviews has carried the ladder since V68 and nothing wrote to it, so a
-                  workplace rating could only ever be filed against the company as a whole - while
-                  a manager review or an interview at the same company could name the branch. Ten
-                  Walmarts in one city can be ten different places to work, which is the entire
-                  reason the ladder exists.
-
-                  Resolution is what makes an exact pick trustworthy: it rejects a building
-                  belonging to another company, promotes one chosen from the corpus, and derives
-                  the coarse rungs from the location row rather than from whatever the form sent.
-                */
-                final String signedAs = author;
-                return declaredLocations.resolve(reviewRepo.client(),
-                        DeclaredLocation.fromBody(body),
-                        CorpusPlace.fromBody(body), companyId)
-                    .compose(declared ->
-                       reviewRepo.upsert(companyId, userId, overall, values, from, until, signedAs,
-                                         declared, datesHidden))
-                    // The draft this rating came from is finished work now, not a queue item.
-                    // Clearing it here rather than on a schedule means an admin never opens one
-                    // whose author came back a minute later.
-                    .compose(row -> drafts.clear(reviewRepo.client(), parseUuid(body.getString("draftToken")))
-                        .map(v -> row))
+                      Resolution is what makes an exact pick trustworthy: it rejects a building
+                      belonging to another company, promotes one chosen from the corpus, and derives
+                      the coarse rungs from the location row rather than from whatever the form sent.
+                    */
+                    declaredLocations.resolve(reviewRepo.client(),
+                            DeclaredLocation.fromBody(body),
+                            CorpusPlace.fromBody(body), companyId)
+                        .compose(declared -> writeOwnRating(companyId, userId, input, declared,
+                                                            parseUuid(body.getString("draftToken")))))
                     /*
                       The company's read-model row is recomputed by the database: the upsert above
                       writes company_reviews.overall_rating, and the company_reviews trigger fires
@@ -182,6 +113,183 @@ public class CompanyReviewService {
                         .put("companySlug", company.getString("slug"))
                         .put("companyName", company.getString("name")));
             }));
+    }
+
+    /** Everything a workplace rating needs from a form body, validated once. */
+    private record RatingInput(double overall, List<Double> values, LocalDate from,
+                               LocalDate until, String author, boolean datesHidden) {}
+
+    /**
+     * Validates a form body, and decides nothing else.
+     *
+     * <p>Extracted so that publishing a captured draft runs the SAME rules a signed-in submission
+     * runs, rather than a second opinion about what "complete" means. Two copies would drift, and
+     * the copy admins rely on is the one whose drift nobody would notice: a draft published with
+     * nine of the ten categories is a public rating with a hole in it, and the aggregate it feeds
+     * cannot be sliced by the category it is missing.
+     *
+     * <p>Every message here reaches a person who is mid-form, so they stay in the second person
+     * and name the field. The admin panel shows the same strings, which is the point: it says why
+     * a draft cannot be published in the words the author would have seen.
+     */
+    private static Future<RatingInput> parseRating(JsonObject body) {
+        Double overall = body.getDouble("overallRating");
+        if (overall == null) {
+            return Future.failedFuture(ServiceException.badRequest(
+                "Give the workplace an overall rating."));
+        }
+        if (overall < 0 || overall > 5) {
+            return Future.failedFuture(ServiceException.badRequest("Rating must be between 0 and 5."));
+        }
+
+        JsonObject ratings = body.getJsonObject("ratings");
+        if (ratings == null) {
+            return Future.failedFuture(ServiceException.badRequest("Missing ratings."));
+        }
+        List<Double> values = new ArrayList<>();
+        for (String category : CompanyReviewRepository.CATEGORIES) {
+            Double v = ratings.getDouble(category);
+            if (v == null) {
+                return Future.failedFuture(ServiceException.badRequest(
+                    "Rate every category before submitting."));
+            }
+            if (v < 0 || v > 5) {
+                return Future.failedFuture(ServiceException.badRequest(
+                    "Ratings must be between 0 and 5."));
+            }
+            values.add(v);
+        }
+
+        LocalDate from  = parseDate(body.getString("workedFrom"));
+        LocalDate until = parseDate(body.getString("workedUntil"));
+        /*
+          Whether to publish the period. Opt-in: absent means show, which is what every
+          rating written before this existed does. The dates stay required and stored -
+          the form reopens on them and the tenure arithmetic reads them - so only the
+          DISPLAY is withheld.
+        */
+        boolean datesHidden = body.getBoolean("datesHidden", false);
+        LocalDate today = LocalDate.now();
+        if (from == null) {
+            return Future.failedFuture(ServiceException.badRequest("When did you start working here?"));
+        }
+        if (from.isAfter(today)) {
+            return Future.failedFuture(ServiceException.badRequest("Your start date cannot be in the future."));
+        }
+        if (until != null && until.isAfter(today)) {
+            return Future.failedFuture(ServiceException.badRequest("Your end date cannot be in the future."));
+        }
+        if (until != null && until.isBefore(from)) {
+            return Future.failedFuture(ServiceException.badRequest(
+                "Your end date cannot be before your start date."));
+        }
+
+        /*
+          The handle the author picked. Trimmed and capped, and blank means none - an
+          empty string would put a nameless byline on the rating rather than leaving it
+          anonymous, which is a different thing.
+        */
+        String author = body.getString("author");
+        if (author != null) {
+            author = author.trim();
+            if (author.isEmpty()) author = null;
+            else if (author.length() > 60) {
+                return Future.failedFuture(ServiceException.badRequest("That name is too long."));
+            }
+        }
+        return Future.succeededFuture(
+            new RatingInput(overall, values, from, until, author, datesHidden));
+    }
+
+    /**
+     * Writes this person's own rating, and retires the captured form it came from.
+     *
+     * <p>One transaction, because three things have to agree about one submission.
+     *
+     * <ol>
+     *   <li>the rating itself;
+     *   <li>the anonymous publication of the same form, if an admin published it from the queue
+     *       while this person was away, which has to go or the company carries the same opinion
+     *       twice;
+     *   <li>the captured draft, which is now finished work rather than a queue item. An untouched
+     *       one is removed; one an admin already published keeps its trail and is pointed at this
+     *       rating instead, because deleting it would destroy the record of where an anonymous
+     *       rating on the page came from.
+     * </ol>
+     *
+     * <p><b>The lock is taken first, and it is what makes this safe.</b> An admin publishing the
+     * draft is a concurrent transaction deciding the same question, and the two writers share no
+     * other row: without the lock both read "nothing published yet" and the company ends up with
+     * an anonymous copy and a signed one. With it, whichever commits second sees the other's work.
+     *
+     * <p>Delete and insert in one transaction also means the anonymous row cannot be removed
+     * unless the replacement commits. The reverse order was considered and rejected: an insert
+     * that fails after the delete would have destroyed somebody's rating to no purpose.
+     *
+     * <p>The person's own row never carries the token. It is the identity of an anonymous
+     * publication, and a signed-in rating holding one would both block the next publication of
+     * that form and make itself a target for the deletion above.
+     */
+    private Future<Row> writeOwnRating(long companyId, UUID userId, RatingInput input,
+                                       DeclaredLocation declared, UUID draftToken) {
+        return ((Pool) reviewRepo.client()).withTransaction(conn ->
+            drafts.lockByToken(conn, draftToken)
+                .compose(v -> reviewRepo.upsert(conn, companyId, userId, input.overall(),
+                        input.values(), input.from(), input.until(), input.author(),
+                        declared, input.datesHidden(), null))
+                .compose(row -> reviewRepo.deleteAnonymousByToken(conn, draftToken).map(v -> row))
+                .compose(row -> drafts.clear(conn, draftToken).map(v -> row))
+                .compose(row -> drafts.repointPublished(conn, draftToken, row.getUUID("id"))
+                    .map(v -> row)));
+    }
+
+    /**
+     * Publishes a captured form as a real rating belonging to nobody.
+     *
+     * <p>Called by the admin queue, inside a transaction that also resolves the draft, so a rating
+     * can never exist with its draft still queued for somebody else to publish a second time.
+     *
+     * <p><b>user_id null, by design.</b> The person who filled this in never signed in, so there
+     * is no account to attach and inventing one would be fabrication. This is the same shape a
+     * manager rating dropped off at the sign-in wall has always had, and the same shape every
+     * withdrawn rating takes after three days: the opinion survives, the link to a person does
+     * not. Nothing downstream treats it specially, which is the whole point of publishing it as a
+     * real row rather than inventing a second class of rating.
+     *
+     * <p><b>No pseudonym is generated.</b> A manager review needs one because {@code author} is
+     * NOT NULL there, but on a workplace rating the column is nullable and empty already means
+     * "no handle shown", which is what the form's default produces. Inventing a byline would put
+     * an identity on the rating that its author never chose.
+     *
+     * <p>The account-scoped rules are not applied and cannot be: one rating per person per
+     * company, the daily cap and the re-rating cooldown are all questions about an account, and
+     * there is no account here. The unique index on {@code draft_token} is what stands in their
+     * place, and it enforces the only rule that still means anything: one published rating per
+     * captured form.
+     */
+    public Future<Row> publishAnonymously(SqlClient conn, long companyId,
+                                          JsonObject payload, UUID draftToken) {
+        return parseRating(payload).compose(input ->
+            declaredLocations.resolve(conn,
+                    DeclaredLocation.fromBody(payload),
+                    CorpusPlace.fromBody(payload), companyId)
+                .compose(declared -> reviewRepo.upsert(conn, companyId, null, input.overall(),
+                        input.values(), input.from(), input.until(), input.author(),
+                        declared, input.datesHidden(), draftToken)));
+    }
+
+    /**
+     * Why this captured form cannot be published, or empty when it can be.
+     *
+     * <p>Runs the real validator rather than a lookalike, so the queue cannot offer a Publish
+     * button that then fails, and cannot withhold one from a draft that would have worked.
+     */
+    public static Optional<String> publicationBlocker(JsonObject payload) {
+        Future<RatingInput> parsed = parseRating(payload);
+        if (parsed.succeeded()) return Optional.empty();
+        Throwable cause = parsed.cause();
+        return Optional.of(cause instanceof ServiceException se ? se.getMessage()
+                                                                : "This draft is incomplete.");
     }
 
     /** This person's own rating of a company, for pre-filling the form and showing the done state. */

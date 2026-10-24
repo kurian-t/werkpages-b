@@ -232,6 +232,8 @@ public class MainVerticle extends AbstractVerticle {
                             // Withdrawn workplace ratings resurface anonymous on the same
                             // schedule as withdrawn manager ratings.
                             .withCompanyReviews(companyReviewRepo)
+                            // And withdrawn interview experiences, which until V96 came back never.
+                            .withInterviews(interviewRepo)
                             .schedule(vertx);
 
                         // ── company_stats_live reconciliation (safety net — primary updates go
@@ -450,6 +452,7 @@ public class MainVerticle extends AbstractVerticle {
                         routerFactory.addHandlerByOperationId("unbanUser",                adminHandler::handleUnbanUser);
                         routerFactory.addHandlerByOperationId("getAdminCapturedDrafts",    adminHandler::handleGetCapturedDrafts);
                         routerFactory.addHandlerByOperationId("markCapturedDraftReviewed", adminHandler::handleMarkDraftReviewed);
+                        routerFactory.addHandlerByOperationId("publishCapturedDraft",      adminHandler::handlePublishDraft);
                         routerFactory.addHandlerByOperationId("getAdminGhostManagers",    adminHandler::handleGetGhostManagers);
                         routerFactory.addHandlerByOperationId("markGhostManagerReviewed", adminHandler::handleMarkGhostReviewed);
                         routerFactory.addHandlerByOperationId("getAdminPendingManagers",  adminHandler::handleGetPendingManagers);

@@ -69,6 +69,27 @@ public class CompanyReviewRepository {
     public Future<Row> upsert(long companyId, UUID userId, double overall, List<Double> categories,
                               LocalDate workedFrom, LocalDate workedUntil, String author,
                               DeclaredLocation declared, boolean datesHidden) {
+        return upsert(db, companyId, userId, overall, categories, workedFrom, workedUntil, author,
+                      declared, datesHidden, null);
+    }
+
+    /**
+     * The same write, on a caller's connection, and able to mark the captured form it came from.
+     *
+     * <p>Exists for the two writes that have to be atomic with something else. An admin publishing
+     * a captured draft resolves that draft in the same transaction, and an author returning to
+     * submit properly removes the anonymous publication in the same transaction, because a rating
+     * deleted without its replacement committing is somebody's opinion destroyed.
+     *
+     * <p>{@code draftToken} is set only on an anonymous publication, and deliberately NOT in the
+     * {@code DO UPDATE} branch: a person editing their own rating must never acquire a token, or
+     * the next publication of that form would be blocked by their row and the author's return
+     * would delete it.
+     */
+    public Future<Row> upsert(SqlClient executor,
+                              long companyId, UUID userId, double overall, List<Double> categories,
+                              LocalDate workedFrom, LocalDate workedUntil, String author,
+                              DeclaredLocation declared, boolean datesHidden, UUID draftToken) {
         if (categories.size() != CATEGORIES.size()) {
             return Future.failedFuture(
                 "Expected " + CATEGORIES.size() + " category ratings, got " + categories.size());
@@ -96,6 +117,7 @@ public class CompanyReviewRepository {
         tuple.addValue(loc.text());
         // Appended last so the computed indices below stay readable; see datesHiddenParam.
         tuple.addBoolean(datesHidden);
+        tuple.addValue(draftToken);
 
         int workedUntilParam = 5 + CATEGORIES.size();
         int authorParam      = workedUntilParam + 1;
@@ -107,13 +129,14 @@ public class CompanyReviewRepository {
         int sourceParam      = locationIdParam + 1;
         int textParam        = sourceParam + 1;
         int datesHiddenParam = textParam + 1;
+        int draftTokenParam  = datesHiddenParam + 1;
 
-        return db.preparedQuery("""
+        return executor.preparedQuery("""
                 INSERT INTO company_reviews (company_id, user_id, overall_rating, worked_from, %s, worked_until, author,
                                              declared_country, declared_state, declared_city,
                                              declared_precision, company_location_id,
-                                             declared_source, declared_text, dates_hidden)
-                VALUES ($1, $2, $3, $4%s, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d)
+                                             declared_source, declared_text, dates_hidden, draft_token)
+                VALUES ($1, $2, $3, $4%s, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d)
                 ON CONFLICT (user_id, company_id) WHERE deleted_at IS NULL
                 DO UPDATE SET overall_rating = EXCLUDED.overall_rating,
                               %s
@@ -167,7 +190,7 @@ public class CompanyReviewRepository {
                 RETURNING %s
                 """.formatted(cols, placeholders, workedUntilParam, authorParam,
                               countryParam, stateParam, cityParam, precisionParam, locationIdParam,
-                              sourceParam, textParam, datesHiddenParam,
+                              sourceParam, textParam, datesHiddenParam, draftTokenParam,
                               updates, COLUMNS))
             .execute(tuple)
             .map(rs -> rs.iterator().next());
@@ -261,6 +284,39 @@ public class CompanyReviewRepository {
                 + "WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL "
                 + "RETURNING company_id")
             .execute(Tuple.of(reviewId, userId))
+            .map(rs -> rs.iterator().hasNext()
+                ? Optional.of(rs.iterator().next().getLong("company_id"))
+                : Optional.empty());
+    }
+
+    /**
+     * Removes the anonymous publication of a captured form, because its author has just written
+     * the real one.
+     *
+     * <p>A hard delete, which is what the manager path does for the same situation: this is not
+     * somebody withdrawing an opinion, it is the same opinion being replaced by the signed-in
+     * version of itself, and leaving a soft-deleted copy behind would hold the token and block the
+     * unique index for three days before the restore sweep brought a duplicate back.
+     *
+     * <p><b>Only a live anonymous row.</b> {@code user_id IS NULL} so a real person's rating can
+     * never be destroyed by a token collision, and {@code deleted_at IS NULL} so a publication a
+     * moderator has already removed stays removed rather than being tidied away along with the
+     * record that it was actioned. The author's own submission is then an ordinary new rating,
+     * which is right: a moderator's decision was about the content that was published, and it is
+     * not a ban on that person writing their own.
+     *
+     * <p>Takes a connection because it only ever runs beside the insert that replaces it.
+     *
+     * @return the company whose average changed, if anything was removed
+     */
+    public Future<Optional<Long>> deleteAnonymousByToken(SqlClient conn, UUID draftToken) {
+        if (draftToken == null) return Future.succeededFuture(Optional.empty());
+        return conn.preparedQuery("""
+                DELETE FROM company_reviews
+                 WHERE draft_token = $1 AND user_id IS NULL AND deleted_at IS NULL
+                RETURNING company_id
+                """)
+            .execute(Tuple.of(draftToken))
             .map(rs -> rs.iterator().hasNext()
                 ? Optional.of(rs.iterator().next().getLong("company_id"))
                 : Optional.empty());
