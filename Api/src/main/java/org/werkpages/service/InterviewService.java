@@ -145,9 +145,9 @@ public class InterviewService {
      * <p>Called by the admin queue, inside a transaction that also resolves the draft, so a review
      * can never exist with its draft still queued for somebody else to publish again.
      *
-     * <p><b>user_id null, by design</b>, the same shape a manager rating dropped off at the
-     * sign-in wall has always had and the same shape every withdrawn review takes after three
-     * days: the experience survives, the link to a person does not.
+     * <p><b>user_id null and a fresh byline, by design</b>, the same shape a manager rating
+     * dropped off at the sign-in wall has always had and the same shape every withdrawn review
+     * takes after three days: the experience survives, the link to a person does not.
      *
      * <p>The account-scoped rules are not applied and cannot be. One experience per person per
      * company per year, the daily cap and the cooldown are all questions about an account, and
@@ -170,9 +170,28 @@ public class InterviewService {
                     draft.processFairness, draft.nextStepTransparency, draft.jobRelevance,
                     draft.difficulty, draft.outcome, draft.roundCount(), draft.processLength,
                     draft.roleCategory, draft.country, draft.city, draft.interviewYear,
-                    draft.author, draft.interviewedFrom, draft.interviewedUntil, declared, draftToken))
+                    /*
+                      A FRESH BYLINE, never the one the draft carried. The person watched the form
+                      show them a handle and then never pressed submit, so publishing under it
+                      tells them the review was theirs. Same decision as the workplace rating; see
+                      CompanyReviewService.publishAnonymously.
+                    */
+                    freshByline(draft.author), draft.interviewedFrom, draft.interviewedUntil,
+                    declared, draftToken))
             .compose(row -> interviewRepo.insertRounds(conn, row.getUUID("id"), draft.rounds)
                 .map(ignored -> row));
+    }
+
+
+    /** A byline for a review its author never submitted: freshly minted, never theirs. */
+    private static String freshByline(String theDraftsHandle) {
+        for (int attempt = 0; attempt < 8; attempt++) {
+            String minted = ManagerService.generatePseudonym();
+            if (theDraftsHandle == null || !minted.equalsIgnoreCase(theDraftsHandle.trim())) {
+                return minted;
+            }
+        }
+        return ManagerService.generatePseudonym() + "x";
     }
 
     /**

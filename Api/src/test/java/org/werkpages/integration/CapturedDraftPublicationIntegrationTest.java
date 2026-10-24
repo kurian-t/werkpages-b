@@ -121,8 +121,22 @@ class CapturedDraftPublicationIntegrationTest {
         assertNull(rating.getUUID("user_id"),
             "nobody signed in, so there is no account to attach - inventing one is fabrication");
         assertEquals(4.0, rating.getDouble("overall_rating"));
-        assertEquals("QuietOtter77", rating.getString("author"),
-            "the handle the author chose is kept; no pseudonym is invented for a nullable column");
+        /*
+          A DIFFERENT HANDLE, and this assertion has now been three things in one afternoon.
+
+          It started out keeping the draft's handle, on the reasoning that the author chose it.
+          They did not choose to publish it: they watched the form show them that name and then
+          never pressed submit, so seeing it on a public rating tells them the rating was theirs.
+          Dropping it entirely was the next attempt and left the card nameless, unlike every other
+          rating on the page. A freshly minted handle is both: it looks like its neighbours and it
+          is not the one anybody saw.
+        */
+        String byline = rating.getString("author");
+        assertNotNull(byline, "a published rating is signed, like every other rating on the page");
+        assertNotEquals("QuietOtter77", byline,
+            "NEVER the handle the draft carried - that is the one its author would recognise");
+        assertTrue(byline.matches("[A-Za-z]+[0-9]{2}x?"),
+            "and it is a handle in the house format rather than anything carried over: " + byline);
         assertEquals(token, rating.getUUID("draft_token").toString(),
             "the publication is identified by the form it came from, which is what stops a second one");
         assertNull(rating.getOffsetDateTime("deleted_at"));
@@ -146,6 +160,43 @@ class CapturedDraftPublicationIntegrationTest {
         assertEquals(1L, stats.getLong("workplace_count"),
             "a published rating is a rating: the read model must count it");
         assertEquals(5.0, stats.getBigDecimal("workplace_avg_rating").doubleValue(), 0.001);
+    }
+
+    @Test
+    void publishingForgetsWhoDroppedItOff() throws Exception {
+        /*
+          THE RATING MUST NOT BE TRACEABLE TO A PERSON BY ANY ROUTE.
+
+          It carries no user_id, but it does carry the draft_token that identifies the form, so
+          while the draft names an account that token is a join straight back to them. A manager
+          rating dropped off at the sign-in wall has no such row anywhere, and the ask was that
+          these behave the same way.
+
+          Deliberately timed: an admin can see who dropped it off while they are DECIDING, which
+          is when that fact is worth having. Afterwards it only serves to re-identify the author
+          of something public.
+        */
+        insertCompany("Red Hat", "red-hat");
+        String adminAuth  = insertUser("auth0|dp-admin-17", "DpAdmin17", "admin");
+        String dropper    = insertUser("auth0|dp-dropper-1", "DpDropper1", "user");
+        await(companyRatings.captureDraft("red-hat", ratingBody(4.0)));
+        UUID dropperId = await(pool.preparedQuery("SELECT id FROM users WHERE auth0_id = $1")
+            .execute(Tuple.of(dropper)).map(rs -> rs.iterator().next().getUUID("id")));
+        await(pool.preparedQuery("UPDATE captured_drafts SET user_id = $1")
+            .execute(Tuple.of(dropperId)).mapEmpty());
+        assertNotNull(one("SELECT user_id FROM captured_drafts").getUUID("user_id"),
+            "the admin sees who it was from while the draft is still in the queue");
+
+        await(admin.publishCapturedDraft(adminAuth, draftId()));
+
+        assertNull(one("SELECT user_id FROM captured_drafts").getUUID("user_id"),
+            "once it is public, nothing may say whose it was");
+        assertNull(one("SELECT user_id FROM company_reviews").getUUID("user_id"));
+        assertEquals(0L, count("""
+                SELECT count(*) AS c FROM company_reviews cr
+                  JOIN captured_drafts d ON d.resolved_id = cr.id
+                 WHERE d.user_id IS NOT NULL
+                """), "and no join from the rating reaches an account");
     }
 
     @Test

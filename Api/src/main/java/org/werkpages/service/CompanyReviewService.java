@@ -256,10 +256,10 @@ public class CompanyReviewService {
      * not. Nothing downstream treats it specially, which is the whole point of publishing it as a
      * real row rather than inventing a second class of rating.
      *
-     * <p><b>No pseudonym is generated.</b> A manager review needs one because {@code author} is
-     * NOT NULL there, but on a workplace rating the column is nullable and empty already means
-     * "no handle shown", which is what the form's default produces. Inventing a byline would put
-     * an identity on the rating that its author never chose.
+     * <p><b>A fresh byline, never the draft's.</b> The person watched the form show them a handle
+     * and then never pressed submit, so publishing under that handle tells them the rating was
+     * theirs. A newly minted one gives the rating the same shape as every other anonymous rating
+     * on the page while breaking the one thread its author could recognise.
      *
      * <p>The account-scoped rules are not applied and cannot be: one rating per person per
      * company, the daily cap and the re-rating cooldown are all questions about an account, and
@@ -274,8 +274,32 @@ public class CompanyReviewService {
                     DeclaredLocation.fromBody(payload),
                     CorpusPlace.fromBody(payload), companyId)
                 .compose(declared -> reviewRepo.upsert(conn, companyId, null, input.overall(),
-                        input.values(), input.from(), input.until(), input.author(),
+                        input.values(), input.from(), input.until(), freshByline(input.author()),
                         declared, input.datesHidden(), draftToken)));
+    }
+
+
+    /**
+     * A byline for a rating its author never submitted: freshly minted, never theirs.
+     *
+     * <p>Three readings of this were tried before the right one. Keeping the draft's handle looked
+     * respectful and is not: the person watched the form show them that name, so seeing it on a
+     * public rating tells them it was theirs. Publishing no name at all is honest but leaves the
+     * card nameless, unlike every other rating on the page. A fresh handle gives the rating the
+     * same shape as its neighbours while severing the one thread the author could recognise.
+     *
+     * <p>Regenerates on the astronomically unlikely collision with the handle the draft held,
+     * because "different" is the entire requirement and a one-in-a-few-thousand sameness would be
+     * indistinguishable from not having done this at all.
+     */
+    private static String freshByline(String theDraftsHandle) {
+        for (int attempt = 0; attempt < 8; attempt++) {
+            String minted = ManagerService.generatePseudonym();
+            if (theDraftsHandle == null || !minted.equalsIgnoreCase(theDraftsHandle.trim())) {
+                return minted;
+            }
+        }
+        return ManagerService.generatePseudonym() + "x";
     }
 
     /**

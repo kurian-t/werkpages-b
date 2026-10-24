@@ -2001,6 +2001,13 @@ public class AdminService {
                                 ? Future.succeededFuture()
                                 : Future.failedFuture(ServiceException.conflict("draft_already_resolved")))
                             .compose(v -> capturedDrafts.supersedeSiblings(conn, draftToken, draftId, ratingId))
+                            /*
+                              And forget who dropped it off. The rating carries no user_id, but it
+                              carries the token, and while the draft names an account that token is
+                              a join back to them. A dropped-off manager rating has no such row
+                              anywhere; these now match.
+                            */
+                            .compose(v -> capturedDrafts.forgetSubmitter(conn, draftId))
                             .map(v -> new JsonObject()
                                 .put("success", true)
                                 .put("kind", kind)

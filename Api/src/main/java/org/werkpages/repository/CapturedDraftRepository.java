@@ -184,6 +184,29 @@ public class CapturedDraftRepository {
             .mapEmpty();
     }
 
+    /**
+     * Forgets who dropped a draft off, at the moment it becomes a public rating.
+     *
+     * <p><b>The published rating must not be traceable to a person, by any route.</b> The rating
+     * itself carries no {@code user_id}, but it does carry the {@code draft_token} that identifies
+     * the form, and while this column holds an account that token is a join back to them. A
+     * dropped-off manager rating has no such row anywhere, and these are meant to behave the same
+     * way.
+     *
+     * <p>Timed deliberately. The admin can see who dropped it off while they are DECIDING, which
+     * is when that fact is worth having: a draft from a known troublemaker is a different thing to
+     * read. Once they have published it, the same fact only serves to re-identify the author of a
+     * public rating, so it goes.
+     *
+     * <p>Only on publication. A dismissed draft keeps its submitter, because no public rating
+     * exists to tie back to and the record is still useful to a moderator.
+     */
+    public Future<Void> forgetSubmitter(SqlClient conn, long id) {
+        return conn.preparedQuery("UPDATE captured_drafts SET user_id = NULL WHERE id = $1")
+            .execute(Tuple.of(id))
+            .mapEmpty();
+    }
+
     /** The queue, newest first. Resolved drafts are kept but not shown. */
     public Future<RowSet<Row>> findUnreviewed(int limit, int offset) {
         return db.preparedQuery("""
