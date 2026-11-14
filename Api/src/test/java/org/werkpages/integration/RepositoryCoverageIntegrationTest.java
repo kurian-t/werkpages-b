@@ -304,7 +304,10 @@ class RepositoryCoverageIntegrationTest {
             .map(rs -> rs.iterator().next().getLong(0)));
         assertEquals(1L, before);
 
-        await(reviewRepo.deleteSeedReview(managerId));
+        // TRUE means "there was one and it is gone", and the caller recalculates on exactly that.
+        assertTrue(await(reviewRepo.deleteSeedReview(managerId)),
+            "deleting a seed that exists must report true, because retireExampleRating only "
+            + "recalculates the manager when it does");
 
         Long after = await(pool.preparedQuery("SELECT COUNT(*) FROM reviews WHERE manager_id = $1 AND weight = TRUE")
             .execute(Tuple.of(managerId))
@@ -315,8 +318,12 @@ class RepositoryCoverageIntegrationTest {
     @Test
     void deleteSeedReview_noSeedPresent_doesNothing() throws Exception {
         long managerId = insertManager("No Seed Mgr", "NoSeedCo");
-        // Should complete without error even when there is no seed review
-        await(reviewRepo.deleteSeedReview(managerId));
+        // Should complete without error even when there is no seed review, and must say so: this
+        // is the common case, and a true here would restore the double recalculation on every
+        // ordinary submission.
+        assertFalse(await(reviewRepo.deleteSeedReview(managerId)),
+            "deleting a seed that was never there must report false, so the caller skips the "
+            + "recalculation it does not need");
     }
 
     // ── ReviewRepository.deleteByDraftToken ──────────────────────────────────

@@ -98,10 +98,22 @@ class ManagerServiceValidationTest {
         // caller already holds - the admin queue, and now an author's own replacement.
         when(managerRepo.recalculate(any(), anyLong())).thenReturn(Future.succeededFuture());
         doNothing().when(managerRepo).recalculateInBackground(anyLong());
-        when(reviewRepo.deleteSeedReview(anyLong())).thenReturn(Future.succeededFuture());
+        // FALSE, not an empty future. deleteSeedReview reports whether it removed a placeholder,
+        // and these managers hold none; an unparameterised succeededFuture() here hands back a null
+        // Boolean and the gate in retireExampleRating NPEs on unboxing it.
+        when(reviewRepo.deleteSeedReview(anyLong())).thenReturn(Future.succeededFuture(false));
         // createReview now starts the placeholder's countdown after a successful insert, so the
         // mock must return a Future here too; unstubbed it hands back null and the compose NPEs.
         when(reviewRepo.scheduleSeedExpiry(anyLong())).thenReturn(Future.succeededFuture());
+        /*
+            The relinquishment guard runs before every duplicate check, so EVERY signed-in
+            submission reaches it. Unstubbed it returned null and the compose NPEd, exactly as the
+            three stubs above once did. False is the precondition every test here already assumes:
+            none of them unlinks anything, and the cases that do belong to UnlinkRatingIntegration
+            Test, which exercises the guard against a real row rather than a double.
+        */
+        when(reviewRepo.hasRelinquishedManager(any(SqlClient.class), any(UUID.class), anyLong()))
+            .thenReturn(Future.succeededFuture(false));
     }
 
     // ── User / auth checks ────────────────────────────────────────────────────
@@ -377,6 +389,33 @@ class ManagerServiceValidationTest {
 
         assertNotNull(result);
         verify(managerRepo).recalculate(MANAGER_ID);   // awaited now, same assertion
+    }
+
+    /**
+     * A submission retires the manager's platform example, and asks for it exactly once.
+     *
+     * <p><b>Why this exists.</b> Nothing asserted that the retirement was reached at all. The
+     * retirement is the whole point of the change that added it: an example sitting beside a real
+     * rating is a fabricated opinion presented next to a genuine one, and the submission is the
+     * moment it has to go. It was reachable only through {@code createReview}'s composition, and a
+     * composition is exactly the kind of thing a later refactor drops silently.
+     *
+     * <p>It was written after WerkPages and RateMyManagers disagreed about how many times this
+     * path recalculates, on {@code createReview} bodies that are byte-identical in the two
+     * products. An assertion that the call happens, in both suites, is what makes that kind of
+     * drift fail a build rather than show up as a number nobody can explain.
+     *
+     * <p>{@code deleteSeedReview} is stubbed false here, so this manager holds no placeholder and
+     * {@code retireExampleRating} correctly skips the recalculation, which is why the assertion
+     * above still wants exactly one, from the insert.
+     */
+    @Test
+    void happyPath_retiresTheExampleRating_once() throws Exception {
+        stubHappyPathTransaction();
+
+        await(service.createReview(AUTH0_ID, MANAGER_ID, validBody(), "https://logo.test"));
+
+        verify(reviewRepo).deleteSeedReview(MANAGER_ID);
     }
 
     @Test

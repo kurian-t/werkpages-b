@@ -1175,11 +1175,25 @@ public class ReviewRepository {
      * predate that column's values and are still placeholders, and both callers that preceded this
      * one spoke of deleting "any legacy seed".
      */
-    public Future<Void> deleteSeedReview(long managerId) {
+    /**
+     * Deletes a manager's platform example, and reports whether there was one to delete.
+     *
+     * <p><b>The row count is the return value, and it is load-bearing.</b> This used to
+     * {@code mapEmpty()}, which threw the count away, so the caller could not tell a real
+     * retirement from a no-op and recalculated either way. The ordinary submission is to a manager
+     * holding no placeholder at all, so that meant recomputing the manager's average twice, and
+     * firing the company_stats_live trigger twice, on the hottest write path in the product, for a
+     * row that was not there. Caught by {@code ManagerServiceValidationTest}, which asserts the
+     * recalculation happens once and said TooManyActualInvocations.
+     *
+     * <p>Still a single statement, so the answer and the deletion cannot disagree: a second query
+     * asking "was there a seed" would be a different transaction's answer to a different question.
+     */
+    public Future<Boolean> deleteSeedReview(long managerId) {
         return db.preparedQuery(
                 "DELETE FROM reviews WHERE manager_id = $1 AND weight = TRUE AND user_id IS NULL")
             .execute(Tuple.of(managerId))
-            .mapEmpty();
+            .map(rows -> rows.rowCount() > 0);
     }
 
     public Future<Void> deleteByDraftToken(UUID draftToken) {

@@ -3112,8 +3112,23 @@ public class ManagerService {
      * no way to add a fifth submission path that remembers the first and forgets the second.
      */
     private Future<Void> retireExampleRating(long managerId) {
+        /*
+          GATED ON WHETHER A ROW ACTUALLY WENT, which is not a softening of the paragraph above.
+
+          Everything it says still holds the moment an example is removed: before V106 the seed
+          counts through the weight window, so the cached average describes a row that no longer
+          exists until this runs. What it does NOT justify is recalculating when nothing was
+          deleted, and that is the common case by a wide margin - most managers hold no placeholder,
+          and every one of their submissions was paying for a second full recomputation and a second
+          company_stats_live trigger firing on top of the one insertReviewTransactionally already
+          does.
+
+          Delete and recalculate remain one unit, so no submission path can remember the first and
+          forget the second. The unit simply now knows when the second is needed.
+        */
         return reviewRepo.deleteSeedReview(managerId)
-            .compose(v -> managerRepo.recalculate(managerId));
+            .compose(retired -> retired ? managerRepo.recalculate(managerId)
+                                        : Future.<Void>succeededFuture());
     }
 
     // ── UPDATE manager ────────────────────────────────────────────────────────
