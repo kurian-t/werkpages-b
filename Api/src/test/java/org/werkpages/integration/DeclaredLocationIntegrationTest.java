@@ -85,6 +85,30 @@ class DeclaredLocationIntegrationTest {
 
     // ── The coarse ladder ─────────────────────────────────────────────────────
 
+    /** All ten categories, as a finished manager rating carries them. */
+    private static JsonObject tenRatings() {
+        JsonObject r = new JsonObject();
+        for (String k : new String[] {
+                "Communication Style", "Perceived Approachability",
+                "Perceived Clarity of Expectations", "Feedback Style", "Perceived Supportiveness",
+                "Decision Making Style", "Organization and Planning Style", "Delegation Style",
+                "Perceived Professional Demeanor", "Overall Working Experience" }) {
+            r.put(k, 4);
+        }
+        return r;
+    }
+
+    /** An approved manager to hang an anonymous rating off. */
+    private long insertManagerRow(String name, String company) throws Exception {
+        await(pool.preparedQuery(
+                "INSERT INTO managers (name, company, title, approval_status, slug, image, status) "
+              + "VALUES ($1, $2, 'Manager', 'approved', $3, 'L', 'active')")
+            .execute(io.vertx.sqlclient.Tuple.of(name, company,
+                     name.toLowerCase().replace(' ', '-'))).mapEmpty());
+        return await(pool.query("SELECT id FROM managers WHERE name = '" + name + "'")
+            .execute().map(rs -> rs.iterator().next())).getLong("id");
+    }
+
     @Test
     void cityPrecision_isStoredAsDeclared() throws Exception {
         insertUser("auth0|dl-city", "DlCity");
@@ -102,6 +126,54 @@ class DeclaredLocationIntegrationTest {
         assertEquals("Kitchener", m.getString("declared_city"));
         assertEquals("city",      m.getString("declared_precision"));
         assertNull(m.getLong("company_location_id"));
+    }
+
+    @Test
+    @DisplayName("an anonymous manager rating keeps the location it was given")
+    void aDropOffReview_keepsItsDeclaredLocation() throws Exception {
+        /*
+          REPORTED as "Halifax, Nova Scotia, Canada does not work".
+
+          Everything visible worked. The suggestion endpoint answered it in single-digit
+          milliseconds on every port, the dropdown offered it, clicking it filled the field in, and
+          the form posted declaredCountry / declaredState / declaredCity / declaredPrecision. The
+          write returned 200. Every declared column on the stored row was NULL.
+
+          The cause was not validation and not the lookup. createDropOffReview called
+          validateAndInsertReview through the overload that supplies SubmissionContext.NONE, and
+          the declared location travels on the SubmissionContext. The signed-in path builds one
+          from the body; this path passed none, so a location somebody had chosen off a list was
+          discarded on every anonymous manager rating with nothing reported.
+
+          Asserted on the STORED ROW rather than on a status code, because the status code was 200
+          throughout and is exactly what made this invisible.
+        */
+        long managerId = insertManagerRow("Leah Declared", "Holt Renfrew");
+        JsonObject body = new JsonObject()
+            .put("author", "HalifaxProbe")
+            .put("overallRating", 4.0)
+            .put("ratings", tenRatings())
+            .put("managerCompany", "Holt Renfrew")
+            .put("managerTitle", "Retail Operations Manager")
+            .put("workedFrom", "2022-03")
+            .put("declaredCountry", "Canada")
+            .put("declaredState", "Nova Scotia")
+            .put("declaredCity", "Halifax")
+            .put("declaredPrecision", DeclaredLocation.CITY)
+            .put("declaredSource", "corpus");
+
+        await(service.createDropOffReview(managerId, body, null, submission(body)));
+
+        Row r = await(pool.query(
+                "SELECT declared_country, declared_state, declared_city, declared_precision "
+              + "FROM reviews WHERE author = 'HalifaxProbe'")
+            .execute().map(rs -> rs.iterator().next()));
+        assertEquals("Canada",      r.getString("declared_country"),
+            "the country somebody chose must survive an anonymous submission");
+        assertEquals("Nova Scotia", r.getString("declared_state"));
+        assertEquals("Halifax",     r.getString("declared_city"));
+        assertEquals("city",        r.getString("declared_precision"),
+            "and the precision, which is what DeclaredLocation.fromBody needs to keep any of it");
     }
 
     @Test

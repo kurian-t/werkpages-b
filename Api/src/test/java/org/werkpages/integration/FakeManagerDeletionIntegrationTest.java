@@ -235,10 +235,11 @@ class FakeManagerDeletionIntegrationTest {
 
     private void insertCareerHistoryDirect(long managerId) throws Exception {
         await(pool.preparedQuery("""
-                INSERT INTO career_history(manager_id, company, title, start_date)
-                VALUES ($1, 'Corp', 'Title', $2)
+                INSERT INTO career_history(manager_id, company, title, start_date, company_id)
+                VALUES ($1, 'Corp', 'Title', $2, $3)
                 """)
-            .execute(Tuple.of(managerId, OffsetDateTime.of(2020, 1, 1, 0, 0, 0, 0, ZoneOffset.UTC))));
+            .execute(Tuple.of(managerId, OffsetDateTime.of(2020, 1, 1, 0, 0, 0, 0, ZoneOffset.UTC),
+                              fixtureCompanyId("Corp"))));
     }
 
     private boolean managerExists(long managerId) throws Exception {
@@ -288,4 +289,19 @@ class FakeManagerDeletionIntegrationTest {
     private static <T> T await(Future<T> future) throws Exception {
         return future.toCompletionStage().toCompletableFuture().get(10, TimeUnit.SECONDS);
     }
+
+    /**
+     * A real employer for a fixture role. {@code career_history.company_id} is NOT NULL as of V99,
+     * so a career row has to name one. findOrCreate by name, which is the rule the product itself
+     * uses, so a fixture mentioning one company twice gets one company row.
+     */
+    private long fixtureCompanyId(String name) throws Exception {
+        return await(pool.preparedQuery("""
+                INSERT INTO companies (name, slug, status)
+                VALUES ($1, 'fixture-' || md5(lower(btrim($1))), 'ghost')
+                ON CONFLICT ((LOWER(TRIM(name)))) DO UPDATE SET updated_at = now()
+                RETURNING id
+                """).execute(Tuple.of(name)).map(rs -> rs.iterator().next().getLong("id")));
+    }
+
 }

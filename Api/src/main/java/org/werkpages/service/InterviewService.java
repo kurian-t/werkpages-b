@@ -133,7 +133,10 @@ public class InterviewService {
                         draft.author, draft.interviewedFrom, draft.interviewedUntil, declared, null))
                 .compose(row -> interviewRepo.insertRounds(conn, row.getUUID("id"), draft.rounds)
                     .map(ignored -> row))
-                .compose(row -> interviewRepo.deleteAnonymousByToken(conn, draftToken).map(v -> row))
+                .compose(row -> interviewRepo.deleteAnonymousByToken(conn, draftToken, companyId).map(v -> row))
+                // And the contributor's own private draft of this interview, in the same
+                // transaction. A failed submission must not cost them their unfinished answers.
+                .compose(row -> clearPrivateDraft(conn, row, userId, "interview", companyId))
                 .compose(row -> drafts.clear(conn, draftToken).map(v -> row))
                 .compose(row -> drafts.repointPublished(conn, draftToken, row.getUUID("id"))
                     .map(v -> row)));
@@ -211,12 +214,81 @@ public class InterviewService {
         }
     }
 
+    /**
+     * Saves the interview form's answers while it is still being filled in.
+     *
+     * <p>Same shape as the workplace rating's autosave, and the same reasoning: somebody who
+     * answers the outcome and two scores then closes the tab has told us three real things, and
+     * until this existed every one of them was lost.
+     *
+     * <p><b>Meaningful progress is defined on THIS form's fields</b>, not borrowed from another.
+     * An outcome on its own is a genuine answer here in a way it is not elsewhere, so the floor
+     * is any category score, the overall, or the outcome. A rule written for the ten-category
+     * rating form would have thrown away an interview whose first answer was "no offer".
+     */
+    public Future<JsonObject> autosaveDraft(String companySlug, JsonObject body) {
+        if (body == null || !interviewHasMeaningfulProgress(body)) {
+            return Future.succeededFuture(new JsonObject().put("saved", false));
+        }
+        UUID draftToken = parseDraftToken(body.getString("draftToken"));
+        if (draftToken == null) return Future.succeededFuture(new JsonObject().put("saved", false));
+
+        return companyRepo.findBySlug(companySlug)
+            .map(opt -> opt.map(row -> row.getLong("id")).orElse(null))
+            .compose(companyId -> drafts.autosave(
+                CapturedDraftRepository.INTERVIEW, companyId, null, null, draftToken,
+                body.copy().put("companySlug", companySlug), body.getLong("revision", 0L))
+                .map(v -> new JsonObject().put("saved", true)));
+    }
+
+    /** A score, the overall, or the outcome. The outcome counts: it is an answer on its own. */
+    static boolean interviewHasMeaningfulProgress(JsonObject body) {
+        if (body.getValue("overallRating") != null) return true;
+        if (body.getString("outcome") != null && !body.getString("outcome").isBlank()) return true;
+        for (String field : new String[]{"communication", "respectForTime", "roleClarity",
+                "processFairness", "nextStepTransparency", "jobRelevance", "difficulty"}) {
+            if (body.getValue(field) != null) return true;
+        }
+        return false;
+    }
+
     private static UUID parseDraftToken(String raw) {
         if (raw == null || raw.isBlank()) return null;
         try { return UUID.fromString(raw.trim()); } catch (IllegalArgumentException e) { return null; }
     }
 
     // ── Create ────────────────────────────────────────────────────────────────
+
+
+    /** Private drafts of signed-in contributors, for cleanup on submission. */
+    private org.werkpages.repository.ContributionDraftRepository contributionDrafts;
+
+    /**
+     * Wires in removal of the contributor's PRIVATE draft when a submission succeeds. Chainable.
+     *
+     * <p>Optional on purpose, so every existing construction site and test keeps working. Null
+     * means no cleanup, which is the behaviour before V110 existed.
+     */
+    public InterviewService withContributionDrafts(
+            org.werkpages.repository.ContributionDraftRepository repo) {
+        this.contributionDrafts = repo;
+        return this;
+    }
+
+    /**
+     * Deletes the draft a submission has just replaced, IN THE SUBMISSION'S OWN TRANSACTION.
+     *
+     * <p>Same transaction, not after it: a submission that failed after the draft was removed
+     * would take somebody's unfinished answers with it and give them nothing in return. Rolling
+     * back puts the draft back.
+     */
+    private Future<Row> clearPrivateDraft(io.vertx.sqlclient.SqlConnection conn, Row row,
+                                          java.util.UUID ownerId, String subjectType,
+                                          long subjectId) {
+        if (contributionDrafts == null || ownerId == null) return Future.succeededFuture(row);
+        return contributionDrafts.deleteOnSubmission(conn, ownerId, subjectType, subjectId)
+            .map(v -> row);
+    }
 
     public Future<JsonObject> createReview(String auth0Id, String companySlug, JsonObject body) {
         if (body == null) return Future.failedFuture(ServiceException.badRequest("Missing request body"));

@@ -9,6 +9,9 @@ import io.vertx.sqlclient.Row;
 import io.vertx.sqlclient.RowSet;
 import io.vertx.sqlclient.SqlClient;
 import io.vertx.sqlclient.Tuple;
+
+import org.werkpages.repository.EmploymentStatusResolver;
+import org.werkpages.repository.CaptureAttemptRepository;
 import org.werkpages.repository.CompanyRepository;
 import org.werkpages.repository.EditRepository;
 import org.werkpages.repository.GeoObservation;
@@ -61,9 +64,33 @@ public class ManagerService {
     private final ReportRepository           reportRepo;
     private final CompanyRepository          companyRepo;
     private final SqlClient                  db; // needed for transactions
+
+    /*
+      Built from the pool this service already holds rather than injected, so no construction site
+      changes and every existing test keeps working. Lazy because `db` is a SqlClient at compile
+      time and a Pool at runtime: a submission needs a transaction, and taking the cast here rather
+      than in the submit path keeps the failure at the first role-aware call instead of halfway
+      through one. Null when there is no pool, which is what a unit test that never submits passes.
+    */
+    private RoleAwareSubmissionService roleAwareSubmissionsOrNull;
+
+    /** Stateless: the claim rules live in the statements, not in the object. */
+    private final RoleClaimService roleClaims = new RoleClaimService();
+
+    private RoleAwareSubmissionService roleAwareSubmissions() {
+        if (roleAwareSubmissionsOrNull == null) {
+            if (!(db instanceof io.vertx.sqlclient.Pool pool)) {
+                throw new IllegalStateException(
+                    "A role-aware submission is one transaction and needs a connection pool");
+            }
+            roleAwareSubmissionsOrNull = new RoleAwareSubmissionService(pool);
+        }
+        return roleAwareSubmissionsOrNull;
+    }
     private final Function<String, String>   logoResolver;
     private final ProofOfWorkService         proofOfWork;
     private final GeoObservationRepository   geoObservations;
+    private final CaptureAttemptRepository   captureAttempts;
     private final DeclaredLocationResolver   declaredLocations;
     private final ReviewDisposition          reviewDisposition;
     private final LocationStatsProjector     locationStats;
@@ -87,6 +114,30 @@ public class ManagerService {
                           UserRepository userRepo, EditRepository editRepo,
                           ReportRepository reportRepo, CompanyRepository companyRepo,
                           SqlClient db, Function<String, String> logoResolver) {
+        // Holds a DuckDB connection to the S3 corpus, opened lazily on first use. Constructing it
+        // is free and cannot fail: an unreachable bucket or an unpublished release disables
+        // suggestions rather than breaking anything that constructs a ManagerService, which
+        // includes every unit test.
+        this(managerRepo, reviewRepo, userRepo, editRepo, reportRepo, companyRepo, db, logoResolver,
+             new org.werkpages.repository.LocationCorpusRepository());
+    }
+
+    /*
+      THE ONE INJECTED COLLABORATOR, and only because nothing else can reach the location tiers.
+
+      Everything else below is built in here deliberately, so the overloads do not have to thread
+      it through. The corpus is the exception. appendCorpusSuggestions decides which tier is read,
+      which breaker counts the outcome and which tier leads the answer, and while the corpus was
+      constructed in here no test could exercise any of that without a network and a published
+      release. The defect that forced this open was real and the whole suite was green through it:
+      the addresses tier was wired to the geography breaker, so geography's breaker could never
+      open. See LocationBreakerWiringTest.
+    */
+    ManagerService(ManagerRepository managerRepo, ReviewRepository reviewRepo,
+                   UserRepository userRepo, EditRepository editRepo,
+                   ReportRepository reportRepo, CompanyRepository companyRepo,
+                   SqlClient db, Function<String, String> logoResolver,
+                   org.werkpages.repository.LocationCorpusRepository locationCorpus) {
         this.managerRepo  = managerRepo;
         this.reviewRepo   = reviewRepo;
         this.userRepo     = userRepo;
@@ -103,15 +154,14 @@ public class ManagerService {
         // Same reasoning as proofOfWork above: stateless, and injecting it would mean threading it
         // through every overload.
         this.geoObservations = new GeoObservationRepository(db);
+        // PHASE 1. The capture-attempt ledger. Same reasoning again: it holds no state of its own,
+        // and every constructor overload would otherwise have to thread it through.
+        this.captureAttempts = new CaptureAttemptRepository(db);
         this.declaredLocations = new DeclaredLocationResolver(
             new org.werkpages.repository.CompanyLocationRepository(db));
         this.locationStats = new LocationStatsProjector();
         this.reviewDisposition = new ReviewDisposition();
-        // Holds a DuckDB connection to the S3 corpus, opened lazily on first use. Constructing it
-        // is free and cannot fail: an unreachable bucket or an unpublished release disables
-        // suggestions rather than breaking anything that constructs a ManagerService, which
-        // includes every unit test.
-        this.locationCorpus = new org.werkpages.repository.LocationCorpusRepository();
+        this.locationCorpus = locationCorpus;
         // Same construction as the others here: stateless beyond its client, and threading it
         // through every constructor overload would touch every test.
         this.ghostSlots = new org.werkpages.repository.AnonymousGhostSlotRepository(db);
@@ -166,8 +216,25 @@ public class ManagerService {
     // ── GET manager by ID ─────────────────────────────────────────────────────
 
     public Future<Row> getManagerById(long managerId, String auth0Id) {
+        /*
+          WHO IS LOOKING, because it decides which reviews come back.
+
+          Everyone gets the live ones. A signed-in contributor also gets their OWN unpublished
+          review, which is the thing they return to the profile to check on. Resolving the id here
+          costs one lookup per signed-in profile view and is what keeps the rule in the query
+          rather than in the client, where it was not being applied at all.
+        */
+        return viewerId(auth0Id).compose(viewer -> getManagerById(managerId, auth0Id, viewer));
+    }
+
+    private Future<UUID> viewerId(String auth0Id) {
+        if (auth0Id == null) return Future.succeededFuture(null);
+        return userRepo.findIdByAuth0Id(auth0Id).map(opt -> opt.orElse(null));
+    }
+
+    private Future<Row> getManagerById(long managerId, String auth0Id, UUID viewer) {
         // Follows merges: an id that was merged away lands on the manager it was merged into.
-        return managerRepo.findByIdFollowingMerges(managerId)
+        return managerRepo.findByIdFollowingMerges(managerId, viewer)
             .compose(opt -> {
                 if (opt.isEmpty()) return Future.failedFuture(ServiceException.notFound("Manager not found"));
                 Row row = opt.get();
@@ -403,7 +470,10 @@ public class ManagerService {
                                 .put("reviewsCount",   reviews != null ? reviews : 0)
                                 .put("company",        row.getString("company"))
                                 .put("slug",           row.getString("slug"))
-                                .put("approvalStatus", row.getString("approval_status"));
+                                .put("approvalStatus", row.getString("approval_status"))
+                                // The label only. status_as_of is a contributor's own departure
+                                // date wherever the basis is a claim, and never public.
+                                .put("employmentStatus", row.getString("employment_status"));
                             if (mgrLogoUrl != null && !mgrLogoUrl.isBlank()) mgr.put("companyLogoUrl", mgrLogoUrl);
                     putCompanyIdentity(mgr, row);
                             managers.add(mgr);
@@ -432,7 +502,8 @@ public class ManagerService {
                     // reader the company page itself. "Part of Loblaw" is useful context; it is
                     // not worth a 500 if the relationship tables are unavailable.
                     .compose(result -> withCorporateStructure(result, companyId))
-                    .compose(result -> withCompanyRating(result, companyId));
+                    .compose(result -> withCompanyRating(result, companyId))
+                    .compose(result -> withEmploymentStats(result, companyId));
             });
     }
 
@@ -505,6 +576,29 @@ public class ManagerService {
      *
      * Absent rather than zero when nobody has rated it - the same rule the tiles follow.
      */
+    /**
+     * The company's employment-attributed figures, added to a profile that already carries its
+     * affiliation ones.
+     *
+     * <p>Both are on the page deliberately and they answer different questions: the directory's
+     * counts say who works here, and these say what it was like to work for them HERE. They
+     * legitimately differ the moment a manager changes employer, which is the whole point of
+     * Phase 5, so the frontend has to label them rather than reconcile them.
+     *
+     * <p>Fails soft, like the rating aggregate below it: a company page must not 500 because one
+     * panel's figures could not be read. Before V101 is applied the columns do not exist, and this
+     * is what keeps the page serving until they do.
+     */
+    private Future<JsonObject> withEmploymentStats(JsonObject profile, long companyId) {
+        return companyRepo.findEmploymentStats(companyId)
+            .map(stats -> profile.mergeIn(stats))
+            .recover(err -> {
+                System.err.println("employment stats unavailable for company " + companyId
+                    + ": " + err.getMessage());
+                return Future.succeededFuture(profile);
+            });
+    }
+
     private Future<JsonObject> withCompanyRating(JsonObject profile, long companyId) {
         if (companyReviewRepo == null) return Future.succeededFuture(profile);
         return companyReviewRepo.findCompanyAggregate(companyId)
@@ -629,7 +723,8 @@ public class ManagerService {
                     // The slug route is the one people actually reach from a link, so it needs the
                     // corporate structure just as much as the by-name route.
                     .compose(result -> withCorporateStructure(result, companyId))
-                    .compose(result -> withCompanyRating(result, companyId));
+                    .compose(result -> withCompanyRating(result, companyId))
+                    .compose(result -> withEmploymentStats(result, companyId));
             });
     }
 
@@ -648,6 +743,13 @@ public class ManagerService {
                 .put("totalReviews",     0)
                 .put("avgRating",        (Object) null)
                 .put("categoryAverages", new JsonObject())
+                // The employment figures are overwritten by withEmploymentStats when the company
+                // exists; these are the shape for a company with no managers at all, so the page
+                // never has to distinguish "absent" from "zero".
+                .put("employmentReviews",          0)
+                .put("employmentAvgRating",        (Object) null)
+                .put("employmentManagerCount",     0)
+                .put("employmentCategoryAverages", new JsonObject())
                 .put("managers",         new JsonArray());
             if (logoUrl != null && !logoUrl.isBlank()) empty.put("logoUrl", logoUrl);
             return empty;
@@ -692,7 +794,10 @@ public class ManagerService {
                 .put("reviewsCount",   reviews != null ? reviews : 0)
                 .put("company",        row.getString("company"))
                 .put("slug",           row.getString("slug"))
-                .put("approvalStatus", row.getString("approval_status"));
+                .put("approvalStatus", row.getString("approval_status"))
+                // The label only, for the reason above. The two tile builders on this page are a
+                // pre-existing duplication; both are fed from one query and both are reported.
+                .put("employmentStatus", row.getString("employment_status"));
             if (mgrLogoUrl != null && !mgrLogoUrl.isBlank()) mgr.put("companyLogoUrl", mgrLogoUrl);
                     putCompanyIdentity(mgr, row);
             managers.add(mgr);
@@ -992,7 +1097,17 @@ public class ManagerService {
           removed here for the same reason the corpus query removes it from the tokens: no label
           has to start with it.
         */
-        String asked  = org.werkpages.repository.LocationCorpusRepository.withoutStatedCountry(query);
+        /*
+          THE PLACE NAME, by the same reading the lookup uses.
+
+          This stripped only a trailing COUNTRY, and only when it was three characters or more.
+          So "Mumbai, IN", "Toronto, Ont" and "Kitchener, Ontario, Ca" kept their qualifiers, the
+          comparison below tested "mumbai in" against "Mumbai Maharashtra", and the gate concluded
+          that nobody had typed a place name - for queries the geography index had just answered
+          correctly. The buildings file was then read anyway, which is where the seconds went and
+          why businesses led the list.
+        */
+        String asked  = org.werkpages.repository.LocationCorpusRepository.leadingPlace(query);
         String needle = collapse(spoken != null ? spoken : asked);
         if (needle.isEmpty()) return false;
         for (int i = 0; i < geography.size(); i++) {
@@ -1493,7 +1608,7 @@ public class ManagerService {
         org.werkpages.repository.CorpusDiagnostics.remoteCall();
         return guarded(PLACES_BREAKER,
             () -> locationCorpus.suggestPlaces(companyName, query, country, city),
-            "places", PLACES_DEADLINE_MS);
+            PLACES_DEADLINE_MS);
     }
 
     /**
@@ -1560,14 +1675,50 @@ public class ManagerService {
       A failure peculiar to the large file must not stop the cheap read that answers "which city",
       which is what most of this field is actually asked.
     */
-    private static final org.werkpages.repository.CorpusBreaker GEO_BREAKER =
+    /*
+      ADDRESSES NEEDED ITS OWN, and sharing geography's silently disabled geography's.
+
+      The addresses tier was added later and reused GEO_BREAKER. Addresses are published for very
+      few countries, so that read returns empty quickly and counts as a SUCCESS, and any success
+      resets consecutiveFailures to zero. Every request therefore recorded one geography failure
+      and one addresses success, the counter oscillated between 1 and 0, and the threshold of 5 was
+      unreachable. Measured on a cold start: nine consecutive geography timeouts, zero breaker
+      lines in the log, and the next request still paid the full 4000ms deadline. The breaker
+      existed and did nothing, which is worse than not having one, because the state endpoint
+      reported it closed and healthy throughout.
+
+      So the breaker IS the tier. See LocationBreakerWiringTest, which drives these three
+      constants through guarded() with injected failures.
+    */
+    static final org.werkpages.repository.CorpusBreaker GEO_BREAKER =
         new org.werkpages.repository.CorpusBreaker("geography", 5, 30_000);
-    private static final org.werkpages.repository.CorpusBreaker PLACES_BREAKER =
+    static final org.werkpages.repository.CorpusBreaker ADDRESS_BREAKER =
+        new org.werkpages.repository.CorpusBreaker("addresses", 5, 30_000);
+    static final org.werkpages.repository.CorpusBreaker PLACES_BREAKER =
         new org.werkpages.repository.CorpusBreaker("places", 5, 30_000);
 
-    /** Both breakers, for the health endpoint and the logs. */
+    /**
+     * Starts the location corpus opening, so the first request does not have to.
+     *
+     * <p>Called once from MainVerticle at boot. It returns immediately: the engine, the release
+     * pointer and the worldwide geography file are all brought up on the corpus's own worker, and
+     * startup never waits for them.
+     *
+     * <p>Deliberately NOT in a constructor. Every unit test in this product builds a
+     * ManagerService, and constructing one must stay free and incapable of failing; a process that
+     * does not call this keeps the old behaviour, where the first query opens the corpus.
+     *
+     * <p>See LocationCorpusRepository.beginInitialisation for the cold-start defect this closes,
+     * and LocationColdStartTest for what is proven about it.
+     */
+    public void startLocationCorpus() {
+        locationCorpus.beginInitialisation();
+    }
+
+    /** Every breaker, for the health endpoint and the logs. */
     public static String corpusBreakerState() {
-        return GEO_BREAKER.state() + " | " + PLACES_BREAKER.state();
+        return GEO_BREAKER.state() + " | " + ADDRESS_BREAKER.state()
+             + " | " + PLACES_BREAKER.state();
     }
 
     /**
@@ -1576,19 +1727,26 @@ public class ManagerService {
      * <p>A corpus read is allowed to be down; it is not allowed to look empty to something that
      * caches, and it is not allowed to make every keystroke wait for it to time out.
      */
-    private Future<JsonArray> guarded(org.werkpages.repository.CorpusBreaker breaker,
-                                      java.util.function.Supplier<Future<JsonArray>> read,
-                                      String what, long deadlineMs) {
+    static Future<JsonArray> guarded(org.werkpages.repository.CorpusBreaker breaker,
+                                     java.util.function.Supplier<Future<JsonArray>> read,
+                                     long deadlineMs) {
         if (!breaker.allow()) {
             // Open: answer from whatever else the caller has, immediately.
             org.werkpages.repository.CorpusDiagnostics.breakerSkip();
             return Future.succeededFuture(new JsonArray());
         }
-        return withDeadline(read.get(), what, deadlineMs)
+        /*
+          THE TIER IS NAMED BY ITS BREAKER, not by a separate argument.
+
+          It used to take both, and they disagreed: the addresses read was labelled "addresses"
+          while its outcome was recorded against the geography breaker. One of the two had to go,
+          and the breaker is the one that carries consequences.
+        */
+        return withDeadline(read.get(), breaker.name(), deadlineMs)
             .onSuccess(v -> breaker.recordSuccess())
             .otherwise(err -> {
                 breaker.recordFailure();
-                System.err.println("location corpus " + what + " unavailable: " + err);
+                System.err.println("location corpus " + breaker.name() + " unavailable: " + err);
                 return new JsonArray();
             });
     }
@@ -1626,7 +1784,9 @@ public class ManagerService {
       and the real fix is to stop making it remotely at all: the local index already holds the
       geography names it would need.
     */
-    private static final long GEOGRAPHY_DEADLINE_MS = 4000;
+    // Package-private so LocationBreakerWiringTest drives the tiers at the real deadline
+    // rather than a copy of this number.
+    static final long GEOGRAPHY_DEADLINE_MS = 4000;
     private static final long PLACES_DEADLINE_MS    = 6000;
 
     /** One daemon thread, for deadlines only. It never does work, it only fires timeouts. */
@@ -1832,9 +1992,11 @@ public class ManagerService {
      * query: <b>geography 0.76s over 194k rows, places 4.82s over 16.1M</b>. A location field is
      * mostly asked "which city", and the city lives in the cheap file.
      */
-    private Future<JsonArray> appendCorpusSuggestions(JsonArray confirmed, String companyName,
-                                                      String query, String country, String state,
-                                                      boolean withPlaces) {
+    // Package-private so LocationBreakerWiringTest can drive the tiers; see the note on the
+    // corpus-injecting constructor.
+    Future<JsonArray> appendCorpusSuggestions(JsonArray confirmed, String companyName,
+                                              String query, String country, String state,
+                                              boolean withPlaces) {
         if (confirmed.size() >= SUGGESTION_LIMIT) return Future.succeededFuture(confirmed);
 
         /*
@@ -1922,7 +2084,7 @@ public class ManagerService {
         long[] tierMs = new long[3];   // 0 geography, 1 places, 2 postgres-confirmed
         Future<JsonArray> geographyF =
             guarded(GEO_BREAKER, () -> locationCorpus.suggestGeography(query, country, null),
-                    "geography", GEOGRAPHY_DEADLINE_MS)
+                    GEOGRAPHY_DEADLINE_MS)
                 .onComplete(r -> tierMs[0] = (System.nanoTime() - geoStarted) / 1_000_000);
 
         return geographyF.compose(geography -> {
@@ -1973,8 +2135,8 @@ public class ManagerService {
               choose elsewhere. That is coverage, reported through addressCoverage(), not failure.
             */
             Future<JsonArray> addressesF = withPlaces
-                ? guarded(GEO_BREAKER, () -> locationCorpus.suggestAddresses(query, country, 5),
-                          "addresses", GEOGRAPHY_DEADLINE_MS)
+                ? guarded(ADDRESS_BREAKER, () -> locationCorpus.suggestAddresses(query, country, 5),
+                          GEOGRAPHY_DEADLINE_MS)
                 : Future.succeededFuture(new JsonArray());
             long placesStarted = System.nanoTime();
             return addressesF.compose(addressRows ->
@@ -2279,9 +2441,15 @@ public class ManagerService {
     public Future<JsonObject> getStats() {
         Future<Long> userSubmittedFuture = db.query("SELECT COUNT(*) FROM managers WHERE approval_status IN ('approved','ghost') AND external_id IS NULL")
             .execute().map(rows -> rows.iterator().next().getLong(0));
-        Future<Long> realReviewsFuture = db.query("SELECT COUNT(*) FROM reviews r JOIN managers m ON r.manager_id = m.id WHERE m.approval_status IN ('approved','ghost') AND m.external_id IS NULL AND r.weight = FALSE")
+        Future<Long> realReviewsFuture = db.query("SELECT COUNT(*) FROM reviews r JOIN managers m ON r.manager_id = m.id WHERE m.approval_status IN ('approved','ghost') AND m.external_id IS NULL AND r.origin = 'contributor'")
             .execute().map(rows -> rows.iterator().next().getLong(0));
-        Future<Long> weightedOpinionsFuture = db.query("SELECT COUNT(*) FROM reviews WHERE weight = TRUE AND (weight_expires_on IS NULL OR weight_expires_on > CURRENT_DATE)")
+        /*
+          WEIGHTED OPINIONS NO LONGER COUNTS EXAMPLES.
+          It counted exactly the platform seeds - weight = TRUE inside its window - so the figure
+          was a count of demonstrations presented as opinions. Examples contribute to no genuine
+          figure, and this is a public one.
+        */
+        Future<Long> weightedOpinionsFuture = db.query("SELECT COUNT(*) FROM reviews WHERE origin = 'contributor' AND weight = TRUE AND (weight_expires_on IS NULL OR weight_expires_on > CURRENT_DATE)")
             .execute().map(rows -> rows.iterator().next().getLong(0));
         Future<Long> seededManagersFuture = db.query("SELECT COUNT(*) FROM managers WHERE approval_status IN ('approved','ghost') AND external_id LIKE 'seed_%'")
             .execute().map(rows -> rows.iterator().next().getLong(0));
@@ -2490,6 +2658,24 @@ public class ManagerService {
             try { draftTokenParsed = UUID.fromString(draftTokenStr); } catch (IllegalArgumentException ignored) {}
         }
 
+        /*
+          PHASE 1. The attempt at the add-manager form that this submission finishes.
+
+          Minted by the client when step one first posts its capture, held in the same localStorage
+          slot as the rating draft, and presented again here - including after a sign-in round
+          trip. It is what identifies the draft this attempt left behind; see
+          ManagerRepository.adoptCaptureByToken.
+
+          A malformed value is ignored rather than refused, exactly as draftToken is: the token is
+          bookkeeping about a request, and a submission somebody spent ten minutes on must not be
+          thrown away over it. Ignoring it costs the adoption, not the contribution.
+        */
+        UUID captureTokenParsed = null;
+        String captureTokenStr = body.getString("captureToken");
+        if (captureTokenStr != null && !captureTokenStr.isBlank()) {
+            try { captureTokenParsed = UUID.fromString(captureTokenStr); } catch (IllegalArgumentException ignored) {}
+        }
+
         final String   fStatus               = submittedStatus;
         final LocalDate fStartDate           = startDateLocal;
         final String   fReviewAuthorType     = reviewBody.getString("authorType", "username");
@@ -2509,6 +2695,7 @@ public class ManagerService {
         final LocalDate fWorkedUntil  = workedUntil;
         final boolean  fDatesHidden   = datesHidden;
         final UUID     fDraftToken    = draftTokenParsed;
+        final UUID     fCaptureToken  = captureTokenParsed;
 
         return userRepo.findByAuth0IdWithBan(auth0Id)
             .compose(opt -> {
@@ -2527,7 +2714,22 @@ public class ManagerService {
                         && !fReviewClientAuthor.isEmpty() && fReviewClientAuthor.length() <= 100) {
                     author = fReviewClientAuthor;
                 } else {
-                    author = dbUsername;
+                    /*
+                      A PROVISIONAL USERNAME IS NEVER PUBLISHED.
+
+                      An account created through Universal Login starts with a generated name of
+                      the shape user_1a2b3c4d, flagged `username_is_provisional`, until the person
+                      completes their profile. Publishing that name was an explicit condition of
+                      the approval: it identifies nobody, it looks like a bug on a profile page,
+                      and once it is in reviews.author it stays there - that column is a snapshot,
+                      not a join, so choosing a real username later does not go back and fix it.
+
+                      A pseudonym rather than a refusal. Somebody who skipped profile completion
+                      and came back to publish a draft must still be able to publish it; refusing
+                      would throw away the contribution to protect a display name, which is the
+                      wrong trade and is the kind of gate section 44 exists to prevent.
+                    */
+                    author = looksProvisional(dbUsername) ? generatePseudonym() : dbUsername;
                 }
                 return managerRepo.countSubmittedTodayByUser(userId)
                     .compose(todayCount -> SubmissionLimits.checkDailyLimit(todayCount, SubmissionLimits.DAILY_MANAGERS))
@@ -2547,17 +2749,26 @@ public class ManagerService {
                           which is what lets the ordinary duplicate detection below find it. No
                           special case downstream: by the time it runs, there is simply an existing
                           manager at this company with this name.
+
+                          PHASE 1: BY TOKEN. This used to pass the name and let the repository find
+                          whatever resembled it - same name, captured company a prefix of this one,
+                          under an hour old. That also describes a stranger's half-typed namesake,
+                          which was then rewritten to this submitter's company and handed to their
+                          account. The attempt now identifies its own draft, so there is nothing
+                          left to recognise. A submission carrying no token adopts nothing, which
+                          is the honest answer: without the token there is no evidence which draft,
+                          if any, belongs to this attempt.
                         */
-                        return managerRepo.adoptCapture(name, company, title, userId, null)
+                        return managerRepo.adoptCaptureByToken(fCaptureToken, company, title, userId, null)
                             .compose(adopted -> managerRepo.findByCompanyExact(company))
                             .compose(candidates -> {
                                 Row fuzzyMatch = findFuzzyNameMatch(candidates, name);
                                 if (fuzzyMatch != null) {
                                     return doAttachToExisting(fuzzyMatch, userId, author,
-                                        name, company, title, fStatus, fCountry, fLinkedinUrl, resolvedLogoUrl,
+                                        company, title, fStatus, fCountry, resolvedLogoUrl,
                                         fStartDate, fEndDate, fOverallRating, fRatings,
                                         fMgrCompany, fMgrTitle, fReviewText, fWorkedFrom, fWorkedUntil, fDraftToken,
-                                        fDatesHidden);
+                                        fCaptureToken, fDatesHidden);
                                 }
 
                                 // No match — create a new pending_approval manager with its first review.
@@ -2596,14 +2807,47 @@ public class ManagerService {
                                         .compose(managerResult -> {
                                             Row managerRow = managerResult.iterator().next();
                                             long managerId = managerRow.getLong("id");
-                                            conn.preparedQuery("INSERT INTO career_history(manager_id, company, title, start_date, end_date, company_id) VALUES ($1,$2,$3,$4,$5,$6)")
-                                                .execute(Tuple.of(managerId, company, title, startDt, endDt, companyId), ignored -> {});
+                                            /*
+                                              WAS FIRE AND FORGET, and a resolution cannot be
+                                              chained onto a result nobody waits for. Composed
+                                              instead, on the same connection, so the role, its
+                                              status and its event commit with the manager and the
+                                              first rating or not at all.
+
+                                              This does make an insert failure fail the request,
+                                              where the result used to be discarded. It is not a
+                                              new failure mode: a failed statement aborts the
+                                              PostgreSQL transaction, so the very next statement on
+                                              this connection would have failed anyway. What
+                                              changes is that it now fails where it happened,
+                                              naming the insert, instead of further down with
+                                              "current transaction is aborted".
+                                            */
+                                            Future<Void> career = conn.preparedQuery("INSERT INTO career_history(manager_id, company, title, start_date, end_date, company_id) VALUES ($1,$2,$3,$4,$5,$6)")
+                                                .execute(Tuple.of(managerId, company, title, startDt, endDt, companyId))
+                                                .compose(v -> EmploymentStatusResolver.resolveManager(conn, managerId));
                                             Future<Void> deleteDraft = (fDraftToken != null)
                                                 ? conn.preparedQuery("DELETE FROM reviews WHERE draft_token = $1 AND user_id IS NULL")
                                                       .execute(Tuple.of(fDraftToken))
                                                       .mapEmpty()
                                                 : Future.succeededFuture();
-                                            return deleteDraft.compose(v ->
+                                            /*
+                                              PHASE 1. This submission created its own manager
+                                              rather than adopting one, and the attempt is over
+                                              either way: the form was submitted. Same transaction
+                                              as the manager and its first review, so a rollback
+                                              leaves the token unspent.
+
+                                              Nothing is inserted when the ledger has no row for
+                                              this token - a capture that never reached the server
+                                              leaves no attempt to resolve, and inventing one here
+                                              would record an attempt that was never seen.
+                                            */
+                                            Future<Void> resolveAttempt = (fCaptureToken != null)
+                                                ? captureAttempts.resolve(conn, fCaptureToken,
+                                                        CaptureAttemptRepository.OUTCOME_SUBMITTED)
+                                                : Future.succeededFuture();
+                                            return career.compose(v -> deleteDraft).compose(v -> resolveAttempt).compose(v ->
                                                 conn.preparedQuery("""
                                                     INSERT INTO reviews (
                                                         manager_id, user_id, author, overall_rating,
@@ -2708,12 +2952,20 @@ public class ManagerService {
      */
     private Future<Row> doAttachToExisting(
             Row match, UUID userId, String author,
-            String name, String company, String title,
-            String status, String country, String linkedinUrl, String logoUrl,
+            // No `name` and no `linkedinUrl`: PHASE 0 removed the only use either had, which was
+            // writing them over the matched manager's own. Attaching a review must not re-identify
+            // the person it is about, so this method is never told what the submitter called them.
+            String company, String title,
+            String status, String country, String logoUrl,
             LocalDate startDate, LocalDate endDate,
             double overallRating, JsonObject ratings,
             String mgrCompany, String mgrTitle, String reviewText,
             LocalDate workedFrom, LocalDate workedUntil, UUID draftToken,
+            // PHASE 1. The add-form attempt this submission finishes, or null. It travels beside
+            // draftToken because it is the same kind of thing - one token per step of one
+            // contribution - and it is resolved in the same transaction as the review below, so a
+            // rollback leaves the attempt unspent and a retry is still able to adopt its draft.
+            UUID captureToken,
             boolean datesHidden) {
 
         long existingId      = match.getLong("id");
@@ -2740,13 +2992,22 @@ public class ManagerService {
         if ("ghost".equals(approvalStatus)) {
             // Enrich the ghost record with the more complete form data, add career history,
             // then attach the review.
-            return managerRepo.updateForAttach(existingId, name, title, status, country, linkedinUrl, logoUrl, userId)
-                /*
-                  The name may have just changed - this is the path that supplies a fuller one for
-                  a row the search created from whatever was typed. The slug has to follow, or the
-                  person is renamed and left on an address derived from a truncation.
-                */
-                .compose(updated -> managerRepo.syncSlugToName(existingId).map(moved -> updated))
+            /*
+              PHASE 0: the submission enriches, it does not re-identify.
+
+              This call used to pass `name`, `title` and `linkedinUrl` too, and then re-slugged the
+              row to match the new name. Since the manager it is updating was found by a fuzzy name
+              match, rating "Emma Davies" renamed a live "Emma Davis", retitled her, moved her
+              public URL and filed the old one as a redirect - a published profile rewritten by one
+              reader's spelling, unreviewed. The name, the title and the LinkedIn URL are what
+              assert which real person the page is about, so a submission no longer writes any of
+              them, and there is therefore no rename left for the slug to follow.
+
+              `status`, `country` and the logo still come from the form: they are detail about the
+              job, not claims about who the person is. Renaming remains available through
+              ManagerRepository.adminEdit, which is reviewed and records what it replaced.
+            */
+            return managerRepo.updateForAttach(existingId, status, country, logoUrl, userId)
                 .compose(updatedOpt -> {
                     if (updatedOpt.isEmpty()) return Future.failedFuture(ServiceException.notFound("Manager not found"));
                     Row updatedRow = updatedOpt.get();
@@ -2758,21 +3019,42 @@ public class ManagerService {
                                 ? Future.succeededFuture()
                                 : companyRepo.findOrCreate(company, null, logoUrl)
                                     .compose(cRow -> managerRepo.insertCareerEntry(existingId, company, title, startDt, endDt, cRow.getLong("id")));
-                            // First-time raters (non-contributors) who rate the ghost manager they
-                            // found via /find get the seed deleted immediately so their real rating
-                            // shows at once. Contributors who happen to rate a ghost manager keep
-                            // the seed on the 14-day expiry counter instead.
-                            Future<Long> reviewCountFuture = userId != null
-                                ? db.preparedQuery("SELECT COUNT(*) AS cnt FROM reviews WHERE user_id = $1 AND deleted_at IS NULL")
-                                    .execute(Tuple.of(userId))
-                                    .map(rs -> rs.iterator().next().getLong("cnt"))
-                                : Future.succeededFuture(1L); // anonymous → treat as contributor
+                            /*
+                              THE EXAMPLE GOES, AT ONCE, the moment a real rating lands.
+
+                              An example exists to show an empty profile what a rating looks like.
+                              Once somebody has actually rated this manager it has nothing left to
+                              demonstrate, and leaving it there means a reader scrolling a profile
+                              with one genuine rating finds a fabricated one sitting beside it.
+
+                              THE HISTORY HERE. Three behaviours in three releases:
+
+                                  1. count == 0 -> delete now, count > 0 -> 14-day expiry, keyed
+                                     on how many reviews the submitter had written ANYWHERE, which
+                                     is not a fact about this manager at all;
+                                  2. left alone permanently, as a retained labelled demonstration;
+                                  3. deleted immediately, which is this.
+
+                              (2) was a deliberate decision and is being reversed deliberately.
+                              `GhostSeedDeletionIntegrationTest.nonContributor_ratesGhostManager_
+                              seedDeletedImmediately` asserted (3) throughout (2) and simply sat
+                              red, which is how the behaviour the test was written to protect was
+                              lost without anybody noticing.
+
+                              AFTER the insert, never before: an invalid submission that fails
+                              validation must not have destroyed the example on its way out,
+                              leaving the profile with neither a rating nor a demonstration.
+
+                              No recalculation follows. `recalculate` counts `ReviewSql.genuine`,
+                              which excludes `origin = 'platform_example'`, so an example was
+                              already contributing nothing to the cached count, the average or any
+                              company or industry projection downstream of them. Removing the row
+                              changes no number anybody sees.
+                            */
                             return histFuture
-                                .compose(v -> reviewCountFuture)
-                                .compose(existingReviewCount -> existingReviewCount == 0
-                                    ? reviewRepo.deleteSeedReview(existingId)
-                                    : reviewRepo.scheduleSeedExpiry(existingId))
-                                .compose(v -> validateAndInsertReview(reviewBody, existingId, userId, author, logoUrl, draftToken))
+                                .compose(v -> validateAndInsertReview(reviewBody, existingId, userId, author, logoUrl, draftToken,
+                                                                      captureToken, false, SubmissionContext.NONE))
+                                .compose(inserted -> retireExampleRating(existingId))
                                 .map(ignored -> updatedRow);
                         });
                 });
@@ -2792,11 +3074,46 @@ public class ManagerService {
                 .compose(opt -> {
                     if (opt.isEmpty()) return Future.failedFuture(ServiceException.notFound("Manager not found"));
                     Row existingRow = opt.get();
-                    return reviewRepo.deleteSeedReview(existingId)
-                        .compose(v -> validateAndInsertReview(reviewBody, existingId, userId, author, logoUrl, draftToken))
+                    // The example goes here too, and for the same reasons; see the /find path
+                    // above. After the insert, never before.
+                    return validateAndInsertReview(reviewBody, existingId, userId, author, logoUrl, draftToken,
+                                                   captureToken, false, SubmissionContext.NONE)
+                        .compose(inserted -> retireExampleRating(existingId))
                         .map(ignored -> existingRow);
                 });
         }
+    }
+
+    /**
+     * Retires a manager's platform example, because a genuine rating has arrived.
+     *
+     * <p><b>The recalculation is not optional, and an earlier version of this change left it
+     * out.</b> The reasoning for omitting it was that {@code recalculate} counts
+     * {@code ReviewSql.genuine}, which requires {@code origin = 'contributor'}, so an example was
+     * already contributing nothing and removing the row could not move a number.
+     *
+     * <p>That is true only where V106 has run. V106 is the migration that ADDS
+     * {@code reviews.origin}, {@code NOT NULL DEFAULT 'contributor'}, and backfills existing seeds
+     * to {@code 'platform_example'} in the same transaction. Before it, there is no provenance at
+     * all and a seed is counted through the weight window that preceded it, so the example IS in
+     * the cached average. Deleting the row without recalculating would leave
+     * {@code managers.overall_rating} and {@code reviews_count} describing a row that no longer
+     * exists, with nothing to point at the discrepancy.
+     *
+     * <p>Relying on a migration in the OTHER repository's stream having been applied, to make a
+     * delete in this one safe, is a cross-repository ordering dependency for no gain. The
+     * recalculation is cheap, idempotent, and correct in both worlds, so it simply always runs.
+     *
+     * <p>It also carries the change outward: {@code recalculate} writes
+     * {@code managers.reviews_count} and {@code overall_rating}, and the managers trigger fires on
+     * those, so {@code company_stats_live} follows inside the same statement (V89).
+     *
+     * <p>Delete and recalculate are one unit here rather than two calls at each site, so there is
+     * no way to add a fifth submission path that remembers the first and forgets the second.
+     */
+    private Future<Void> retireExampleRating(long managerId) {
+        return reviewRepo.deleteSeedReview(managerId)
+            .compose(v -> managerRepo.recalculate(managerId));
     }
 
     // ── UPDATE manager ────────────────────────────────────────────────────────
@@ -2963,28 +3280,106 @@ public class ManagerService {
                             try { draftToken = UUID.fromString(draftTokenStr); } catch (IllegalArgumentException ignored) {}
                         }
                         /*
-                            Start the placeholder's countdown once the real review is in.
+                            Remove the placeholder once the real review is in.
 
-                            This path - opening a ghost's profile and pressing "Write a Review" -
-                            retired the placeholder neither way, so the seeded review kept counting
-                            toward the average forever alongside the genuine one.
+                            This is the path most people actually take - opening a profile and
+                            pressing "Write a Review" - and it is the one that retired the
+                            placeholder neither way for longest. In live data: 304 placeholders,
+                            not one with a clock started, because the two callers that touched it
+                            were the find-or-create flow and the drop-off draft.
 
-                            AFTER the insert, not before. Retiring it first means a submission that
-                            then fails validation has already timed out the placeholder, leaving
-                            the manager with a retired seed and no review to replace it.
+                            A 14-DAY COUNTDOWN STOOD HERE, and the reasoning given for it was that
+                            "no manager's displayed rating changes the instant somebody submits".
+                            That reasoning no longer holds: `recalculate` counts
+                            `ReviewSql.genuine`, which excludes `origin = 'platform_example'`, so
+                            an example contributes nothing to the cached count or average either
+                            way. The timer was protecting a number that had already stopped moving,
+                            while leaving a fabricated rating visible in the list for a fortnight
+                            next to a real one.
 
-                            Always the 14-day countdown, never an immediate delete: no manager's
-                            displayed rating changes the instant somebody submits.
+                            AFTER the insert, not before. Retiring it first means an invalid
+                            submission - one that then fails validation and is rejected - has
+                            already destroyed the placeholder, leaving the manager with neither a
+                            rating nor a demonstration. Nothing may touch it until a genuine review
+                            is definitely recorded.
                         */
                         return validateAndInsertReview(body, managerId, userId, author,
-                                resolvedLogoUrl, draftToken, submission)
-                            .compose(reviewRow -> reviewRepo.scheduleSeedExpiry(managerId)
-                                .map(seedScheduled -> reviewRow));
+                                resolvedLogoUrl, draftToken, null, false, submission)
+                            .compose(reviewRow -> retireExampleRating(managerId)
+                                .map(seedDeleted -> reviewRow));
                     });
             });
     }
 
+    /**
+     * Saves the manager-rating form's answers while it is still being filled in.
+     *
+     * <p><b>Deliberately NOT the drop-off path, and the distinction matters.</b>
+     * {@code createDropOffReview} writes a real, live, public review and runs once, when somebody
+     * presses submit without an account. This runs every few seconds while they are still typing,
+     * and must never publish anything: half the categories answered is not a rating, and a
+     * profile that showed one would be stating an opinion nobody finished forming.
+     *
+     * <p>So it lands in {@code captured_drafts} as {@code manager_review}, a kind the column has
+     * always permitted and nothing has ever written. Internal data, never aggregated, never
+     * served to a reader.
+     *
+     * <p>Both paths share the form's token, so a submit after several autosaves resolves the
+     * draft rather than adding to it, and no duplicate review is created.
+     *
+     * <p>Meaningful progress for this form: one of the ten category scores, or the overall.
+     */
+    public Future<JsonObject> autosaveReviewDraft(long managerId, JsonObject body) {
+        if (body == null || !reviewHasMeaningfulProgress(body)) {
+            return Future.succeededFuture(new JsonObject().put("saved", false));
+        }
+        UUID draftToken = null;
+        String raw = body.getString("draftToken");
+        if (raw != null && !raw.isBlank()) {
+            try { draftToken = UUID.fromString(raw.trim()); } catch (IllegalArgumentException ignored) {}
+        }
+        if (draftToken == null) return Future.succeededFuture(new JsonObject().put("saved", false));
+
+        return new org.werkpages.repository.CapturedDraftRepository(db)
+            .autosave(org.werkpages.repository.CapturedDraftRepository.MANAGER_REVIEW,
+                      null, managerId, null, draftToken, body.copy(),
+                      body.getLong("revision", 0L))
+            .map(v -> new JsonObject().put("saved", true));
+    }
+
+    /** One category score or the overall. Written for THIS form's fields, not shared blindly. */
+    static boolean reviewHasMeaningfulProgress(JsonObject body) {
+        if (body.getDouble("overallRating") != null) return true;
+        JsonObject ratings = body.getJsonObject("ratings");
+        if (ratings == null) return false;
+        for (String key : ratings.fieldNames()) {
+            Double v = ratings.getDouble(key);
+            if (v != null && v > 0) return true;
+        }
+        return false;
+    }
+
     public Future<Void> createDropOffReview(long managerId, JsonObject body, String resolvedLogoUrl) {
+        return createDropOffReview(managerId, body, resolvedLogoUrl, SubmissionContext.NONE);
+    }
+
+    /**
+     * An anonymous manager rating, with the location its author actually chose.
+     *
+     * <p>REPORTED as "Halifax, Nova Scotia, Canada does not work". Everything visible worked: the
+     * suggestions answered, the dropdown offered it, clicking it filled the field, the form posted
+     * the declared keys and the write returned 200. Every declared column on the stored row was
+     * NULL.
+     *
+     * <p>The declared location travels on the {@link SubmissionContext}, and this method used to
+     * call the insert through the overload that supplies {@link SubmissionContext#NONE}. The
+     * signed-in path has always built one from the request; this one passed nothing, so a location
+     * somebody had picked off a list was discarded on every anonymous rating, silently.
+     *
+     * <p>The no-context overload above is kept for callers that genuinely have none.
+     */
+    public Future<Void> createDropOffReview(long managerId, JsonObject body, String resolvedLogoUrl,
+                                            SubmissionContext submission) {
         if (body == null) return Future.failedFuture(ServiceException.badRequest("Missing request body"));
 
         String author = body.getString("author");
@@ -3011,20 +3406,20 @@ public class ManagerService {
                 if (isBlank(body.getString("managerCompany"))) body.put("managerCompany", mgr.getString("company"));
                 if (isBlank(body.getString("managerTitle")))   body.put("managerTitle",   mgr.getString("title"));
             }
-            return validateAndInsertReview(body, managerId, null, fAuthor, resolvedLogoUrl, fDraftToken, true);
+            return validateAndInsertReview(body, managerId, null, fAuthor, resolvedLogoUrl, fDraftToken, null, true, submission);
         }).mapEmpty();
     }
 
     private Future<Row> validateAndInsertReview(JsonObject body, long managerId, UUID userId, String author, String resolvedLogoUrl, UUID draftToken) {
-        return validateAndInsertReview(body, managerId, userId, author, resolvedLogoUrl, draftToken, false, SubmissionContext.NONE);
+        return validateAndInsertReview(body, managerId, userId, author, resolvedLogoUrl, draftToken, null, false, SubmissionContext.NONE);
     }
 
     private Future<Row> validateAndInsertReview(JsonObject body, long managerId, UUID userId, String author, String resolvedLogoUrl, UUID draftToken, SubmissionContext submission) {
-        return validateAndInsertReview(body, managerId, userId, author, resolvedLogoUrl, draftToken, false, submission);
+        return validateAndInsertReview(body, managerId, userId, author, resolvedLogoUrl, draftToken, null, false, submission);
     }
 
     private Future<Row> validateAndInsertReview(JsonObject body, long managerId, UUID userId, String author, String resolvedLogoUrl, UUID draftToken, boolean allowIncomplete) {
-        return validateAndInsertReview(body, managerId, userId, author, resolvedLogoUrl, draftToken, allowIncomplete, SubmissionContext.NONE);
+        return validateAndInsertReview(body, managerId, userId, author, resolvedLogoUrl, draftToken, null, allowIncomplete, SubmissionContext.NONE);
     }
 
     /**
@@ -3034,7 +3429,116 @@ public class ManagerService {
      *                        person never reached that field. Requiring it there threw away exactly
      *                        the submissions the capture exists to save.
      */
-    private Future<Row> validateAndInsertReview(JsonObject body, long managerId, UUID userId, String author, String resolvedLogoUrl, UUID draftToken, boolean allowIncomplete, SubmissionContext submission) {
+    /**
+     * Why a captured manager-rating draft cannot be published, or empty when it can be.
+     *
+     * <h2>This is a FLOOR, not a clone of the validator</h2>
+     *
+     * <p>The workplace form splits its validation into a pure {@code parseRating}, so its queue can
+     * run the real validator without writing. The manager validator does not split that way: its
+     * checks are interleaved with the insert in one method, and pulling them out in an order that
+     * preserved every error message was not possible without reordering the ones a reader sees.
+     *
+     * <p>So this answers the narrower question the queue actually needs: are the required answers
+     * present. {@link #validateAndInsertReview} stays the authority on validity and runs inside
+     * the publishing transaction, so a draft that clears this floor and is then refused by the
+     * real validator fails the publish with the real message and writes nothing. The floor can
+     * only ever be too generous, never too strict, and the transaction is what makes being too
+     * generous safe.
+     *
+     * <p>Required because this is a PUBLICATION: the autosave floor is one category score, which
+     * is the right bar for keeping an observation and nowhere near the bar for a public opinion.
+     */
+    public static Optional<String> publicationBlocker(JsonObject payload) {
+        if (payload == null) return Optional.of("This draft holds no answers.");
+        JsonObject ratings = payload.getJsonObject("ratings");
+        String missing = reviewFieldMissing(payload.getDouble("overallRating"), ratings,
+                                            payload.getString("managerCompany"),
+                                            payload.getString("managerTitle"));
+        if (missing != null) return Optional.of(missing);
+        if (isBlank(payload.getString("workedFrom"))) {
+            return Optional.of("Your start date working with this manager is required");
+        }
+        /*
+          Every category, not merely some. A partially rated manager is exactly what autosave is
+          for, and publishing one would put a number on a page that nobody finished forming.
+        */
+        for (int i = 0; i < RATING_KEYS.length; i++) {
+            if (!hasRating(ratings, i)) {
+                return Optional.of("This draft is missing a rating for '" + RATING_KEYS[i] + "'.");
+            }
+        }
+        return Optional.empty();
+    }
+
+    /**
+     * Publishes a captured manager rating as a real review belonging to nobody.
+     *
+     * <p>The workplace and interview forms gained this first; a {@code manager_review} draft sat in
+     * the queue readable and unpublishable however complete it was, which is the gap this closes.
+     * A manager rating dropped off at the SIGN-IN wall has always become a real review at once -
+     * that path is untouched. This is for the other case: a form abandoned part-way, autosaved,
+     * and later found to be complete after all.
+     *
+     * <p><b>Runs on the caller's transaction</b>, which is the whole reason the connection is
+     * threaded through the insert. The review and the resolution of the draft it came from have to
+     * commit together, or the next admin publishes the same opinion a second time.
+     *
+     * <p><b>user_id null and a fresh byline</b>, for the same reasons the workplace path documents:
+     * there is no account to attach, and the handle the person watched the form show them must not
+     * appear on a rating they never submitted.
+     *
+     * <p>The account-scoped rules are not applied and cannot be. The unique index on
+     * {@code draft_token} carries the only one that still means anything: one published rating per
+     * captured form.
+     */
+    public Future<Row> publishAnonymously(io.vertx.sqlclient.SqlConnection conn, long managerId,
+                                          JsonObject payload, UUID draftToken) {
+        JsonObject body = payload.copy();
+        /*
+          No logo is resolved here. The form paths resolve one in the HTTP handler, which is where
+          that utility lives; reaching for it from the service layer would invert the dependency
+          for a decoration. The manager row already carries its company's logo, which is what the
+          profile renders, so a null here costs nothing a reader can see.
+        */
+        return validateAndInsertReview(body, managerId, null, freshByline(body.getString("author")),
+                                       null, draftToken, null, false, SubmissionContext.NONE, conn);
+    }
+
+    /**
+     * A byline for a rating its author never submitted: freshly minted, never theirs.
+     *
+     * <p>The same rule the workplace path follows, and for the same reason: the person watched the
+     * form offer them a handle and then never pressed submit, so publishing under it would tell
+     * them the rating was theirs.
+     */
+    private static String freshByline(String theDraftsHandle) {
+        for (int attempt = 0; attempt < 8; attempt++) {
+            String minted = generatePseudonym();
+            if (theDraftsHandle == null || !minted.equalsIgnoreCase(theDraftsHandle.trim())) {
+                return minted;
+            }
+        }
+        return generatePseudonym() + "x";
+    }
+
+    /**
+     * The form paths, which each own their transaction. Unchanged behaviour.
+     */
+    private Future<Row> validateAndInsertReview(JsonObject body, long managerId, UUID userId, String author, String resolvedLogoUrl, UUID draftToken, UUID captureToken, boolean allowIncomplete, SubmissionContext submission) {
+        return validateAndInsertReview(body, managerId, userId, author, resolvedLogoUrl, draftToken, captureToken, allowIncomplete, submission, null);
+    }
+
+    /**
+     * The same validation and insert, optionally joining a transaction the caller already holds.
+     *
+     * <p>{@code caller} is null for every form submission: each is a unit of work on its own and
+     * opens its own transaction, exactly as before. It is non-null only for the admin queue, where
+     * writing the review and resolving the draft it came from have to succeed or fail together.
+     * Two transactions there would let a review land while its draft stayed queued, and the next
+     * admin would publish the same opinion a second time with nothing to show they were the same.
+     */
+    private Future<Row> validateAndInsertReview(JsonObject body, long managerId, UUID userId, String author, String resolvedLogoUrl, UUID draftToken, UUID captureToken, boolean allowIncomplete, SubmissionContext submission, io.vertx.sqlclient.SqlConnection caller) {
         Double overallRating      = body.getDouble("overallRating");
         JsonObject ratings        = body.getJsonObject("ratings");
         String managerCompany     = body.getString("managerCompany") != null ? body.getString("managerCompany").trim() : null;
@@ -3111,9 +3615,40 @@ public class ManagerService {
                   .mapEmpty()
             : Future.succeededFuture();
 
+        /*
+          THE RELINQUISHMENT GUARD, checked before anything is written.
+
+          Every duplicate rule below works from the ratings this account still OWNS, and unlinking
+          is precisely the act of ceasing to own one. The unlinked rating stays published and keeps
+          counting, but it leaves every per-user query - so without this check, unlinking would
+          itself have been the way to rate the same manager twice.
+
+          Read from the participation record, which is the only durable trace of the forfeit, and
+          keyed on RELINQUISHMENT rather than participation: Rev 268 deliberately allows an account
+          two ratings of one manager when it held two separate employments, and that must survive
+          for contributors who never unlinked anything.
+
+          Server-side and unconditional. The UI also hides the action, but the row is what enforces
+          it, and two simultaneous submissions both read a row that is already committed.
+        */
+        Future<Void> relinquishedGuard = userId == null
+            ? Future.succeededFuture()
+            : reviewRepo.hasRelinquishedManager((io.vertx.sqlclient.SqlClient) db, userId, managerId)
+                .compose(relinquished -> relinquished
+                    ? Future.<Void>failedFuture(
+                          ServiceException.conflict("rating_unlinked_for_this_manager"))
+                    : Future.<Void>succeededFuture());
+
         // Fetch all existing reviews by this user (or anonymous reviews with the same author name)
-        return deleteDraftFirst.compose(v ->
-            reviewRepo.findByUserForValidation(userId != null ? userId : UUID.fromString("00000000-0000-0000-0000-000000000000"), author)
+        return relinquishedGuard.compose(guardPassed -> deleteDraftFirst).compose(v ->
+            // The overload is taken ONLY when the caller holds a transaction. Every form
+            // submission is a unit of work on its own and keeps the pool-reading call it has
+            // always made, so this change is confined to the paths that genuinely needed it.
+            (caller != null
+                ? reviewRepo.findByUserForValidation(caller,
+                    userId != null ? userId : UUID.fromString("00000000-0000-0000-0000-000000000000"), author)
+                : reviewRepo.findByUserForValidation(
+                    userId != null ? userId : UUID.fromString("00000000-0000-0000-0000-000000000000"), author))
             .compose(existingRows -> {
                 List<Row> existing = new ArrayList<>();
                 for (Row r : existingRows) existing.add(r);
@@ -3146,9 +3681,9 @@ public class ManagerService {
 
                 // ── 3. Manager role period overlap (only when role dates were provided) ─
                 if (managerRoleStart == null) {
-                    return insertReviewTransactionally(managerId, userId, author, overallRating,
+                    return insertReviewTransactionally(caller, managerId, userId, author, overallRating,
                             ratings, managerCompany, managerTitle, text,
-                            workedFrom, workedUntil, null, null, resolvedLogoUrl, draftToken, submission,
+                            workedFrom, workedUntil, null, null, resolvedLogoUrl, draftToken, captureToken, submission,
                             managerStatus, datesHidden);
                 }
                 return reviewRepo.findRolePeriodsForManager(managerId)
@@ -3168,9 +3703,9 @@ public class ManagerService {
                             }
                         }
 
-                        return insertReviewTransactionally(managerId, userId, author, overallRating,
+                        return insertReviewTransactionally(caller, managerId, userId, author, overallRating,
                                 ratings, managerCompany, managerTitle, text,
-                                workedFrom, workedUntil, managerRoleStart, managerRoleEnd, resolvedLogoUrl, draftToken, submission,
+                                workedFrom, workedUntil, managerRoleStart, managerRoleEnd, resolvedLogoUrl, draftToken, captureToken, submission,
                                 managerStatus, datesHidden);
                     });  // closes allRoleRows compose
             })  // closes existingRows compose
@@ -3257,15 +3792,60 @@ public class ManagerService {
             });
     }
 
+
+    /** Private drafts of signed-in contributors, for cleanup on submission. */
+    private org.werkpages.repository.ContributionDraftRepository contributionDrafts;
+
+    /**
+     * Wires in removal of the contributor's PRIVATE draft when a submission succeeds. Chainable.
+     *
+     * <p>Optional on purpose, so every existing construction site and test keeps working. Null
+     * means no cleanup, which is the behaviour before V110 existed.
+     */
+    public ManagerService withContributionDrafts(
+            org.werkpages.repository.ContributionDraftRepository repo) {
+        this.contributionDrafts = repo;
+        return this;
+    }
+
+    /**
+     * Deletes the draft a submission has just replaced, IN THE SUBMISSION'S OWN TRANSACTION.
+     *
+     * <p>Same transaction, not after it: a submission that failed after the draft was removed
+     * would take somebody's unfinished answers with it and give them nothing in return. Rolling
+     * back puts the draft back.
+     */
+    private Future<Row> clearPrivateDraft(io.vertx.sqlclient.SqlConnection conn, Row row,
+                                          java.util.UUID ownerId, String subjectType,
+                                          long subjectId) {
+        if (contributionDrafts == null || ownerId == null) return Future.succeededFuture(row);
+        return contributionDrafts.deleteOnSubmission(conn, ownerId, subjectType, subjectId)
+            .map(v -> row);
+    }
+
     private Future<Row> insertReviewTransactionally(
+            io.vertx.sqlclient.SqlConnection caller,
             long managerId, UUID userId, String author, double overallRating,
             JsonObject ratings, String managerCompany, String managerTitle, String text,
             LocalDate workedFrom, LocalDate workedUntil,
             LocalDate managerRoleStart, LocalDate managerRoleEnd,
-            String resolvedLogoUrl, UUID draftToken, SubmissionContext submission,
+            String resolvedLogoUrl, UUID draftToken, UUID captureToken, SubmissionContext submission,
             String managerStatus, boolean datesHidden) {
 
-        return ((Pool) db).withTransaction(conn -> {
+        /*
+          ONE BODY, RUN EITHER ON THE CALLER'S TRANSACTION OR ON A NEW ONE.
+
+          Everything below used to live directly inside withTransaction, so this method always
+          owned its transaction and could not be part of anybody else's. That is fine for the
+          three form submissions, which are each a unit of work on their own, and it is wrong for
+          the admin queue: publishing a captured draft has to write the review AND resolve the
+          draft AND retire its siblings, or none of them. Two transactions means the review can
+          land while the draft stays queued, and the next admin publishes the same opinion twice.
+
+          So the work is named, and the caller decides where it runs. Passing null is exactly the
+          previous behaviour, and every form path passes null.
+        */
+        java.util.function.Function<io.vertx.sqlclient.SqlConnection, Future<Row>> work = conn -> {
             // Authenticated submit with a token: delete the matching anonymous drop-off draft first.
             Future<Void> deleteDraft = (userId != null && draftToken != null)
                 ? conn.preparedQuery("DELETE FROM reviews WHERE draft_token = $1 AND user_id IS NULL")
@@ -3273,10 +3853,66 @@ public class ManagerService {
                       .mapEmpty()
                 : Future.succeededFuture();
 
+            /*
+              AND THE CAPTURED DRAFT LEAVES THE ADMIN QUEUE.
+
+              The line above removes the anonymous REVIEW a drop-off wrote. It did not touch
+              captured_drafts, so an autosaved manager rating stayed in Unfinished Forms after its
+              author came back and submitted it properly. Now that those drafts can be published,
+              that left an admin holding a publishable copy of a rating that already existed - and
+              approving it would have produced the same opinion twice, from the same person, with
+              nothing to show they were the same.
+
+              The workplace and interview forms have always cleared theirs at this point; this one
+              simply never did. Same statement, same transaction, same condition: reviewed_at IS
+              NULL, so a decision an admin has already made is never deleted out from under them.
+
+              Both the authenticated submit and the anonymous drop-off clear it, because both mean
+              the form is finished and there is nothing left for anybody to review.
+
+              NOT ON THE ADMIN PUBLISH PATH, and the test caught this immediately. A publication
+              runs this insert on the admin's own connection and then RESOLVES the draft, marking
+              it published and naming the rating it became - which is the record of where a public
+              rating came from, and what stops a second admin publishing it again. Deleting the row
+              here left that resolve with nothing to update, and the publish failed with
+              "draft_already_resolved" having already written the rating.
+
+              caller != null is exactly "somebody else owns this draft's ending", so this stands
+              down for it.
+            */
+            Future<Void> clearCaptured = (caller == null && draftToken != null)
+                ? conn.preparedQuery(
+                        "DELETE FROM captured_drafts WHERE draft_token = $1 AND reviewed_at IS NULL")
+                      .execute(Tuple.of(draftToken))
+                      .mapEmpty()
+                : Future.succeededFuture();
+
             // draft_token is stored only on anonymous drop-off inserts; authenticated reviews get null.
             UUID tokenToStore = (userId == null) ? draftToken : null;
 
+            /*
+              PHASE 1. THE CAPTURE ATTEMPT IS SPENT HERE, AND NOWHERE EARLIER.
+
+              The add-form attempt ends when the form is submitted, and this insert is what
+              submitting means. Resolving it in this transaction is the whole point: the attempt is
+              consumed if and only if the rating exists.
+
+              Resolving it at adoption time instead - a statement earlier, outside this
+              transaction - would spend the token on a submission that then failed validation or
+              rolled back, leaving an attempt marked 'submitted' with no rating behind it and a
+              retry unable to adopt its own draft. "A failed transaction must not prematurely
+              consume a token" is a property of where this statement sits, not of what it says.
+
+              Guarded on resolved_at IS NULL inside the repository, so a replay cannot overwrite
+              the first outcome.
+            */
+            Future<Void> resolveAttempt = captureToken != null
+                ? captureAttempts.resolve(conn, captureToken, CaptureAttemptRepository.OUTCOME_SUBMITTED)
+                : Future.succeededFuture();
+
             return deleteDraft
+                .compose(v -> clearCaptured)
+                .compose(v -> resolveAttempt)
                 .compose(v -> resolveDeclaredForManager(conn, submission.declared(),
                                                         submission.corpusPlace(), managerId))
                 .compose(resolvedDeclared ->
@@ -3443,7 +4079,25 @@ public class ManagerService {
                                 .map(ignored -> afterDecision != null ? afterDecision : reviewRow);
                         }));
                 }));
-        }).compose(row -> {
+        };
+        /*
+          The dispatch: the caller's transaction when there is one, a new one otherwise.
+          The recalculation below deliberately stays OUTSIDE it, exactly as before.
+        */
+        /*
+          The contributor's own private draft of this review, removed INSIDE whichever transaction
+          actually writes the review - the caller's when there is one, a new one otherwise.
+
+          Wrapped here rather than appended to `written` below, because `written` has already left
+          the transaction by then: a delete there would survive a rollback and cost somebody their
+          unfinished answers for a submission that never happened.
+        */
+        java.util.function.Function<io.vertx.sqlclient.SqlConnection, Future<Row>> workThenDraft =
+            conn -> work.apply(conn)
+                .compose(row -> clearPrivateDraft(conn, row, userId, "manager", managerId));
+        Future<Row> written = caller != null ? workThenDraft.apply(caller)
+                                             : ((Pool) db).withTransaction(workThenDraft);
+        return written.compose(row -> {
             /*
                 The recalculation comes first, and is awaited.
 
@@ -3456,7 +4110,19 @@ public class ManagerService {
                 was not, which made the guarantee half a guarantee.
             */
             // recalculate writes reviews_count and overall_rating, and the managers trigger fires on it, so company_stats_live follows inside that same statement (V89).
-            return managerRepo.recalculate(managerId).map(recalced -> row);
+            /*
+              ON THE CALLER'S CONNECTION WHEN THERE IS ONE.
+
+              This recomputation sits after the write deliberately, and for a form submission it
+              runs on the pool because the transaction above has already committed. For the admin
+              queue it has NOT: that transaction is still open and still holds locks on reviews and
+              managers, so recalculating on a second connection waited for locks the first one was
+              holding and simply hung. The failure was a timeout, then every later test timing out
+              on TRUNCATE, with nothing naming the cause.
+            */
+            return (caller != null ? managerRepo.recalculate(caller, managerId)
+                                   : managerRepo.recalculate(managerId))
+                .map(recalced -> row);
         });
     }
 
@@ -3835,6 +4501,12 @@ public class ManagerService {
             conn.preparedQuery("""
                     SELECT id FROM reviews
                      WHERE deleted_at IS NOT NULL AND deleted_at < now() - INTERVAL '3 days'
+                       -- A moderator's removal, a seed superseded by a merge and an author's own
+                       -- replacement all carry a reason and never come back. This SECOND
+                       -- implementation of the sweep did not say so. Only a test reaches it, but
+                       -- it would have resurrected every one of them, and a loaded gun in the
+                       -- tree is worth unloading while it is in hand.
+                       AND deleted_reason IS NULL
                     """)
                 .execute()
                 .compose(rs -> {
@@ -3844,6 +4516,7 @@ public class ManagerService {
                     return conn.preparedQuery("""
                             UPDATE reviews SET deleted_at = NULL
                              WHERE deleted_at IS NOT NULL AND deleted_at < now() - INTERVAL '3 days'
+                               AND deleted_reason IS NULL
                             """)
                         .execute()
                         .compose(updated -> {
@@ -3862,6 +4535,64 @@ public class ManagerService {
     /** Holds, releases or rejects a rating. See {@link ReviewDisposition}. */
     public Future<Void> setReviewDisposition(UUID reviewId, String disposition) {
         return ((Pool) db).withTransaction(conn -> reviewDisposition.set(conn, reviewId, disposition));
+    }
+
+    /**
+     * UNLINK a rating: the contributor gives up the rating, the rating stays published.
+     *
+     * <p>Replaces delete as the contributor-facing action. The differences from
+     * {@link #deleteReview} are the whole point, so they are listed rather than implied:
+     *
+     * <ul>
+     *   <li><b>No soft delete.</b> {@code deleted_at} is never set, so the rating never leaves
+     *       publication and the restoration sweep has nothing to act on. There is no three-day
+     *       dip in the manager's average and no republication event.</li>
+     *   <li><b>No cooldown.</b> {@code recordDeletion} is not called: nothing was deleted, and a
+     *       cooldown on unlinking would punish a contributor for exercising it.</li>
+     *   <li><b>No recalculate.</b> The scores are unchanged and still count, so the cached average
+     *       and count are already correct. Recalculating would be a no-op that masks the fact that
+     *       unlinking deliberately does not move the numbers.</li>
+     *   <li><b>A participation record is written</b>, in the same transaction, so this account can
+     *       never rate this manager again.</li>
+     * </ul>
+     *
+     * <p>The employment projection IS resynced, because the severance clears {@code claim_id} and
+     * moves {@code attribution_basis}, which is exactly what the employment-attributed company
+     * statistics are keyed on. Leaving that stale would credit a company for an employment the
+     * rating no longer asserts.
+     *
+     * <p>Idempotent by construction: {@code unlinkByOwner} matches on ownership, so a repeated or
+     * concurrent request finds no row and reports success without doing anything twice.
+     */
+    public Future<JsonObject> unlinkReview(String auth0Id, long managerId, UUID reviewId) {
+        return userRepo.findByAuth0IdWithBan(auth0Id)
+            .compose(opt -> {
+                if (opt.isEmpty()) return Future.failedFuture(ServiceException.unauthorized("Unauthorized"));
+                Row callerRow = opt.get();
+                if (callerRow.getBoolean("is_banned")) return Future.failedFuture(ServiceException.forbidden("account_suspended"));
+                UUID userId = callerRow.getUUID("id");
+                return reviewRepo.findOwnerUserId(reviewId, managerId)
+                    .compose(ownerOpt -> {
+                        /*
+                          An already-unlinked rating has no owner, so this reports not-found rather
+                          than leaking that the rating exists and used to be theirs. A contributor
+                          who unlinks twice sees the same answer as one who never owned it, which is
+                          the correct amount of information to give.
+                        */
+                        if (ownerOpt.isEmpty()) return Future.failedFuture(ServiceException.notFound("Review not found"));
+                        if (!ownerOpt.get().equals(userId)) return Future.failedFuture(ServiceException.forbidden("Forbidden"));
+
+                        return ((Pool) db).withTransaction(conn ->
+                                locationStats.contributionOf(conn, reviewId)
+                                    .compose(before -> reviewRepo.unlinkByOwner(conn, reviewId, managerId, userId)
+                                        .compose(done -> locationStats.resyncManagerReview(conn, reviewId, before)
+                                            .map(v -> done))))
+                            .map(done -> new JsonObject()
+                                .put("success", true)
+                                .put("unlinked", done)
+                                .put("message", "Rating unlinked"));
+                    });
+            });
     }
 
     // ── REPLACE review (delete old + create new, no cooldown recorded) ────────
@@ -3890,14 +4621,57 @@ public class ManagerService {
                 ServiceException syncError = validateBodySync(body);
                 if (syncError != null) return Future.failedFuture(syncError);
 
-                return reviewRepo.findOwnerUserId(oldReviewId, managerId)
-                    .compose(ownerOpt -> {
-                        if (ownerOpt.isEmpty()) return Future.failedFuture(ServiceException.notFound("Review not found"));
-                        if (!ownerOpt.get().equals(userId)) return Future.failedFuture(ServiceException.forbidden("Forbidden"));
-                        // Delete without recording cooldown, then create new review
-                        return reviewRepo.delete(oldReviewId, managerId)
-                            .compose(v -> validateAndInsertReview(body, managerId, userId, author, resolvedLogoUrl, null));
-                    });
+                /*
+                  ONE TRANSACTION, and that is issues 37 and 38 (OPEN_ISSUES.md).
+
+                  It used to be two statements on the pool: delete, then insert. Three things
+                  were wrong with that, and only the third was obvious.
+
+                    1. The original was soft-deleted with NO deleted_reason, which is what an
+                       author's own withdrawal looks like, so restoreExpiredDeletions brought it
+                       back three days later - live, anonymous and counted beside its own
+                       replacement, with user_id already gone so nothing could tell they came
+                       from one person. deleteAsReplacedByAuthor names it instead.
+
+                    2. The same reason frees its slot in the legacy dedup index, which V111
+                       narrowed with deleted_reason IS NULL. Before that, a replacement keeping
+                       the manager's title and employer - the ordinary case, since the form
+                       prefills both - collided with the very row it was replacing. The order
+                       matters: the original must leave the index before the insert runs, which
+                       is only true if both are in one transaction.
+
+                    3. If the insert failed, the author was left with neither rating. The
+                       synchronous validation above shrank that window; it did not close it,
+                       because the insert does its own asynchronous checks. Now a failure
+                       anywhere rolls the delete back with it.
+
+                  The lock is what makes two simultaneous replacements safe, and it also settles
+                  the race against the restoration sweep. Both are described on the repository
+                  methods.
+                */
+                return ((Pool) db).withTransaction(conn ->
+                    reviewRepo.lockForReplacement(conn, oldReviewId, managerId)
+                        .compose(ownerOpt -> {
+                            if (ownerOpt.isEmpty()) {
+                                return Future.failedFuture(ServiceException.notFound("Review not found"));
+                            }
+                            if (!userId.equals(ownerOpt.get())) {
+                                return Future.failedFuture(ServiceException.forbidden("Forbidden"));
+                            }
+                            return reviewRepo.deleteAsReplacedByAuthor(conn, oldReviewId, managerId, userId)
+                                .compose(superseded -> {
+                                    if (!superseded) {
+                                        // Somebody else replaced or withdrew it between the lock
+                                        // and here. Nothing is written, and their rating stands.
+                                        return Future.failedFuture(ServiceException.conflict(
+                                            "That rating has already been replaced. Reload the page and try again."));
+                                    }
+                                    // Joins THIS transaction - the overload exists for exactly
+                                    // this: a delete and an insert that must stand or fall together.
+                                    return validateAndInsertReview(body, managerId, userId, author,
+                                        resolvedLogoUrl, null, null, false, SubmissionContext.NONE, conn);
+                                });
+                        }));
             });
     }
 
@@ -4235,7 +5009,20 @@ public class ManagerService {
               just happened, which is a race the write itself does not have: the server knows the
               disposition at the moment it writes it.
             */
-            .put("disposition",   dispositionOf(row));
+            .put("disposition",   dispositionOf(row))
+            /*
+              PLATFORM-GENERATED EXAMPLE, surfaced so the client can label it "Example Rating -
+              Demonstration Only" rather than present it as an employee opinion.
+
+              Reads provenance from the origin column (V106), NOT from the weight flag: weight is a
+              statistics-window concept and is also false on expired seeds, whereas origin is the
+              durable classification. Fails CLOSED to false when the column is absent (a pre-V106
+              projection, or production before V106 ships) - an unclassified row is treated as a
+              genuine contribution, which is the safe direction: the worst case is an example that
+              is not yet labelled, never a genuine rating mislabelled as a demo.
+            */
+            .put("isExample", row.getColumnIndex("origin") >= 0
+                              && "platform_example".equals(row.getString("origin")));
     }
 
     /** Tolerates rows selected before V60, and rows from projections that omit the column. */
@@ -4706,25 +5493,54 @@ public class ManagerService {
                                 .put("hasContributed", contributed));
                     }
 
+                    /*
+                      NOT PUBLISHING IS ONE OUTCOME, REACHED TWO WAYS.
+
+                      A silent pending_approval row for admin review. No notification is sent on
+                      approval or rejection: the user searched but did not explicitly submit, so
+                      they must not receive emails about a submission they aren't aware of.
+
+                      Written once and shared, because there are now two reasons to take it and a
+                      second copy is a second thing to keep in step.
+                    */
+                    final String fState3 = trimmedState;
+                    final String fCity3  = trimmedCity;
+                    final java.util.function.Supplier<Future<JsonObject>> searchPending = () ->
+                        companyRepo.resolve(companyIdSafe, company, null, resolvedLogoUrl)
+                            .compose(cRow -> managerRepo.createSearchPending(
+                                fullName, company, title, country,
+                                fState3, fCity3, resolvedLogoUrl, cRow.getLong("id"), userId))
+                            .map(row -> new JsonObject()
+                                .put("data", new JsonArray())
+                                .put("created", false)
+                                .put("hasContributed", contributed));
+
+                    /*
+                      A GHOST IS FOR SOMEBODY WHO HAS NEVER RATED ANYBODY.
+
+                      Two conditions, both required: they have contributed nothing, and this is
+                      their first ever search. The slot alone used to decide it, so a contributor
+                      searching for the first time published a profile - and then saw it blurred,
+                      because the auto-created row carries only a platform example and the reader
+                      had already earned the unlock. A manager minted for somebody who does not
+                      need the crutch, and shown to them behind a gate they had already paid.
+
+                      The slot is NOT claimed on this path. Spending it here would deny them the
+                      one auto-creation later, on a search that might genuinely need it.
+
+                      This is checked BEFORE the claim for exactly that reason, and it is why the
+                      two conditions are not folded into one expression.
+                    */
+                    if (contributed) {
+                        return searchPending.get();
+                    }
+
                     // Atomically claim the one-time ghost slot. Only one concurrent request wins;
                     // the loser gets empty results — no silent pending that could trigger a
                     // confusing rejection notification.
                     return userRepo.claimAutoCreatedManagerSlot(userId).compose(claimed -> {
                         if (!claimed) {
-                            // Ghost slot already used — silently create a pending_approval for admin
-                            // review. No notification is sent on approval or rejection: the user
-                            // searched but did not explicitly submit, so they must not receive emails
-                            // about a submission they aren't aware of.
-                            final String fState3 = trimmedState;
-                            final String fCity3  = trimmedCity;
-                            return companyRepo.resolve(companyIdSafe, company, null, resolvedLogoUrl)
-                                .compose(cRow -> managerRepo.createSearchPending(
-                                    fullName, company, title, country,
-                                    fState3, fCity3, resolvedLogoUrl, cRow.getLong("id"), userId))
-                                .map(row -> new JsonObject()
-                                    .put("data", new JsonArray())
-                                    .put("created", false)
-                                    .put("hasContributed", contributed));
+                            return searchPending.get();
                         }
 
                         // Slot claimed — create ghost. If the insert fails, release the slot so
@@ -4855,6 +5671,62 @@ public class ManagerService {
         return createGhostManager(body, resolvedLogoUrl, SubmissionContext.NONE);
     }
 
+    /**
+     * Writes the add-form capture for an attempt, or hands back the one that attempt already made.
+     *
+     * <p>PHASE 1. The ledger row is claimed and the manager inserted in ONE transaction, in that
+     * order. Claiming first means a failed insert cannot leave an orphan manager; claiming in a
+     * transaction of its own would mean a failed insert left the token permanently consumed with
+     * nothing behind it, which is the defect the ledger was rewritten to avoid. If this
+     * transaction aborts, neither row exists, the token is unspent, and a retry is a clean first
+     * attempt.
+     *
+     * <p>There is no read before the write. A row that does not exist cannot be locked, so two
+     * concurrent requests carrying one new token would both read nothing and both insert. The
+     * upsert is the serialisation point: the loser blocks on the winner's row lock and then reads
+     * the winner's committed row, {@code manager_id} included.
+     *
+     * <p>A caller with no token gets exactly the previous behaviour. That is an older client
+     * during a deploy, and nothing else: it writes its capture unconditionally, and the only thing
+     * standing between it and a duplicate is the name lookup this endpoint already does.
+     */
+    private Future<ManagerRepository.GhostInsert> captureOnceForAttempt(
+            UUID captureToken, String name, String company, String title,
+            String country, String state, String city, String logoUrl, Long companyId) {
+        if (captureToken == null) {
+            return managerRepo.createCapturedDraft(name, company, title, country, state, city,
+                                                   logoUrl, companyId)
+                .map(row -> new ManagerRepository.GhostInsert(row, true));
+        }
+        // Decided before the transaction opens. Generating it reads `managers`, and asking the
+        // pool for that while holding a transaction borrows a second connection - enough of those
+        // at once and every holder waits for a connection none of them will release.
+        return managerRepo.generatePendingSlug(name).compose(slug ->
+            ((Pool) db).withTransaction(conn ->
+            captureAttempts.claim(conn, captureToken).compose(attempt -> {
+                if (!Boolean.TRUE.equals(attempt.getBoolean("created"))) {
+                    Long produced = attempt.getLong("manager_id");
+                    if (produced == null) {
+                        /*
+                          The attempt exists and produced nothing we can hand back: its manager was
+                          deleted, or it resolved while this request was in flight. Either way it is
+                          spent, and recreating a manager for a spent token is exactly the
+                          resurrection the ledger prevents. The read above this call answers the
+                          ordinary spent case without reaching here; this is the race against it.
+                        */
+                        return Future.failedFuture(ServiceException.conflict("capture_attempt_spent"));
+                    }
+                    return conn.preparedQuery("SELECT * FROM managers WHERE id = $1")
+                        .execute(Tuple.of(produced))
+                        .map(rows -> new ManagerRepository.GhostInsert(rows.iterator().next(), false));
+                }
+                return managerRepo.insertCapturedDraft(conn, name, company, title, country, state, city,
+                                                       logoUrl, companyId, slug, captureToken)
+                    .compose(row -> captureAttempts.link(conn, captureToken, row.getLong("id"))
+                        .map(linked -> new ManagerRepository.GhostInsert(row, true)));
+            })));
+    }
+
     public Future<JsonObject> createGhostManager(JsonObject body, String resolvedLogoUrl,
                                                  SubmissionContext submission) {
         final GeoObservation observed = submission.observed();
@@ -4899,6 +5771,26 @@ public class ManagerService {
 
         final String fState = state;
         final String fCity  = city;
+
+        /*
+          PHASE 1. The add-form attempt behind this capture.
+
+          The client mints it when step one first posts and sends the same value every time this
+          endpoint is called for that form session, including after a reload. It is what makes a
+          repeated capture a repeat rather than a second person: the ledger row is claimed in the
+          same transaction as the insert, so one attempt can only ever produce one manager.
+
+          Absent on the search path, which has its own once-per-visitor allowance and creates
+          public ghosts rather than drafts. A token arriving with fromSearch is ignored: the two
+          intents this endpoint serves are deliberately different, and the ledger belongs to the
+          add form (CLAUDE.md section 41).
+        */
+        UUID captureTokenParsed = null;
+        String captureTokenStr = body.getString("captureToken");
+        if (captureTokenStr != null && !captureTokenStr.isBlank()) {
+            try { captureTokenParsed = UUID.fromString(captureTokenStr); } catch (IllegalArgumentException ignored) {}
+        }
+        final UUID fCaptureToken = captureTokenParsed;
 
         /*
             Which rows this endpoint may even see depends on who is calling.
@@ -5016,7 +5908,42 @@ public class ManagerService {
                     return Future.succeededFuture((JsonObject) null);   // CREATE_GHOST: fall through
                 }));
 
-        return searchDecision.compose(answered -> {
+        /*
+          PHASE 1. AN ATTEMPT WE HAVE ALREADY SEEN IS ANSWERED FROM THE LEDGER, FIRST.
+
+          This runs before the name lookup below on purpose. A second capture from the same form
+          session - a reload, a retry, a second tab - must be handed the draft ITS OWN attempt
+          made, not whichever row happens to resemble what was typed. The name lookup is still
+          there and still correct for a DIFFERENT visitor who half-typed the same person; it is
+          simply not the right answer for a request that can prove which draft is its own.
+
+          Each state the ledger can be in, and why:
+
+            unresolved, manager_id present  the intended path. Adopt that draft, create nothing
+            resolved                        the attempt is spent. Create nothing, whatever the
+                                            outcome was: a retry of a spent attempt is not a new
+                                            attempt, and a genuinely new contribution mints a new
+                                            token and is unaffected
+            manager_id null                 the manager was deleted or merged. Still spent
+
+          published is false in every one of them. A captured draft is never servable, so a tile
+          must never be built from this response - the invariant in CLAUDE.md section 41.
+        */
+        Future<JsonObject> ledgerDecision = (callerIsSearch || fCaptureToken == null)
+            ? Future.succeededFuture((JsonObject) null)
+            : captureAttempts.find(fCaptureToken).map(found -> {
+                if (found.isEmpty()) return null;
+                JsonObject answer = new JsonObject()
+                    .put("created", false)
+                    .put("published", false);
+                Long produced = found.get().getLong("manager_id");
+                if (produced != null) answer.put("id", produced);
+                return answer;
+            });
+
+        return ledgerDecision.compose(fromLedger -> {
+            if (fromLedger != null) return Future.succeededFuture(fromLedger);
+            return searchDecision.compose(answered -> {
             if (answered != null) return Future.succeededFuture(answered);
             return (callerIsSearch
                     ? db.preparedQuery("SELECT 1 WHERE false").execute()
@@ -5139,14 +6066,19 @@ public class ManagerService {
                           two anonymous visitors searching the same unknown manager at once. The
                           loser is handed the row the winner published rather than an exception,
                           and `created` tells the block below not to seed a second review onto it.
-                          A capture is never racing anybody - it writes its own pending row - so it
-                          reports created unconditionally.
+
+                          PHASE 1 CORRECTION. This used to end "a capture is never racing anybody -
+                          it writes its own pending row - so it reports created unconditionally",
+                          and that is no longer true. A capture now races the OTHER REQUESTS
+                          CARRYING ITS OWN TOKEN: a reload, a retry, two tabs. The ledger makes the
+                          loser of that race adopt the winner's draft instead of writing a second
+                          one, and it reports created=false so no second seed review is written
+                          onto it.
                         */
                         ? managerRepo.createAutoApprovedOrExisting(name, company, title, country, fState, fCity,
                                                          null, resolvedLogoUrl, resolvedCompanyId)
-                        : managerRepo.createCapturedDraft(name, company, title, country, fState, fCity,
-                                                          resolvedLogoUrl, resolvedCompanyId)
-                              .map(r -> new ManagerRepository.GhostInsert(r, true)))
+                        : captureOnceForAttempt(fCaptureToken, name, company, title, country,
+                                                fState, fCity, resolvedLogoUrl, resolvedCompanyId))
                     .recover(err -> {
                         // The quota was spent before the insert was attempted, so a failure here
                         // would otherwise cost this address its window for nothing.
@@ -5214,6 +6146,8 @@ public class ManagerService {
             });
         });   // end searchDecision.compose - the anonymous search either answered above or fell
               // through to the creation path with an empty lookup
+        });   // end ledgerDecision.compose - an add-form attempt we had already seen answered
+              // without reaching any of the above
     }
 
     /**
@@ -5379,11 +6313,26 @@ public class ManagerService {
                     // This path was calling the strict overload, so every abandoned review for a
                     // new manager was validated as though it were a finished one, and rejected.
                     if ("ghost".equals(approvalStatus)) {
-                        return validateAndInsertReview(review, existingId, null, fAuthor, resolvedLogoUrl, fDropOffToken, true, submission)
-                            .compose(ignored -> reviewRepo.scheduleSeedExpiry(existingId))
+                        /*
+                          THE EXAMPLE GOES HERE TOO, and this path is the reason to say so
+                          explicitly. A drop-off review is not a draft: createDropOffReview writes
+                          a real, live, public review, once, for somebody who pressed submit
+                          without an account. So a genuine rating has arrived and the example has
+                          nothing left to demonstrate, exactly as on the three paths that reach it
+                          through a signed-in submission.
+
+                          This scheduled a 14-day expiry instead, and it was the last caller still
+                          doing so. Leaving it would have meant the example survived precisely on
+                          the anonymous path - the one where nobody is watching - for a fortnight
+                          beside the real rating.
+
+                          After the insert, never before; see the find-or-create path.
+                        */
+                        return validateAndInsertReview(review, existingId, null, fAuthor, resolvedLogoUrl, fDropOffToken, null, true, submission)
+                            .compose(ignored -> retireExampleRating(existingId))
                             .map(ignored -> new JsonObject().put("id", existingId).put("created", false));
                     } else {
-                        return validateAndInsertReview(review, existingId, null, fAuthor, resolvedLogoUrl, fDropOffToken, true, submission)
+                        return validateAndInsertReview(review, existingId, null, fAuthor, resolvedLogoUrl, fDropOffToken, null, true, submission)
                             .map(ignored -> new JsonObject().put("id", existingId).put("created", false));
                     }
                 } else {
@@ -5394,7 +6343,7 @@ public class ManagerService {
                         .compose(resolvedCompanyId -> managerRepo.createPending(name, company, title, fStatus, country, fState, resolvedLogoUrl, resolvedCompanyId))
                         .compose(managerRow -> {
                             long managerId = managerRow.getLong("id");
-                            return validateAndInsertReview(review, managerId, null, fAuthor, resolvedLogoUrl, fDropOffToken, true, submission)
+                            return validateAndInsertReview(review, managerId, null, fAuthor, resolvedLogoUrl, fDropOffToken, null, true, submission)
                                 .map(ignored -> new JsonObject().put("id", managerId).put("created", true))
                                 // The manager row is already committed by the time the review can
                                 // fail, and there is no transaction spanning the two. Rather than
@@ -5423,15 +6372,13 @@ public class ManagerService {
                 "Drop-off capture failed for " + name + " @ " + company + ": " + err.getMessage()));
     }
 
-    private static final String[] PSEUDO_ADJ = {
-        "Brave", "Swift", "Bold", "Calm", "Keen", "Wise", "Fair", "Kind",
-        "Sharp", "Quiet", "Clear", "Warm", "Cool", "Bright", "Loyal"
-    };
-    private static final String[] PSEUDO_ANIMAL = {
-        "Falcon", "Tiger", "Eagle", "Wolf", "Bison", "Crane", "Lynx",
-        "Otter", "Raven", "Gecko", "Heron", "Panda", "Finch", "Moose"
-    };
-    private static final Random PSEUDO_RNG = new Random();
+    /*
+      THE VOCABULARY MOVED to org.ratemymanager.repository.Pseudonyms, and the arrays that stood
+      here are gone rather than kept alongside it. Account erasure mints a byline too and runs in
+      UserRepository, so the words had to be reachable from both; two copies of the list would
+      eventually diverge, and a byline minted from a different vocabulary is a byline a reader can
+      tell apart from the others. See that class for why that matters.
+    */
 
     /** Creates a pending_approval manager — goes to the admin queue with no seed review. */
     private Future<Row> createSearchPending(
@@ -5442,11 +6389,26 @@ public class ManagerService {
     }
 
     /** Mirrors the frontend generateUsername() format: AdjectiveAnimal + 10–99 */
+    /**
+     * Whether a username is one this system generated rather than one somebody chose.
+     *
+     * <p>Matched on SHAPE, not on the {@code username_is_provisional} flag, deliberately. The flag
+     * is the authority on whether a profile is complete, and reading it here would mean another
+     * query on the submission path. The shape is enough for this one decision, and V99's
+     * constraint guarantees the two agree in the direction that matters: a flagged username MUST
+     * look like this, so anything flagged is caught.
+     *
+     * <p>It over-matches by design. Somebody who deliberately chose the name {@code user_deadbeef}
+     * is unflagged and legitimate, and they get a pseudonym on their reviews instead of that name
+     * - a trivial cost, against publishing a name that identifies nobody.
+     */
+    static boolean looksProvisional(String username) {
+        return username != null && username.matches("^user_[0-9a-f]{8}$");
+    }
+
+    /** Delegates to {@link org.werkpages.repository.Pseudonyms}; kept so callers need no change. */
     static String generatePseudonym() {
-        String adj    = PSEUDO_ADJ[PSEUDO_RNG.nextInt(PSEUDO_ADJ.length)];
-        String animal = PSEUDO_ANIMAL[PSEUDO_RNG.nextInt(PSEUDO_ANIMAL.length)];
-        int    num    = 10 + PSEUDO_RNG.nextInt(90);
-        return adj + animal + num;
+        return org.werkpages.repository.Pseudonyms.mint();
     }
 
     private static JsonObject rowToManagerJson(Row row) {
@@ -5567,8 +6529,419 @@ public class ManagerService {
      * admin queue or silently overturn an admin's rejection. So non-public rows are consulted, never
      * rendered, and they downgrade a would-be ghost to a review rather than blocking the search.
      */
+
+    /**
+     * Who the contributor might mean, and which jobs they could pick. Creates nothing.
+     *
+     * <h2>Why this endpoint exists at all</h2>
+     *
+     * <p>The legacy form never asked. It took a typed name, found candidates by exact company, ran
+     * a Levenshtein comparison and <b>attached the rating to whichever manager was within one edit
+     * of what was typed</b>. A machine decided which human a person's opinion was about, and when
+     * it was wrong one person accumulated eight profiles while twenty-one people ended up with two
+     * public profiles each and their reviews split between them.
+     *
+     * <p>So this method answers the question and <b>declines to decide it</b>. It returns the
+     * people who might match and the employments each of them has, and the contributor chooses.
+     * Fuzzy matching helps them FIND somebody; it never decides who that somebody is.
+     *
+     * <h2>Why it reuses runMatcher rather than searching again</h2>
+     *
+     * <p>Corpus rule 8: one implementation. Five separate lookups is how the matching rules drifted
+     * apart in the first place. {@code runMatcher} owns name-first discovery, the normalisation,
+     * the three name classes, employment pairing and the deterministic candidate budget, and it is
+     * read-only, so this adds presentation and nothing else. If the rules change there, they change
+     * here, which is the point.
+     *
+     * <h2>What the three Rev 268 paths look like in this response</h2>
+     *
+     * <pre>
+     *   candidates non-empty, the right person has the right employment  -> select both
+     *   candidates non-empty, none of their employments is the right one -> propose the employment
+     *   candidates empty, or the contributor says "none of these"        -> propose the manager
+     * </pre>
+     *
+     * <p>{@code nameClass} is reported so the client can show a PLAUSIBLE match differently from a
+     * CONFIRMED one. It is a display distinction, not a decision: both are offered, neither is
+     * chosen, and a plausible candidate is never pre-selected.
+     *
+     * @return {@code candidates}, each with its {@code employments}; {@code nameClass};
+     *         {@code incompleteEvidence} when the candidate budget truncated the scan, so the
+     *         client can say "there may be more" rather than implying the list is exhaustive.
+     */
+
+    /**
+     * A rating whose subject the CONTRIBUTOR chose. The role-aware submission, all three paths.
+     *
+     * <h2>Why this does not call createManager</h2>
+     *
+     * <p>{@link #createManager} is where the fuzzy attachment lives: it reads
+     * {@code findByCompanyExact}, runs {@code findFuzzyNameMatch} and calls
+     * {@code doAttachToExisting} when a name is within one edit. Routing a role-aware submission
+     * through it would reintroduce the exact guess this phase removes, and it would do so silently.
+     *
+     * <p>So path 3 creates the manager with {@code managerRepo.createPending} directly, skipping
+     * the matcher entirely. That is not a shortcut: <b>the contributor has already answered the
+     * question the matcher exists to ask.</b> They were shown the candidates and said none of them
+     * is the person. Running a similarity comparison after an explicit "none of these" would be
+     * overruling them.
+     *
+     * <h2>The three paths</h2>
+     *
+     * <pre>
+     *   managerId + selectedRoleId  -> they picked a person and one of that person's jobs
+     *   managerId, no selectedRoleId -> they picked a person; the job is new
+     *   no managerId                 -> "none of these": the person and the job are both new
+     * </pre>
+     *
+     * <p>A {@code selectedRoleId} is never inferred. If the client omits it the submission proposes
+     * an employment, which is what the contributor asked for by choosing "a different job" or by
+     * selecting an employment that has no canonical record behind it.
+     *
+     * <h2>What it does NOT re-implement</h2>
+     *
+     * <p>The claim's revision guard, finalization, resolution, conflict detection, the publication
+     * decision, the opportunity charge and the retry all belong to
+     * {@code RoleAwareSubmissionService} and stay there. This method resolves the company, makes
+     * the manager when there is not one, and hands over.
+     */
+
+    /**
+     * Save the contributor's selection as a draft claim, so a reload or a sign-in does not lose it.
+     *
+     * <h2>What this can and cannot cover</h2>
+     *
+     * <p><b>Paths 1 and 2 only.</b> {@code role_claims.manager_id} is NOT NULL, so a claim cannot
+     * exist before the manager does: there is nothing for it to be a claim ABOUT. A path-3 draft -
+     * "none of these people" - therefore has no claim row to live in, and its home is the existing
+     * {@code captured_drafts} drop-off capture, which is exactly what that table was built for and
+     * which publishes nothing. No new schema, and no second mechanism.
+     *
+     * <h2>The revision guard, and why the server does not trust the client's word</h2>
+     *
+     * <p>Every save carries a revision, and {@code saveDraft} overwrites a field only while the
+     * claim is still a draft AND the incoming revision is strictly newer. So an autosave that was
+     * in flight when a newer one landed cannot win on arrival, and a resumed tab cannot overwrite
+     * a selection the contributor has since changed somewhere else.
+     *
+     * <p><b>A finalized claim is immutable to this.</b> Once the rating is submitted the claim is a
+     * saved observation, and a late autosave from a tab left open must not rewrite the assertion
+     * behind a published rating. That is enforced in the statement, not here, so there is no path
+     * around it. The response reports {@code finalized} so the client can stop trying and tell the
+     * contributor their rating is already in.
+     *
+     * <h2>What it does not do</h2>
+     *
+     * <p>It never finalizes, never resolves and never charges an opportunity. Autosave is a
+     * safety net for unfinished work; the submission is the act.
+     */
+    public Future<JsonObject> autosaveRoleClaim(String auth0Id, JsonObject body) {
+        if (!RoleClaimService.roleAwareSubmissionEnabled()) {
+            return Future.failedFuture(new IllegalStateException(
+                "Role-aware submission is disabled"));
+        }
+        Long managerId = body.getLong("managerId");
+        if (managerId == null) {
+            // Not an error the contributor caused: path 3 has no manager yet, so there is no claim
+            // to draft. Reported plainly so the client keeps using the drop-off capture instead of
+            // retrying something that cannot work.
+            return Future.succeededFuture(new JsonObject()
+                .put("saved", false)
+                .put("reason", "no_manager_selected_yet"));
+        }
+        String proposalKeyRaw = body.getString("proposalKey");
+        if (proposalKeyRaw == null) {
+            return Future.failedFuture(new IllegalArgumentException("proposalKey is required"));
+        }
+        String title = body.getString("title", "").trim();
+        if (title.isEmpty()) {
+            return Future.failedFuture(new IllegalArgumentException("title is required"));
+        }
+
+        java.util.UUID proposalKey = java.util.UUID.fromString(proposalKeyRaw);
+        long revision = body.getLong("revision", 1L);
+        Long selectedRoleId = body.getLong("selectedRoleId");
+        java.time.LocalDate startDate = parseIsoDateOrNull(body.getString("startDate"));
+        java.time.LocalDate endDate   = parseIsoDateOrNull(body.getString("endDate"));
+        Boolean stillThere = body.getBoolean("stillThere");
+
+        Future<java.util.UUID> viewer = auth0Id == null
+            ? Future.succeededFuture(null)
+            : userRepo.findByAuth0IdWithBan(auth0Id).map(o -> o.map(r -> r.getUUID("id")).orElse(null));
+
+        return viewer.compose(userId -> managerRepo.findPubliclyVisibleId(managerId)
+            .compose(visible -> {
+                if (!visible) {
+                    return Future.failedFuture(new IllegalArgumentException(
+                        "That manager is no longer available."));
+                }
+                return companyRepo.resolve(body.getLong("companyId"),
+                                           body.getString("company", "").trim(),
+                                           body.getString("companyDomain"), null);
+            })
+            .compose(companyRow -> ((io.vertx.sqlclient.Pool) db).withTransaction(tx ->
+                roleClaims.saveDraft(tx, new RoleClaimService.Draft(
+                    proposalKey, managerId, companyRow.getLong("id"), title,
+                    startDate, endDate, startDate != null, stillThere,
+                    selectedRoleId, "contributor", userId, revision))))
+            .map(draft -> new JsonObject()
+                .put("saved",     true)
+                .put("claimId",   draft.id())
+                // The revision the server now holds, which may be NEWER than the one just sent if
+                // another tab got there first. The client adopts it rather than counting on its
+                // own, which is what stops two tabs fighting.
+                .put("revision",  draft.revision())
+                .put("finalized", draft.isFinalized())
+                .put("resolved",  draft.isResolved())));
+    }
+
+    public Future<JsonObject> submitRoleAwareRating(String auth0Id, JsonObject body) {
+        if (!RoleClaimService.roleAwareSubmissionEnabled()) {
+            return Future.failedFuture(new IllegalStateException(
+                "Role-aware submission is disabled"));
+        }
+        String firstName = body.getString("firstName", "").trim();
+        String lastName  = body.getString("lastName", "").trim();
+        String title     = body.getString("title", "").trim();
+        String company   = body.getString("company", "").trim();
+        if (firstName.isEmpty() || lastName.isEmpty() || title.isEmpty() || company.isEmpty()) {
+            return Future.failedFuture(new IllegalArgumentException(
+                "firstName, lastName, title and company are required"));
+        }
+        String name = firstName + " " + lastName;
+
+        Long   managerId      = body.getLong("managerId");
+        Long   selectedRoleId = body.getLong("selectedRoleId");
+        String author         = body.getString("author");
+        java.util.UUID proposalKey = body.getString("proposalKey") == null
+            ? java.util.UUID.randomUUID()
+            : java.util.UUID.fromString(body.getString("proposalKey"));
+        long revision = body.getLong("revision", 1L);
+
+        // The contributor's own employment period, which is what role_claims records and what a
+        // proposed employment is created from.
+        java.time.LocalDate startDate = parseIsoDateOrNull(body.getString("startDate"));
+        java.time.LocalDate endDate   = parseIsoDateOrNull(body.getString("endDate"));
+        boolean periodKnown = startDate != null;
+        Boolean stillThere  = body.getBoolean("stillThere");
+
+        double overall = body.getDouble("overallRating", 0.0);
+        double[] categories = tenCategoriesOf(body.getJsonObject("ratings", new JsonObject()));
+        java.time.OffsetDateTime workedFrom = startDate == null
+            ? java.time.OffsetDateTime.now()
+            : startDate.atStartOfDay(java.time.ZoneOffset.UTC).toOffsetDateTime();
+
+        Future<java.util.UUID> viewer = auth0Id == null
+            ? Future.succeededFuture(null)
+            : userRepo.findByAuth0IdWithBan(auth0Id).map(o -> o.map(r -> r.getUUID("id")).orElse(null));
+
+        return viewer.compose(userId -> companyRepo
+            .resolve(body.getLong("companyId"), company, body.getString("companyDomain"), null)
+            .compose(companyRow -> {
+                long resolvedCompanyId = companyRow.getLong("id");
+
+                /*
+                  THE CLIENT'S IDS ARE VERIFIED, NOT TRUSTED.
+
+                  A manager id arriving in a request body is a claim about which person is being
+                  rated, and the fact that our own form put it there is not evidence: anybody can
+                  post this body. So an id the CLIENT sent is checked against the same visibility
+                  rule the directory uses, and only approved or ghost rows pass. Without it a
+                  caller could attach a rating to a pending profile an admin has not approved, or
+                  to a rejected one, neither of which a contributor can legitimately reach.
+
+                  The role id is verified too, but not here: RoleClaimService.resolveBySelection
+                  reads it `WHERE id = ... AND manager_id = ... AND company_id = ...` under FOR
+                  SHARE, so a role belonging to a different person or employer is refused in the
+                  same statement that locks it. One check, in the component that owns the rule.
+
+                  A manager WE create on path 3 is not re-verified, deliberately: it is
+                  pending_approval by construction, so the visibility rule would refuse the row we
+                  just made on the contributor's explicit instruction.
+                */
+                /*
+                  The Submission, for whichever subject we end up with. NEVER infers a role id:
+                  absent means "propose the employment", which is what the contributor chose, and
+                  guessing one here would attach their rating to a job they did not pick.
+                */
+                java.util.function.LongFunction<RoleAwareSubmissionService.Submission> build =
+                    subjectId -> new RoleAwareSubmissionService.Submission(
+                        proposalKey, revision, subjectId, resolvedCompanyId, title,
+                        selectedRoleId,
+                        startDate, endDate, periodKnown, stillThere,
+                        company, author, userId, overall, categories, workedFrom);
+
+                if (managerId == null) {
+                    /*
+                      PATH 3, and the manager is created INSIDE the submission's transaction.
+
+                      pending_approval, as every contributor-added manager is: it reaches the admin
+                      queue rather than the directory. What changed is only where it is created.
+                      It used to happen here, on the pool, before the submission began - so a
+                      retried form made a second pending person before anything could recognise the
+                      retry, and a failed submission left one behind with no rating. Issue 34.
+                    */
+                    return roleAwareSubmissions().submitProposingManager(
+                        new RoleAwareSubmissionService.PendingManager(
+                            name, company, title, body.getString("status", "active"),
+                            body.getString("country"), body.getString("state"), resolvedCompanyId,
+                            // The contributor, so the profile they are sent to afterwards is one
+                            // the server will actually serve them.
+                            userId),
+                        build);
+                }
+
+                // PATHS 1 AND 2, unchanged: the manager exists and is verified before anything.
+                return managerRepo.findPubliclyVisibleId(managerId)
+                    .compose(found -> found
+                        ? Future.succeededFuture(managerId)
+                        : Future.failedFuture(new IllegalArgumentException(
+                            "That manager is no longer available. Please choose again.")))
+                    .compose(subjectId -> roleAwareSubmissions().submit(build.apply(subjectId)));
+            }))
+            .map(outcome -> new JsonObject()
+                .put("reviewId",   outcome.reviewId().toString())
+                .put("claimId",    outcome.claimId())
+                // Where to send the contributor next. On the propose-manager path this is the row
+                // just created, which the client cannot know any other way.
+                .put("managerId",  outcome.managerId())
+                .put("roleId",     outcome.roleId())
+                .put("resolution", outcome.resolution())
+                .put("live",       outcome.live())
+                .put("heldBecause", outcome.heldBecause())
+                .put("replayed",   outcome.replayed()));
+    }
+
+    private static java.time.LocalDate parseIsoDateOrNull(String raw) {
+        if (raw == null || raw.isBlank()) return null;
+        try {
+            // "2023-04" from a month picker, or a full date. Same two shapes the rest of the form
+            // accepts, so a contributor who gave only a month is not refused.
+            return raw.length() == 7 ? java.time.LocalDate.parse(raw + "-01")
+                                     : java.time.LocalDate.parse(raw);
+        } catch (java.time.format.DateTimeParseException e) {
+            return null;
+        }
+    }
+
+    /**
+     * The ten categories, in the fixed order the columns are written in.
+     *
+     * <p>A missing category is 0 rather than an error: the submit path already refuses an
+     * incomplete rating before it gets here, and silently reordering them would mis-attribute
+     * somebody's answers to the wrong question, which is worse than either.
+     */
+    private static double[] tenCategoriesOf(JsonObject ratings) {
+        String[] keys = {
+            "communicationStyle", "perceivedApproachability", "perceivedClarityOfExpectations",
+            "feedbackStyle", "perceivedSupportiveness", "decisionMakingStyle",
+            "organizationAndPlanningStyle", "delegationStyle", "perceivedProfessionalDemeanor",
+            "overallWorkingExperience"
+        };
+        double[] out = new double[10];
+        for (int i = 0; i < keys.length; i++) out[i] = ratings.getDouble(keys[i], 0.0);
+        return out;
+    }
+
+    public Future<JsonObject> identifyManager(String firstName, String lastName,
+                                              String company, String title, Long companyId) {
+        return identifyManager(firstName, lastName, company, title, companyId, null);
+    }
+
+    /**
+     * Identification from a NAME, with the rest optional.
+     *
+     * <p>The search screen asks for a first name, a last name and - optionally - a country, because
+     * that is all it needs to find who somebody means. Company and title were never filters here
+     * (matching spec, rule 1); they only ranked, so a form that insisted on them was asking two
+     * questions to improve an ordering and refusing to search without the answers.
+     */
+    public Future<JsonObject> identifyManager(String firstName, String lastName,
+                                              String company, String title, Long companyId,
+                                              String country) {
+        return runMatcher(firstName, lastName, company, title, companyId, country)
+            .compose(outcome -> managerRepo.findSelectableEmployments(outcome.candidateIds())
+                .map(employmentRows -> {
+                    // manager id -> its selectable employments, in the order the query returned.
+                    java.util.Map<Long, JsonArray> byManager = new java.util.LinkedHashMap<>();
+                    for (Row r : employmentRows) {
+                        JsonObject e = new JsonObject()
+                            .put("roleId",       r.getLong("role_id"))
+                            .put("companyId",    r.getLong("company_id"))
+                            .put("company",      r.getString("company"))
+                            .put("title",        r.getString("title"))
+                            .put("state",        r.getString("state"))
+                            .put("periodKnown",  r.getBoolean("period_known"))
+                            .put("startDate",    r.getLocalDate("start_date") == null
+                                                 ? null : r.getLocalDate("start_date").toString())
+                            .put("endDate",      r.getLocalDate("end_date") == null
+                                                 ? null : r.getLocalDate("end_date").toString())
+                            // No career_history row behind it, so it cannot be a resolved
+                            // selection: picking it is the "employment missing" path. The client
+                            // needs to know, because the difference decides whether the rating
+                            // publishes now or waits for a moderator.
+                            .put("selectable",   r.getLong("role_id") != null)
+                            .put("isCurrentRoleWithoutRecord",
+                                 r.getBoolean("is_current_role_without_record"))
+                            // The employer's logo identity, so the selection screen draws the
+                            // company. All three are sent because the renderer resolves them in
+                            // order and a name alone makes it guess a domain.
+                            .put("companyDomain", r.getString("company_domain"))
+                            .put("companyLogoUrl", r.getString("company_logo_url"))
+                            .put("companyBrandfetchIconUrl",
+                                 r.getString("company_brandfetch_icon_url"));
+                        byManager.computeIfAbsent(r.getLong("manager_id"), k -> new JsonArray())
+                                 .add(e);
+                    }
+
+                    JsonArray candidates = new JsonArray();
+                    for (int i = 0; i < outcome.tiles().size(); i++) {
+                        JsonObject tile = outcome.tiles().getJsonObject(i).copy();
+                        tile.put("employments",
+                                 byManager.getOrDefault(tile.getLong("id"), new JsonArray()));
+                        candidates.add(tile);
+                    }
+
+                    return new JsonObject()
+                        .put("candidates",         candidates)
+                        .put("nameClass",          outcome.decision().nameClass().name())
+                        .put("incompleteEvidence", outcome.incompleteEvidence())
+                        // Deliberately NOT returned: the matcher's Outcome. Whether a ghost WOULD
+                        // be created is a decision about creation, and this endpoint creates
+                        // nothing. Exposing it would invite the client to act on it, which is the
+                        // automatic attachment being removed.
+                        .put("entered", new JsonObject()
+                            .put("firstName", firstName)
+                            .put("lastName",  lastName)
+                            .put("company",   company)
+                            .put("title",     title));
+                }));
+    }
+
     private Future<MatchOutcome> runMatcher(String firstName, String lastName,
                                             String company, String title, Long companyId) {
+        return runMatcher(firstName, lastName, company, title, companyId, null);
+    }
+
+    /**
+     * The same matcher, with the country the contributor said they worked in.
+     *
+     * <p>A TIE-BREAK, never a filter and never a band. Rule 1 of the matching spec is that a
+     * public profile whose name matches is never hidden because an employer differs; the identical
+     * argument holds for a country, and more strongly - people relocate, the column is often empty,
+     * and a manager's recorded country is where their CURRENT employer is, not where the
+     * contributor worked with them. Filtering on it would be the fuzzy-match mistake wearing a
+     * different hat.
+     *
+     * <p>So it orders candidates INSIDE a band, ahead of review count: among people the matcher
+     * already considers equally good matches, the one in the country the contributor named is more
+     * likely to be the person they mean than the one with more reviews. It can never lift a
+     * plausible name above a confirmed one, and it never reaches the decision - what gets created
+     * is unchanged, which is what keeps every other caller of this matcher exactly as it was.
+     */
+    private Future<MatchOutcome> runMatcher(String firstName, String lastName,
+                                            String company, String title, Long companyId,
+                                            String country) {
         java.util.List<String> tokens = ManagerMatcher.candidateTokens(firstName, lastName);
         if (tokens.isEmpty()) {
             return Future.succeededFuture(new MatchOutcome(
@@ -5784,8 +7157,25 @@ public class ManagerService {
 
                         java.util.List<JsonObject> ordered = new java.util.ArrayList<>();
                         for (Row row : fullRows) ordered.add(rowToManagerJson(row));
+                        /*
+                          Country breaks ties INSIDE a band, before review count.
+
+                          Among candidates the matcher already rates equally, the one in the
+                          country the contributor named is more likely to be the person they mean
+                          than the one with more reviews. Absent on either side is not a mismatch
+                          and not a match: it simply does not break the tie, which is why this is
+                          a boolean rather than a penalty.
+                        */
+                        final String wantedCountry = country == null ? null : country.trim();
+                        java.util.function.Function<JsonObject, Integer> countryFirst = o -> {
+                            if (wantedCountry == null || wantedCountry.isEmpty()) return 0;
+                            String c = o.getString("country");
+                            if (c == null || c.isBlank()) return 0;
+                            return c.trim().equalsIgnoreCase(wantedCountry) ? -1 : 0;
+                        };
                         ordered.sort(java.util.Comparator
                             .<JsonObject>comparingInt(o -> rank.getOrDefault(o.getLong("id"), 3))
+                            .thenComparingInt(countryFirst::apply)
                             .thenComparing(o -> -o.getInteger("reviewsCount", 0))
                             .thenComparing(o -> o.getLong("id")));
 

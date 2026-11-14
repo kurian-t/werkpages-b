@@ -295,7 +295,7 @@ public class LocationCorpusRepository {
     /** Set by the lookup so a test can prove it ran off the caller's thread. */
     volatile String lastIndexLookupThread;
 
-    private Future<JsonArray> geographyFromIndex(String rawQuery, String iso, String state) {
+    private Future<JsonArray> geographyFromIndex(QualifiedPlace place, String state) {
         /*
           THE SHARED FOLD, not this class's own normalise().
 
@@ -304,7 +304,20 @@ public class LocationCorpusRepository {
           normalises differently from its index cannot match it - which is the entire class of bug
           the equivalence test exists to catch.
         */
-        final String needle = GeographyIndex.fold(rawQuery);
+        /*
+          The PLACE name only. This folded the whole typed string, so "Toronto, Canada" asked the
+          index for somewhere called "toronto canada", got nothing, and the empty result then sent
+          every keystroke into the 16-million-row buildings file - which is why a qualified
+          location was both wrong and slow.
+        */
+        final String needle   = GeographyIndex.fold(place.name());
+        final String iso      = place.countryIso();
+        final String region   = place.regionName();
+        /*
+          A typed qualifier we understood NARROWS; anything else only ranks. A country the form
+          happens to hold must never exclude: "Tokyo" with Canada selected has to offer Tokyo.
+        */
+        final boolean narrows = place.confidence() == Qualifier.RESOLVED && place.hasScope();
         Promise<JsonArray> promise = Promise.promise();
         worker.execute(() -> {
             lastIndexLookupThread = Thread.currentThread().getName();
@@ -318,7 +331,70 @@ public class LocationCorpusRepository {
                 if (hits.isEmpty() && needle.matches("(?:[a-z0-9] )+[a-z0-9]")) {
                     hits = geographyIdx.byAlias(needle.replace(" ", ""), iso, 10);
                 }
-                if (hits.isEmpty()) hits = geographyIdx.byPrefix(needle, iso, state, LIMIT);
+                /*
+                  A larger read when a region was named, because the filter below happens here
+                  rather than in SQL: byPrefix scopes on state_code ("US.CA"), and somebody types
+                  the state's NAME. Filtering in Java against state_name avoids a second index.
+                */
+                if (hits.isEmpty()) {
+                    int width = region != null ? LIMIT * 5 : LIMIT;
+                    /*
+                      EXACTLY WHAT WAS TYPED IS READ SEPARATELY, THEN BOTH SETS COMPETE ON SCORE.
+
+                      A prefix read ordered by importance and cut at eight cannot be trusted to
+                      contain the places actually named. "Paris" returned eight rows and every one
+                      was in France: Paris, then seven of its own arrondissements, each holding
+                      around 180,000 people and therefore outranking Paris, Texas and Paris,
+                      Ontario on importance. Those seven are the same city as the first row, and
+                      between them they made every other Paris on earth impossible to pick.
+
+                      The limit is what did the damage, not the ranking. The client can only
+                      reorder what it is sent, so a limit that hides places is the same defect as
+                      a filter that excluded them.
+
+                      Widening the prefix read was the obvious repair and is the wrong one: no
+                      bound exists on how many "Paris..." rows outrank Paris, Texas, so any width
+                      chosen is a guess the next crowded name defeats. Reading the exact name is
+                      bounded by the question asked, and entity(norm) is indexed.
+
+                      Merged by SCORE rather than placed in front, using the same rank() that the
+                      typo path already uses: an exact match is worth EXACT_MATCH_BONUS more than
+                      a guess of equal standing, so Paris, France still leads its own
+                      arrondissements and they in turn still outrank a hamlet. Being named exactly
+                      is evidence, not a veto.
+                    */
+                    java.util.List<GeographyIndex.Hit> prefix =
+                        geographyIdx.byPrefix(needle, iso, state, width);
+                    java.util.List<GeographyIndex.Hit> named =
+                        geographyIdx.byName(needle, iso, blankToNull(state), width);
+                    if (named.isEmpty()) {
+                        hits = prefix;
+                    } else {
+                        java.util.Set<Long> seen = new java.util.HashSet<>();
+                        java.util.List<GeographyIndex.Hit> merged = new java.util.ArrayList<>();
+                        for (GeographyIndex.Hit h : named)  if (seen.add(h.id())) merged.add(h);
+                        for (GeographyIndex.Hit h : prefix) if (seen.add(h.id())) merged.add(h);
+                        merged.sort((a, b) -> Double.compare(rank(b, needle), rank(a, needle)));
+                        // Back to the width byPrefix was asked for, so every step below - the
+                        // region filter, the widening, the typo gate - sees the list it expects.
+                        hits = merged.size() > width ? new java.util.ArrayList<>(merged.subList(0, width))
+                                                     : merged;
+                    }
+                }
+                if (region != null) {
+                    String wanted = GeographyIndex.fold(region);
+                    java.util.List<GeographyIndex.Hit> inRegion = new java.util.ArrayList<>();
+                    for (GeographyIndex.Hit h : hits) {
+                        if (h.stateName() != null && GeographyIndex.fold(h.stateName()).equals(wanted)) {
+                            inRegion.add(h);
+                        }
+                    }
+                    // Only when it found something: a region we resolved but cannot match here is
+                    // better answered with the unfiltered list than with nothing at all.
+                    if (!inRegion.isEmpty()) {
+                        hits = inRegion.size() > LIMIT ? inRegion.subList(0, LIMIT) : inRegion;
+                    }
+                }
 
                 /*
                   A COUNTRY IS A PREFERENCE, NEVER A PRISON.
@@ -337,7 +413,7 @@ public class LocationCorpusRepository {
                   Only when a scope was actually applied; an unscoped lookup has already seen
                   everything.
                 */
-                if (iso != null && hits.size() < LIMIT) {
+                if (iso != null && !narrows && hits.size() < LIMIT) {
                     java.util.List<GeographyIndex.Hit> worldwide =
                         geographyIdx.byPrefix(needle, null, blankToNull(state), LIMIT);
                     if (!worldwide.isEmpty()) {
@@ -690,7 +766,15 @@ public class LocationCorpusRepository {
           Same contract: same arguments, same JSON shape, same worker. What changes is only where
           the rows come from.
         */
-        if (geographyIdx != null) return geographyFromIndex(query, iso, blankToNull(state));
+        /*
+          Parsed once, here, above the fork. Both reads below take the same interpretation, which
+          is the whole point: the stated-country handling used to live inside the corpus read, so
+          wiring in the index skipped it and every "<place>, <country>" query searched for a place
+          with the country's name glued on. See parseQualified.
+        */
+        if (geographyIdx != null) {
+            return geographyFromIndex(parseQualified(query, iso), blankToNull(state));
+        }
 
         if (iso == null && !geographyIsWorldwide()) return Future.succeededFuture(new JsonArray());
 
@@ -1142,6 +1226,14 @@ public class LocationCorpusRepository {
 
     // ── Plumbing ─────────────────────────────────────────────────────────────
 
+    /**
+     * Above which a single corpus read is reported with its phase breakdown.
+     *
+     * <p>Well under the geography deadline of 4000ms, so a read that is about to be cut off is
+     * always accounted for, and far above a healthy local read of roughly 20ms.
+     */
+    private static final long SLOW_READ_MS = 750;
+
     private interface Binder { void bind(PreparedStatement statement) throws SQLException; }
 
     private interface RowMapper { JsonObject map(ResultSet rs) throws SQLException; }
@@ -1157,9 +1249,24 @@ public class LocationCorpusRepository {
      */
     private Future<JsonArray> query(SqlFor sqlFor, Binder binder, RowMapper mapper) {
         Promise<JsonArray> promise = Promise.promise();
+        /*
+          THREE NUMBERS, BECAUSE A SLOW READ HAS THREE POSSIBLE CAUSES.
+
+          Waiting for a worker thread, opening the engine, and running the query are entirely
+          different problems with entirely different fixes, and a single duration cannot tell them
+          apart. There are three worker threads and a request can read three tiers, so a burst
+          queues; the engine opens once per process and under a lock, so everything that arrives
+          during it waits for it; the query itself reads Parquet, locally or over S3.
+
+          Logged only when a read is slow, so this says nothing on a healthy one.
+        */
+        long submitted = System.nanoTime();
         worker.execute(() -> {
+            long startedAt = System.nanoTime();
+            long connectedAt = startedAt;
             try {
                 Connection conn = threadConnection();
+                connectedAt = System.nanoTime();
                 if (conn == null) {
                     promise.complete(new JsonArray());
                     return;
@@ -1170,6 +1277,14 @@ public class LocationCorpusRepository {
                     try (ResultSet rs = statement.executeQuery()) {
                         while (rs.next()) out.add(mapper.map(rs));
                     }
+                }
+                long totalMs = (System.nanoTime() - submitted) / 1_000_000;
+                if (totalMs >= SLOW_READ_MS) {
+                    LOG.info("location corpus read slow: totalMs=" + totalMs
+                        + " queuedMs=" + ((startedAt - submitted) / 1_000_000)
+                        + " connectMs=" + ((connectedAt - startedAt) / 1_000_000)
+                        + " executeMs=" + ((System.nanoTime() - connectedAt) / 1_000_000)
+                        + " rows=" + out.size());
                 }
                 promise.complete(out);
             } catch (Throwable err) {
@@ -1231,9 +1346,104 @@ public class LocationCorpusRepository {
         return shared;
     }
 
+    /**
+     * Whether initialisation has been asked for, so repeated calls do not queue repeated attempts.
+     *
+     * <p>{@link #connection()} is already idempotent - synchronized, memoised, and sticky once the
+     * corpus has been found unavailable - so a second attempt would be harmless. This exists so a
+     * second CALLER does not occupy a worker thread to discover that.
+     */
+    private final java.util.concurrent.atomic.AtomicBoolean initialisationStarted =
+        new java.util.concurrent.atomic.AtomicBoolean(false);
+
+    /** Counts initialisations asked for, and engines actually opened, so a test can see the order. */
+    private final java.util.concurrent.atomic.AtomicInteger initialisationsAsked =
+        new java.util.concurrent.atomic.AtomicInteger();
+    private final java.util.concurrent.atomic.AtomicInteger engineOpens =
+        new java.util.concurrent.atomic.AtomicInteger();
+
+    /**
+     * Opens the corpus now, off the caller's thread, instead of waiting for somebody to type.
+     *
+     * <h2>The defect this closes</h2>
+     *
+     * <p>Everything here was lazy: the engine opened on the first query, and
+     * {@link #materialiseGeography} - the only thing that counts {@link #geographyReady} down - was
+     * submitted at the END of that open. But the first request without a country calls
+     * {@link #awaitGeography()} BEFORE it issues any query, so on a cold process it waited the full
+     * {@link #GEOGRAPHY_WAIT_MS} for a signal that nothing had been started to produce, then fell
+     * back to the configured countries and answered a worldwide question with a shortlist.
+     *
+     * <p>Measured on a cold process: 2,000ms of unproductive waiting, then 801ms to open the engine
+     * and 663ms to do the work. 3.51s, and the wrong answer. The wait was not too short - it was
+     * waiting for something nobody had asked for.
+     *
+     * <p>So the application asks for it at startup. The request-time wait is unchanged and still
+     * bounded; the difference is that what it waits for is now actually in flight.
+     *
+     * <h2>What it deliberately does not do</h2>
+     *
+     * <p>It does not block the caller. Startup must not wait out a 54MB download, and a bucket that
+     * never answers must not hold the process at boot - {@code http_timeout} alone would be ten
+     * seconds of it.
+     *
+     * <p>It does not run a query. A warm-up query would prove the engine works by reading rows
+     * nobody asked for; what the first request waits for is initialisation, so initialisation is
+     * what gets started.
+     *
+     * <p>It is not called from a constructor. Every unit test in both products builds a
+     * ManagerService, and that constructs one of these: construction stays free and cannot fail,
+     * and a process that never calls this keeps exactly the old lazy behaviour.
+     *
+     * <p>Safe to call more than once, and from any thread.
+     */
+    public void beginInitialisation() {
+        if (!initialisationStarted.compareAndSet(false, true)) return;
+        initialisationsAsked.incrementAndGet();
+        worker.submit(() -> {
+            // The result is deliberately discarded: connection() logs its own outcome, and a corpus
+            // that cannot be reached is a degraded suggestion list, never a failed boot.
+            connection();
+        });
+    }
+
+    /** Visible for tests: how many callers actually started an initialisation. */
+    int initialisationsBegun() { return initialisationsAsked.get(); }
+
+    /** Visible for tests: how many times the engine has really been opened. */
+    int engineOpenAttempts() { return engineOpens.get(); }
+
+    /** Visible for tests: whether initialisation has signalled, either outcome. */
+    boolean geographySignalled() { return geographyReady.getCount() == 0; }
+
+    /**
+     * Says geography is not coming, so nothing waits out the full {@link #GEOGRAPHY_WAIT_MS} for a
+     * signal that will never arrive.
+     *
+     * <p>Counting the latch down does NOT claim readiness. Every waiter re-checks
+     * {@link #geographyIsWorldwide()} after the await, so a signalled failure reports not-ready
+     * immediately rather than after two seconds of nothing. Before this, a corpus that could not be
+     * opened at all left the latch up for the life of the process, and every countryless request
+     * paid two seconds to learn what the first one already knew.
+     */
+    private void geographyWillNotArrive() { geographyReady.countDown(); }
+
     private synchronized Connection connection() {
         if (unavailable) return null;
         if (connection != null) return connection;
+        engineOpens.incrementAndGet();
+
+        /*
+          TIMED, PHASE BY PHASE, because this is what a cold request actually waits for.
+
+          The first query of a process pays all of this before it reads a single row, and the
+          whole cost was invisible: a request logged geoMs=4006 against a 4000ms deadline and
+          nothing said whether the four seconds were spent reading geography or opening the engine
+          that would read it. Measuring the query and not its prerequisite is how the cold-start
+          defect went four days without a demonstrated cause.
+        */
+        long openedAt = System.nanoTime();
+        long engineMs = 0, tuningMs = 0, secretMs = 0, releaseMs = 0;
 
         try {
             Connection conn = DriverManager.getConnection("jdbc:duckdb:");
@@ -1255,6 +1465,9 @@ public class LocationCorpusRepository {
                 // search silently returning nothing.
                 statement.execute("SET preserve_insertion_order=false");
             }
+            // The native library, the httpfs extension and the base settings. INSTALL reaches
+            // extensions.duckdb.org when the extension is not already on this host.
+            engineMs = (System.nanoTime() - openedAt) / 1_000_000;
             /*
               Keep Parquet footers between queries.
 
@@ -1309,6 +1522,7 @@ public class LocationCorpusRepository {
                     LOG.fine(() -> "corpus engine did not accept: " + tuning);
                 }
             }
+            tuningMs = (System.nanoTime() - openedAt) / 1_000_000 - engineMs;
             try (Statement statement = conn.createStatement()) {
                 // credential_chain, never keys in configuration: the instance role in production,
                 // ~/.aws/credentials locally. Identical to how SecretsConfig authenticates.
@@ -1316,16 +1530,23 @@ public class LocationCorpusRepository {
                     + "PROVIDER credential_chain, REGION '" + region + "', "
                     + "SCOPE 's3://" + bucket + "')");
             }
+            secretMs = (System.nanoTime() - openedAt) / 1_000_000 - engineMs - tuningMs;
+            // The first S3 round trip: a listing of the corpus root, over the network.
             String active = activeRelease(conn);
+            releaseMs = (System.nanoTime() - openedAt) / 1_000_000 - engineMs - tuningMs - secretMs;
             if (active == null) {
                 LOG.warning("location corpus has no published release; suggestions disabled");
                 unavailable = true;
                 conn.close();
+                geographyWillNotArrive();
                 return null;
             }
             release = active;
             connection = conn;
-            LOG.info("location corpus ready, release " + active);
+            LOG.info("location corpus ready, release " + active
+                + " initMs=" + ((System.nanoTime() - openedAt) / 1_000_000)
+                + " engineMs=" + engineMs + " tuningMs=" + tuningMs
+                + " secretMs=" + secretMs + " releaseMs=" + releaseMs);
             // In the background: a cold start serves from S3 and gets faster, rather than waiting.
             materialiseGeography(conn, active);
             return conn;
@@ -1340,10 +1561,12 @@ public class LocationCorpusRepository {
                 + "). The shaded jar ships only linux/amd64; see the maven-shade-plugin filter in "
                 + "RestApi/pom.xml. Location suggestions are disabled.", err);
             unavailable = true;
+            geographyWillNotArrive();
             return null;
         } catch (Exception err) {
             LOG.log(Level.WARNING, "location corpus unavailable; suggestions disabled", err);
             unavailable = true;
+            geographyWillNotArrive();
             return null;
         }
     }
@@ -1369,9 +1592,13 @@ public class LocationCorpusRepository {
           until it is published. Neither is set in production, where current.json stays the single
           source of truth.
         */
-        String pinned = System.getenv("LOCATION_CORPUS_RELEASE");
-        if (pinned != null && !pinned.isBlank()) {
-            searchTextSorted = "true".equalsIgnoreCase(System.getenv("LOCATION_CORPUS_SORTED"));
+        // Through env(), so a system property works too. Its own javadoc gives the reason: a test
+        // cannot set an environment variable for the JVM it is already running in, and an
+        // environment-only read means the cold path can only ever be exercised by hand. Production
+        // passes these as environment variables and is unaffected.
+        String pinned = env("LOCATION_CORPUS_RELEASE", "");
+        if (!pinned.isBlank()) {
+            searchTextSorted = "true".equalsIgnoreCase(env("LOCATION_CORPUS_SORTED", ""));
             LOG.info("location corpus pinned to " + pinned.trim()
                      + " (sorted=" + searchTextSorted + ") by LOCATION_CORPUS_RELEASE");
             return pinned.trim();
@@ -1449,7 +1676,9 @@ public class LocationCorpusRepository {
      * already has the file this is not reached at all; it only applies to the first requests after
      * a cold start on a host with an empty temporary directory.
      */
-    private static final long GEOGRAPHY_WAIT_MS = 2_000;
+    // Package-private so the cold-start tests assert against the real bound rather than a
+    // copy of it that can drift. See LocationColdStartTest.
+    static final long GEOGRAPHY_WAIT_MS = 2_000;
 
     /** The FROM clause for geography, and the country predicate that goes with it. */
     private String geographyFrom(String release, String iso) {
@@ -1647,62 +1876,85 @@ public class LocationCorpusRepository {
      * never sees a half-written copy.
      */
     private void materialiseGeography(Connection conn, String release) {
-        worker.submit(() -> {
-            try {
-                java.nio.file.Path dir = java.nio.file.Path.of(
-                    System.getProperty("java.io.tmpdir"), "location-corpus");
-                java.nio.file.Files.createDirectories(dir);
-                java.nio.file.Path tmp   = dir.resolve("geography-" + release + ".parquet.tmp");
-                java.nio.file.Path final_ = dir.resolve("geography-" + release + ".parquet");
+        worker.submit(() -> cacheGeographyLocally(conn, release));
+    }
 
-                if (java.nio.file.Files.exists(final_)) {
-                    localGeography = final_.toString();
-                geographyReady.countDown();
-                    geographyReady.countDown();
-                    LOG.info("location corpus geography already local: " + final_);
-                    return;
-                }
-                long started = System.currentTimeMillis();
-                /*
-                  Its own connection, not the shared one.
+    /**
+     * The body of {@link #materialiseGeography}, on the caller's thread.
+     *
+     * <p>Separate so both of its paths can be driven in a test without a published corpus: the
+     * already-local one, and a copy that cannot run. The signalling is the part that was wrong, and
+     * it is not observable from outside unless something can reach the two branches.
+     */
+    void cacheGeographyLocally(Connection conn, String release) {
+        try {
+            java.nio.file.Path dir = java.nio.file.Path.of(
+                System.getProperty("java.io.tmpdir"), "location-corpus");
+            java.nio.file.Files.createDirectories(dir);
+            java.nio.file.Path tmp   = dir.resolve("geography-" + release + ".parquet.tmp");
+            java.nio.file.Path final_ = dir.resolve("geography-" + release + ".parquet");
 
-                  A DuckDBConnection is not safe to use from two threads at once, which is why
-                  every query already runs on a duplicate. This download takes seconds and would
-                  otherwise be holding the shared connection while requests use it.
-
-                  NO MEMORY OVERRIDE. This used to raise the limit to 2GB here, on the reasoning
-                  that a duplicated connection has "its own memory limit". It does not: duplicate()
-                  shares the database instance and DuckDB's memory_limit is instance-wide, so the
-                  line quietly lifted the cap for every concurrent request on a 4GB box, and never
-                  put it back. The engine also allocates outside the buffer manager, so the cap was
-                  never the whole story anyway.
-
-                  If this COPY cannot run inside the configured limit, the answer is to publish the
-                  compact geography file during the corpus build and download it, rather than
-                  rebuilding it here with the engine's safety belt loosened.
-                */
-                try (Connection own = ((org.duckdb.DuckDBConnection) conn).duplicate();
-                     Statement statement = own.createStatement()) {
-                    statement.execute("COPY (SELECT * FROM read_parquet('s3://" + bucket
-                        + "/processed/" + release + "/geography/*/*.parquet', hive_partitioning=true))"
-                        + " TO '" + tmp + "' (FORMAT parquet, COMPRESSION zstd)");
-                }
-                java.nio.file.Files.move(tmp, final_,
-                    java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+            if (java.nio.file.Files.exists(final_)) {
                 localGeography = final_.toString();
-                LOG.info("location corpus geography cached locally in "
-                         + (System.currentTimeMillis() - started) + "ms: " + final_);
-            } catch (Throwable err) {
-                /*
-                  Throwable, not Exception.
-
-                  The first version caught Exception and the task died in silence: an engine that
-                  runs out of memory throws an Error, so nothing was logged, no file appeared, and
-                  every query carried on hitting S3 with no indication why.
-                */
-                LOG.log(Level.WARNING, "could not cache geography locally; using S3", err);
+                LOG.info("location corpus geography already local: " + final_);
+                return;
             }
-        });
+            long started = System.currentTimeMillis();
+            /*
+              Its own connection, not the shared one.
+
+              A DuckDBConnection is not safe to use from two threads at once, which is why
+              every query already runs on a duplicate. This download takes seconds and would
+              otherwise be holding the shared connection while requests use it.
+
+              NO MEMORY OVERRIDE. This used to raise the limit to 2GB here, on the reasoning
+              that a duplicated connection has "its own memory limit". It does not: duplicate()
+              shares the database instance and DuckDB's memory_limit is instance-wide, so the
+              line quietly lifted the cap for every concurrent request on a 4GB box, and never
+              put it back. The engine also allocates outside the buffer manager, so the cap was
+              never the whole story anyway.
+
+              If this COPY cannot run inside the configured limit, the answer is to publish the
+              compact geography file during the corpus build and download it, rather than
+              rebuilding it here with the engine's safety belt loosened.
+            */
+            try (Connection own = ((org.duckdb.DuckDBConnection) conn).duplicate();
+                 Statement statement = own.createStatement()) {
+                statement.execute("COPY (SELECT * FROM read_parquet('s3://" + bucket
+                    + "/processed/" + release + "/geography/*/*.parquet', hive_partitioning=true))"
+                    + " TO '" + tmp + "' (FORMAT parquet, COMPRESSION zstd)");
+            }
+            java.nio.file.Files.move(tmp, final_,
+                java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+            localGeography = final_.toString();
+            LOG.info("location corpus geography cached locally in "
+                     + (System.currentTimeMillis() - started) + "ms: " + final_);
+        } catch (Throwable err) {
+            /*
+              Throwable, not Exception.
+
+              The first version caught Exception and the task died in silence: an engine that
+              runs out of memory throws an Error, so nothing was logged, no file appeared, and
+              every query carried on hitting S3 with no indication why.
+            */
+            LOG.log(Level.WARNING, "could not cache geography locally; using S3", err);
+        } finally {
+            /*
+              EVERY PATH SIGNALS, which two of them did not.
+
+              The already-local branch counted down twice and the download branch never counted
+              down at all - not on success, not on failure - so a request that was already
+              inside awaitGeography() when the file landed still waited out the whole
+              GEOGRAPHY_WAIT_MS, and one that arrived during a failed copy waited two seconds to
+              be told nothing. The double countdown was harmless on a latch of one and the
+              missing one was not.
+
+              In a finally, because the failure case is exactly the one that must not hang:
+              readiness is reported by geographyIsWorldwide(), which every waiter re-checks, so
+              signalling here says the attempt is OVER, never that it worked.
+            */
+            geographyReady.countDown();
+        }
     }
 
     /** Lower-cased and trimmed, or null when there is nothing worth searching for. */
@@ -2162,6 +2414,132 @@ public class LocationCorpusRepository {
      * characters - and that is the safe direction: it still searches worldwide and still finds
      * London.
      */
+    /**
+     * How confidently a trailing qualifier was understood, which decides whether it filters.
+     *
+     * <p>A qualifier somebody TYPED is a stronger statement than a country a form happens to
+     * hold, so a confidently resolved one narrows the search. One that is ambiguous or still
+     * being typed only ranks, because filtering on a guess hides the thing they meant.
+     */
+    enum Qualifier { NONE, RESOLVED, AMBIGUOUS, PARTIAL }
+
+    /**
+     * A typed location, split into the place and whatever qualifies it.
+     *
+     * <p>"Kitchener, Ontario, Canada" is one place name and two qualifiers, and the index stores
+     * the name alone: {@code norm} holds "kitchener", with the region and country in their own
+     * columns. Searching the whole typed string as a name therefore matches nothing, which is
+     * exactly the defect this exists to fix.
+     */
+    record QualifiedPlace(String name, String countryIso, String regionName, Qualifier confidence) {
+        boolean hasScope() { return countryIso != null || regionName != null; }
+    }
+
+    /**
+     * Reads a typed location into a place and its qualifiers, once, for every search path.
+     *
+     * <p><b>Computed above the index/corpus branch on purpose.</b> The old code resolved a stated
+     * country inside the DuckDB read only, so when the SQLite index was wired in and short
+     * circuited that function, the interpretation was skipped with it: the index was handed the
+     * raw string and asked for a place called "california united states". Keeping one parser
+     * above the fork is what stops the two paths disagreeing again.
+     *
+     * <p><b>Ambiguity is resolved from the data, not from a list.</b> The index already carries
+     * both readings of the hard cases - "ca" aliases California and Canada, "georgia" is a US
+     * region and a country - so the honest method is to ask it for the candidates and keep the
+     * one consistent with the place in front of it. "Los Angeles, CA" is California because Los
+     * Angeles is in California; "Tbilisi, Georgia" is the country because Tbilisi is in it. A
+     * hand-written rule table would have to enumerate those and would be wrong at the edges.
+     */
+    QualifiedPlace parseQualified(String rawQuery, String formIso) {
+        if (rawQuery == null) return new QualifiedPlace(null, formIso, null, Qualifier.NONE);
+        String[] parts = rawQuery.split(",");
+        String leading = parts[0].trim();
+        if (parts.length == 1 || leading.isEmpty()) {
+            return new QualifiedPlace(leading, formIso, null, Qualifier.NONE);
+        }
+
+        String countryIso = null;
+        String regionName = null;
+        Qualifier confidence = Qualifier.RESOLVED;
+
+        for (int i = 1; i < parts.length; i++) {
+            String tail = parts[i].trim();
+            if (tail.isEmpty()) continue;
+
+            String asCountry = Countries.iso(tail);
+            String asRegion  = regionFor(leading, tail);
+
+            if (asCountry != null && asRegion != null) {
+                /*
+                  Both readings are live - "Ontario, CA" is a region of Canada and a city in
+                  California. Neither is filtered on; prominence orders them and the other stays
+                  in the list. Filtering here is how somebody loses the place they meant.
+                */
+                confidence = Qualifier.AMBIGUOUS;
+                countryIso = asCountry;
+            } else if (asCountry != null) {
+                countryIso = asCountry;
+            } else if (asRegion != null) {
+                regionName = asRegion;
+            } else {
+                /*
+                  Still being typed: "Toronto, Ont", "California, U". Resolving nothing is the
+                  correct answer and the search runs on the place name alone, unscoped. The
+                  important part is that it does NOT fall through to a 16-million-row business
+                  read, which is what made a half-typed qualifier take six seconds.
+                */
+                confidence = Qualifier.PARTIAL;
+            }
+        }
+        if (countryIso == null && regionName == null && confidence != Qualifier.PARTIAL) {
+            confidence = Qualifier.NONE;
+        }
+        return new QualifiedPlace(leading,
+                                  countryIso != null ? countryIso : formIso,
+                                  regionName, confidence);
+    }
+
+    /**
+     * The region a qualifier names, if the place in front of it is actually in one by that name.
+     *
+     * <p>Checked against the leading place's own candidates rather than a list of regions, so
+     * "Paris, Texas" resolves and "Paris, Nonsense" does not. Returns the region exactly as the
+     * index spells it, because that is what the rows will be compared against.
+     */
+    private String regionFor(String leading, String tail) {
+        if (geographyIdx == null || leading == null || leading.isBlank()) return null;
+        String wanted = GeographyIndex.fold(tail);
+        if (wanted.isEmpty()) return null;
+        for (GeographyIndex.Hit h : geographyIdx.byPrefix(GeographyIndex.fold(leading), null, null, 40)) {
+            String state = h.stateName();
+            if (state == null) continue;
+            String folded = GeographyIndex.fold(state);
+            // A prefix match, so "Toronto, Ont" finds Ontario while it is still being typed.
+            if (folded.equals(wanted) || folded.startsWith(wanted)) return state;
+        }
+        return null;
+    }
+
+    /**
+     * The place name out of a typed location: everything before the first comma.
+     *
+     * <p>Deliberately trivial and static, so the tier gate can use the same reading of a typed
+     * string as the lookup does without needing an index open. "Mumbai, IN" is a search for
+     * Mumbai whether or not we can resolve what IN means, and the gate asking whether geography
+     * answered has to compare against that rather than against the whole string.
+     *
+     * <p>Without this the gate was still testing "mumbai in" against "Mumbai Maharashtra",
+     * failing, and concluding that nobody had typed a place name - so it read the buildings file
+     * for a query the geography index had already answered correctly, which is both the slowness
+     * and the businesses leading the list.
+     */
+    public static String leadingPlace(String query) {
+        if (query == null) return null;
+        int comma = query.indexOf(',');
+        return (comma < 0 ? query : query.substring(0, comma)).trim();
+    }
+
     static String statedCountry(String needle) {
         if (needle == null) return null;
         int comma = needle.lastIndexOf(',');

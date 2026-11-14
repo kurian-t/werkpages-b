@@ -51,8 +51,10 @@ class CapturedDraftPublicationIntegrationTest {
     static Vertx                vertx;
     static AdminService         admin;
     static CompanyReviewService companyRatings;
+    static ManagerService       managers;
     static InterviewService     interviews;
     static MaintenanceSweep     sweep;
+    static CapturedDraftRepository drafts;
 
     @BeforeAll
     static void setUpAll() {
@@ -73,10 +75,15 @@ class CapturedDraftPublicationIntegrationTest {
         InterviewRepository     interviewRepo = new InterviewRepository(pool);
 
         companyRatings = new CompanyReviewService(companyReviews, companyRepo, userRepo);
+        managers = new ManagerService(new ManagerRepository(pool), new ReviewRepository(pool),
+                                      userRepo, new EditRepository(pool),
+                                      new ReportRepository(pool), companyRepo, pool,
+                                      company -> null);
         interviews     = new InterviewService(interviewRepo, companyRepo, userRepo);
         admin = new AdminService(userRepo, new ManagerRepository(pool), new ReviewRepository(pool),
                                  new EditRepository(pool), new NotificationRepository(pool),
                                  companyRepo, new MergeSuggestionsRepository(pool), pool);
+        drafts = new CapturedDraftRepository(pool);
         sweep = new MaintenanceSweep(new ReviewRepository(pool), new ManagerRepository(pool),
                                      companyRepo, new ProofChallengeRepository(pool),
                                      new ConfidenceRepository(pool))
@@ -93,7 +100,139 @@ class CapturedDraftPublicationIntegrationTest {
     @BeforeEach
     void cleanDb() throws Exception {
         await(pool.query("TRUNCATE captured_drafts, company_reviews, interview_reviews, "
-                       + "companies, users CASCADE").execute().mapEmpty());
+                       + "reviews, managers, companies, users CASCADE").execute().mapEmpty());
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // Publishing a MANAGER rating
+    //
+    // The queue could read a manager_review draft and never publish it, however complete it was.
+    // A manager rating dropped off at the SIGN-IN wall has always become a real review at once;
+    // the gap was the other case, a form abandoned part-way, autosaved, and complete after all.
+    // ══════════════════════════════════════════════════════════════════════════
+
+    @Test
+    void aCompleteManagerDraftBecomesARealReviewBelongingToNobody() throws Exception {
+        long managerId = insertManager("Dana Fox", "Red Hat");
+        String adminAuth = insertUser("auth0|mgr-pub-1", "MgrPub1", "admin");
+        String token = UUID.randomUUID().toString();
+        await(managers.autosaveReviewDraft(managerId,
+            managerReviewBody(4.0).put("author", "BraveHeron19").put("draftToken", token)));
+        // Only an idle form reaches the queue, and the publish must not care which it was.
+        await(drafts.markAbandoned(0));
+
+        JsonObject result = await(admin.publishCapturedDraft(adminAuth, draftId()));
+
+        assertTrue(result.getBoolean("success"));
+        assertEquals("manager_review", result.getString("kind"));
+        Row review = one("SELECT user_id, overall_rating, author, draft_token, disposition, "
+                       + "deleted_at, manager_company, manager_title FROM reviews");
+        /*
+          An ORDINARY review row, which is the whole point. A second class of "admin-approved
+          rating" would have to be understood by every read path, every aggregate and every
+          moderation tool; this one is understood by all of them already.
+        */
+        assertNull(review.getUUID("user_id"),
+            "nobody signed in, so there is no account to attach - inventing one is fabrication");
+        assertEquals(4.0, review.getDouble("overall_rating"));
+        assertEquals("live", review.getString("disposition"));
+        assertNull(review.getOffsetDateTime("deleted_at"));
+        assertEquals("Red Hat", review.getString("manager_company"));
+        // A DIFFERENT handle: the person watched the form offer them one and never pressed submit.
+        String byline = review.getString("author");
+        assertNotNull(byline, "a published review is signed, like every other review on the page");
+        assertNotEquals("BraveHeron19", byline,
+            "NEVER the handle the draft carried - that is the one its author would recognise");
+        assertEquals(token, review.getUUID("draft_token").toString(),
+            "identified by the form it came from, which is what stops a second publication");
+    }
+
+    @Test
+    void anIncompleteManagerDraftIsRefusedAndNamesWhatIsMissing() throws Exception {
+        long managerId = insertManager("Dana Fox", "Red Hat");
+        String adminAuth = insertUser("auth0|mgr-pub-2", "MgrPub2", "admin");
+        /*
+          One category answered is exactly what autosave exists to keep, and nowhere near the bar
+          for a public opinion. The queue has to say so BEFORE anything is written, not discover it
+          by attempting the insert.
+        */
+        await(managers.autosaveReviewDraft(managerId, new JsonObject()
+            .put("draftToken", UUID.randomUUID().toString())
+            .put("ratings", new JsonObject().put("Communication Style", 4.0))));
+        await(drafts.markAbandoned(0));
+
+        ServiceException refused = assertThrows(ServiceException.class,
+            () -> awaitCause(admin.publishCapturedDraft(adminAuth, draftId())));
+
+        assertEquals(400, refused.getStatusCode());
+        assertEquals(0L, count("SELECT count(*) AS c FROM reviews"),
+            "a refused publication writes NOTHING - that is what the transaction is for");
+        assertNull(one("SELECT resolution FROM captured_drafts").getString("resolution"),
+            "and the draft is still waiting, not marked as dealt with");
+    }
+
+    @Test
+    void aManagerDraftWhoseManagerIsGoneCannotBePublished() throws Exception {
+        long managerId = insertManager("Dana Fox", "Red Hat");
+        String adminAuth = insertUser("auth0|mgr-pub-3", "MgrPub3", "admin");
+        await(managers.autosaveReviewDraft(managerId,
+            managerReviewBody(4.0).put("draftToken", UUID.randomUUID().toString())));
+        await(drafts.markAbandoned(0));
+        /*
+          The manager_id is nulled rather than the row deleted, because that is what a deletion
+          leaves behind. Reading it as a primitive long is how this threw a NullPointerException
+          instead of refusing politely, which compiles and fails only when somebody clicks.
+        */
+        await(pool.query("UPDATE captured_drafts SET manager_id = NULL").execute().mapEmpty());
+
+        /*
+          A ServiceException, NOT a NullPointerException. Reading manager_id as a primitive long
+          above the dispatch is how this threw one: it compiles perfectly and fails only at the
+          moment an admin presses the button.
+        */
+        ServiceException refused = assertThrows(ServiceException.class,
+            () -> awaitCause(admin.publishCapturedDraft(adminAuth, draftId())));
+
+        assertEquals(400, refused.getStatusCode());
+        assertEquals(0L, count("SELECT count(*) AS c FROM reviews"));
+    }
+
+    @Test
+    void submittingTheFormRemovesItsDraftFromTheQueue() throws Exception {
+        long managerId = insertManager("Dana Fox", "Red Hat");
+        String userAuth = insertUser("auth0|dup-author", "DupAuthor", "user");
+        String token = UUID.randomUUID().toString();
+
+        /*
+          THE DUPLICATE AN ADMIN WOULD OTHERWISE PUBLISH.
+
+          Somebody fills the manager form in, is bounced to sign in, and the autosave keeps what
+          they had. They come back, sign in, and submit it properly. The rating now exists and
+          belongs to them.
+
+          The draft used to STAY in Unfinished Forms. Harmless while nothing could publish a
+          manager draft; now that something can, it left an admin holding a publishable copy of a
+          rating that already existed, and approving it would have produced the same opinion twice
+          from the same person with nothing to show they were the same.
+
+          The workplace and interview forms have always cleared theirs here. This one never did.
+        */
+        await(managers.autosaveReviewDraft(managerId,
+            managerReviewBody(4.0).put("author", "DupAuthor").put("draftToken", token)));
+        assertEquals(1L, count("SELECT count(*) AS c FROM captured_drafts"),
+            "the autosave kept their answers, which is the point of it");
+
+        // They come back and submit it themselves.
+        await(managers.createReview("auth0|dup-author", managerId,
+            managerReviewBody(4.0).put("author", "DupAuthor").put("draftToken", token), null));
+
+        assertEquals(0L, count("SELECT count(*) AS c FROM captured_drafts"),
+            "the form is finished, so there is nothing left for an admin to review");
+        assertEquals(1L, count("SELECT count(*) AS c FROM reviews"),
+            "and exactly ONE rating exists - the one its author submitted");
+        Row review = one("SELECT user_id FROM reviews");
+        assertNotNull(review.getUUID("user_id"),
+            "it belongs to them, because they signed in and submitted it themselves");
     }
 
     // ══════════════════════════════════════════════════════════════════════════
@@ -274,24 +413,33 @@ class CapturedDraftPublicationIntegrationTest {
     @Test
     void severalCapturesOfOneFormProduceOneRating() throws Exception {
         /*
-          The capture path inserts a fresh row every time somebody is bounced, so one form can hold
-          several drafts sharing a token. Publishing one has to retire the rest, or they sit in the
-          queue looking publishable and the next attempt is refused by a unique index rather than
-          by anything an admin can act on.
+          REWRITTEN when capture began superseding, and worth saying why rather than quietly
+          editing the numbers.
+
+          It used to assert that two captures left TWO queue rows, and that publishing one retired
+          the other as 'superseded'. That was true while capture was a plain insert. It is not now:
+          the form captures on every submit attempt so a partial answer survives, and a plain
+          insert would have put one row in the queue per keystroke-fixing attempt.
+
+          The guarantee the test is named for is unchanged and is simply reached earlier: one form
+          becomes one rating. The deduplication now happens at capture rather than at publication.
+
+          supersedeSiblings still exists and is still called. It is a backstop for a race between
+          two captures rather than the ordinary path, which is the right place for it.
         */
         insertCompany("Red Hat", "red-hat");
         String adminAuth = insertUser("auth0|dp-admin-7", "DpAdmin7", "admin");
         String token = UUID.randomUUID().toString();
         await(companyRatings.captureDraft("red-hat", ratingBody(4.0).put("draftToken", token)));
         await(companyRatings.captureDraft("red-hat", ratingBody(4.5).put("draftToken", token)));
-        assertEquals(2L, count("SELECT count(*) AS c FROM captured_drafts"));
+        assertEquals(1L, count("SELECT count(*) AS c FROM captured_drafts"),
+            "superseded at capture: one form is one queue item");
 
         await(admin.publishCapturedDraft(adminAuth, draftId()));
 
         assertEquals(1L, count("SELECT count(*) AS c FROM company_reviews"));
         assertEquals(0L, count("SELECT count(*) AS c FROM captured_drafts WHERE reviewed_at IS NULL"),
-            "the duplicate capture must not be left in the queue as a second publishable copy");
-        assertEquals(1L, count("SELECT count(*) AS c FROM captured_drafts WHERE resolution = 'superseded'"));
+            "and nothing is left in the queue pretending to be a second copy");
     }
 
     @Test
@@ -319,6 +467,328 @@ class CapturedDraftPublicationIntegrationTest {
         assertNull(one("SELECT draft_token FROM company_reviews").getUUID("draft_token"),
             "nothing is invented: a publication with no form token simply has none, and its "
             + "author's return has no token to match it with either");
+    }
+
+    @Test
+    void capturingTheSameFormTwiceLeavesOneQueueItem() throws Exception {
+        /*
+          The form captures on every submit attempt now, including attempts that fail validation,
+          which is how a partial answer survives at all. Somebody who presses submit, fixes a
+          category, presses it again and then gives up is ONE person with ONE opinion, and the
+          queue must say so.
+
+          This is the manager queue's defect in a new place: "Cepe", "Cepep" and "Cégep de
+          Saint-Laurent" were three rows describing one search, and that queue has not recovered
+          from it.
+        */
+        insertCompany("Red Hat", "red-hat");
+        String token = UUID.randomUUID().toString();
+        JsonObject partial = ratingBody(4.0);
+        partial.getJsonObject("ratings").remove("career_growth");
+
+        await(companyRatings.captureDraft("red-hat", partial.put("draftToken", token)));
+        await(companyRatings.captureDraft("red-hat", ratingBody(4.5).put("draftToken", token)));
+
+        assertEquals(1L, count("SELECT count(*) AS c FROM captured_drafts"),
+            "one form, one row, however many times they pressed submit");
+        assertEquals(4.5, one("SELECT payload FROM captured_drafts")
+                .getJsonObject("payload").getDouble("overallRating"),
+            "and it holds the LATEST answers, not the first attempt");
+    }
+
+    @Test
+    void aCaptureNeverOverwritesADecisionAnAdminAlreadyMade() throws Exception {
+        /*
+          REWRITTEN when V97 made the token unique, and the change is behavioural rather than
+          cosmetic, so it is written down.
+
+          It used to assert that a later capture sat BESIDE the published row as a second record.
+          That is no longer possible, and should not be: one form session is one row, and a
+          session that has already become a published rating is finished. A late capture under
+          its token is now ignored outright rather than reopening or duplicating it.
+
+          The guarantee in the name is unchanged and is in fact stronger: the admin's decision,
+          and the record of what it became, survive untouched.
+        */
+        insertCompany("Red Hat", "red-hat");
+        String adminAuth = insertUser("auth0|dp-cap-1", "DpCap1", "admin");
+        String token = UUID.randomUUID().toString();
+        await(companyRatings.captureDraft("red-hat", ratingBody(4.0).put("draftToken", token)));
+        await(admin.publishCapturedDraft(adminAuth, draftId()));
+        UUID published = one("SELECT resolved_id FROM captured_drafts").getUUID("resolved_id");
+
+        await(companyRatings.captureDraft("red-hat", ratingBody(2.0).put("draftToken", token)));
+
+        assertEquals(1L, count("SELECT count(*) AS c FROM captured_drafts"),
+            "one session, one row - the late capture does not create a second");
+        Row draft = one("SELECT resolution, state, resolved_id, payload FROM captured_drafts");
+        assertEquals("published", draft.getString("resolution"), "the decision survives");
+        assertEquals("resolved", draft.getString("state"));
+        assertEquals(published, draft.getUUID("resolved_id"), "still pointing at what it became");
+        assertEquals(4.0, draft.getJsonObject("payload").getDouble("overallRating"),
+            "and holding what was actually published, not the late capture's answers");
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // Autosave: answers kept while the form is still being filled in
+    // ══════════════════════════════════════════════════════════════════════════
+
+    /** The form's own payload shape, with only the categories somebody has actually answered. */
+    // ── out-of-order autosaves ──────────────────────────────────────────────
+    //
+    // The ordering guarantee itself is covered by anOutOfOrderAutosaveCannotOverwriteNewerAnswers
+    // and by the increasing-revision loop above, both of which predate these. Verified by
+    // deleting "WHERE captured_drafts.revision < EXCLUDED.revision" from autosave(), which fails
+    // them. What was missing is below: equal revisions, and a late autosave meeting a resolved
+    // draft.
+
+    /**
+     * EQUAL REVISIONS ARE REFUSED, which is what makes the beacon's duplicate harmless.
+     *
+     * <p>The in-flight fix can send the same payload twice: once by the aborted request and again
+     * by the flush on unmount, both carrying the revision they were built with. The guard is
+     * strictly {@code <}, so the second is a no-op rather than a second row or a rewrite, and that
+     * is why re-sending is safe rather than merely tolerable.
+     */
+    @Test
+    void anIdenticalResendIsANoOpRatherThanASecondRow() throws Exception {
+        insertCompany("Halverson Logistics", "halverson");
+        long company = companyId("halverson");
+        UUID token = UUID.randomUUID();
+        JsonObject body = partial(java.util.Map.of("communication", 4.0, "fairness", 4.0), 7);
+
+        await(drafts.autosave("company_rating", company, null, null, token, body, 7));
+        Row first = one("SELECT payload, revision, updated_at FROM captured_drafts");
+        await(drafts.autosave("company_rating", company, null, null, token, body, 7));
+
+        assertEquals(1L, count("SELECT count(*) AS c FROM captured_drafts"),
+            "the resend created a second row");
+        Row second = one("SELECT payload, revision, updated_at FROM captured_drafts");
+        assertEquals(first.getOffsetDateTime("updated_at"), second.getOffsetDateTime("updated_at"),
+            "the resend rewrote the row it should have left alone");
+    }
+
+    /**
+     * A LATE AUTOSAVE MUST NOT REOPEN A DRAFT AN ADMINISTRATOR HAS ALREADY DECIDED.
+     *
+     * <p>The upsert's second condition, {@code resolution IS NULL}, and also untested. A draft
+     * that was published or dismissed carries that decision and the record of what it became; an
+     * autosave arriving afterwards would quietly put it back in the queue.
+     */
+    @Test
+    void aLateAutosaveCannotReopenAResolvedDraft() throws Exception {
+        insertCompany("Halverson Logistics", "halverson");
+        long company = companyId("halverson");
+        UUID token = UUID.randomUUID();
+        await(drafts.autosave("company_rating", company, null, null, token,
+            partial(java.util.Map.of("communication", 4.0), 1), 1));
+        await(pool.query("""
+                UPDATE captured_drafts
+                   SET resolution = 'dismissed', state = 'abandoned'
+                """).execute().mapEmpty());
+
+        await(drafts.autosave("company_rating", company, null, null, token,
+            partial(java.util.Map.of("communication", 1.0, "fairness", 1.0), 9), 9));
+
+        Row row = one("SELECT payload, revision, state, resolution FROM captured_drafts");
+        assertEquals("dismissed", row.getString("resolution"), "the decision was overwritten");
+        assertEquals("abandoned", row.getString("state"), "the draft was put back in the queue");
+        assertEquals(1L, row.getLong("revision"), "the late save was applied anyway");
+    }
+
+    private static JsonObject partial(java.util.Map<String, Double> answered, long revision) {
+        JsonObject ratings = new JsonObject();
+        answered.forEach(ratings::put);
+        return new JsonObject().put("ratings", ratings).put("revision", revision);
+    }
+
+    @Test
+    void anEmptyFormIsNotWorthARow() throws Exception {
+        /*
+          The floor. Without one the table fills with rows describing somebody who opened a page,
+          and the aggregate statistics this data exists to feed would count them as participants.
+        */
+        insertCompany("Red Hat", "red-hat");
+        String token = UUID.randomUUID().toString();
+
+        await(companyRatings.autosaveDraft("red-hat",
+            partial(java.util.Map.of(), 1).put("draftToken", token)));
+
+        assertEquals(0L, count("SELECT count(*) AS c FROM captured_drafts"));
+    }
+
+    @Test
+    void oneAnsweredCategoryIsKeptWithoutPressingSubmit() throws Exception {
+        /*
+          THE POINT OF THE WHOLE FEATURE. Four numbers from somebody who closed the tab are four
+          real observations about an employer, and until autosave existed every one was lost.
+        */
+        insertCompany("Red Hat", "red-hat");
+        String token = UUID.randomUUID().toString();
+
+        await(companyRatings.autosaveDraft("red-hat",
+            partial(java.util.Map.of("work_life_balance", 3.0), 100).put("draftToken", token)));
+
+        Row draft = one("SELECT payload, state, revision FROM captured_drafts");
+        assertEquals("active", draft.getString("state"), "being edited, so not in the queue yet");
+        assertEquals(3.0, draft.getJsonObject("payload").getJsonObject("ratings")
+                .getDouble("work_life_balance"));
+    }
+
+    @Test
+    void unansweredCategoriesStayMissingRatherThanBecomingZero() throws Exception {
+        /*
+          A zero is a rating. An absent key is a question nobody answered. Conflating them would
+          put invented bottom scores into the dataset and defame employers at scale.
+        */
+        insertCompany("Red Hat", "red-hat");
+        await(companyRatings.autosaveDraft("red-hat",
+            partial(java.util.Map.of("work_life_balance", 4.0), 100)
+                .put("draftToken", UUID.randomUUID().toString())));
+
+        JsonObject ratings = one("SELECT payload FROM captured_drafts")
+            .getJsonObject("payload").getJsonObject("ratings");
+        assertEquals(1, ratings.size(), "only what was answered");
+        assertNull(ratings.getValue("career_growth"), "absent, not zero");
+    }
+
+    @Test
+    void manyAutosavesLeaveExactlyOneDraft() throws Exception {
+        /*
+          Autosave fires every few seconds. Without an upsert on the token the queue fills with a
+          row per pause in typing, and one person's single opinion is counted dozens of times in
+          any statistic built on this table.
+        */
+        insertCompany("Red Hat", "red-hat");
+        String token = UUID.randomUUID().toString();
+        for (int i = 1; i <= 6; i++) {
+            await(companyRatings.autosaveDraft("red-hat",
+                partial(java.util.Map.of("work_life_balance", (double) i), i * 100L)
+                    .put("draftToken", token)));
+        }
+
+        assertEquals(1L, count("SELECT count(*) AS c FROM captured_drafts"));
+        assertEquals(6.0, one("SELECT payload FROM captured_drafts").getJsonObject("payload")
+                .getJsonObject("ratings").getDouble("work_life_balance"),
+            "and it holds the newest answer");
+    }
+
+    @Test
+    void anOutOfOrderAutosaveCannotOverwriteNewerAnswers() throws Exception {
+        /*
+          Two tabs, or one request delayed in flight. Without the revision comparison the write
+          that ARRIVED last would win, which is not the same as the newest answer winning, and the
+          contributor would watch their earlier answers silently replace their later ones.
+        */
+        insertCompany("Red Hat", "red-hat");
+        String token = UUID.randomUUID().toString();
+        await(companyRatings.autosaveDraft("red-hat",
+            partial(java.util.Map.of("work_life_balance", 5.0), 200).put("draftToken", token)));
+
+        await(companyRatings.autosaveDraft("red-hat",
+            partial(java.util.Map.of("work_life_balance", 1.0), 50).put("draftToken", token)));
+
+        assertEquals(5.0, one("SELECT payload FROM captured_drafts").getJsonObject("payload")
+                .getJsonObject("ratings").getDouble("work_life_balance"),
+            "the stale save is ignored outright");
+    }
+
+    @Test
+    void twoContributorsDoNotOverwriteEachOther() throws Exception {
+        /*
+          Deduplication is keyed on a random per-session token and NEVER on an address. Two people
+          on one office network are two contributors.
+        */
+        insertCompany("Red Hat", "red-hat");
+        await(companyRatings.autosaveDraft("red-hat",
+            partial(java.util.Map.of("work_life_balance", 1.0), 100)
+                .put("draftToken", UUID.randomUUID().toString())));
+        await(companyRatings.autosaveDraft("red-hat",
+            partial(java.util.Map.of("work_life_balance", 5.0), 100)
+                .put("draftToken", UUID.randomUUID().toString())));
+
+        assertEquals(2L, count("SELECT count(*) AS c FROM captured_drafts"));
+    }
+
+    @Test
+    void aLateAutosaveCannotReopenADraftAnAdminResolved() throws Exception {
+        /*
+          A request already in flight when the admin pressed Publish, or a retry behind it. The
+          row carries their decision and what it became; reopening it would silently undo that.
+        */
+        insertCompany("Red Hat", "red-hat");
+        String adminAuth = insertUser("auth0|dp-auto-1", "DpAuto1", "admin");
+        String token = UUID.randomUUID().toString();
+        await(companyRatings.captureDraft("red-hat", ratingBody(4.0).put("draftToken", token)));
+        await(admin.publishCapturedDraft(adminAuth, draftId()));
+
+        await(companyRatings.autosaveDraft("red-hat",
+            partial(java.util.Map.of("work_life_balance", 1.0), 999999).put("draftToken", token)));
+
+        Row draft = one("SELECT resolution, state FROM captured_drafts");
+        assertEquals("published", draft.getString("resolution"), "the decision survives");
+        assertEquals("resolved", draft.getString("state"));
+    }
+
+    @Test
+    void anActivelyEditedDraftStaysOutOfTheApprovalQueue() throws Exception {
+        /*
+          Do not flood the queue. A form being typed into is not an abandoned rating, and an admin
+          watching items appear and mutate every few seconds cannot review anything.
+        */
+        insertCompany("Red Hat", "red-hat");
+        String adminAuth = insertUser("auth0|dp-auto-2", "DpAuto2", "admin");
+        await(companyRatings.autosaveDraft("red-hat",
+            partial(java.util.Map.of("work_life_balance", 3.0), 100)
+                .put("draftToken", UUID.randomUUID().toString())));
+
+        JsonArray queue = await(admin.getCapturedDrafts(adminAuth, 50, 0)).getJsonArray("data");
+        assertEquals(0, queue.size(), "active drafts are invisible to the queue");
+    }
+
+    @Test
+    void goingQuietPutsADraftInTheQueue_andReturningTakesItOutAgain() throws Exception {
+        /*
+          Abandonment is an observation about silence, not a verdict, so it has to be reversible:
+          somebody who comes back to an unfinished form must not still be sitting in the queue.
+        */
+        insertCompany("Red Hat", "red-hat");
+        String adminAuth = insertUser("auth0|dp-auto-3", "DpAuto3", "admin");
+        String token = UUID.randomUUID().toString();
+        await(companyRatings.autosaveDraft("red-hat",
+            partial(java.util.Map.of("work_life_balance", 3.0), 100).put("draftToken", token)));
+
+        await(pool.query("UPDATE captured_drafts SET updated_at = now() - INTERVAL '45 minutes'")
+            .execute().mapEmpty());
+        await(drafts.markAbandoned(30));
+        assertEquals(1, await(admin.getCapturedDrafts(adminAuth, 50, 0)).getJsonArray("data").size(),
+            "gone quiet, so the admin may look at it");
+
+        await(companyRatings.autosaveDraft("red-hat",
+            partial(java.util.Map.of("work_life_balance", 4.0), 200).put("draftToken", token)));
+
+        assertEquals(0, await(admin.getCapturedDrafts(adminAuth, 50, 0)).getJsonArray("data").size(),
+            "they came back, so it leaves the queue again");
+    }
+
+    @Test
+    void anIncompleteDraftNeverReachesAPublicAverage() throws Exception {
+        /*
+          The line this feature must never cross. Partial answers are an internal dataset; they
+          are not a rating and cannot be made into one by an admin pressing a button.
+        */
+        insertCompany("Red Hat", "red-hat");
+        String adminAuth = insertUser("auth0|dp-auto-4", "DpAuto4", "admin");
+        await(companyRatings.autosaveDraft("red-hat",
+            partial(java.util.Map.of("work_life_balance", 2.0), 100)
+                .put("draftToken", UUID.randomUUID().toString())));
+        await(pool.query("UPDATE captured_drafts SET state = 'abandoned'").execute().mapEmpty());
+
+        assertThrows(ServiceException.class,
+            () -> awaitCause(admin.publishCapturedDraft(adminAuth, draftId())));
+        assertEquals(0L, count("SELECT count(*) AS c FROM company_reviews"));
+        assertEquals(0L, count("SELECT coalesce(sum(workplace_count),0) AS c FROM company_stats_live"),
+            "and nothing of it reaches the public read model");
     }
 
     // ══════════════════════════════════════════════════════════════════════════
@@ -629,6 +1099,103 @@ class CapturedDraftPublicationIntegrationTest {
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
+
+    /** A manager-rating body with all ten categories answered, as the form submits one. */
+    private static JsonObject managerReviewBody(double overall) {
+        JsonObject ratings = new JsonObject();
+        for (String key : new String[] {
+                "Communication Style", "Perceived Approachability",
+                "Perceived Clarity of Expectations", "Feedback Style", "Perceived Supportiveness",
+                "Decision Making Style", "Organization and Planning Style", "Delegation Style",
+                "Perceived Professional Demeanor", "Overall Working Experience" }) {
+            ratings.put(key, overall);
+        }
+        return new JsonObject()
+            .put("overallRating", overall)
+            .put("ratings", ratings)
+            .put("managerCompany", "Red Hat")
+            .put("managerTitle", "Engineering Manager")
+            .put("workedFrom", "2022-01");
+    }
+
+    private long insertManager(String name, String company) throws Exception {
+        await(pool.preparedQuery(
+                // status is NOT NULL on managers; 'active' is what the add form sends.
+                "INSERT INTO managers (name, company, title, approval_status, slug, image, status) "
+              + "VALUES ($1, $2, 'Engineering Manager', 'approved', $3, 'D', 'active')")
+            .execute(io.vertx.sqlclient.Tuple.of(name, company,
+                     name.toLowerCase().replace(' ', '-'))).mapEmpty());
+        return one("SELECT id FROM managers WHERE name = '" + name + "'").getLong("id");
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // ISSUE 33: a capture token resolves ONE subject's publication, not any
+    // ══════════════════════════════════════════════════════════════════════════
+
+    @Test
+    void aCaptureTokenCannotRemoveAPublicationForADifferentCompany() throws Exception {
+        /*
+          deleteAnonymousByToken removed the anonymous publication keyed on the TOKEN ALONE. Its
+          two guards were user_id IS NULL, so a real person's rating could not be destroyed, and
+          deleted_at IS NULL, so a moderator's removal stayed removed. Neither said anything about
+          WHICH COMPANY was being rated, and the write is a hard DELETE.
+
+          So a token arriving on a submission for a different company deleted the wrong
+          publication. Client-minted UUIDs make an accidental collision negligible, but nothing
+          prevented a reused one, and issue 32 had already shown this form's token handling was not
+          what its comments claimed.
+
+          Red Hat's published anonymous rating has nothing to do with somebody rating Canonical.
+        */
+        insertCompany("Red Hat", "red-hat");
+        insertCompany("Canonical", "canonical");
+        String adminAuth  = insertUser("auth0|dp-admin-33", "DpAdmin33", "admin");
+        String authorAuth = insertUser("auth0|dp-author-33", "DpAuthor33", "user");
+        String token = UUID.randomUUID().toString();
+
+        await(companyRatings.captureDraft("red-hat", ratingBody(4.0).put("draftToken", token)));
+        await(admin.publishCapturedDraft(adminAuth, draftId()));
+        UUID published = one("SELECT id FROM company_reviews").getUUID("id");
+
+        await(companyRatings.submit(authorAuth, "canonical",
+            ratingBody(3.0).put("draftToken", token)));
+
+        assertEquals(1L,
+            count("SELECT count(*) AS c FROM company_reviews WHERE id = '" + published + "'"),
+            "a rating of Canonical must not delete Red Hat's publication");
+        assertEquals(2L, count("SELECT count(*) AS c FROM company_reviews"),
+            "both stand: the published anonymous one, and the author's own for another company");
+    }
+
+    @Test
+    void aCaptureTokenCannotRemoveAnInterviewPublicationForADifferentCompany() throws Exception {
+        /*
+          The same defect, in InterviewRepository, which carries the same statement shape. Written
+          separately because one fix that happens to cover both is still two code paths, and the
+          one nobody tested is the one that regresses.
+        */
+        insertCompany("Red Hat", "red-hat");
+        insertCompany("Canonical", "canonical");
+        String adminAuth  = insertUser("auth0|dp-admin-34", "DpAdmin34", "admin");
+        String authorAuth = insertUser("auth0|dp-author-34", "DpAuthor34", "user");
+        String token = UUID.randomUUID().toString();
+
+        await(interviews.captureDraft("red-hat", new JsonObject()
+            .put("overallRating", 4.0).put("outcome", "offer").put("interviewYear", 2024)
+            .put("draftToken", token)
+            .put("rounds", new JsonArray().add("recruiter_screen"))));
+        await(admin.publishCapturedDraft(adminAuth, draftId()));
+        UUID published = one("SELECT id FROM interview_reviews").getUUID("id");
+
+        await(interviews.createReview(authorAuth, "canonical", new JsonObject()
+            .put("overallRating", 3.0).put("outcome", "no_offer").put("interviewYear", 2024)
+            .put("draftToken", token)
+            .put("rounds", new JsonArray().add("technical"))));
+
+        assertEquals(1L,
+            count("SELECT count(*) AS c FROM interview_reviews WHERE id = '" + published + "'"),
+            "an interview at Canonical must not delete Red Hat's publication");
+    }
 
     private static JsonObject ratingBody(double overall) {
         JsonObject ratings = new JsonObject();

@@ -175,4 +175,52 @@ class GeographyIndexTest {
             "Java folding disagrees with the index for " + mismatched + " of " + checked
             + " rows; query and index must normalise identically:" + examples);
     }
+
+    @Test
+    @DisplayName("an exact-name read reaches the places a prefix read truncates away")
+    void exactNameEscapesTheCrowding() {
+        /*
+          THE DEFECT THIS EXISTS FOR, reported as "searching Paris only offers French suburbs".
+
+          byPrefix is ORDER BY importance DESC LIMIT n. Paris has seven of its own arrondissements
+          in the index - Paris 15 Vaugirard, Paris 20 Menilmontant and the rest - each holding
+          around 180,000 people and therefore each scoring higher on importance than Paris, Texas
+          or Paris, Ontario. They all begin with "Paris", so eight rows ordered by importance were
+          Paris plus seven slices of the same city, and no other Paris on earth could be picked.
+
+          The limit did the damage, not the ranking: a client can only reorder what it is sent, so
+          a limit that hides places is the same defect as a filter that excluded them.
+
+          Asserted as the two halves, because that is what the fix actually is: the prefix read
+          still answers with one country, and the exact read is what reaches the others.
+        */
+        List<GeographyIndex.Hit> prefix = idx.byPrefix("paris", null, null, 8);
+        assertTrue(prefix.size() > 1, "the index under test has no Paris rows to crowd");
+        long prefixCountries = prefix.stream().map(GeographyIndex.Hit::countryCode).distinct().count();
+
+        List<GeographyIndex.Hit> exact = idx.byName("paris", null, null, 8);
+        assertFalse(exact.isEmpty(), "byName found no row named exactly Paris");
+        for (GeographyIndex.Hit h : exact) {
+            assertEquals("paris", h.norm(), "byName must return exact matches only");
+        }
+        long exactCountries = exact.stream().map(GeographyIndex.Hit::countryCode).distinct().count();
+
+        assertTrue(exactCountries > prefixCountries,
+            "the exact read must reach countries the prefix read cannot: prefix offered "
+            + prefixCountries + ", exact offered " + exactCountries);
+        assertTrue(exactCountries >= 3,
+            "a name on three continents must offer at least three countries, got " + exactCountries);
+    }
+
+    @Test
+    @DisplayName("an exact-name read honours the same scopes as a prefix read")
+    void exactNameRespectsScope() {
+        // The caller passes a country only when the QUERY named one, and this must not ignore it.
+        for (GeographyIndex.Hit h : idx.byName("paris", "US", null, 10)) {
+            assertEquals("US", h.countryCode(), "a US-scoped exact read must not return France");
+        }
+        // An unknown name is empty rather than an error, which is what the merge above relies on.
+        assertTrue(idx.byName("zzzzznowhere", null, null, 5).isEmpty());
+        assertTrue(idx.byName("", null, null, 5).isEmpty());
+    }
 }

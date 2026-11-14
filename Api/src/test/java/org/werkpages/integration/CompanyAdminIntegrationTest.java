@@ -70,7 +70,11 @@ class CompanyAdminIntegrationTest {
         EditRepository    editRepo    = new EditRepository(pool);
         ReportRepository  reportRepo  = new ReportRepository(pool);
         NotificationRepository notifRepo = new NotificationRepository(pool);
-        service = new AdminService(userRepo, managerRepo, reviewRepo, editRepo, notifRepo, companyRepo);
+        // With the pool, because the merge is a transaction over six tables and AdminService
+        // builds its ManagerMergeService from the client. Without one it reports that merging is
+        // unavailable rather than half-doing it.
+        service = new AdminService(userRepo, managerRepo, reviewRepo, editRepo, notifRepo,
+                                   companyRepo, null, pool);
         managerService = new ManagerService(managerRepo, reviewRepo, userRepo, editRepo, reportRepo, companyRepo, pool, name -> null);
     }
 

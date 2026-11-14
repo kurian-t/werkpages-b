@@ -11,6 +11,23 @@
 	</parent>
 
 	<artifactId>RestApi</artifactId>
+
+	<properties>
+		<!--
+			The Docker socket Testcontainers talks to.
+
+			CLAUDE.md section 29 requires DOCKER_HOST in the Failsafe block and it still is there -
+			this moves only the VALUE into a property so it can be overridden. The default is the
+			development machine's Docker Desktop socket, so a local `mvn verify` is unchanged.
+
+			A GitHub runner's daemon listens on /var/run/docker.sock, and the hardcoded Desktop
+			path made these integration tests unrunnable in CI - part of why this repository had no
+			workflow at all.
+
+			    mvn verify -Ddocker.host=unix:///var/run/docker.sock
+		-->
+		<docker.host>unix:///home/noragrats/.docker/desktop/docker.sock</docker.host>
+	</properties>
 	<dependencyManagement>
 		<dependencies>
 			<dependency>
@@ -147,6 +164,32 @@
 			<version>5.10.2</version>
 			<scope>test</scope>
 		</dependency>
+
+		<!--
+			Testcontainers, test scope, for ONE suite: SessionLifecycleIntegrationTest.
+
+			The Api module has had these for a long time; this module had neither them nor Failsafe,
+			which is why authentication could be proven against a real Postgres (the repository) and
+			over real HTTP (the handler) but never both at once. The security handler lives here and the
+			database lives there, and Api cannot depend on RestApi, so the only place a test can hold
+			both is this module.
+
+			Versions match Api/pom.xml exactly - 1.20.4 - deliberately. Two Testcontainers versions in
+			one build is a docker-java conflict waiting to happen, and the shaded client's api.version
+			is pinned per module in the Failsafe configuration below.
+		-->
+		<dependency>
+			<groupId>org.testcontainers</groupId>
+			<artifactId>junit-jupiter</artifactId>
+			<version>1.20.4</version>
+			<scope>test</scope>
+		</dependency>
+		<dependency>
+			<groupId>org.testcontainers</groupId>
+			<artifactId>postgresql</artifactId>
+			<version>1.20.4</version>
+			<scope>test</scope>
+		</dependency>
 	</dependencies>
 
 	<build>
@@ -167,6 +210,36 @@
 				<groupId>org.apache.maven.plugins</groupId>
 				<artifactId>maven-surefire-plugin</artifactId>
 				<version>3.2.5</version>
+				<configuration>
+					<!--
+						Integration tests are Failsafe's, not surefire's.
+
+						Without this, surefire picks up **/*IntegrationTest.java and runs it in the
+						UNIT phase - where DOCKER_HOST is not set, because that variable lives in
+						the Failsafe configuration below. The symptom is "Could not find a valid
+						Docker environment" on three suites that pass perfectly well when Failsafe
+						runs them, which is a confusing way to learn that two plugins were both
+						claiming the same files. Api/pom.xml has had this exclusion for a long time.
+					-->
+					<excludes>
+						<exclude>**/*IntegrationTest.java</exclude>
+					</excludes>
+					<environmentVariables>
+						<!--
+							AppEnv.current() is deliberately fatal when APP_ENV is unset: it decides
+							CORS, the auth cookie's Secure flag, database TLS, HSTS and whether
+							Swagger is published, so there is no safe default and the process
+							refuses to boot without it.
+
+							AuthCallbackHttpTest drives the real social callback, which reads it.
+							Declared here rather than left to the developer's shell so the test
+							behaves the same locally and in CI; 'development' is what makes the
+							assertions about the dev origin and the cookie's absent Secure flag
+							mean anything. NO version is changed by this block.
+						-->
+						<APP_ENV>development</APP_ENV>
+					</environmentVariables>
+				</configuration>
 			</plugin>
 
 			<!-- Shade Plugin for fat JAR -->
@@ -246,6 +319,67 @@
 				<groupId>org.openapitools</groupId>
 				<artifactId>openapi-generator-maven-plugin</artifactId>
 				<version>${openapi.generator.version}</version>
+			</plugin>
+			<!--
+				Integration tests, verify phase. Mirrors Api/pom.xml.
+
+				The three settings below are NOT interchangeable with other configuration mechanisms,
+				and CLAUDE.md section 29 records why:
+
+				  * api.version MUST be a Java system property. The shaded docker-java client reads it
+				    from system properties only, never from the environment.
+				  * TESTCONTAINERS_RYUK_DISABLED MUST be an environment variable. The forked JVM does
+				    not inherit it correctly from ~/.testcontainers.properties in this setup.
+				  * DOCKER_HOST points at Docker Desktop's socket for this machine.
+
+				No argLine here: unlike Api this module has no JaCoCo prepare-agent-integration
+				execution, and @{argLine} with nothing to expand it fails the build.
+			-->
+			<plugin>
+				<groupId>org.apache.maven.plugins</groupId>
+				<artifactId>maven-failsafe-plugin</artifactId>
+				<version>3.2.5</version>
+				<configuration>
+					<includes>
+						<include>**/*IntegrationTest.java</include>
+					</includes>
+					<environmentVariables>
+						<DOCKER_HOST>${docker.host}</DOCKER_HOST>
+						<TESTCONTAINERS_RYUK_DISABLED>true</TESTCONTAINERS_RYUK_DISABLED>
+						<!--
+							Session ISSUANCE, on for integration tests only, for the same reason
+							ROLE_AWARE_SUBMISSION_ENABLED is set in Api: a flag read from the environment
+							cannot be set from inside a JVM that is already running. Off everywhere else.
+						-->
+						<APP_SESSIONS_ENABLED>true</APP_SESSIONS_ENABLED>
+						<!--
+							APP_ENV, for FAILSAFE as well as surefire.
+
+							It was declared in the surefire block only, so integration tests ran
+							without it. AppEnv.current() is deliberately fatal when it is unset, so
+							any integration test that reaches Database.init - the migration
+							fail-fast regression test does - died on the missing variable rather
+							than on the behaviour it was asserting.
+
+							'development' matches the surefire block, and keeps database TLS off
+							against the Testcontainers Postgres, which does not serve TLS.
+
+							NO version is changed by this block.
+						-->
+						<APP_ENV>development</APP_ENV>
+					</environmentVariables>
+					<systemPropertyVariables>
+						<api.version>1.44</api.version>
+					</systemPropertyVariables>
+				</configuration>
+				<executions>
+					<execution>
+						<goals>
+							<goal>integration-test</goal>
+							<goal>verify</goal>
+						</goals>
+					</execution>
+				</executions>
 			</plugin>
 		</plugins>
 	</build>

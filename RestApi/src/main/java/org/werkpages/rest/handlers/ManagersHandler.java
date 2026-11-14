@@ -4,6 +4,7 @@ import io.vertx.core.Future;
 import io.vertx.core.Vertx;
 import io.vertx.core.json.JsonArray;
 import io.vertx.core.json.JsonObject;
+import org.werkpages.service.RoleClaimService;
 import io.vertx.ext.auth.jwt.JWTAuth;
 import io.vertx.ext.web.RoutingContext;
 import io.vertx.ext.web.client.WebClient;
@@ -259,7 +260,22 @@ public class ManagersHandler {
         )).onSuccess(cf -> {
             JsonObject json = cf.resultAt(0);
             boolean contributed = cf.resultAt(1);
-            if (!contributed) json.put("categoryAverages", new JsonObject());
+            /*
+              THE CONTRIBUTION GATE, and it covers BOTH category panels.
+
+              The employment-attributed averages are the same kind of analytic as the affiliation
+              ones beside them and are gated identically. Adding the figures without adding them
+              here would have published, to everybody, exactly the breakdown the gate exists to
+              withhold - and it would have been invisible, because the frontend hides the panel
+              either way. CLAUDE.md section 23: visual hiding is not access enforcement.
+
+              The headline employment count and average stay public, like totalReviews and
+              avgRating. It is the per-category breakdown that is contribution-gated.
+            */
+            if (!contributed) {
+                json.put("categoryAverages", new JsonObject());
+                json.put("employmentCategoryAverages", new JsonObject());
+            }
             ctx.response().putHeader("Content-Type", "application/json").end(json.encode());
         }).onFailure(err -> handleError(ctx, err));
     }
@@ -274,7 +290,22 @@ public class ManagersHandler {
         )).onSuccess(cf -> {
             JsonObject json = cf.resultAt(0);
             boolean contributed = cf.resultAt(1);
-            if (!contributed) json.put("categoryAverages", new JsonObject());
+            /*
+              THE CONTRIBUTION GATE, and it covers BOTH category panels.
+
+              The employment-attributed averages are the same kind of analytic as the affiliation
+              ones beside them and are gated identically. Adding the figures without adding them
+              here would have published, to everybody, exactly the breakdown the gate exists to
+              withhold - and it would have been invisible, because the frontend hides the panel
+              either way. CLAUDE.md section 23: visual hiding is not access enforcement.
+
+              The headline employment count and average stay public, like totalReviews and
+              avgRating. It is the per-category breakdown that is contribution-gated.
+            */
+            if (!contributed) {
+                json.put("categoryAverages", new JsonObject());
+                json.put("employmentCategoryAverages", new JsonObject());
+            }
             ctx.response().putHeader("Content-Type", "application/json").end(json.encode());
         }).onFailure(err -> handleError(ctx, err));
     }
@@ -448,6 +479,155 @@ public class ManagersHandler {
 
         service.discoverByName(firstName, lastName, company, title, cid, limit, offset,
                                true, RateLimitHandler.clientIpOf(ctx))
+            .onSuccess(result -> ctx.response()
+                .putHeader("Content-Type", "application/json")
+                .end(result.encode()))
+            .onFailure(err -> handleError(ctx, err));
+    }
+
+
+
+
+    // ── POST /api/managers/role-claim-draft ──────────────────────────────────
+
+    /** Revision-guarded autosave of the contributor's selection. Finalizes nothing. */
+    public void handleAutosaveRoleClaim(RoutingContext ctx) {
+        if (!RoleClaimService.roleAwareSubmissionEnabled()) {
+            respond(ctx, 404, new JsonObject().put("error", "Not found"));
+            return;
+        }
+        JsonObject body = ctx.getBodyAsJson();
+        if (body == null) {
+            respond(ctx, 400, new JsonObject().put("error", "Missing request body"));
+            return;
+        }
+        AuthTokenUtils.verifiedAuth0Id(ctx, jwtAuth)
+            .compose(auth0Id -> service.autosaveRoleClaim(auth0Id, body))
+            .onSuccess(result -> ctx.response()
+                .putHeader("Content-Type", "application/json")
+                .end(result.encode()))
+            .onFailure(err -> {
+                if (err instanceof IllegalArgumentException) {
+                    respond(ctx, 400, new JsonObject().put("error", err.getMessage()));
+                } else {
+                    handleError(ctx, err);
+                }
+            });
+    }
+
+    // ── POST /api/managers/rate-with-role ────────────────────────────────────
+
+    /**
+     * The role-aware submission. One transaction, and no path back to the matcher.
+     *
+     * <p><b>Failure returns a failure.</b> There is deliberately no fallback to
+     * {@code createManager} or the legacy submission here: those run the fuzzy attachment, so
+     * "retry the old way" would quietly attach the rating to whichever manager was within one edit
+     * of the typed name - the exact behaviour this phase removes, reached only when something has
+     * already gone wrong and nobody is watching.
+     *
+     * <p>So the client keeps the contributor's answers and shows an error. A submission the person
+     * can retry is recoverable; a rating silently filed against the wrong human is not.
+     */
+    public void handleRateWithRole(RoutingContext ctx) {
+        if (!RoleClaimService.roleAwareSubmissionEnabled()) {
+            respond(ctx, 404, new JsonObject().put("error", "Not found"));
+            return;
+        }
+        JsonObject body = ctx.getBodyAsJson();
+        if (body == null) {
+            respond(ctx, 400, new JsonObject().put("error", "Missing request body"));
+            return;
+        }
+        /*
+          Anonymous is legitimate and resolves to null: a signed-out contributor submits, and the
+          claim is adopted when they return and sign in. Absent means anonymous, never an error.
+
+          The endpoint declares no security, so the token is verified HERE rather than trusted. An
+          unverified subject would let a caller write a rating under somebody else's account, and
+          an unparseable token degrades to anonymous rather than failing: the contribution is worth
+          more than the attribution.
+        */
+        AuthTokenUtils.verifiedAuth0Id(ctx, jwtAuth)
+            .compose(auth0Id -> service.submitRoleAwareRating(auth0Id, body))
+            .onSuccess(result -> ctx.response()
+                .putHeader("Content-Type", "application/json")
+                .end(result.encode()))
+            .onFailure(err -> {
+                String msg = err.getMessage() == null ? "" : err.getMessage();
+                // The cap is a product outcome with its own status, so the client can say "you
+                // have already rated this manager twice" rather than showing a generic failure.
+                if (msg.contains("already used both")) {
+                    respond(ctx, 409, new JsonObject().put("error", msg));
+                } else if (msg.contains("role_claims_one_per_contributor_per_role")) {
+                    /*
+                      ONE RATING PER PERSON PER JOB, SAID AS A PRODUCT OUTCOME.
+
+                      The database enforces this with a unique index, and the index was the only
+                      thing enforcing it: nothing checked first, so a contributor rating a job they
+                      had already rated got a raw 23505 out of the driver, a 500 from here, and
+                      "We couldn't save your rating" on screen - which reads as the platform being
+                      broken rather than as the rule it is.
+
+                      409, with words somebody can act on. The rating itself is not lost: their
+                      first one still stands, which is the whole point of the rule.
+                    */
+                    respond(ctx, 409, new JsonObject().put(
+                        "error", "You've already rated this job. Pick a different job, or edit your existing rating."));
+                } else if (err instanceof IllegalArgumentException
+                           || msg.contains("no longer available")
+                           || msg.contains("changed while it was being submitted")) {
+                    respond(ctx, 400, new JsonObject().put("error", msg));
+                } else {
+                    handleError(ctx, err);
+                }
+            });
+    }
+
+    // ── POST /api/managers/identify ──────────────────────────────────────────
+
+    /**
+     * Candidates and their employments, so the CONTRIBUTOR decides. Creates nothing.
+     *
+     * <p><b>Feature gated, and it answers 404 rather than 403 when closed.</b> A disabled endpoint
+     * should not advertise itself: 403 tells a prober that the route exists and is worth coming
+     * back to, while 404 is indistinguishable from a route that was never deployed. The flag is
+     * off, so as far as the public is concerned this is not here yet.
+     *
+     * <p>Null-safe on company, title and companyId throughout. A contributor who knows the name
+     * and not the employer must still get candidates, because company and title classify and rank
+     * name matches and never filter them out. Omitting {@code nullable: true} from the schema
+     * while the handler sends null is how /find was broken before; the schema carries it and a
+     * router-level test covers it, because a service-level test cannot see a validation layer it
+     * does not go through.
+     */
+    public void handleIdentifyManager(RoutingContext ctx) {
+        if (!RoleClaimService.roleAwareSubmissionEnabled()) {
+            respond(ctx, 404, new JsonObject().put("error", "Not found"));
+            return;
+        }
+        JsonObject body = ctx.getBodyAsJson();
+        if (body == null) {
+            respond(ctx, 400, new JsonObject().put("error", "Missing request body"));
+            return;
+        }
+        String firstName = body.getString("firstName");
+        String lastName  = body.getString("lastName");
+        if (firstName == null || firstName.isBlank() || lastName == null || lastName.isBlank()) {
+            respond(ctx, 400, new JsonObject().put("error", "firstName and lastName are required"));
+            return;
+        }
+        /*
+          EVERYTHING BUT THE NAME IS OPTIONAL, and always was: company and title never filtered
+          this search, they only ranked it. The search screen asks for a name and, if the
+          contributor offers it, a country.
+        */
+        String company = body.getString("company");
+        String title   = body.getString("title");
+        Long   cid     = body.getLong("companyId");
+        String country = body.getString("country");
+
+        service.identifyManager(firstName, lastName, company, title, cid, country)
             .onSuccess(result -> ctx.response()
                 .putHeader("Content-Type", "application/json")
                 .end(result.encode()))
@@ -730,6 +910,30 @@ public class ManagersHandler {
 
     // ── DELETE /api/managers/:managerId/reviews/:reviewId ─────────────────────
 
+    /**
+     * UNLINK, the contributor-facing replacement for deleting a rating.
+     *
+     * <p>POST rather than DELETE, on a sub-resource, because nothing is removed: the rating stays
+     * published and only the ownership link is severed. Using DELETE would tell every client and
+     * every proxy that this removes the thing named in the path, which is the opposite of what it
+     * does.
+     */
+    public void handleUnlinkManagerReview(RoutingContext ctx) {
+        String auth0Id = ctx.get("auth0Id");
+        if (auth0Id == null) { respond(ctx, 401, new JsonObject().put("error", "Unauthorized")); return; }
+        long managerId;
+        UUID reviewId;
+        try {
+            managerId = Long.parseLong(ctx.pathParam("managerId"));
+            reviewId  = UUID.fromString(ctx.pathParam("reviewId"));
+        } catch (Exception e) {
+            respond(ctx, 400, new JsonObject().put("error", "Invalid managerId or reviewId")); return;
+        }
+        service.unlinkReview(auth0Id, managerId, reviewId)
+            .onSuccess(json -> ctx.response().setStatusCode(200).putHeader("Content-Type", "application/json").end(json.encode()))
+            .onFailure(err -> handleError(ctx, err));
+    }
+
     public void handleDeleteManagerReview(RoutingContext ctx) {
         String auth0Id = ctx.get("auth0Id");
         if (auth0Id == null) { respond(ctx, 401, new JsonObject().put("error", "Unauthorized")); return; }
@@ -857,6 +1061,27 @@ public class ManagersHandler {
 
     // ── Drop-off review for existing manager (no auth) ───────────────────────
 
+    /**
+     * The manager-rating form's answers as they stand, while it is still being filled in.
+     *
+     * <p>Never publishes. The drop-off handler below writes a real review; this one writes an
+     * internal draft, and the two are deliberately different endpoints so neither can be mistaken
+     * for the other.
+     */
+    public void handleAutosaveReview(RoutingContext ctx) {
+        long managerId;
+        try {
+            managerId = Long.parseLong(ctx.pathParam("id"));
+        } catch (NumberFormatException e) {
+            ctx.response().setStatusCode(400).putHeader("Content-Type", "application/json")
+               .end(new JsonObject().put("error", "Invalid manager id").encode());
+            return;
+        }
+        service.autosaveReviewDraft(managerId, ctx.body().asJsonObject())
+            .onSuccess(json -> ctx.response().putHeader("Content-Type", "application/json").end(json.encode()))
+            .onFailure(err -> handleError(ctx, err));
+    }
+
     public void handleDropOffReview(RoutingContext ctx) {
         long managerId;
         try {
@@ -866,7 +1091,10 @@ public class ManagersHandler {
         }
         JsonObject body = ctx.getBodyAsJson();
         String resolvedLogoUrl = CompanyLogoUtils.resolveLogoUrl(body != null ? body.getString("managerCompany") : null);
-        service.createDropOffReview(managerId, body, resolvedLogoUrl)
+        // The same context the signed-in path builds: without it the location the
+        // person chose is dropped on the floor. See createDropOffReview.
+        service.createDropOffReview(managerId, body, resolvedLogoUrl,
+                                    SubmissionContext.of(GeoUtils.observed(ctx), body))
             .onSuccess(v -> ctx.response().setStatusCode(200).end())
             .onFailure(err -> handleError(ctx, err));
     }
@@ -973,7 +1201,45 @@ public class ManagersHandler {
 
     // ── Shared helpers ────────────────────────────────────────────────────────
 
+    /**
+     * SQLSTATE raised by the S4 enforcement trigger when a claimless rating is refused.
+     *
+     * <p>A custom class, so this layer can recognise the refusal without matching on a message
+     * string - which would break the first time somebody reworded the exception.
+     */
+    private static final String S4_RETIRED_PATH = "S4010";
+
     static void handleError(RoutingContext ctx, Throwable err) {
+        /*
+          410 GONE, NOT 500, and the design is explicit about it: an old client submitting to the
+          retired path must get "a 410 with an explanatory body, not a 500 from a CHECK".
+
+          The difference matters to whoever is holding the old client. A 500 says "this is broken,
+          try again"; a 410 says "this way of submitting no longer exists", which is true and is
+          actionable. It also keeps a predictable refusal out of the error logs, where it would
+          otherwise look like a defect every time an old build submitted.
+
+          Checked before the ServiceException branch because the trigger's error arrives as a
+          PgException from deep in the write path, wrapped or not, and the cause chain is walked
+          rather than assumed to be one level deep.
+        */
+        for (Throwable t = err; t != null; t = t.getCause()) {
+            if (t instanceof io.vertx.pgclient.PgException pg
+                && S4_RETIRED_PATH.equals(pg.getSqlState())) {
+                ctx.response()
+                    .setStatusCode(410)
+                    .putHeader("Content-Type", "application/json")
+                    .end(new JsonObject()
+                        .put("error", "role_required")
+                        .put("message",
+                             "Ratings must now be attached to a job. Please reload the page to "
+                           + "get the current version of the form.")
+                        .encode());
+                return;
+            }
+            if (t.getCause() == t) break;        // a self-referencing cause would spin for ever
+        }
+
         if (err instanceof ServiceException se) {
             ctx.response()
                 .setStatusCode(se.getStatusCode())

@@ -125,6 +125,85 @@ class CompanyMergeDataLossIntegrationTest {
             "the denormalised name is recorded too, or an undo could not restore the picker");
     }
 
+    /**
+     * A MERGE MUST CARRY EMPLOYMENT ATTRIBUTION WITH IT.
+     *
+     * <p>V97 added {@code reviews.attributed_company_id} and the merge was never taught about it.
+     * Every other table the merge touches is moved - {@code managers}, {@code career_history},
+     * {@code interview_reviews}, {@code interview_review_deletions}, {@code company_reviews} - and
+     * this column was simply missed, because at the time nothing wrote to it.
+     *
+     * <p>V102 now writes to it for every legacy rating it can attribute, which turns the omission
+     * into a real defect: merge a company afterwards and its ratings keep pointing at the retired
+     * row. {@code company_employment_stats_expected} groups by that id, so those ratings are
+     * counted under a company that appears in no listing and no search - they vanish from the
+     * surviving company's employment figures without vanishing from the database, which is the
+     * hardest kind of wrong number to find.
+     *
+     * <p>Note what this test does NOT assert: that attribution follows a correction to
+     * {@code career_history}. It must not. V102 freezes the company it derived at backfill time,
+     * so fixing a manager's employment dates later cannot retroactively move somebody's rating to
+     * a different employer. A merge is different in kind - the two companies are being declared
+     * the same company, so following it is not a reassignment.
+     */
+    @Test
+    void mergeCarriesEmploymentAttributionToTheSurvivingCompany() throws Exception {
+        long keep  = insertCompany("Attribution Survivor Co");
+        long merge = insertCompany("Attribution Retired Co");
+        long managerId = insertManager("Attributed Manager", "Attribution Retired Co", merge);
+
+        UUID reviewId = await(pool.preparedQuery("""
+                INSERT INTO reviews (manager_id, author, overall_rating, manager_company,
+                                     manager_title, overall_working_experience,
+                                     attributed_company_id, attribution_basis)
+                VALUES ($1, 'merge-attrib-rater', 4, 'Attribution Retired Co', 'VP', 4, $2, 'inferred')
+                RETURNING id
+                """)
+            .execute(Tuple.of(managerId, merge))
+            .map(rs -> rs.iterator().next().getUUID("id")));
+
+        await(companyRepo.mergeCompanies(keep, merge, adminId));
+
+        long attributedTo = await(pool.preparedQuery(
+                "SELECT attributed_company_id FROM reviews WHERE id = $1")
+            .execute(Tuple.of(reviewId))
+            .map(rs -> rs.iterator().next().getLong("attributed_company_id")));
+
+        assertEquals(keep, attributedTo,
+            "the rating's employment attribution must follow the merge; left on the retired "
+          + "company it is counted under a company nothing can reach, and the surviving "
+          + "company's employment figures are quietly short by one rating");
+    }
+
+    /** And the undo must put it back, or an undone merge leaves the attribution moved. */
+    @Test
+    void undoReturnsEmploymentAttributionToTheOriginalCompany() throws Exception {
+        long keep  = insertCompany("Undo Attribution Survivor Ltd");
+        long merge = insertCompany("Undo Attribution Retired Ltd");
+        long managerId = insertManager("Undo Attributed", "Undo Attribution Retired Ltd", merge);
+
+        UUID reviewId = await(pool.preparedQuery("""
+                INSERT INTO reviews (manager_id, author, overall_rating, manager_company,
+                                     manager_title, overall_working_experience,
+                                     attributed_company_id, attribution_basis)
+                VALUES ($1, 'merge-undo-rater', 3, 'Undo Attribution Retired Ltd', 'VP', 3, $2, 'inferred')
+                RETURNING id
+                """)
+            .execute(Tuple.of(managerId, merge))
+            .map(rs -> rs.iterator().next().getUUID("id")));
+
+        UUID mergeUuid = await(companyRepo.mergeCompanies(keep, merge, adminId));
+        await(companyRepo.undoMerge(mergeUuid));
+
+        long attributedTo = await(pool.preparedQuery(
+                "SELECT attributed_company_id FROM reviews WHERE id = $1")
+            .execute(Tuple.of(reviewId))
+            .map(rs -> rs.iterator().next().getLong("attributed_company_id")));
+
+        assertEquals(merge, attributedTo,
+            "an undone merge must leave the attribution where it started");
+    }
+
     @Test
     void mergeKeepsTheOldUrlWorking() throws Exception {
         long keep  = insertCompany("Umbrella");

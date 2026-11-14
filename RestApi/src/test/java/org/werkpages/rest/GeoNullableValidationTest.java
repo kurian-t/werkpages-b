@@ -48,7 +48,10 @@ class GeoNullableValidationTest {
     /** Every operationId whose request body accepts geo state/city. */
     static final List<String> GEO_OPS = List.of(
         "findOrCreateManager", "createGhostManager", "captureAnonymousSearch",
-        "createDropOffDraft", "createManager", "createDropOffReview");
+        "createDropOffDraft", "createManager", "createDropOffReview",
+        // Not a geo operation: added in phase 4B so its own optional-field validation is
+        // exercised by the same real router. The list is "operations this class stubs".
+        "identifyManager", "rateWithRole");
 
     @BeforeAll
     static void setUp() throws Exception {
@@ -213,5 +216,122 @@ class GeoNullableValidationTest {
         // proves the validator is still switched on for this endpoint.
         JsonObject body = new JsonObject().put("managerCompany", "Acme");
         assertEquals(400, post("/api/managers/7/reviews/drop-off", body));
+    }
+
+    // ── POST /api/managers/identify (phase 4B) ───────────────────────────────
+    //
+    // The identify endpoint takes the same four fields as a search, and three of them are optional:
+    // a contributor who knows a name and not the employer must still get candidates, because
+    // company and title classify and RANK name matches rather than filtering them out.
+    //
+    // These run through the real validation layer for the reason this whole class exists: a service
+    // test calls the method directly and never sees the spec, so an omitted `nullable: true` would
+    // 400 every such request in production while every service test stayed green. That is exactly
+    // how /find broke before.
+
+    @Test
+    void identify_nullCompanyTitleAndCompanyId_passesValidation() throws Exception {
+        JsonObject body = new JsonObject()
+            .put("firstName", "Aaron").put("lastName", "Yip")
+            .putNull("company").putNull("title").putNull("companyId");
+        assertEquals(200, post("/api/managers/identify", body));
+    }
+
+    @Test
+    void identify_omittingTheOptionalFieldsEntirely_passesValidation() throws Exception {
+        // Absent and null must both work: the client omits a field it never collected and sends
+        // null for one the person cleared, and neither is a client error.
+        JsonObject body = new JsonObject().put("firstName", "Wei").put("lastName", "Li");
+        assertEquals(200, post("/api/managers/identify", body));
+    }
+
+    @Test
+    void identify_withEveryFieldPopulated_passesValidation() throws Exception {
+        JsonObject body = new JsonObject()
+            .put("firstName", "Aaron").put("lastName", "Yip")
+            .put("company", "QuadReal Property Group").put("title", "Controller")
+            .put("companyId", 42);
+        assertEquals(200, post("/api/managers/identify", body));
+    }
+
+    // Negative controls, so a future change that disables validation does not make the three above
+    // pass for the wrong reason.
+
+    @Test
+    void identify_missingLastName_isRejected() throws Exception {
+        JsonObject body = new JsonObject().put("firstName", "Aaron");
+        assertEquals(400, post("/api/managers/identify", body));
+    }
+
+    @Test
+    void identify_wrongTypedCompanyId_isRejected() throws Exception {
+        JsonObject body = new JsonObject()
+            .put("firstName", "Aaron").put("lastName", "Yip")
+            .put("companyId", "not-a-number");
+        assertEquals(400, post("/api/managers/identify", body));
+    }
+
+    // ── POST /api/managers/rate-with-role (phase 4B) ─────────────────────────
+    //
+    // Most of this body is optional, and every optional field is one a contributor legitimately
+    // leaves empty: no manager id on "none of these", no role id when the job is new, no end date
+    // when they still work there. A missing `nullable: true` would 400 the submission in production
+    // while every service test stayed green, which is how /find broke before.
+
+    private JsonObject validRoleAwareSubmission() {
+        return new JsonObject()
+            .put("firstName", "Priya").put("lastName", "Raghunathan")
+            .put("title", "Dispatch Lead").put("company", "Halverson Logistics")
+            .put("overallRating", 4.0)
+            .put("ratings", new JsonObject().put("communicationStyle", 4));
+    }
+
+    @Test
+    void rateWithRole_pathOne_passesValidation() throws Exception {
+        JsonObject body = validRoleAwareSubmission()
+            .put("managerId", 101).put("selectedRoleId", 55)
+            .put("proposalKey", "11111111-1111-1111-1111-111111111111")
+            .put("revision", 2)
+            .put("startDate", "2022-03").putNull("endDate").put("stillThere", true);
+        assertEquals(200, post("/api/managers/rate-with-role", body));
+    }
+
+    @Test
+    void rateWithRole_pathTwo_nullSelectedRoleId_passesValidation() throws Exception {
+        // The employment is missing and is being proposed. Null is the meaning, not an omission.
+        JsonObject body = validRoleAwareSubmission()
+            .put("managerId", 101).putNull("selectedRoleId").put("startDate", "2022-05");
+        assertEquals(200, post("/api/managers/rate-with-role", body));
+    }
+
+    @Test
+    void rateWithRole_pathThree_nullManagerId_passesValidation() throws Exception {
+        // "None of these people": both the manager and the employment are new.
+        JsonObject body = validRoleAwareSubmission()
+            .putNull("managerId").putNull("selectedRoleId")
+            .putNull("country").putNull("state");
+        assertEquals(200, post("/api/managers/rate-with-role", body));
+    }
+
+    @Test
+    void rateWithRole_anonymousWithNoProposalKey_passesValidation() throws Exception {
+        // A signed-out first attempt carries no key yet; the server mints one.
+        JsonObject body = validRoleAwareSubmission().putNull("proposalKey").putNull("author");
+        assertEquals(200, post("/api/managers/rate-with-role", body));
+    }
+
+    // Negative controls.
+
+    @Test
+    void rateWithRole_missingRatings_isRejected() throws Exception {
+        JsonObject body = validRoleAwareSubmission();
+        body.remove("ratings");
+        assertEquals(400, post("/api/managers/rate-with-role", body));
+    }
+
+    @Test
+    void rateWithRole_wrongTypedManagerId_isRejected() throws Exception {
+        JsonObject body = validRoleAwareSubmission().put("managerId", "one-hundred-and-one");
+        assertEquals(400, post("/api/managers/rate-with-role", body));
     }
 }

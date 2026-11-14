@@ -58,7 +58,7 @@ public class UserRepository {
         return db.preparedQuery("""
                 SELECT u.id, u.auth0_id,
                        COALESCE(u.email_encrypted, u.email)           AS email,
-                       u.username,
+                       u.username, u.username_is_provisional,
                        COALESCE(u.first_name_encrypted, u.first_name) AS first_name,
                        COALESCE(u.last_name_encrypted,  u.last_name)  AS last_name,
                        u.role, u.created_at, (b.id IS NOT NULL) AS is_banned
@@ -86,7 +86,7 @@ public class UserRepository {
         return db.preparedQuery("""
                 SELECT u.id,
                        COALESCE(u.email_encrypted, u.email)           AS email,
-                       u.username,
+                       u.username, u.username_is_provisional,
                        COALESCE(u.first_name_encrypted, u.first_name) AS first_name,
                        COALESCE(u.last_name_encrypted,  u.last_name)  AS last_name,
                        u.role, (b.id IS NOT NULL) AS is_banned
@@ -116,35 +116,250 @@ public class UserRepository {
 
     public Future<RowSet<Row>> create(String auth0Id, String email, String username,
                                       String firstName, String lastName) {
-        return db.preparedQuery("""
-                INSERT INTO users (auth0_id, email_encrypted, email_hash, username,
-                                   first_name_encrypted, last_name_encrypted)
-                VALUES ($1, $2, $3, $4, $5, $6)
-                """)
-            .execute(Tuple.of(auth0Id, e(email), h(email), username, e(firstName), e(lastName)));
+        return create(auth0Id, email, username, firstName, lastName, false);
     }
 
     /**
-     * Anonymizes all reviews written by the user and then deletes the user record.
-     * These two operations are chained but not transactional — acceptable given
-     * the soft anonymize-then-delete pattern.
+     * Creates the account, recording whether the username is a placeholder.
+     *
+     * <p>{@code provisional} is what makes V99's column mean anything. An account created through
+     * Universal Login has no username yet - the person chose an email and a password on Auth0's
+     * page and was never asked for one - so the callback generates {@code user_1a2b3c4d} and the
+     * profile-completion step asks them to choose. Until they do, the flag says so.
+     *
+     * <p>Without the flag the generated name is indistinguishable from a chosen one, so nothing
+     * can tell who still needs to complete their profile, and
+     * {@code ManagerService.looksProvisional} would be the only guard standing between a
+     * placeholder and a published review.
+     *
+     * <p>V99 constrains the pair: a flagged username must match {@code ^user_[0-9a-f]{8}$}. The
+     * check is one-directional on purpose - choosing {@code user_deadbeef} unflagged is allowed,
+     * because forbidding it would mean policing a name somebody is entitled to pick.
+     */
+    public Future<RowSet<Row>> create(String auth0Id, String email, String username,
+                                      String firstName, String lastName, boolean provisional) {
+        return db.preparedQuery("""
+                INSERT INTO users (auth0_id, email_encrypted, email_hash, username,
+                                   first_name_encrypted, last_name_encrypted,
+                                   username_is_provisional)
+                VALUES ($1, $2, $3, $4, $5, $6, $7)
+                """)
+            .execute(Tuple.of(auth0Id, e(email), h(email), username, e(firstName), e(lastName),
+                              provisional));
+    }
+
+    /**
+     * Claims a real username, clearing the provisional flag. ONE statement.
+     *
+     * <p>The uniqueness check and the write have to be the same statement. Checking availability
+     * and then writing is a race two people hit at once, and V99's {@code users_username_ci} index
+     * is what actually decides it - so the insert is attempted and a unique violation is reported
+     * as "taken" rather than asked about first.
+     *
+     * <p>Refuses when the account's username is NOT provisional. Changing an established username
+     * is a different feature with different consequences - old links, old mentions, impersonation
+     * of somebody who released a name - and this endpoint must not become a back door to it.
+     *
+     * @return true when the username was claimed, false when the profile was already complete
+     */
+    public Future<Boolean> claimUsername(java.util.UUID userId, String username) {
+        return claimUsername(userId, username, null, null);
+    }
+
+    /**
+     * Claims the username AND the names, in one statement.
+     *
+     * <p>One statement because they were one form. The old signup page asked for a first name, a
+     * last name, an email, a username and a password together; Universal Login takes the email and
+     * the password, so everything else is asked for here instead - and a profile that is complete
+     * except for a surname is not a state worth being able to reach.
+     *
+     * <p>A null name leaves whatever is there alone rather than blanking it. The social path
+     * already fills names from the identity provider, so somebody completing a profile after a
+     * Google sign-in must not have those wiped by a form that did not ask.
+     */
+    public Future<Boolean> claimUsername(java.util.UUID userId, String username,
+                                         String firstName, String lastName) {
+        return db.preparedQuery("""
+                UPDATE users
+                   SET username = $2,
+                       username_is_provisional = FALSE,
+                       first_name_encrypted = COALESCE($3, first_name_encrypted),
+                       last_name_encrypted  = COALESCE($4, last_name_encrypted)
+                 WHERE id = $1 AND username_is_provisional
+                """)
+            .execute(Tuple.of(userId, username,
+                              firstName == null || firstName.isBlank() ? null : e(firstName),
+                              lastName  == null || lastName.isBlank()  ? null : e(lastName)))
+            .map(rows -> rows.rowCount() > 0);
+    }
+
+    /**
+     * Anonymises everything the person wrote, then deletes the account. <b>One transaction.</b>
+     *
+     * <h2>Why this is now transactional, and what it was before</h2>
+     *
+     * <p>These statements used to be chained on the pool, with a comment saying that was
+     * "acceptable given the soft anonymize-then-delete pattern". It was not, and the reason is the
+     * order: <b>the delete is last</b>. When it fails, the anonymisation has already committed.
+     *
+     * <p>That end state was reached for real, not hypothesised: once a signed-in contributor owned
+     * a {@code role_claims} row, {@code role_claims_user_id_fkey} refused the delete, and the
+     * person was left <b>half-deleted</b> - their ratings severed from them and anonymous, their
+     * account still present, and no way to put the identity back. A retry cannot repair it, because
+     * the identity it would need is already gone.
+     *
+     * <p>So the three statements are one transaction. A failure at any point leaves the person
+     * exactly as they were, which is the only state from which a deletion can be attempted again.
+     *
+     * <h2>Why the review anonymisation is load-bearing rather than cosmetic</h2>
+     *
+     * <p>{@code reviews_user_id_fkey} is <b>ON DELETE CASCADE</b>. Without the UPDATE that nulls
+     * {@code user_id} first, deleting an account would <b>delete the person's ratings</b> instead of
+     * anonymising them. The order here is the only thing standing between a deletion request and
+     * the loss of every opinion they contributed.
+     *
+     * <h2>All three contribution types, not just one</h2>
+     *
+     * <p>{@code reviews}, {@code company_reviews} and {@code interview_reviews} were all
+     * {@code ON DELETE CASCADE}, and only the first was protected: this method nulled
+     * {@code reviews.user_id} first, so the cascade found nothing to delete. The other two had no
+     * such protection, so <b>deleting an account destroyed every company rating and interview
+     * experience that person had written</b> while their manager ratings survived. Both tables also
+     * carry statement-level AFTER DELETE triggers that recalculate {@code company_stats_live}, so
+     * the published figures for every company they had rated fell with them.
+     *
+     * <p>V105 makes all three {@code SET NULL}, so destruction is no longer reachable by any path
+     * rather than being prevented by one method remembering to run a statement in the right order.
+     * This method still severs the byline, which the schema cannot do.
+     *
+     * <h2>The retirement clear, which no cascade can do</h2>
+     *
+     * <p>{@code rating_opportunity_retirements} deliberately has <b>no foreign key</b> to
+     * {@code users}: the row it names is gone and a constraint would make the record unwritable,
+     * and its append-only trigger refuses DELETE so a cascade would have failed anyway. Nothing
+     * therefore clears it automatically, and erasure was found incomplete in exactly this one table
+     * for exactly that reason. It is cleared explicitly, and the trigger permits precisely this one
+     * shape: {@code user_id} nulled, every other column byte-identical.
      */
     public Future<Void> deleteWithReviewAnonymization(UUID userId) {
-        return db.preparedQuery("""
-                UPDATE reviews
-                SET author = 'Anonymous User', user_id = NULL, updated_at = now()
-                WHERE user_id = $1
-                """)
-            .execute(Tuple.of(userId))
-            .compose(ignored ->
-                db.preparedQuery("UPDATE managers SET search_created_by_user_id = NULL WHERE search_created_by_user_id = $1")
-                    .execute(Tuple.of(userId))
-            )
-            .compose(ignored ->
-                db.preparedQuery("DELETE FROM users WHERE id = $1")
-                    .execute(Tuple.of(userId))
-            )
-            .mapEmpty();
+        // The runtime client is the application pool; ManagerRepository.deleteOrRetire already
+        // takes this same cast for the same reason. A test that passed a bare SqlClient would fail
+        // loudly here rather than silently skipping the transaction.
+        return ((io.vertx.sqlclient.Pool) db).withTransaction(tx ->
+            // 1. MANAGER RATINGS. The byline is severed here; the row itself is protected by
+            //    V105's SET NULL rather than by this statement running first.
+            //
+            //    dates_hidden = TRUE, AND THAT IS A PRIVACY REQUIREMENT RATHER THAN A TIDY-UP.
+            //    An employment period identifies a person: "worked with this manager Mar 2023 to
+            //    Jun 2023" narrows the candidates to very few at a small employer, and to exactly
+            //    one often enough to matter. Severing the name while publishing the dates leaves
+            //    the rating re-attributable by anybody who knows the team.
+            //
+            //    The same flag the contributor's own privacy toggle uses, so the whole masking path
+            //    is the one already in production: buildReviewJson drops workedFrom, workedUntil
+            //    AND effectiveWorkedUntil together, the last of these being the back door, since it
+            //    is the value the profile actually renders. It is masked server-side, so the dates
+            //    are absent from the response rather than hidden in the client.
+            //
+            //    isAuthor cannot rescue them: it requires a non-null viewer AND a match on
+            //    user_id, which is now NULL, so no signed-out visitor and no signed-in account sees
+            //    the period. The rating itself stays live and counted.
+            //    author_erased = TRUE takes the row out of the legacy author dedup index. Without
+            //    it, two people who rated the same manager under the same title and employer could
+            //    not both delete their accounts: the second deletion collided with the first on
+            //    'Anonymous User', so a stranger's earlier erasure blocked somebody from erasing
+            //    themselves. V107, and the flag rather than a unique byline, because minting
+            //    'anon-1821' would put an identifier back on the row the erasure exists to remove.
+            //    THE BYLINE IS A PLAUSIBLE HANDLE, NOT 'Anonymous User'.
+            //
+            //    It was the literal string 'Anonymous User', and that string is a disclosure: it
+            //    is worn by no live account, so every reader of a profile could tell which rating
+            //    had been written by somebody who deleted themselves. Erasure is supposed to make
+            //    an author unknowable, and labelling the row announced the one fact about them
+            //    that remained.
+            //
+            //    A MINTED HANDLE IS NOT THE 'anon-1821' THIS DELIBERATELY AVOIDED. V107's note
+            //    rejected minting a unique byline because it "would put an identifier back on the
+            //    row the erasure exists to remove", and that objection is right about a name of
+            //    that shape: anon-1821 still says "this row was anonymised", and the number gives
+            //    a reader something to correlate on. Pseudonyms.mint() produces KindPanda11 -
+            //    byte-identical in form to the handles live accounts carry and to the ones the
+            //    rating forms already hand to anonymous contributors. It is drawn from nothing
+            //    about the person, so it identifies nobody and it discloses nothing.
+            //
+            //    ONE NAME PER ROW, not one per account. Sharing a handle across an erased
+            //    account's ratings would relink them: a reader could see that one person rated
+            //    these four managers, which is a fact the erasure removed everywhere else. That is
+            //    also why this is a batch rather than the single UPDATE it replaced - the old
+            //    statement could set one literal for every row, and a per-row value cannot come
+            //    from a single SET.
+            //
+            //    author_erased = TRUE still goes on, unchanged, and still does the work V107 gave
+            //    it: it takes the row out of the legacy author dedup index, so two people who
+            //    rated the same manager under the same title and employer can both erase
+            //    themselves. The flag does that, not the byline, so varying the byline costs
+            //    nothing there.
+            tx.preparedQuery("SELECT id FROM reviews WHERE user_id = $1")
+                .execute(Tuple.of(userId))
+                .compose(idRows -> {
+                    java.util.List<Tuple> batch = new java.util.ArrayList<>();
+                    for (Row idRow : idRows) {
+                        // getValue, not getUUID or getLong: this id's type is not this method's
+                        // business, and naming it wrongly would break only on the erasure path.
+                        batch.add(Tuple.of(Pseudonyms.mint(), idRow.getValue("id")));
+                    }
+                    // An account with no ratings is ordinary, and executeBatch on an empty list
+                    // is not: the driver rejects it.
+                    if (batch.isEmpty()) return Future.succeededFuture();
+                    return tx.preparedQuery("""
+                            UPDATE reviews
+                            SET author = $1, user_id = NULL, dates_hidden = TRUE,
+                                author_erased = TRUE, updated_at = now()
+                            WHERE id = $2
+                            """)
+                        .executeBatch(batch)
+                        .mapEmpty();
+                })
+                // 2. COMPANY RATINGS. Were being DESTROYED: company_reviews.user_id was CASCADE and
+                //    nothing anonymised them, so deleting an account silently deleted every company
+                //    rating that person had written while their manager ratings survived. Worse, the
+                //    table carries a statement-level AFTER DELETE trigger that recalculates
+                //    company_stats_live, so the published figures for every company they had rated
+                //    fell as a side effect of somebody closing their account.
+                //
+                //    A company rating is anonymous by construction and no author name is ever
+                //    selected for display, so severing the identity is all that is needed.
+                //    dates_hidden here too: company_reviews carries the same column and the same
+                //    worked_from / worked_until pair, and a period at one employer is no less
+                //    identifying than a period under one manager. The self-deletion path already
+                //    sets it, so this makes the two routes agree.
+                .compose(ignored -> tx.preparedQuery(
+                        "UPDATE company_reviews SET author = NULL, user_id = NULL, "
+                        + "dates_hidden = TRUE WHERE user_id = $1")
+                    .execute(Tuple.of(userId)))
+                // 3. INTERVIEW EXPERIENCES. Same defect, same fix.
+                .compose(ignored -> tx.preparedQuery(
+                        "UPDATE interview_reviews SET author = NULL, user_id = NULL WHERE user_id = $1")
+                    .execute(Tuple.of(userId)))
+                .compose(ignored -> tx.preparedQuery(
+                        "UPDATE managers SET search_created_by_user_id = NULL "
+                        + "WHERE search_created_by_user_id = $1")
+                    .execute(Tuple.of(userId)))
+                // 4. THE ACCOUNT. Everything that should follow it does so by cascade or by
+                //    SET NULL, both of which V105 put in the schema rather than here.
+                .compose(ignored -> tx.preparedQuery("DELETE FROM users WHERE id = $1")
+                    .execute(Tuple.of(userId)))
+                // 5. THE RETIREMENT AUDIT, LAST, and the order is load-bearing.
+                //    rating_opportunity_retirements has no foreign key to users, so no cascade can
+                //    clear it, and its append-only trigger now permits the clear only when the
+                //    account is already gone. Running this before the DELETE would be refused by
+                //    that guard, which is the point: nothing can erase an identity from history
+                //    while the account it belongs to still exists.
+                .compose(ignored -> tx.preparedQuery(
+                        "UPDATE rating_opportunity_retirements SET user_id = NULL WHERE user_id = $1")
+                    .execute(Tuple.of(userId)))
+                .mapEmpty());
     }
 
     // ── Admin user management ─────────────────────────────────────────────────
@@ -267,10 +482,34 @@ public class UserRepository {
      * not. Reading the view inherits the publication rule instead of approximating it.
      */
     public Future<Boolean> hasContributed(UUID userId) {
+        /*
+          TWO SOURCES, because unlinking severs the only one this used to have.
+
+          The original query asked `reviews.user_id = $1`. Unlinking sets that column to NULL by
+          design - that IS the unlinking - so a contributor who unlinked their single rating went
+          from eligible to ineligible and lost access to the profiles their contribution had paid
+          for. The rating is still published and still counting toward the manager's average; only
+          the person who wrote it was penalised.
+
+          So the gate also reads rating_participation, which outlives the severance and records
+          whether the contribution earned the gate. It records nothing else about it: no rating id,
+          no score, no dates.
+
+          The live query is KEPT rather than replaced. It still decides the ordinary case, and
+          keeping it preserves the existing behaviour that a held or moderator-rejected rating does
+          not buy access - participation is backfilled and written from the rating's live,
+          gate-eligible state, so a rejected contribution carries gate_eligible = FALSE.
+
+          `genuine` rather than `live`: a platform example has no user_id so it could never have
+          matched, but saying so in the predicate means nobody has to work that out to be sure.
+        */
         return db.preparedQuery(
-                "SELECT EXISTS(SELECT 1 FROM reviews r "
-                + "WHERE " + ReviewSql.live("r")
-                + " AND r.user_id = $1 AND r.gate_eligible = TRUE) AS contributed")
+                "SELECT ("
+                + "  EXISTS(SELECT 1 FROM reviews r WHERE " + ReviewSql.genuine("r")
+                + "         AND r.user_id = $1 AND r.gate_eligible = TRUE)"
+                + "  OR EXISTS(SELECT 1 FROM rating_participation p"
+                + "            WHERE p.user_id = $1 AND p.gate_eligible = TRUE)"
+                + ") AS contributed")
             .execute(Tuple.of(userId))
             .map(rows -> rows.iterator().next().getBoolean("contributed"));
     }

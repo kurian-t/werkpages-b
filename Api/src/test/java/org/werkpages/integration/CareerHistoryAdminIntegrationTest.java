@@ -760,9 +760,17 @@ class CareerHistoryAdminIntegrationTest {
         long managerId = insertManager("Alice", "Acme", "Manager");
         long entryId   = insertCareerEntry(managerId, "Acme", "Manager", "2020");
 
+        /*
+          TWO parameters, because GET_BY_ID_SQL takes two.
+
+          The statement gained a second one, the viewer whose own held reviews come back, and this
+          test was still passing one. It is the only caller of that SQL outside the repository, so
+          nothing else drifted with it. A null viewer is the anonymous reader, which is what this
+          test is about.
+        */
         Row managerRow = await(pool
             .preparedQuery(ManagerRepository.GET_BY_ID_SQL)
-            .execute(Tuple.of(managerId))
+            .execute(Tuple.tuple().addLong(managerId).addUUID(null))
             .map(rs -> rs.iterator().next()));
 
         JsonArray history = managerRow.getJsonArray("career_history");
@@ -830,10 +838,10 @@ class CareerHistoryAdminIntegrationTest {
     private long insertCareerEntry(long managerId, String company, String title, String startYear) throws Exception {
         java.time.OffsetDateTime startDt = java.time.OffsetDateTime.parse(startYear + "-01-01T00:00:00Z");
         return await(pool.preparedQuery("""
-                INSERT INTO career_history(manager_id, company, title, start_date)
-                VALUES ($1, $2, $3, $4) RETURNING id
+                INSERT INTO career_history(manager_id, company, title, start_date, company_id)
+                VALUES ($1, $2, $3, $4, $5) RETURNING id
                 """)
-            .execute(Tuple.of(managerId, company, title, startDt))
+            .execute(Tuple.of(managerId, company, title, startDt, fixtureCompanyId(company)))
             .map(rs -> rs.iterator().next().getLong("id")));
     }
 
@@ -855,4 +863,19 @@ class CareerHistoryAdminIntegrationTest {
     private static <T> T await(Future<T> future) throws Exception {
         return future.toCompletionStage().toCompletableFuture().get(10, TimeUnit.SECONDS);
     }
+
+    /**
+     * A real employer for a fixture role. {@code career_history.company_id} is NOT NULL as of V99,
+     * so a career row has to name one. findOrCreate by name, which is the rule the product itself
+     * uses, so a fixture mentioning one company twice gets one company row.
+     */
+    private long fixtureCompanyId(String name) throws Exception {
+        return await(pool.preparedQuery("""
+                INSERT INTO companies (name, slug, status)
+                VALUES ($1, 'fixture-' || md5(lower(btrim($1))), 'ghost')
+                ON CONFLICT ((LOWER(TRIM(name)))) DO UPDATE SET updated_at = now()
+                RETURNING id
+                """).execute(Tuple.of(name)).map(rs -> rs.iterator().next().getLong("id")));
+    }
+
 }

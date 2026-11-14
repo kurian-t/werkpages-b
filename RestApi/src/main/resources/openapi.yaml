@@ -20,36 +20,6 @@ tags:
   - name: Stats
     description: Site-wide statistics
 paths:
-  /api/auth/signup:
-    post:
-      operationId: signup
-      summary: Create a new user account
-      tags:
-        - Auth
-      security: []
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: '#/components/schemas/SignupRequest'
-      responses:
-        '200':
-          description: User created successfully
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/User'
-        '400':
-          description: Missing or invalid fields
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  error:
-                    type: string
-
   /api/auth/check-username:
     get:
       operationId: checkUsername
@@ -76,36 +46,6 @@ paths:
         '400':
           description: Missing or invalid username
 
-  /api/auth/signin:
-    post:
-      operationId: signin
-      summary: Authenticate a user and return JWT
-      tags:
-        - Auth
-      security: []
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: '#/components/schemas/SigninRequest'
-      responses:
-        '200':
-          description: Authentication successful
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/SigninResponse'
-        '401':
-          description: Invalid credentials
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  error:
-                    type: string
-
   /api/auth/signout:
     post:
       operationId: signout
@@ -129,6 +69,180 @@ paths:
                 properties:
                   error:
                     type: string
+
+  /api/auth/complete-profile:
+    post:
+      operationId: completeProfile
+      summary: Choose a username, completing a newly created profile
+      description: >
+        An account created through Universal Login has a generated placeholder username and
+        `username_is_provisional` set, because Universal Login asks for an email and a password
+        and never for a username. This claims a real one and clears the flag. It refuses once the
+        profile is complete: changing an established username is a different feature with
+        different consequences, and this endpoint must not become a back door to it.
+      tags:
+        - Auth
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - username
+              properties:
+                username:
+                  type: string
+                  minLength: 3
+                  maxLength: 30
+                firstName:
+                  type: string
+                  maxLength: 100
+                  description: >
+                    Optional. Omitted or blank leaves whatever is stored alone, which matters for
+                    an account created through a social provider that already filled it in.
+                lastName:
+                  type: string
+                  maxLength: 100
+      responses:
+        '200':
+          description: Username claimed
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:  { type: boolean }
+                  username: { type: string }
+        '400':
+          description: The username is not valid
+        '401':
+          description: Unauthorized
+        '409':
+          description: >
+            Either the username is taken, or this profile was already complete. The two are
+            reported distinctly so the page can say which.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error: { type: string, enum: [username_taken, profile_already_complete] }
+
+  /api/auth/recover:
+    post:
+      operationId: recoverAccount
+      summary: Ask for a reminder of which email address an account uses
+      description: >
+        Takes a username and, when it matches an account, sends a message to THAT ACCOUNT'S OWN
+        email address naming the address it uses. The response is identical whether or not an
+        account matched: it carries no field that could differ, and it does not wait for the mail
+        to be sent, so neither the body nor the timing distinguishes the two cases. This is
+        deliberate - resolving a username to an email in a response, a redirect or an Auth0
+        login_hint would be an account enumeration oracle.
+      tags:
+        - Auth
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - username
+              properties:
+                username:
+                  type: string
+                  minLength: 1
+                  maxLength: 100
+      responses:
+        '202':
+          description: >
+            Accepted. Always returned, for any syntactically valid username, whether or not an
+            account exists and whether or not a message was sent.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+
+  /api/auth/sessions:
+    get:
+      operationId: listMySessions
+      summary: The sessions this account currently has open
+      tags:
+        - Auth
+      responses:
+        '200':
+          description: Live sessions, most recently used first
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  sessions:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        product:    { type: string }
+                        createdAt:  { type: string, format: date-time }
+                        lastSeenAt: { type: string, format: date-time }
+                        expiresAt:  { type: string, format: date-time }
+                        userAgent:  { type: string, nullable: true }
+                        current:    { type: boolean }
+        '401':
+          description: Unauthorized
+
+  /api/auth/sessions/revoke-all:
+    post:
+      operationId: revokeMySessions
+      summary: Sign out of every session on this account, on every device
+      tags:
+        - Auth
+      responses:
+        '200':
+          description: Sessions revoked
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:          { type: boolean }
+                  sessionsRevoked:  { type: integer }
+        '401':
+          description: Unauthorized
+
+  /api/admin/users/{userId}/sessions:
+    delete:
+      operationId: adminRevokeUserSessions
+      summary: End every session an account holds, without banning it (admin only)
+      tags:
+        - Admin
+      parameters:
+        - in: path
+          name: userId
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Sessions revoked
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:          { type: boolean }
+                  sessionsRevoked:  { type: integer }
+        '403':
+          description: Forbidden
+        '404':
+          description: User not found
 
   /api/auth/me:
     get:
@@ -199,10 +313,67 @@ paths:
                   error:
                     type: string
 
+  /api/auth/start:
+    get:
+      operationId: socialAuthStart
+      summary: Begin a social login; mints state and a PKCE verifier and redirects to Auth0
+      description: >
+        The server mints `state` and a PKCE `code_verifier`, stores both in an HttpOnly
+        `auth_preauth` cookie, and redirects to Auth0 carrying only the S256 `code_challenge`.
+        The browser never sees the verifier, which is what binds the authorization code to the
+        browser that began the login. `redirect_uri` is built server-side and is never taken
+        from the caller.
+      security: []
+      tags:
+        - Auth
+      parameters:
+        - in: query
+          name: connection
+          required: true
+          schema:
+            type: string
+          description: The Auth0 connection, checked against a fixed allowlist.
+        - in: query
+          name: screen_hint
+          required: false
+          schema:
+            type: string
+            enum: [signup]
+          description: >
+            Opens Universal Login's registration panel instead of its sign-in panel. The ONLY
+            accepted value is `signup`; anything else is ignored rather than reflected, because
+            this value is interpolated into the authorize URL the browser is redirected to and a
+            passthrough there would be a parameter-injection vector.
+        - in: query
+          name: returnTo
+          required: false
+          schema:
+            type: string
+          description: >
+            Where to send the user after sign-in. Accepted only as a site-relative path;
+            anything else falls back to the product default.
+      responses:
+        '302':
+          description: Redirect to Auth0, setting the auth_preauth cookie
+        '400':
+          description: Unsupported connection
+
   /api/auth/callback:
     post:
       operationId: socialAuthCallback
       summary: Exchange an OAuth authorization code for a session (social login)
+      description: >
+        Completes a login begun at `/api/auth/start`. Requires the `__Host-auth_tx` cookie set
+        there, and a `state` the server issued. Both are checked against one server-side row in
+        a single atomic delete, so a callback is single-use and is bound to the browser that
+        began it; the stored PKCE `code_verifier` never reaches any browser and is sent to Auth0
+        with the exchange. Every binding failure - absent cookie, duplicate cookie name, unknown
+        state, wrong browser, already used, expired - is refused identically with 400
+        `invalid_login_transaction`, and the exchange is not attempted. `redirectUri` in the body
+        is IGNORED: the value presented to Auth0 is derived server side from the canonical app
+        origin, because a client-supplied one is an invitation to have codes delivered elsewhere.
+        The cookie is deliberately NOT cleared on a refusal, which would strand this browser's
+        other tabs mid-login.
       security: []
       tags:
         - Auth
@@ -218,6 +389,18 @@ paths:
                   type: string
                 redirectUri:
                   type: string
+                  description: >
+                    IGNORED. Kept in the schema because the frontend still sends it and the field
+                    is required. The exchange presents a redirect_uri derived server side.
+                state:
+                  type: string
+                  description: >
+                    Echoed by Auth0, and the key of the server-side login transaction. A callback
+                    without it is always refused; there is no longer any flag or rollout window in
+                    which it is optional. It stays optional in THIS SCHEMA on purpose, so that the
+                    refusal is the handler's audited one - 400 `invalid_login_transaction`, the
+                    message the callback page renders - rather than a contract-validation 400 the
+                    frontend does not recognise.
       responses:
         '200':
           description: Authentication successful — sets auth_token cookie
@@ -289,6 +472,153 @@ paths:
                 properties:
                   hasContributed:
                     type: boolean
+
+  # The contributor's own unfinished ratings (V110).
+  #
+  # Private to the account that wrote them: never read by moderation, never aggregated. Addressed
+  # under /users/me so there is no object id whose owner could be checked wrongly, and no route
+  # accepts an owner or a draft token. application/json only, which is also what makes a cross-site
+  # HTML form unable to reach any of this.
+  /api/users/me/drafts:
+    get:
+      operationId: listMyDrafts
+      summary: The authenticated contributor's unfinished ratings, newest first
+      tags:
+        - Users
+      responses:
+        '200':
+          description: The caller's own drafts, with what can still be done with each
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  drafts:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/ContributionDraft'
+                  retentionDays:
+                    type: integer
+    put:
+      operationId: saveMyDraft
+      summary: Save the authenticated contributor's unfinished rating
+      tags:
+        - Users
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [subjectType, subjectId, payload, writeId]
+              properties:
+                subjectType:
+                  type: string
+                  enum: [manager, company, interview]
+                subjectId:
+                  type: integer
+                  format: int64
+                ordinal:
+                  type: integer
+                  description: Which of the person's two rating slots. Defaults to 1.
+                payload:
+                  type: object
+                  description: The form, verbatim.
+                baseVersion:
+                  type: integer
+                  format: int64
+                  description: The version the client last saw. Omitted on the first write.
+                writeId:
+                  type: string
+                  description: >-
+                    Identifies ONE immutable write, reused across every retry of that same
+                    payload. Answers that changed are a different write and need a different id,
+                    or a delayed response would acknowledge answers it never carried.
+                captureToken:
+                  type: string
+                  description: >-
+                    The anonymous capture this draft continues, on creation only. A write
+                    resolution key; it authorizes nothing.
+      responses:
+        '200':
+          description: Accepted, or a recognised replay answered from the stored version
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id:
+                    type: string
+                  version:
+                    type: integer
+                    format: int64
+                  replayed:
+                    type: boolean
+                  retentionDays:
+                    type: integer
+        '409':
+          description: Another device is ahead. Nothing was written.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id:
+                    type: string
+                  version:
+                    type: integer
+                    format: int64
+                  conflict:
+                    type: boolean
+                  payload:
+                    type: object
+
+  /api/users/me/drafts/{draftId}:
+    get:
+      operationId: getMyDraft
+      summary: One of the authenticated contributor's own unfinished ratings
+      tags:
+        - Users
+      parameters:
+        - in: path
+          name: draftId
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: The draft
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ContributionDraft'
+        '404':
+          description: >-
+            No such draft of the caller's own. A draft belonging to somebody else answers
+            identically, so a stranger cannot learn which ids exist.
+    delete:
+      operationId: discardMyDraft
+      summary: Discard one of the authenticated contributor's own unfinished ratings
+      tags:
+        - Users
+      parameters:
+        - in: path
+          name: draftId
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Discarded
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  discarded:
+                    type: boolean
+        '404':
+          description: No such draft of the caller's own
 
   /api/stats:
     get:
@@ -370,6 +700,50 @@ paths:
   /api/companies/{companySlug}/interviews/draft:
     post:
       operationId: captureInterviewDraft
+      summary: Keep an interview experience somebody assembled but could not submit
+      description: >-
+        The form renders for everybody; the account is asked for at submit. Somebody who is not
+        signed in has answered every question by then, and most do not come back from the sign-in
+        page - this keeps what they had for an admin to read. Never published, never aggregated.
+        Unauthenticated by design.
+      tags:
+        - Interviews
+      security: []
+      parameters:
+        - in: path
+          name: companySlug
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              description: Whatever the form held. Stored verbatim; no key is required.
+              properties:
+                draftToken:
+                  type: string
+                  format: uuid
+                  description: >-
+                    Carried into the real submission so the draft is deleted when the form is
+                    finished, rather than leaving an admin to review completed work.
+      responses:
+        '200':
+          description: Captured
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  captured: { type: boolean }
+        '400':
+          description: Nothing to capture
+
+  /api/companies/{companySlug}/interviews/autosave:
+    post:
+      operationId: autosaveInterview
       summary: Keep an interview experience somebody assembled but could not submit
       description: >-
         The form renders for everybody; the account is asked for at submit. Somebody who is not
@@ -846,6 +1220,58 @@ paths:
         sign in. Many do not come back. This keeps what they had for an admin to read; it is never
         published and never aggregated. Unauthenticated by design - the whole point is the person
         who has no account yet.
+      tags:
+        - Companies
+      security: []
+      parameters:
+        - in: path
+          name: companySlug
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              description: Whatever the form held. Stored verbatim; no key is required.
+              properties:
+                datesHidden:
+                  type: boolean
+                  default: false
+                  description: >-
+                    Declared explicitly even though this body is stored verbatim: the
+                    router drops properties a schema does not name, so an undeclared
+                    field reaches the handler as absent however the box was ticked. That
+                    exact trap already cost the manager form a release.
+                draftToken:
+                  type: string
+                  format: uuid
+                  description: >-
+                    Carried into the real submission so the draft is deleted when the form is
+                    finished, rather than leaving an admin to review completed work.
+      responses:
+        '200':
+          description: Captured
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  captured: { type: boolean }
+        '400':
+          description: Nothing to capture
+
+  /api/companies/{companySlug}/rating/autosave:
+    post:
+      operationId: autosaveCompanyRating
+      summary: Save the answers a rating form holds while it is still being filled in
+      description: >-
+        Called on a debounce while somebody is completing the form, so partial answers survive a
+        closed tab. Idempotent on draftToken: one form session is one row however many times this
+        is called, and an autosave carrying an older revision is ignored. Never published and
+        never counted in a public average. Unauthenticated by design.
       tags:
         - Companies
       security: []
@@ -1557,6 +1983,19 @@ paths:
                 city:
                   type: string
                   nullable: true
+                # PHASE 1. One attempt at the add-manager form. The ledger row is claimed in the
+                # same transaction as the captured draft, so however many times this is called for
+                # one form session - a reload, a retry, a second tab - that attempt produces at
+                # most one manager, and the submission that follows adopts exactly that one.
+                #
+                # Ignored on the search path (fromSearch), which has its own once-per-visitor
+                # allowance and publishes a ghost rather than writing a draft. The two intents this
+                # endpoint serves are deliberately different.
+                captureToken:
+                  type: string
+                  format: uuid
+                  nullable: true
+                  description: Client-generated UUID identifying this attempt at the add-manager form
       responses:
         '200':
           description: Existing manager found — no new record created
@@ -1744,6 +2183,399 @@ paths:
                     type: integer
                   created:
                     type: boolean
+
+  /api/managers/role-claim-draft:
+    post:
+      operationId: autosaveRoleClaim
+      summary: Save the contributor's manager and employment selection as a draft
+      description: >
+        Autosave for the role-aware form, so a reload or a sign-in does not lose the selection.
+        Never finalizes, never resolves and never charges a rating opportunity: it is a safety net
+        for unfinished work, and the submission is the act.
+
+        REVISION GUARDED. A field is overwritten only while the claim is still a draft AND the
+        incoming revision is strictly newer, so an autosave in flight when a newer one lands cannot
+        win on arrival. A FINALIZED claim is immutable to this: once the rating is submitted the
+        claim is a saved observation, and a late autosave from a tab left open must not rewrite the
+        assertion behind a published rating.
+
+        PATHS 1 AND 2 ONLY. role_claims.manager_id is NOT NULL, so a claim cannot exist before the
+        manager does. A path-3 draft - "none of these people" - answers saved=false with
+        reason=no_manager_selected_yet, and belongs in the existing captured_drafts drop-off
+        capture instead, which publishes nothing.
+
+        FEATURE GATED. Returns 404 unless ROLE_AWARE_SUBMISSION_ENABLED is set.
+      tags:
+        - Managers
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - proposalKey
+              properties:
+                proposalKey:
+                  type: string
+                  format: uuid
+                revision:
+                  type: integer
+                  format: int64
+                  default: 1
+                managerId:
+                  type: integer
+                  format: int64
+                  nullable: true
+                  description: Null means path 3, and the response says so rather than failing.
+                selectedRoleId:
+                  type: integer
+                  format: int64
+                  nullable: true
+                title:
+                  type: string
+                  nullable: true
+                company:
+                  type: string
+                  nullable: true
+                companyId:
+                  type: integer
+                  format: int64
+                  nullable: true
+                companyDomain:
+                  type: string
+                  nullable: true
+                startDate:
+                  type: string
+                  nullable: true
+                endDate:
+                  type: string
+                  nullable: true
+                stillThere:
+                  type: boolean
+                  nullable: true
+      responses:
+        '200':
+          description: The draft as the server now holds it
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  saved:
+                    type: boolean
+                  reason:
+                    type: string
+                    nullable: true
+                  claimId:
+                    type: integer
+                    format: int64
+                  revision:
+                    type: integer
+                    format: int64
+                    description: >
+                      What the server now holds, which may be NEWER than what was sent if another
+                      tab got there first. The client adopts it rather than counting on its own.
+                  finalized:
+                    type: boolean
+                    description: The rating is already submitted, so stop autosaving.
+                  resolved:
+                    type: boolean
+        '400':
+          description: The request is incomplete, or the manager is unavailable
+        '404':
+          description: The role-aware flow is disabled
+
+  /api/managers/rate-with-role:
+    post:
+      operationId: rateWithRole
+      summary: Submit a rating against an explicitly chosen manager and employment
+      description: >
+        The role-aware submission. The contributor has already said which person they mean and
+        which job they worked under, and this records that decision together with their rating in
+        ONE transaction: the claim is finalized, resolved, the rating written and the rating
+        opportunity charged, or none of it happens.
+
+        NOTHING HERE IS INFERRED. An omitted selectedRoleId means "the employment is missing, add
+        it", which is what the contributor chose; it is never resolved to the closest matching
+        record. An absent managerId means "none of these people", and the manager is created
+        explicitly rather than matched by name similarity. This endpoint never reaches the fuzzy
+        attachment in createManager, which is the behaviour the whole phase removes.
+
+        IDS ARE VERIFIED, NOT TRUSTED. A managerId the client sends must name a publicly visible
+        manager, and a selectedRoleId must belong to that manager at that employer and be in a
+        usable state, both checked server-side regardless of where the id came from.
+
+        FEATURE GATED. Returns 404 unless ROLE_AWARE_SUBMISSION_ENABLED is set.
+      tags:
+        - Managers
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - firstName
+                - lastName
+                - title
+                - company
+                - overallRating
+                - ratings
+              properties:
+                firstName:
+                  type: string
+                lastName:
+                  type: string
+                title:
+                  type: string
+                  description: The job title the rating concerns.
+                company:
+                  type: string
+                companyId:
+                  type: integer
+                  format: int64
+                  nullable: true
+                companyDomain:
+                  type: string
+                  nullable: true
+                managerId:
+                  type: integer
+                  format: int64
+                  nullable: true
+                  description: >
+                    The person they picked. Null means "none of these people", so the manager is
+                    created as pending_approval.
+                selectedRoleId:
+                  type: integer
+                  format: int64
+                  nullable: true
+                  description: >
+                    The employment they picked. Null means the employment is missing and is being
+                    proposed. NEVER inferred from the other fields.
+                proposalKey:
+                  type: string
+                  format: uuid
+                  nullable: true
+                  description: >
+                    The form's own identity, stable across autosaves and retries. What makes a
+                    repeated submission idempotent rather than duplicated.
+                revision:
+                  type: integer
+                  format: int64
+                  default: 1
+                  description: Guards ordering, so an autosave in flight cannot overwrite a newer one.
+                startDate:
+                  type: string
+                  nullable: true
+                  description: The contributor's own employment period start. "2023-04" or a full date.
+                endDate:
+                  type: string
+                  nullable: true
+                stillThere:
+                  type: boolean
+                  nullable: true
+                status:
+                  type: string
+                  nullable: true
+                country:
+                  type: string
+                  nullable: true
+                state:
+                  type: string
+                  nullable: true
+                author:
+                  type: string
+                  nullable: true
+                overallRating:
+                  type: number
+                ratings:
+                  type: object
+                  description: The ten categories, by name.
+      responses:
+        '200':
+          description: The rating, and whether it is public yet
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  reviewId:
+                    type: string
+                    format: uuid
+                  claimId:
+                    type: integer
+                    format: int64
+                  roleId:
+                    type: integer
+                    format: int64
+                    nullable: true
+                  resolution:
+                    type: string
+                    description: linked when it attached to an existing employment, created when it made one.
+                  live:
+                    type: boolean
+                    description: >
+                      False is normal, not a failure: a proposed employment holds the rating until
+                      a moderator accepts it.
+                  heldBecause:
+                    type: string
+                    nullable: true
+                  replayed:
+                    type: boolean
+                    description: True when this submission had already been recorded and nothing new was written.
+        '400':
+          description: The selection is stale or the request is incomplete
+        '404':
+          description: The role-aware flow is disabled
+        '409':
+          description: The contributor has no rating opportunity left for this manager
+
+  /api/managers/identify:
+    post:
+      operationId: identifyManager
+      summary: Who the contributor might mean, and which jobs they could pick
+      description: >
+        Read-only. Returns the managers whose name might match and the employments each of them
+        has, so the CONTRIBUTOR chooses the person and the job. Creates nothing: no manager, no
+        company, no claim, no review.
+
+        This exists because the legacy path decided for them. It took a typed name, found
+        candidates by exact company, ran an edit-distance comparison and attached the rating to
+        whichever manager was within one edit of what was typed. One person accumulated eight
+        profiles that way and twenty-one people ended up with two public profiles each, their
+        reviews split between them.
+
+        Fuzzy matching may help somebody FIND a manager here. It never decides who that manager
+        is, and nameClass is returned so a PLAUSIBLE candidate can be shown differently from a
+        CONFIRMED one rather than being pre-selected.
+
+        FEATURE GATED. Returns 404 unless ROLE_AWARE_SUBMISSION_ENABLED is set, so the endpoint
+        does not exist as far as the public is concerned until the whole flow is ready.
+      tags:
+        - Managers
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - firstName
+                - lastName
+              properties:
+                firstName:
+                  type: string
+                lastName:
+                  type: string
+                # nullable, every one of them. A contributor who knows the name and not the
+                # employer must still get candidates: company and title only classify and rank,
+                # they never filter a name match out. An earlier release broke /find outright by
+                # omitting nullable here while the handler happily sent null.
+                title:
+                  type: string
+                  nullable: true
+                company:
+                  type: string
+                  nullable: true
+                companyId:
+                  type: integer
+                  format: int64
+                  nullable: true
+                country:
+                  type: string
+                  nullable: true
+                  description: >
+                    Where the contributor worked with this manager. A TIE-BREAK, never a filter:
+                    among candidates the matcher already rates equally it prefers the one in this
+                    country, and it never hides a name match, never changes a match band and never
+                    reaches what gets created. People relocate, the column is often empty, and a
+                    manager's recorded country is where their current employer is rather than
+                    where the contributor worked with them - so filtering on it would be the
+                    fuzzy-match mistake in a new form.
+      responses:
+        '200':
+          description: Candidates with their selectable employments
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  candidates:
+                    type: array
+                    description: >
+                      Every public manager whose name is CONFIRMED or PLAUSIBLE, each carrying its
+                      employments. An empty array means nobody matched, which is the third Rev 268
+                      path: propose the manager.
+                    items:
+                      type: object
+                      properties:
+                        id:
+                          type: integer
+                          format: int64
+                        name:
+                          type: string
+                        company:
+                          type: string
+                          nullable: true
+                        title:
+                          type: string
+                          nullable: true
+                        employments:
+                          type: array
+                          items:
+                            type: object
+                            properties:
+                              roleId:
+                                type: integer
+                                format: int64
+                                nullable: true
+                                description: >
+                                  Null for the manager's current role when no career_history row
+                                  backs it, which search-created managers never have. Such an
+                                  employment is NOT selectable: picking it is the "employment
+                                  missing" path and proposes the role.
+                              companyId:
+                                type: integer
+                                format: int64
+                                nullable: true
+                              company:
+                                type: string
+                                nullable: true
+                              title:
+                                type: string
+                                nullable: true
+                              state:
+                                type: string
+                                description: proposed or accepted. A proposed employment holds the rating until a moderator accepts it.
+                              periodKnown:
+                                type: boolean
+                              startDate:
+                                type: string
+                                nullable: true
+                              endDate:
+                                type: string
+                                nullable: true
+                              selectable:
+                                type: boolean
+                              isCurrentRoleWithoutRecord:
+                                type: boolean
+                  nameClass:
+                    type: string
+                    enum: [CONFIRMED, PLAUSIBLE, NONE]
+                  incompleteEvidence:
+                    type: boolean
+                    description: >
+                      The candidate budget truncated the scan, so the list is not exhaustive. Say
+                      "there may be others" rather than implying it is complete.
+                  entered:
+                    type: object
+                    description: What was searched, echoed so the client can show it beside "none of these".
+        '404':
+          description: The role-aware flow is disabled
 
   /api/managers/search:
     post:
@@ -1978,6 +2810,16 @@ paths:
                   type: string
                   format: uuid
                   description: Client-generated UUID from drop-off draft; matching anonymous review is deleted before inserting the authenticated one
+                # PHASE 1. The add-form attempt this submission finishes. Minted by the client when
+                # step one first posts its capture and presented again here, so the draft that
+                # capture left behind is adopted by identity rather than because some row resembles
+                # what was typed. Resolved in the same transaction as the rating, so a submission
+                # that fails leaves the attempt unspent and a retry can still adopt its own draft.
+                captureToken:
+                  type: string
+                  format: uuid
+                  nullable: true
+                  description: Client-generated UUID identifying this attempt at the add-manager form
       responses:
         '201':
           description: Manager created successfully
@@ -2227,6 +3069,68 @@ paths:
     post:
       operationId: createDropOffReview
       summary: Capture a review drop-off for an existing manager without authentication
+      tags:
+        - Managers
+      security: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              # Only the ratings are required. This endpoint exists to capture a review somebody
+              # started and did not finish, so requiring the fields they had not reached yet threw
+              # away precisely the submissions it was built to keep: the router rejected the
+              # request with a 400 and the client swallowed it. The service already treats these
+              # as optional and reviews.worked_from is nullable, so partial captures store fine.
+              required:
+                - ratings
+              properties:
+                author:
+                  type: string
+                overallRating:
+                  type: number
+                ratings:
+                  type: object
+                managerCompany:
+                  type: string
+                  nullable: true
+                managerTitle:
+                  type: string
+                  nullable: true
+                workedFrom:
+                  type: string
+                  nullable: true
+                workedUntil:
+                  type: string
+                  nullable: true
+                datesHidden:
+                  type: boolean
+                  default: false
+                  description: >-
+                    Carried on a captured draft too, so somebody who ticked the box before being
+                    bounced to sign in does not have the choice silently dropped when the draft
+                    is promoted.
+                draftToken:
+                  type: string
+                  format: uuid
+                  description: Client-generated UUID linking this drop-off draft to a future authenticated submit for deduplication
+      responses:
+        '200':
+          description: Drop-off review recorded
+        '400':
+          description: Invalid request
+
+  /api/managers/{id}/reviews/autosave:
+    post:
+      operationId: autosaveManagerReview
+      summary: Save a manager-rating form's answers while it is still being filled in
       tags:
         - Managers
       security: []
@@ -2883,6 +3787,522 @@ paths:
           description: Forbidden
         '404':
           description: Ghost manager not found
+
+  # ── Role-aware moderation (Rev 268 phase 4C) ──────────────────────────────
+  #
+  # Admin only, enforced in ModerationService: every method resolves the caller
+  # through AdminService.requireAdminPublic before touching a row, so a
+  # hand-built request gets the same 401 or 403 as a misdirected click.
+  #
+  # Deliberately NOT gated on ROLE_AWARE_SUBMISSION_ENABLED. Role conflicts and
+  # held ratings are created by the manager merge, which is not behind that
+  # flag, so a queue can exist while public role-aware submission is off. An
+  # admin must be able to clear it.
+  /api/admin/moderation/summary:
+    get:
+      operationId: adminModerationSummary
+      summary: Counts and oldest-waiting ages for every moderation queue (admin only)
+      tags:
+        - Admin
+      responses:
+        '200':
+          description: Queue summary
+        '401':
+          description: Unauthorized
+        '403':
+          description: Forbidden
+
+  /api/admin/moderation/employments:
+    get:
+      operationId: adminModerationPendingEmployments
+      summary: Proposed employments awaiting a decision, with corroboration counts (admin only)
+      tags:
+        - Admin
+      parameters:
+        - in: query
+          name: limit
+          schema:
+            type: integer
+        - in: query
+          name: offset
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: Proposed employments
+        '401':
+          description: Unauthorized
+        '403':
+          description: Forbidden
+
+  /api/admin/moderation/employments/{roleId}:
+    get:
+      operationId: adminModerationEmploymentDetail
+      summary: One proposed employment with its claims, held ratings and the manager's history
+      tags:
+        - Admin
+      parameters:
+        - in: path
+          name: roleId
+          required: true
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: Employment detail
+        '401':
+          description: Unauthorized
+        '403':
+          description: Forbidden
+        '404':
+          description: No such employment
+
+  /api/admin/moderation/employments/{roleId}/accept:
+    post:
+      operationId: adminModerationAcceptEmployment
+      summary: Accept a proposed employment and release the ratings that become publishable
+      tags:
+        - Admin
+      parameters:
+        - in: path
+          name: roleId
+          required: true
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: Accepted
+        '400':
+          description: Not a proposed employment
+        '401':
+          description: Unauthorized
+        '403':
+          description: Forbidden
+        '404':
+          description: No such employment
+
+  /api/admin/moderation/employments/{roleId}/reject:
+    post:
+      operationId: adminModerationRejectEmployment
+      summary: Reject a proposed employment; its ratings stay held and are never deleted
+      tags:
+        - Admin
+      parameters:
+        - in: path
+          name: roleId
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                reason:
+                  type: string
+      responses:
+        '200':
+          description: Rejected
+        '400':
+          description: Not a proposed employment
+        '401':
+          description: Unauthorized
+        '403':
+          description: Forbidden
+        '404':
+          description: No such employment
+
+  /api/admin/moderation/employments/{roleId}/correct:
+    post:
+      operationId: adminModerationCorrectEmployment
+      summary: Correct a canonical employment's title or dates, leaving every contributor's
+        assertion untouched, and optionally accept it in the same transaction
+      description: >-
+        The employer cannot be changed here. reviews_withdrawn_role_is_the_managers ties a held
+        rating to (withdrawn_role_id, manager_id) without company_id, so changing a role's company
+        would silently re-attribute that rating with no constraint objecting; employer changes
+        belong to the supersession design. A key's PRESENCE is what selects a field, so
+        "endDate": null records "no recorded end date" while omitting endDate leaves it alone.
+      tags:
+        - Admin
+      parameters:
+        - in: path
+          name: roleId
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - reason
+              properties:
+                title:
+                  type: string
+                startDate:
+                  type: string
+                  nullable: true
+                  description: YYYY-MM-DD or YYYY-MM. Null clears it.
+                endDate:
+                  type: string
+                  nullable: true
+                  description: Null means no recorded end date, which is not the same as an
+                    unknown period.
+                periodKnown:
+                  type: boolean
+                  description: False means nobody has established when this employment was.
+                reason:
+                  type: string
+                  description: Recorded in role_corrections. Required.
+                thenAccept:
+                  type: boolean
+                  description: Accept in the same transaction, so the employment is never briefly
+                    live with the values just corrected.
+      responses:
+        '200':
+          description: Corrected
+        '400':
+          description: No reason, nothing changed, an impossible period, or not correctable
+        '401':
+          description: Unauthorized
+        '403':
+          description: Forbidden
+        '404':
+          description: No such employment
+        '409':
+          description: The correction would duplicate an employment that already exists
+
+  /api/admin/moderation/employments/{roleId}/reopen:
+    post:
+      operationId: adminModerationReopenEmployment
+      summary: Reopen a rejected employment as a fresh proposal, publishing nothing
+      description: >-
+        Inserts a new proposed row carrying reopened_from, so the rejection stays on the record.
+        No rating is republished: the new row has no claims, so rating_role_is_publishable has
+        nothing to say yes to, and releasing held ratings remains the separate act of linking each
+        claim to the new employment.
+      tags:
+        - Admin
+      parameters:
+        - in: path
+          name: roleId
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - reason
+              properties:
+                reason:
+                  type: string
+      responses:
+        '200':
+          description: Reopened as a fresh proposal
+        '400':
+          description: Not a rejected employment, or no reason given
+        '401':
+          description: Unauthorized
+        '403':
+          description: Forbidden
+        '404':
+          description: No such employment
+        '409':
+          description: A live employment for the same job already exists
+
+  /api/admin/moderation/employments/{roleId}/history:
+    get:
+      operationId: adminModerationEmploymentHistory
+      summary: One page of everything that has happened to this employment, in one timeline
+      description: >-
+        Reads role_corrections, claim_corrections, claim_resolution_events, manager_merge_events,
+        review_supersessions, company_merges and role_conflicts. No contributor identity is
+        selected: every actor is an administrator, resolved to a username, and an erased actor
+        reads as withdrawn rather than as absent.
+      tags:
+        - Admin
+      parameters:
+        - in: path
+          name: roleId
+          required: true
+          schema:
+            type: integer
+        - in: query
+          name: cursor
+          required: false
+          schema:
+            type: string
+          description: nextCursor from a previous page. Keyset over (at, kind, source id), so it
+            cannot skip or repeat an event while new ones arrive.
+        - in: query
+          name: limit
+          required: false
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: >-
+            One page. lineageComplete answers whether every predecessor employment was found and
+            is decided by cycle detection; hasMore answers whether every event was returned and
+            is decided by the page size. The two are never conflated, and a partial timeline is
+            never labelled complete.
+        '401':
+          description: Unauthorized
+        '403':
+          description: Forbidden
+        '404':
+          description: No such employment
+
+  /api/admin/moderation/conflicts:
+    get:
+      operationId: adminModerationConflicts
+      summary: Open role conflicts, blocking ones first (admin only)
+      tags:
+        - Admin
+      parameters:
+        - in: query
+          name: limit
+          schema:
+            type: integer
+        - in: query
+          name: offset
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: Open conflicts
+        '401':
+          description: Unauthorized
+        '403':
+          description: Forbidden
+
+  /api/admin/moderation/conflicts/{conflictId}:
+    get:
+      operationId: adminModerationConflictDetail
+      summary: One conflict with every attached claim and its role in the dispute
+      description: >
+        Each claim also carries what its contributor says NOW - the latest testimony rather than
+        the claim's frozen assertion - and whether it has since been withdrawn, because a
+        withdrawn claim grounds no status. For an employment_status_dispute the response adds
+        caseEmployments: every accepted employment record under the dispute's case, with what each
+        currently answers and whether a determination would move it. It is empty for every other
+        kind, which decides only the role the conflict names.
+      tags:
+        - Admin
+      parameters:
+        - in: path
+          name: conflictId
+          required: true
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: Conflict detail
+        '401':
+          description: Unauthorized
+        '403':
+          description: Forbidden
+        '404':
+          description: No such conflict
+
+  /api/admin/moderation/conflicts/{conflictId}/resolve:
+    post:
+      operationId: adminModerationResolveConflict
+      summary: Record a decision on a conflict and release what it was holding
+      tags:
+        - Admin
+      parameters:
+        - in: path
+          name: conflictId
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - resolution
+              properties:
+                resolution:
+                  type: string
+                  enum:
+                    - merged
+                    - kept_separate
+                    - corrected
+                    - dismissed
+                    - superseded_the_legacy
+                note:
+                  type: string
+      responses:
+        '200':
+          description: Resolved
+        '400':
+          description: Unknown resolution
+        '401':
+          description: Unauthorized
+        '403':
+          description: Forbidden
+        '404':
+          description: No such conflict
+
+  /api/admin/moderation/conflicts/{conflictId}/determine-status:
+    post:
+      operationId: adminModerationDetermineStatus
+      summary: Answer an employment-status dispute and take the employment out of disputed
+      description: >
+        Applies one determination to every disputed employment record under the dispute's case,
+        records it with basis 'moderator' and the moderator's identity, and resolves the dispute
+        as status_determined. An asserting status must carry the date its evidence speaks to;
+        'unknown' must not, because it asserts nothing. No rating changes state: an
+        employment-status dispute never held one.
+      tags:
+        - Admin
+      parameters:
+        - in: path
+          name: conflictId
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - status
+                - note
+              properties:
+                status:
+                  type: string
+                  enum:
+                    - ongoing
+                    - ended
+                    - unknown
+                asOf:
+                  type: string
+                  format: date
+                  nullable: true
+                  description: >
+                    The date the evidence speaks to, not the date of the decision. Required for
+                    'ongoing' and 'ended', and forbidden for 'unknown'.
+                note:
+                  type: string
+                  description: Why. A determination overrides what contributors said.
+      responses:
+        '200':
+          description: Determined
+        '400':
+          description: Unknown status, a missing or future evidence date, or a missing reason
+        '401':
+          description: Unauthorized
+        '403':
+          description: Forbidden
+        '404':
+          description: No such conflict
+
+  /api/admin/moderation/claims/{claimId}/link:
+    post:
+      operationId: adminModerationLinkClaim
+      summary: Point a claim at an existing employment, preserving what the contributor selected
+      tags:
+        - Admin
+      parameters:
+        - in: path
+          name: claimId
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - roleId
+              properties:
+                roleId:
+                  type: integer
+      responses:
+        '200':
+          description: Linked
+        '400':
+          description: Target employment is not available, or the claim was never finalized
+        '401':
+          description: Unauthorized
+        '403':
+          description: Forbidden
+        '404':
+          description: No such claim
+
+  /api/admin/moderation/roles/merge:
+    post:
+      operationId: adminModerationMergeRoles
+      summary: Merge one employment into another on the same manager (delegates to ManagerMergeService)
+      tags:
+        - Admin
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - managerId
+                - keepRoleId
+                - supersededRoleId
+              properties:
+                managerId:
+                  type: integer
+                keepRoleId:
+                  type: integer
+                supersededRoleId:
+                  type: integer
+      responses:
+        '200':
+          description: Merged
+        '400':
+          description: Invalid merge request
+        '401':
+          description: Unauthorized
+        '403':
+          description: Forbidden
+
+  /api/admin/moderation/held-ratings:
+    get:
+      operationId: adminModerationHeldRatings
+      summary: Every held rating with why it is held and the action that would release it
+      tags:
+        - Admin
+      parameters:
+        - in: query
+          name: limit
+          schema:
+            type: integer
+        - in: query
+          name: offset
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: Held ratings
+        '401':
+          description: Unauthorized
+        '403':
+          description: Forbidden
 
   /api/admin/pending-managers:
     get:
@@ -4167,6 +5587,55 @@ paths:
         '404':
           description: Review not found
 
+  /api/managers/{managerId}/reviews/{reviewId}/unlink:
+    post:
+      operationId: unlinkManagerReview
+      summary: Unlink a rating from the contributor's account, keeping it published
+      description: >
+        Severs the contributor's ownership of their rating permanently. The rating REMAINS
+        published as anonymous feedback and its scores continue contributing to statistics -
+        this is not a deletion and there is no withdrawal window. A private participation
+        record is kept so the account cannot rate this manager again. Irreversible.
+      tags:
+        - Managers
+      parameters:
+        - in: path
+          name: managerId
+          required: true
+          schema:
+            type: integer
+        - in: path
+          name: reviewId
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Rating unlinked
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  unlinked:
+                    type: boolean
+                    description: >
+                      False when the rating had already been unlinked. The call still succeeds,
+                      because repeating an irreversible action is not an error.
+                  message:
+                    type: string
+                    example: Rating unlinked
+        '401':
+          description: Unauthorized
+        '403':
+          description: Not the contributor's rating
+        '404':
+          description: Rating not found, or no longer linked to this account
+
   /api/managers/{managerId}/reviews/{reviewId}/replace:
     post:
       operationId: replaceManagerReview
@@ -4280,6 +5749,42 @@ paths:
 
 components:
   schemas:
+    ContributionDraft:
+      type: object
+      description: >-
+        An unfinished rating belonging to the authenticated contributor. Carries no moderation
+        state and no capture token: a contributor reading their own draft is not reading the
+        review queue.
+      properties:
+        id:
+          type: string
+        subjectType:
+          type: string
+          enum: [manager, company, interview]
+        subjectId:
+          type: integer
+          format: int64
+        ordinal:
+          type: integer
+        payload:
+          type: object
+        version:
+          type: integer
+          format: int64
+        savedAt:
+          type: string
+        expiresAt:
+          type: string
+          description: When the retention period removes it, so expiry is never a surprise.
+        available:
+          type: boolean
+          description: Whether the subject can still be rated.
+        unavailableReason:
+          type: string
+        redirectTo:
+          type: integer
+          format: int64
+          description: The surviving subject, when this one was merged into another.
     RoleCoverage:
       type: object
       properties:
@@ -5275,6 +6780,12 @@ components:
       properties:
         success:
           type: boolean
+        auth0LogoutUrl:
+          type: string
+          description: >
+            Where the browser should navigate to end the Auth0 session as well. The product
+            session is already revoked by the time this is returned; this only stops Auth0
+            recognising the person and signing them straight back in.
 
     ManagerReviewUpdated:
       allOf:

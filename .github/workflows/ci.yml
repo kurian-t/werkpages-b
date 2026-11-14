@@ -1,0 +1,86 @@
+name: CI
+
+# THIS REPOSITORY HAD NO WORKFLOW AT ALL until 2026-11-12, which meant the backend's
+# WerkPages unit tests ran in CI only as a side effect of `mvn package` in the frontend's
+# deploy job, and the integration tests never ran in CI at any point.
+#
+# Two reasons it could not have worked before:
+#   * the Failsafe configuration hardcoded a Docker Desktop socket path that exists only on the
+#     development machine, so Testcontainers could not start on a runner. It is a property now
+#     (`docker.host`) with that path as the default, so local behaviour is unchanged;
+#   * the whole integration suite is far too large for a routine push. It is selected by TAG
+#     instead - see below.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+# A second push to the same branch makes the first run's result irrelevant. Cancelling it frees
+# runners instead of paying for an answer nobody will read.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  routine:
+    name: Build, unit tests, critical integration tests
+    timeout-minutes: 30
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+          cache: maven
+
+      # Compilation is the cheapest useful signal and catches most mistakes, so it runs first and
+      # separately: a compile failure should not be reported as a test failure.
+      - name: Compile (main and test)
+        run: mvn -B -ntp test-compile
+
+      # Surefire only. Fast, no Docker, and it covers the pure logic.
+      - name: Backend unit tests
+        run: mvn -B -ntp test
+
+      # ROUTINE CI RUNS THE "critical" TAG, NOT THE WHOLE INTEGRATION SUITE.
+      #
+      # The tag marks the classes protecting security, account erasure and data integrity: S4
+      # enforcement, sessions, profile completion, account recovery, identity mutation, company
+      # merge, employment statistics and the migration head. About 152 tests of roughly 2,000.
+      #
+      # What this intentionally excludes stays in the repository and runs in the full-suite
+      # workflow and locally. Nothing is deleted to make this fit.
+      #
+      # -Dtest=NONE, NOT -Dsurefire.skip.
+      #
+      # `surefire.skip` is not a real property. Maven accepts it silently and surefire runs
+      # anyway, so this step re-ran all 744 unit tests that the previous step had just run -
+      # doubling the most expensive part of the job to no effect. Caught by counting surefire
+      # executions in the log rather than by the build failing, because it did not fail.
+      #
+      # `-Dtest=NONE` with `failIfNoSpecifiedTests=false` is the form that actually selects
+      # nothing for surefire while leaving failsafe alone. Verified by timestamp rather than by
+      # reading the log: after this command, the failsafe report files are rewritten and the
+      # surefire ones are not touched. Counting plugin banners proves nothing, because surefire's
+      # banner prints whether or not it selects a single test.
+      - name: Critical integration tests
+        run: >
+          mvn -B -ntp verify -DskipITs=false -Dgroups=critical
+          -Ddocker.host=unix:///var/run/docker.sock
+          -Dtest=NONE -Dsurefire.failIfNoSpecifiedTests=false
+
+      - uses: actions/upload-artifact@v4
+        if: ${{ !cancelled() }}
+        with:
+          name: surefire-and-failsafe-reports
+          path: |
+            **/target/surefire-reports/
+            **/target/failsafe-reports/
+          retention-days: 14

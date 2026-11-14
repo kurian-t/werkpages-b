@@ -114,6 +114,9 @@ public final class CorpusBreaker {
         }
     }
 
+    /** The tier this breaker guards. Used as the log label, so the two cannot disagree. */
+    public String name() { return name; }
+
     public boolean isOpen() { return openedAtMs.get() != 0; }
 
     public String state() {

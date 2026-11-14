@@ -25,6 +25,9 @@ import java.util.List;
  */
 public class MaintenanceSweep {
 
+    /** How long a rating form may sit untouched before the approval queue may show it. */
+    private static final int DRAFT_IDLE_MINUTES = 30;
+
     /**
      * How long after boot the first sweep runs.
      *
@@ -54,6 +57,10 @@ public class MaintenanceSweep {
     private CompanyReviewRepository companyReviewRepo;
     /** Optional, set after construction, for the same reason as {@link #companyReviewRepo}. */
     private org.werkpages.repository.InterviewRepository interviewRepo;
+    /** Optional, set after construction, for the same reason as the two above. */
+    private org.werkpages.repository.CapturedDraftRepository draftRepo;
+    /** Private drafts of signed-in contributors. Null when nothing wired it. */
+    private org.werkpages.repository.ContributionDraftRepository contributionDraftRepo;
     private final ProofChallengeRepository proofChallengeRepo;
     private final ConfidenceRepository     confidenceRepo;
 
@@ -133,10 +140,57 @@ public class MaintenanceSweep {
         return this;
     }
 
+    /** Wires in draft housekeeping: abandonment and retention. Chainable. */
+    public MaintenanceSweep withCapturedDrafts(org.werkpages.repository.CapturedDraftRepository repo) {
+        this.draftRepo = repo;
+        return this;
+    }
+
+    /**
+     * Wires in retention for a signed-in contributor's PRIVATE drafts. Chainable.
+     *
+     * <p>Not the same housekeeping as {@link #withCapturedDrafts}, and the difference is the
+     * point: an anonymous capture is kept for ever because a partial rating does not go stale and
+     * the aggregate is why it exists. A contribution draft is an IDENTIFIED half-formed opinion
+     * belonging to a named account, so it is not kept indefinitely, and the retention period is
+     * disclosed to the person it belongs to.
+     */
+    public MaintenanceSweep withContributionDrafts(
+            org.werkpages.repository.ContributionDraftRepository repo) {
+        this.contributionDraftRepo = repo;
+        return this;
+    }
+
     /** Wires in the interview restore. Chainable, like {@code withCompanyReviews}. */
     public MaintenanceSweep withInterviews(org.werkpages.repository.InterviewRepository repo) {
         this.interviewRepo = repo;
         return this;
+    }
+
+    /**
+     * Accepted employment whose stored status does not follow from the record.
+     *
+     * <p>The reconciliation routine CLAUDE.md section 21 requires of anything derived. It repairs
+     * nothing, deliberately: a drifting row means a writing path reached {@code career_history}
+     * without resolving, and silently fixing it would hide the defect while making the symptom go
+     * away. The job of this step is to make such a path impossible to miss.
+     *
+     * <p>Reports the ids, because "three roles are wrong" sends somebody looking and
+     * "roles 41, 88 and 107 are wrong" tells them where.
+     */
+    private Future<Void> checkEmploymentStatusDrift() {
+        return managerRepo.driftingEmploymentStatuses()
+            .onSuccess(ids -> {
+                if (!ids.isEmpty()) {
+                    System.err.println("\u26a0 " + ids.size() + " accepted employment role(s) carry "
+                        + "an end date but are not resolved as ended: " + ids
+                        + " - a writing path reached career_history without resolving its status");
+                }
+            })
+            .onFailure(err -> System.err.println(
+                "\u26a0 Employment status drift check failed: " + err.getMessage()))
+            .otherwiseEmpty()
+            .mapEmpty();
     }
 
     public Future<Void> runOnce() {
@@ -146,9 +200,12 @@ public class MaintenanceSweep {
                 restoreExpiredDeletions(),
                 restoreExpiredCompanyDeletions(),
                 restoreExpiredInterviewDeletions(),
+                sweepCapturedDrafts(),
+                sweepContributionDrafts(),
                 ageOutAbandonedChallenges(),
                 awardStandingCredit(),
                 refreshExpiredPlaceholders(),
+                checkEmploymentStatusDrift(),
                 resolveBrands()))
             .mapEmpty();
     }
@@ -497,6 +554,73 @@ public class MaintenanceSweep {
                 if (n > 0) System.out.println("\u2713 Restored " + n + " anonymised interview experience(s)");
             })
             .onFailure(err -> System.err.println("\u26a0 Interview restore job failed: " + err.getMessage()))
+            .otherwiseEmpty()
+            .mapEmpty();
+    }
+
+    /**
+     * Draft housekeeping: what has gone quiet, and what has aged out.
+     *
+     * <p><b>Abandonment is reversible and is not a decision.</b> A form silent for the window is
+     * moved out of 'active' so the approval queue can show it; a contributor who returns to the
+     * same token moves it straight back. Without this step an admin would watch items appear and
+     * change under them every few seconds as somebody typed.
+     *
+     * <p><b>Nothing is ever deleted here.</b> Drafts are kept indefinitely: a partial rating is
+     * evidence about an employer and does not stop being true with age, and the aggregate it
+     * feeds is worth less every time its older half is thrown away.
+     */
+    /**
+     * Deletes a signed-in contributor's unfinished rating once the retention period has passed.
+     *
+     * <p>UNLIKE the anonymous capture sweep above, this one really does delete. An anonymous
+     * partial rating is kept for ever because nobody is identified by it and the aggregate is the
+     * whole purpose. A contribution draft names an account, so keeping it indefinitely would mean
+     * holding somebody's half-formed opinion about their employer with no end date, which is the
+     * opposite of what the feature is for.
+     *
+     * <p>The period is disclosed with every draft the API returns, and submitting or discarding
+     * ends it sooner. Scheduled here rather than from a new timer: this is the daily housekeeping
+     * and a second scheduler would be a second thing to forget to start.
+     */
+    private Future<Void> sweepContributionDrafts() {
+        if (contributionDraftRepo == null) return Future.succeededFuture();
+        return contributionDraftRepo.deleteStale(
+                org.werkpages.service.ContributionDraftService.RETENTION_DAYS)
+            .onSuccess(removed -> {
+                if (removed > 0) {
+                    System.out.println("\u2713 " + removed + " private draft(s) past retention removed");
+                }
+            })
+            .onFailure(err -> System.err.println(
+                "\u26a0 Contribution draft retention sweep failed: " + err.getMessage()))
+            .otherwiseEmpty()
+            .mapEmpty();
+    }
+
+    private Future<Void> sweepCapturedDrafts() {
+        if (draftRepo == null) return Future.succeededFuture();
+        /*
+          DRAFTS ARE KEPT FOR EVER. There is no expiry step here and that is deliberate.
+
+          This used to delete unresolved drafts after 180 days, with a comment claiming the period
+          matched the privacy policy. It did not: the policy says incomplete responses "may be
+          automatically saved and retained" and names no period, so the deletion was a limit
+          nothing asked for, quietly destroying the exact data the capture exists to collect.
+
+          A partial rating does not go stale. Somebody started rating this employer, got this far
+          and stopped, and that is as true in two years as it was on the day. The whole point of
+          keeping them is the aggregate, and an aggregate that silently loses its older half is
+          worse than no aggregate.
+
+          What remains is the abandonment step, which only decides when a row is VISIBLE in the
+          queue. It deletes nothing.
+        */
+        return draftRepo.markAbandoned(DRAFT_IDLE_MINUTES)
+            .onSuccess(moved -> {
+                if (moved > 0) System.out.println("\u2713 " + moved + " draft(s) went quiet");
+            })
+            .onFailure(err -> System.err.println("\u26a0 Draft sweep failed: " + err.getMessage()))
             .otherwiseEmpty()
             .mapEmpty();
     }

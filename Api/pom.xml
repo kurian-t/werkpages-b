@@ -188,8 +188,21 @@
 					<!-- @{argLine} picks up the JaCoCo agent set by prepare-agent-integration -->
 					<argLine>@{argLine}</argLine>
 					<environmentVariables>
-						<DOCKER_HOST>unix:///home/noragrats/.docker/desktop/docker.sock</DOCKER_HOST>
+						<DOCKER_HOST>${docker.host}</DOCKER_HOST>
 						<TESTCONTAINERS_RYUK_DISABLED>true</TESTCONTAINERS_RYUK_DISABLED>
+						<!--
+							The role-aware contribution flow, ON FOR INTEGRATION TESTS ONLY.
+
+							It is off everywhere else: no production or staging environment sets it, and the
+							frontend has its own separate VITE_ROLE_AWARE_SUBMISSION which is also off, so
+							neither alone exposes the flow. Enabling it here is what lets the three
+							contribution paths be tested at all, since a flag read from the environment
+							cannot be set from inside a JVM that is already running.
+
+							NOT a version or plugin change: an environment variable for the test harness,
+							in the same block as DOCKER_HOST and the Ryuk setting and for the same reason.
+						-->
+						<ROLE_AWARE_SUBMISSION_ENABLED>true</ROLE_AWARE_SUBMISSION_ENABLED>
 					</environmentVariables>
 					<systemPropertyVariables>
 						<api.version>1.44</api.version>
@@ -302,6 +315,21 @@
 	</build>
 
 	<properties>
+		<!--
+			The Docker socket Testcontainers talks to.
+
+			CLAUDE.md section 29 requires DOCKER_HOST to be set in the Failsafe block, and it still
+			is - this only moves the VALUE into a property so it can be overridden. The default is
+			the Docker Desktop socket on the development machine, so a local `mvn verify` behaves
+			exactly as before.
+
+			CI needs a different path: a GitHub runner's daemon listens on /var/run/docker.sock, and
+			the hardcoded Desktop path made the integration tests unrunnable there - which is part of
+			why these repositories had no CI workflow at all.
+
+			    mvn verify -Ddocker.host=unix:///var/run/docker.sock
+		-->
+		<docker.host>unix:///home/noragrats/.docker/desktop/docker.sock</docker.host>
 		<maven.compiler.source>21</maven.compiler.source>
 		<maven.compiler.target>21</maven.compiler.target>
 		<project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>

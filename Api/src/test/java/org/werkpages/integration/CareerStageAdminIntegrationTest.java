@@ -231,9 +231,9 @@ class CareerStageAdminIntegrationTest {
         long managerId = insertManager("Acme");
         insertSeedReview(managerId, "Old Co", "Director", 4.0);
         await(pool.preparedQuery(
-                "INSERT INTO career_history(manager_id, company, title, start_date, date_source) "
-              + "VALUES ($1, 'Old Co', 'Director', now() - interval '3 years', 'unknown')")
-            .execute(Tuple.of(managerId)));
+                "INSERT INTO career_history(manager_id, company, title, start_date, date_source, company_id) "
+              + "VALUES ($1, 'Old Co', 'Director', now() - interval '3 years', 'unknown', $2)")
+            .execute(Tuple.of(managerId, fixtureCompanyId("Old Co"))));
 
         JsonObject result = await(admin.adminResolveCareerStage(ADMIN, managerId,
             new JsonObject().put("action", "delete").put("company", "Old Co")));
@@ -255,9 +255,9 @@ class CareerStageAdminIntegrationTest {
         insertRealReview(managerId, "Old Co", "Director", 4.0);
         insertRealReview(managerId, "Acme", "CEO", 3.0);
         await(pool.preparedQuery(
-                "INSERT INTO career_history(manager_id, company, title, start_date, date_source) "
-              + "VALUES ($1, 'Old Co', 'Director', now() - interval '3 years', 'unknown')")
-            .execute(Tuple.of(managerId)));
+                "INSERT INTO career_history(manager_id, company, title, start_date, date_source, company_id) "
+              + "VALUES ($1, 'Old Co', 'Director', now() - interval '3 years', 'unknown', $2)")
+            .execute(Tuple.of(managerId, fixtureCompanyId("Old Co"))));
 
         await(admin.adminResolveCareerStage(ADMIN, managerId,
             new JsonObject().put("action", "reassign").put("company", "Old Co")
@@ -354,4 +354,19 @@ class CareerStageAdminIntegrationTest {
             throw e.getCause();
         }
     }
+
+    /**
+     * A real employer for a fixture role. {@code career_history.company_id} is NOT NULL as of V99,
+     * so a career row has to name one. findOrCreate by name, which is the rule the product itself
+     * uses, so a fixture mentioning one company twice gets one company row.
+     */
+    private long fixtureCompanyId(String name) throws Exception {
+        return await(pool.preparedQuery("""
+                INSERT INTO companies (name, slug, status)
+                VALUES ($1, 'fixture-' || md5(lower(btrim($1))), 'ghost')
+                ON CONFLICT ((LOWER(TRIM(name)))) DO UPDATE SET updated_at = now()
+                RETURNING id
+                """).execute(Tuple.of(name)).map(rs -> rs.iterator().next().getLong("id")));
+    }
+
 }

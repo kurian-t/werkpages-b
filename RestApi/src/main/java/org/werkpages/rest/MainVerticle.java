@@ -17,7 +17,9 @@ import org.werkpages.repository.ReviewRepository;
 import org.werkpages.repository.ProofChallengeRepository;
 import org.werkpages.repository.ConfidenceRepository;
 import org.werkpages.repository.UserRepository;
+import org.werkpages.rest.handlers.ContributionDraftHandler;
 import org.werkpages.rest.handlers.AdminHandler;
+import org.werkpages.rest.handlers.ModerationHandler;
 import org.werkpages.rest.handlers.AuthHandler;
 import org.werkpages.rest.handlers.ManagersHandler;
 import org.werkpages.rest.handlers.NotificationsHandler;
@@ -30,6 +32,7 @@ import org.werkpages.rest.handlers.CompanyRatingsHandler;
 import org.werkpages.rest.handlers.ProofChallengesHandler;
 import org.werkpages.service.CompanyStatsRebuilder;
 import org.werkpages.service.AdminService;
+import org.werkpages.service.ModerationService;
 import org.werkpages.service.AnthropicClient;
 import org.werkpages.rest.handlers.CompanyLogoUtils;
 import org.werkpages.service.DeduplicationJob;
@@ -54,8 +57,6 @@ import io.vertx.core.AbstractVerticle;
 import io.vertx.core.Vertx;
 import io.vertx.core.http.HttpMethod;
 import io.vertx.core.json.JsonObject;
-import java.nio.charset.StandardCharsets;
-import java.security.MessageDigest;
 import java.util.concurrent.atomic.AtomicBoolean;
 import io.vertx.ext.auth.jwt.JWTAuth;
 import io.vertx.ext.auth.jwt.JWTAuthOptions;
@@ -160,6 +161,20 @@ public class MainVerticle extends AbstractVerticle {
 
                 JWTAuth jwtAuth = JwtAuthFactory.create(vertx, keys, secrets.auth0Audience);
 
+                // The ID TOKEN validator, built from the same keys but scoped differently.
+                //
+                // A session token's `aud` is the API identifier; an ID token's is the CLIENT ID,
+                // so the two cannot share an instance without widening both. The issuer IS
+                // enforced here, unlike for sessions: JwtAuthFactory leaves it open because the
+                // password and social paths historically reached different Auth0 domains, while
+                // an ID token on this path always comes from the domain the exchange calls.
+                //
+                // The trailing slash matters. Auth0 issues `iss` as https://<domain>/ and an
+                // exact comparison against a value without it refuses every token.
+                String idTokenIssuer = "https://" + secrets.auth0Domain + "/";
+                IdTokenValidator idTokenValidator =
+                    IdTokenValidator.create(vertx, keys, secrets.auth0ClientId, idTokenIssuer);
+
                 OpenAPI3RouterFactory.create(vertx, "openapi.yaml", routerFactoryAr -> {
                     if (routerFactoryAr.succeeded()) {
                         OpenAPI3RouterFactory routerFactory = routerFactoryAr.result();
@@ -173,7 +188,7 @@ public class MainVerticle extends AbstractVerticle {
 
                         // ── Repositories ──────────────────────────────────────────────────────
                         UserRepository         userRepo    = new UserRepository(Database.getClient(), enc);
-                        ManagerRepository      managerRepo = new ManagerRepository(Database.getClient());
+                        ManagerRepository      managerRepo = new ManagerRepository(Database.getPool());
                         ReviewRepository       reviewRepo  = new ReviewRepository(Database.getClient());
                         NotificationRepository notifRepo   = new NotificationRepository(Database.getClient());
                         ReportRepository       reportRepo  = new ReportRepository(Database.getClient());
@@ -187,17 +202,41 @@ public class MainVerticle extends AbstractVerticle {
 
                         // ── Services ──────────────────────────────────────────────────────────
                         MergeSuggestionsRepository mergeSuggestionsRepo = new MergeSuggestionsRepository(Database.getClient());
+                        // One repository, shared by every path that must clear a private draft
+                        // when a submission succeeds. Wired with the chainable setters so no
+                        // existing constructor or test had to change.
+                        org.werkpages.repository.ContributionDraftRepository contributionDraftRepo =
+                            new org.werkpages.repository.ContributionDraftRepository(Database.getPool());
                         ManagerService      managerService = new ManagerService(managerRepo, reviewRepo, userRepo, editRepo, reportRepo, companyRepo, Database.getClient(), CompanyLogoUtils::resolveLogoUrl);
+                        managerService.withContributionDrafts(contributionDraftRepo);
+                        /*
+                          The location corpus starts opening NOW, not on the first keystroke.
+
+                          Lazily, the engine opened on the first query and the worldwide geography
+                          file was only asked for after that - while the first request without a
+                          country waits for geography BEFORE it issues any query. So the first
+                          person to type after a restart waited two seconds for a signal nothing
+                          had been started to produce, and was then answered from the configured
+                          country shortlist instead of the world. Measured cold: 3.51s and the
+                          wrong country.
+
+                          This returns immediately; the work happens on the corpus's own worker. A
+                          bucket that cannot be reached logs and disables suggestions, exactly as
+                          it does today, and never delays or fails the boot.
+                        */
+                        managerService.startLocationCorpus();
                         AdminService        adminService   = new AdminService(userRepo, managerRepo, reviewRepo, editRepo, notifRepo, companyRepo, mergeSuggestionsRepo, Database.getClient());
                         NotificationService notifService   = new NotificationService(userRepo, notifRepo);
                         ReportService       reportService  = new ReportService(userRepo, reportRepo);
                         ResumeService       resumeService  = new ResumeService(userRepo, resumeRepo, companyRepo);
                         IndustryService     industryService = new IndustryService(companyRepo, CompanyLogoUtils::resolveLogoUrl);
                         InterviewService    interviewService = new InterviewService(interviewRepo, companyRepo, userRepo);
+                        interviewService.withContributionDrafts(contributionDraftRepo);
                         org.werkpages.repository.CompanyReviewRepository companyReviewRepo =
                             new org.werkpages.repository.CompanyReviewRepository(Database.getClient());
                         org.werkpages.service.CompanyReviewService companyReviewService =
                             new org.werkpages.service.CompanyReviewService(companyReviewRepo, companyRepo, userRepo);
+                        companyReviewService.withContributionDrafts(contributionDraftRepo);
                         RoleService         roleService      = new RoleService(roleAliasRepo);
 
                         // ── Sitemap ───────────────────────────────────────────────────────────
@@ -234,6 +273,10 @@ public class MainVerticle extends AbstractVerticle {
                             .withCompanyReviews(companyReviewRepo)
                             // And withdrawn interview experiences, which until V96 came back never.
                             .withInterviews(interviewRepo)
+                            .withCapturedDrafts(new org.werkpages.repository.CapturedDraftRepository(Database.getClient()))
+                            // Retention for a signed-in contributor's private drafts, on the same
+                            // daily schedule. A second timer would be a second thing to forget.
+                            .withContributionDrafts(new org.werkpages.repository.ContributionDraftRepository(Database.getPool()))
                             .schedule(vertx);
 
                         // ── company_stats_live reconciliation (safety net — primary updates go
@@ -375,11 +418,26 @@ public class MainVerticle extends AbstractVerticle {
                         CompanyRatingsHandler companyRatingsHandler = new CompanyRatingsHandler(companyReviewService);
                         ProofChallengeService proofChallengeService = new ProofChallengeService(proofChallengeRepo, userRepo);
                         ProofChallengesHandler proofChallengesHandler = new ProofChallengesHandler(proofChallengeService, adminService);
+
+                        /*
+                          Role-aware moderation (Rev 268 phase 4C).
+
+                          Deliberately NOT behind ROLE_AWARE_SUBMISSION_ENABLED. The manager merge
+                          creates role conflicts and holds ratings whether or not public
+                          role-aware submission is switched on, so a queue can exist while the flag
+                          is off - and a queue nobody can clear is worse than no queue. The
+                          authorization is in the service, not here.
+                        */
+                        ModerationService      moderationService = new ModerationService(Database.getPool(), adminService);
+                        ModerationHandler      moderationHandler = new ModerationHandler(moderationService);
                         // The profile endpoint reports the workplace rating beside the manager one.
                         managerService.setCompanyReviewRepo(companyReviewRepo);
 
                         routerFactory.addHandlerByOperationId("getManagers",           managersHandler::handleGetManagers);
                         routerFactory.addHandlerByOperationId("searchManagers",        managersHandler::handleSearchManagers);
+                        routerFactory.addHandlerByOperationId("identifyManager",      managersHandler::handleIdentifyManager);
+                        routerFactory.addHandlerByOperationId("rateWithRole",         managersHandler::handleRateWithRole);
+                        routerFactory.addHandlerByOperationId("autosaveRoleClaim",    managersHandler::handleAutosaveRoleClaim);
                         routerFactory.addHandlerByOperationId("getManagerById",        managersHandler::handleGetManagerById);
                         routerFactory.addHandlerByOperationId("createManager",         managersHandler::handleCreateManager);
                         routerFactory.addHandlerByOperationId("updateManager",         managersHandler::handleUpdateManager);
@@ -388,10 +446,28 @@ public class MainVerticle extends AbstractVerticle {
                         routerFactory.addHandlerByOperationId("getManagerCareerSegments", managersHandler::handleGetManagerCareerSegments);
                         routerFactory.addHandlerByOperationId("updateManagerReview",   managersHandler::handleUpdateReview);
                         routerFactory.addHandlerByOperationId("deleteManagerReview",   managersHandler::handleDeleteManagerReview);
+                        routerFactory.addHandlerByOperationId("unlinkManagerReview",   managersHandler::handleUnlinkManagerReview);
                         routerFactory.addHandlerByOperationId("replaceManagerReview",  managersHandler::handleReplaceManagerReview);
                         routerFactory.addHandlerByOperationId("getMyReviews",          managersHandler::handleGetMyReviews);
                         routerFactory.addHandlerByOperationId("getMySubmittedManagers", managersHandler::handleGetMySubmittedManagers);
                         routerFactory.addHandlerByOperationId("hasContributed",         managersHandler::handleHasContributed);
+
+                        /*
+                          The contributor's own unfinished ratings (V110). Private to the account
+                          that wrote them: nothing here is reachable by moderation, and no route
+                          takes an owner or a draft token.
+                        */
+                        ContributionDraftHandler draftsHandler = new ContributionDraftHandler(
+                            new org.werkpages.service.ContributionDraftService(
+                                new org.werkpages.repository.ContributionDraftRepository(
+                                    // getPool, not getClient: this repository opens a transaction
+                                    // to resolve a write, and getClient hides the pool by design.
+                                    Database.getPool()),
+                                userRepo));
+                        routerFactory.addHandlerByOperationId("listMyDrafts",           draftsHandler::handleListDrafts);
+                        routerFactory.addHandlerByOperationId("saveMyDraft",            draftsHandler::handleSaveDraft);
+                        routerFactory.addHandlerByOperationId("getMyDraft",             draftsHandler::handleGetDraft);
+                        routerFactory.addHandlerByOperationId("discardMyDraft",         draftsHandler::handleDiscardDraft);
                         routerFactory.addHandlerByOperationId("reportManager",         reportsHandler::handleReportManager);
                         routerFactory.addHandlerByOperationId("getStats",               managersHandler::handleGetStats);
                         routerFactory.addHandlerByOperationId("getCompanyListing",      managersHandler::handleGetCompanyListing);
@@ -402,6 +478,7 @@ public class MainVerticle extends AbstractVerticle {
                         routerFactory.addHandlerByOperationId("getCompanyInterviews",   interviewsHandler::handleGetCompanyInterviews);
                         routerFactory.addHandlerByOperationId("listCompanyInterviews",  interviewsHandler::handleListCompanyInterviews);
                         routerFactory.addHandlerByOperationId("captureInterviewDraft",  interviewsHandler::handleCaptureInterviewDraft);
+                        routerFactory.addHandlerByOperationId("autosaveInterview",  interviewsHandler::handleAutosave);
                         routerFactory.addHandlerByOperationId("createInterviewReview",  interviewsHandler::handleCreateInterviewReview);
                         routerFactory.addHandlerByOperationId("deleteInterviewReview",  interviewsHandler::handleDeleteInterviewReview);
                         routerFactory.addHandlerByOperationId("updateInterviewReview",  interviewsHandler::handleUpdateInterviewReview);
@@ -412,6 +489,7 @@ public class MainVerticle extends AbstractVerticle {
                         // router factory refuses to boot, which is why these three go in together.
                         routerFactory.addHandlerByOperationId("submitCompanyRating", companyRatingsHandler::handleSubmit);
                         routerFactory.addHandlerByOperationId("captureCompanyRatingDraft", companyRatingsHandler::handleCaptureDraft);
+                        routerFactory.addHandlerByOperationId("autosaveCompanyRating", companyRatingsHandler::handleAutosave);
                         routerFactory.addHandlerByOperationId("getMyCompanyRating",  companyRatingsHandler::handleGetMine);
                         routerFactory.addHandlerByOperationId("listCompanyRatings",   companyRatingsHandler::handleList);
 
@@ -439,9 +517,25 @@ public class MainVerticle extends AbstractVerticle {
                         routerFactory.addHandlerByOperationId("captureAnonymousSearch", managersHandler::handleAnonymousCapture);
                         routerFactory.addHandlerByOperationId("createDropOffDraft",      managersHandler::handleDropOffDraft);
                         routerFactory.addHandlerByOperationId("createDropOffReview",     managersHandler::handleDropOffReview);
+                        routerFactory.addHandlerByOperationId("autosaveManagerReview",     managersHandler::handleAutosaveReview);
                         routerFactory.addHandlerByOperationId("createManagerEditRequest", managersHandler::handleCreateEditRequest);
                         routerFactory.addHandlerByOperationId("getManagerPendingEdits",   managersHandler::handleGetPendingEditsForManager);
                         routerFactory.addHandlerByOperationId("getAdminPendingEdits",     adminHandler::handleGetPendingEdits);
+                        routerFactory.addHandlerByOperationId("adminModerationSummary",             moderationHandler::handleSummary);
+                        routerFactory.addHandlerByOperationId("adminModerationPendingEmployments",  moderationHandler::handlePendingEmployments);
+                        routerFactory.addHandlerByOperationId("adminModerationEmploymentDetail",    moderationHandler::handleEmploymentDetail);
+                        routerFactory.addHandlerByOperationId("adminModerationAcceptEmployment",    moderationHandler::handleAcceptEmployment);
+                        routerFactory.addHandlerByOperationId("adminModerationRejectEmployment",    moderationHandler::handleRejectEmployment);
+                        routerFactory.addHandlerByOperationId("adminModerationCorrectEmployment",   moderationHandler::handleCorrectEmployment);
+                        routerFactory.addHandlerByOperationId("adminModerationReopenEmployment",    moderationHandler::handleReopenEmployment);
+                        routerFactory.addHandlerByOperationId("adminModerationEmploymentHistory",   moderationHandler::handleEmploymentHistory);
+                        routerFactory.addHandlerByOperationId("adminModerationConflicts",           moderationHandler::handleConflicts);
+                        routerFactory.addHandlerByOperationId("adminModerationConflictDetail",      moderationHandler::handleConflictDetail);
+                        routerFactory.addHandlerByOperationId("adminModerationResolveConflict",     moderationHandler::handleResolveConflict);
+                        routerFactory.addHandlerByOperationId("adminModerationDetermineStatus",     moderationHandler::handleDetermineEmploymentStatus);
+                        routerFactory.addHandlerByOperationId("adminModerationLinkClaim",           moderationHandler::handleLinkClaim);
+                        routerFactory.addHandlerByOperationId("adminModerationMergeRoles",          moderationHandler::handleMergeRoles);
+                        routerFactory.addHandlerByOperationId("adminModerationHeldRatings",         moderationHandler::handleHeldRatings);
                         routerFactory.addHandlerByOperationId("approveManagerEdit",       adminHandler::handleApproveEdit);
                         routerFactory.addHandlerByOperationId("rejectManagerEdit",        adminHandler::handleRejectEdit);
                         routerFactory.addHandlerByOperationId("adminGetReviews",          adminHandler::handleGetReviews);
@@ -450,6 +544,7 @@ public class MainVerticle extends AbstractVerticle {
                         routerFactory.addHandlerByOperationId("getAdminBannedUsers",      adminHandler::handleGetBannedUsers);
                         routerFactory.addHandlerByOperationId("banUser",                  adminHandler::handleBanUser);
                         routerFactory.addHandlerByOperationId("unbanUser",                adminHandler::handleUnbanUser);
+                        routerFactory.addHandlerByOperationId("adminRevokeUserSessions", adminHandler::handleRevokeUserSessions);
                         routerFactory.addHandlerByOperationId("getAdminCapturedDrafts",    adminHandler::handleGetCapturedDrafts);
                         routerFactory.addHandlerByOperationId("markCapturedDraftReviewed", adminHandler::handleMarkDraftReviewed);
                         routerFactory.addHandlerByOperationId("publishCapturedDraft",      adminHandler::handlePublishDraft);
@@ -498,8 +593,18 @@ public class MainVerticle extends AbstractVerticle {
                         routerFactory.addHandlerByOperationId("markNotificationRead",         notificationsHandler::handleMarkAsRead);
                         
                         
+                        // One instance, shared by the security handler and AuthHandler, so
+                        // the lifetimes and the product scope cannot drift between the code that
+                        // issues sessions and the code that validates them.
+                        org.werkpages.repository.SessionRepository sessionRepo =
+                            new org.werkpages.repository.SessionRepository(
+                                org.werkpages.db.Database.getPool(),
+                                org.werkpages.repository.SessionRepository.Product.WERKPAGES);
+
                         AuthHandler authHandler = new AuthHandler(
                             userRepo,
+                            new org.werkpages.repository.OAuthTransactionRepository(
+                                org.werkpages.db.Database.getPool()),
                             secrets.auth0Domain,          // original tenant domain — /dbconnections/signup and /oauth/token must use this, not the custom domain
                             secrets.auth0ClientId,
                             secrets.auth0ClientSecret,
@@ -508,64 +613,67 @@ public class MainVerticle extends AbstractVerticle {
                             vertx
                         );
                         routerFactory.addHandlerByOperationId("checkUsername",     authHandler::handleCheckUsername);
-                        routerFactory.addHandlerByOperationId("signup",            authHandler::handleSignup);
-                        routerFactory.addHandlerByOperationId("signin",            authHandler::handleSignin);
+                        // Without this the callback refuses rather than falling back to an
+                        // unverified decode. Fail closed, deliberately.
+                        authHandler.setIdTokenValidator(idTokenValidator);
+                        authHandler.setSessionRepository(sessionRepo);
+                        /*
+                          Recovery, and the only place a mail sender is chosen.
+
+                          MailSenders.fromEnvironment returns the RECORDING sender unless outbound
+                          mail is explicitly switched on, so a local run and every test produce a
+                          console line instead of a billed Mailgun call to a real person's inbox.
+
+                          Mailgun because it is already the provider: Auth0 sends this product's
+                          verification and password-reset mail through a Mailgun SMTP
+                          configuration, and a second provider would mean two sending reputations
+                          and two sets of DNS records for no benefit.
+                        */
+                        authHandler.setAccountRecoveryService(
+                            new org.werkpages.service.AccountRecoveryService(
+                                org.werkpages.db.Database.getPool(),
+                                org.werkpages.rest.mail.MailSenders.fromEnvironment(vertx),
+                                userRepo,
+                                "WerkPages",
+                                ApiOrigins.allowedOriginPattern(
+                                    org.werkpages.config.AppEnv.current().isProduction())
+                                    + "/signin"));
+                        // Administrative revocation lives in AdminService; without this the ban
+                        // records itself and reports zero sessions ended, which would be a lie by
+                        // omission on the one action that is supposed to take effect immediately.
+                        adminService.setSessionRepository(sessionRepo);
+                        routerFactory.addHandlerByOperationId("socialAuthStart",   authHandler::handleStart);
                         routerFactory.addHandlerByOperationId("socialAuthCallback",authHandler::handleCallback);
                         routerFactory.addHandlerByOperationId("me",                authHandler::handleMe);
                         routerFactory.addHandlerByOperationId("signout",           authHandler::handleSignout);
+                        routerFactory.addHandlerByOperationId("listMySessions",    authHandler::handleListMySessions);
+                        routerFactory.addHandlerByOperationId("revokeMySessions",  authHandler::handleRevokeMySessions);
+                        routerFactory.addHandlerByOperationId("recoverAccount",    authHandler::handleRecoverAccount);
+                        routerFactory.addHandlerByOperationId("completeProfile",   authHandler::handleCompleteProfile);
                         routerFactory.addHandlerByOperationId("deleteMe",          authHandler::handleDeleteMe);
                         
-                        routerFactory.addSecurityHandler("bearerAuth", routingContext -> {
-                            // Cron job authentication via X-Cron-Secret header (constant-time compare)
-                            String cronHeader = routingContext.request().getHeader("X-Cron-Secret");
-                            if (secrets.cronSecret != null && cronHeader != null) {
-                                byte[] expected = secrets.cronSecret.getBytes(StandardCharsets.UTF_8);
-                                byte[] received = cronHeader.getBytes(StandardCharsets.UTF_8);
-                                if (MessageDigest.isEqual(expected, received)) {
-                                    routingContext.put("auth0Id", "cron");
-                                    routingContext.next();
-                                    return;
-                                }
-                            }
-
-                            // Accept token from Authorization header OR HttpOnly cookie
-                            String token = null;
-                            String authHeader = routingContext.request().getHeader("Authorization");
-                            if (authHeader != null && authHeader.startsWith("Bearer ")) {
-                                token = authHeader.substring(7);
-                            } else {
-                                String cookieHeader = routingContext.request().getHeader("Cookie");
-                                if (cookieHeader != null) {
-                                    for (String part : cookieHeader.split(";")) {
-                                        String trimmed = part.trim();
-                                        if (trimmed.startsWith("auth_token=")) {
-                                            token = trimmed.substring("auth_token=".length());
-                                            break;
-                                        }
-                                    }
-                                }
-                            }
-                            if (token == null) {
-                                routingContext.fail(401);
-                                return;
-                            }
-                            final String finalToken = token;
-                            jwtAuth.authenticate(new JsonObject().put("token", finalToken), res -> {
-                                if (res.succeeded()) {
-                                    routingContext.setUser(res.result());
-                                    try {
-                                        com.auth0.jwt.interfaces.DecodedJWT decoded = com.auth0.jwt.JWT.decode(finalToken);
-                                        routingContext.put("auth0Id", decoded.getSubject());
-                                    } catch (Exception ignored) {}
-                                    routingContext.next();
-                                } else {
-                                    routingContext.fail(401);
-                                }
-                            });
-                        });
-
+                        /*
+                          Authentication now lives in RequestAuthenticator, which is a class rather
+                          than a lambda for one reason: as a lambda in the middle of this method it
+                          was the most security-critical code in the product and the only code no
+                          test could construct. It behaves identically, and the cron credential is
+                          unchanged and still checked first.
+                        */
+                        routerFactory.addSecurityHandler("bearerAuth",
+                            new RequestAuthenticator(secrets.cronSecret, sessionRepo::touch, jwtAuth));
                         Router apiRouter = routerFactory.getRouter();
                         Router router    = Router.router(vertx);
+
+                        /*
+                          ON THE SUB-ROUTER, which is the half that was missing.
+
+                          The security handler runs on apiRouter, so its failures never reached the
+                          main router's failure handler below - an anonymous request to an admin
+                          endpoint answered 401 correctly and wrote a bare
+                          "SEVERE: Unhandled exception in router" every single time, from Vert.x's
+                          own logger, with no method, no path and no stack trace.
+                        */
+                        RouterFailureLogging.install(apiRouter, "api");
 
                         // 64 KB body size limit — applied before the API sub-router
                         router.route().handler(BodyHandler.create().setBodyLimit(65_536L));
@@ -587,9 +695,9 @@ public class MainVerticle extends AbstractVerticle {
                         // Dev origin is 8081 — it must track the Vite dev server port in
                         // werkpages/vite.config.ts, which moved off 8080 so RateMyManagers'
                         // frontend can run alongside this one.
-                        String allowedOrigin = org.werkpages.config.AppEnv.current().isProduction()
-                        	    ? "https://werkpages\\.com|https://www\\.werkpages\\.com"
-                        	    : "http://localhost:8081";
+                        // One definition, tested: see AuthTokenUtils.allowedOriginPattern.
+                        String allowedOrigin = ApiOrigins
+                            .allowedOriginPattern(org.werkpages.config.AppEnv.current().isProduction());
                         
                         router.route().handler(
                             CorsHandler.create(allowedOrigin)
@@ -644,18 +752,7 @@ public class MainVerticle extends AbstractVerticle {
                           to tie it to a request, nothing to debug. This runs first, logs what is
                           actually needed, and does not interfere with the response handling below.
                         */
-                        router.route().failureHandler(ctx -> {
-                            Throwable t = ctx.failure();
-                            if (t != null) {
-                                System.err.println("⚠ Router failure on " + ctx.request().method()
-                                    + " " + ctx.request().path()
-                                    + " (status " + ctx.statusCode()
-                                    + ", responseEnded=" + ctx.response().ended() + ")");
-                                t.printStackTrace(System.err);
-                            }
-                            // Never terminate here: the handlers below own the response.
-                            ctx.next();
-                        });
+                        RouterFailureLogging.install(router, "root");
 
                         router.errorHandler(500, ctx -> {
                             Throwable t = ctx.failure();
@@ -760,17 +857,23 @@ public class MainVerticle extends AbstractVerticle {
                             .requestHandler(router)
                             .listen(httpPort)
                             .onSuccess(server -> System.out.println("✓ HTTP server started on port " + httpPort))
-                            .onFailure(err -> System.err.println("✗ Failed to start server: " + err.getMessage()));
+                            .onFailure(err -> org.werkpages.db.Database.failFast("Failed to start server", err));
 
                         startCorpusDiagnosticsListener(vertx);
 
                         }); // end Database.init onReady
                     } else {
-                        System.err.println("✗ Failed to create RouterFactory: " + routerFactoryAr.cause());
+                        org.werkpages.db.Database.failFast("Failed to create RouterFactory",
+                                                           routerFactoryAr.cause());
                     }
                 });
             } else {
-                System.err.println("✗ Failed to fetch JWKS from Auth0: " + ar.cause());
+                /*
+                  THE SAME SHRUG AS THE MIGRATION ONE, and it had already bitten us: an
+                  unreachable JWKS at boot left the process alive with no HTTP server and no
+                  retry, so every liveness check lied. Boot failures end the process.
+                */
+                org.werkpages.db.Database.failFast("Failed to fetch JWKS from Auth0", ar.cause());
             }
         });
     }

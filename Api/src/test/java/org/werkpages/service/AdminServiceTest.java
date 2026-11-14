@@ -44,6 +44,7 @@ class AdminServiceTest {
     private EditRepository         editRepo;
     private NotificationRepository notifRepo;
     private CompanyRepository      companyRepo;
+    private ManagerMergeService    mergeService;
     private AdminService           service;
 
     @BeforeEach
@@ -80,7 +81,12 @@ class AdminServiceTest {
         when(managerRepo.reslug(anyLong(), anyString())).thenReturn(Future.succeededFuture());
         when(managerRepo.findSlugs(anyLong())).thenReturn(Future.succeededFuture(Optional.empty()));
         when(managerRepo.findCurrentRoleStart(anyLong())).thenReturn(Future.succeededFuture(Optional.empty()));
-        service     = new AdminService(userRepo, managerRepo, reviewRepo, editRepo, notifRepo, companyRepo);
+        // The merge is a transaction over six tables now, so it lives in its own collaborator and
+        // is injected here as a double. What it DOES is covered against a real database by
+        // ManagerMergeIntegrationTest; what these tests still own is the orchestration around it.
+        mergeService = mock(ManagerMergeService.class);
+        service     = new AdminService(userRepo, managerRepo, reviewRepo, editRepo, notifRepo,
+                                       companyRepo, null, null, mergeService);
 
         Row adminRow = adminUserRow(ADMIN_ID);
         when(userRepo.findByAuth0IdWithBan(ADMIN_AUTH0_ID))
@@ -354,6 +360,12 @@ class AdminServiceTest {
             .thenReturn(Future.succeededFuture(Optional.of(editRow)));
         when(companyRepo.findOrCreate(anyString(), isNull(), isNull()))
             .thenReturn(Future.succeededFuture(companyRow));
+        // This edit carries no company identity and the manager has none either, so the archive
+        // and insert below now resolve one through companyIdForCareerEntry: V99 made
+        // career_history.company_id NOT NULL, and a career entry may no longer be written without
+        // an employer. The assertions are unchanged; this is the collaborator the path reaches now.
+        when(companyRepo.resolve(isNull(), anyString(), isNull(), isNull()))
+            .thenReturn(Future.succeededFuture(companyRow));
         when(managerRepo.closeOpenCareerEntry(eq(MANAGER_ID), any()))
             .thenReturn(Future.succeededFuture(0));
         when(managerRepo.insertCareerEntry(eq(MANAGER_ID), anyString(), anyString(), any(), any(), any()))
@@ -620,9 +632,8 @@ class AdminServiceTest {
     void mergeManagers_success_returnsKeepId() throws Exception {
         when(managerRepo.countExistingById(any())).thenReturn(Future.succeededFuture(2));
         when(managerRepo.isMergeable(anyLong())).thenReturn(Future.succeededFuture(true));
-        when(managerRepo.mergeInto(1L, 2L)).thenReturn(Future.succeededFuture(
+        when(mergeService.mergeManagers(eq(1L), eq(2L), any())).thenReturn(Future.succeededFuture(
             new JsonObject().put("moved", 3).put("parked", 0)));
-        when(managerRepo.mergeInlineRecalculate(1L)).thenReturn(Future.succeededFuture());
         // The merge now asks for the plain slug back once the duplicate is retired.
         when(managerRepo.reclaimBaseSlug(1L)).thenReturn(Future.succeededFuture(false));
 
@@ -634,26 +645,32 @@ class AdminServiceTest {
     @Test
     void mergeManagers_checksDependencyOrder() throws Exception {
         /*
-         * Changed deliberately. This used to verify move -> deleteByManager -> delete, which is
-         * the sequence that lost data: the move skipped reviews it could not carry and the delete
-         * then destroyed them. The moving and the removal are now one transactional repository
-         * call that refuses rather than deletes, so there is no ordering left to get wrong -
-         * what remains to check is that the merge happens before the surviving manager's cached
-         * figures are recomputed.
+         * Changed twice, deliberately, and the reason is recorded both times.
+         *
+         * It first verified move -> deleteByManager -> delete, which is the sequence that lost
+         * data: the move skipped reviews it could not carry and the delete then destroyed them.
+         * It then verified merge -> mergeInlineRecalculate, because the recalculation ran after
+         * the merge had committed.
+         *
+         * Phase 3 recalculates BOTH managers inside the merge transaction, so that second
+         * ordering no longer exists to observe, and what replaced it is stronger than an ordering
+         * between two calls. What is left to check is the ordering still load-bearing here: the
+         * merge happens before the slug is reclaimed and before the suggestion is marked
+         * resolved. Marking it earlier would hide a suggestion whose merge then refused, and the
+         * duplicate would never be offered again.
          */
         when(managerRepo.countExistingById(any())).thenReturn(Future.succeededFuture(2));
         when(managerRepo.isMergeable(anyLong())).thenReturn(Future.succeededFuture(true));
-        when(managerRepo.mergeInto(1L, 3L)).thenReturn(Future.succeededFuture(
+        when(mergeService.mergeManagers(eq(1L), eq(3L), any())).thenReturn(Future.succeededFuture(
             new JsonObject().put("moved", 0).put("parked", 0)));
-        when(managerRepo.mergeInlineRecalculate(1L)).thenReturn(Future.succeededFuture());
         // The merge now asks for the plain slug back once the duplicate is retired.
         when(managerRepo.reclaimBaseSlug(1L)).thenReturn(Future.succeededFuture(false));
 
         await(service.mergeManagers(ADMIN_AUTH0_ID, 1L, 3L));
 
-        InOrder order = inOrder(managerRepo);
-        order.verify(managerRepo).mergeInto(1L, 3L);
-        order.verify(managerRepo).mergeInlineRecalculate(1L);
+        InOrder order = inOrder(mergeService, managerRepo);
+        order.verify(mergeService).mergeManagers(eq(1L), eq(3L), any());
+        order.verify(managerRepo).reclaimBaseSlug(1L);
         verify(reviewRepo, never()).deleteByManager(anyLong());
     }
 

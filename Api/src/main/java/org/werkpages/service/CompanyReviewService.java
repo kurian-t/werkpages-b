@@ -230,6 +230,39 @@ public class CompanyReviewService {
      * publication, and a signed-in rating holding one would both block the next publication of
      * that form and make itself a target for the deletion above.
      */
+
+    /** Private drafts of signed-in contributors, for cleanup on submission. */
+    private org.werkpages.repository.ContributionDraftRepository contributionDrafts;
+
+    /**
+     * Wires in removal of the contributor's PRIVATE draft when a submission succeeds. Chainable.
+     *
+     * <p>Optional on purpose, so every existing construction site and test keeps working. Null
+     * means no cleanup, which is the behaviour before V110 existed.
+     */
+    public CompanyReviewService withContributionDrafts(org.werkpages.repository.ContributionDraftRepository repo) {
+        this.contributionDrafts = repo;
+        return this;
+    }
+
+    /**
+     * Deletes the draft a submission has just replaced, IN THE SUBMISSION'S OWN TRANSACTION.
+     *
+     * <p>Same transaction, not after it, and that is the requirement rather than a preference: a
+     * submission that fails after the draft was removed would take somebody's unfinished answers
+     * with it and give them nothing in return. Rolling back puts the draft back.
+     *
+     * <p>A draft that outlived its own published rating would be offered back as unfinished work,
+     * and resuming it would look to its author as though their rating had reverted.
+     */
+    private Future<Row> clearPrivateDraft(io.vertx.sqlclient.SqlConnection conn, Row row,
+                                          java.util.UUID ownerId, String subjectType,
+                                          long subjectId) {
+        if (contributionDrafts == null || ownerId == null) return Future.succeededFuture(row);
+        return contributionDrafts.deleteOnSubmission(conn, ownerId, subjectType, subjectId)
+            .map(v -> row);
+    }
+
     private Future<Row> writeOwnRating(long companyId, UUID userId, RatingInput input,
                                        DeclaredLocation declared, UUID draftToken) {
         return ((Pool) reviewRepo.client()).withTransaction(conn ->
@@ -237,7 +270,10 @@ public class CompanyReviewService {
                 .compose(v -> reviewRepo.upsert(conn, companyId, userId, input.overall(),
                         input.values(), input.from(), input.until(), input.author(),
                         declared, input.datesHidden(), null))
-                .compose(row -> reviewRepo.deleteAnonymousByToken(conn, draftToken).map(v -> row))
+                .compose(row -> reviewRepo.deleteAnonymousByToken(conn, draftToken, companyId).map(v -> row))
+                // The contributor's own private draft of this rating, gone in the same transaction
+                // that publishes it. A failed submission rolls this back with everything else.
+                .compose(row -> clearPrivateDraft(conn, row, userId, "company", companyId))
                 .compose(row -> drafts.clear(conn, draftToken).map(v -> row))
                 .compose(row -> drafts.repointPublished(conn, draftToken, row.getUUID("id"))
                     .map(v -> row)));
@@ -345,6 +381,60 @@ public class CompanyReviewService {
                 // the two disagree.
                 body.copy().put("companySlug", companySlug))
                 .map(v -> new JsonObject().put("captured", true)));
+    }
+
+    /**
+     * Saves whatever the rating form holds right now, while it is still being filled in.
+     *
+     * <p>The counterpart to {@code captureDraft}, which runs once at submit. This runs on a
+     * debounce every few seconds, so somebody who answers four categories and closes the tab
+     * leaves those four numbers behind rather than nothing. They are real observations and the
+     * aggregate statistics are the reason to keep them.
+     *
+     * <p><b>Meaningful progress is required</b>, and defined on this form's own fields: at least
+     * one of the ten category scores, or the overall rating. An empty form, or one holding only a
+     * date, writes nothing. Without a floor the table fills with rows describing somebody who
+     * opened a page.
+     *
+     * <p><b>Never a rating.</b> This lands in captured_drafts, which is JSONB, is never joined
+     * into an aggregate and is never served to a reader. Unanswered categories are absent keys
+     * rather than zeroes, so nothing downstream can mistake "did not answer" for "scored zero".
+     *
+     * <p>Failure is swallowed by the caller. Autosave is a courtesy to somebody mid-form and must
+     * never be the reason their typing stutters.
+     */
+    public Future<JsonObject> autosaveDraft(String companySlug, JsonObject body) {
+        if (body == null || !hasMeaningfulProgress(body)) {
+            return Future.succeededFuture(new JsonObject().put("saved", false));
+        }
+        UUID draftToken = parseUuid(body.getString("draftToken"));
+        if (draftToken == null) return Future.succeededFuture(new JsonObject().put("saved", false));
+        long revision = body.getLong("revision", 0L);
+
+        return companyRepo.findBySlug(companySlug)
+            .map(opt -> opt.map(row -> row.getLong("id")).orElse(null))
+            .compose(companyId -> drafts.autosave(
+                CapturedDraftRepository.COMPANY_RATING, companyId, null, null, draftToken,
+                body.copy().put("companySlug", companySlug), revision)
+                .map(v -> new JsonObject().put("saved", true)));
+    }
+
+    /**
+     * Whether a workplace rating form holds enough to be worth a row.
+     *
+     * <p>One category score or the overall. Deliberately NOT a universal rule across every form:
+     * an interview carries an outcome that matters on its own, and a rule written for one form
+     * would quietly discard the others' first meaningful answer.
+     */
+    static boolean hasMeaningfulProgress(JsonObject body) {
+        if (body.getDouble("overallRating") != null) return true;
+        JsonObject ratings = body.getJsonObject("ratings");
+        if (ratings == null) return false;
+        for (String category : CompanyReviewRepository.CATEGORIES) {
+            Double v = ratings.getDouble(category);
+            if (v != null && v > 0) return true;
+        }
+        return false;
     }
 
     private static UUID parseUuid(String raw) {

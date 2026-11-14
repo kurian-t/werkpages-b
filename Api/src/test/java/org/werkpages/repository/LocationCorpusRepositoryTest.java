@@ -542,4 +542,41 @@ class LocationCorpusRepositoryTest {
         assertNull(LocationCorpusRepository.statedCountry("wilmington, de"));
         assertNull(LocationCorpusRepository.statedCountry("new orleans, la"));
     }
+
+    @Test
+    @DisplayName("the place name is everything before the first comma, whatever follows it")
+    void leadingPlaceIgnoresEveryQualifier() {
+        /*
+          THE READING THE TIER GATE GETS WRONG WHEN THIS IS WRONG.
+
+          The gate asks "did somebody type a place name that geography answered?" and compares the
+          typed string against the row's label. It used to ask withoutStatedCountry(), which
+          strips a trailing country ONLY when it is three characters or more and only when
+          Countries recognises it.
+
+          So "Mumbai, IN" kept its qualifier. The gate compared "mumbai in" against
+          "Mumbai Maharashtra", found no match, concluded that no place had been named, and read
+          the 16-million-row buildings file for a query the geography index had ALREADY answered
+          correctly. Measured at 1702ms in the places tier for a lookup geography did in 7ms, and
+          the businesses it found then led the list ahead of the city.
+
+          The three cases below are exactly the ones that leaked: a two-letter country, a
+          half-typed region, and a region plus a truncated country.
+        */
+        assertEquals("Mumbai",     LocationCorpusRepository.leadingPlace("Mumbai, IN"));
+        assertEquals("Toronto",    LocationCorpusRepository.leadingPlace("Toronto, Ont"));
+        assertEquals("Kitchener",  LocationCorpusRepository.leadingPlace("Kitchener, Ontario, Ca"));
+
+        // Unqualified and already-trimmed strings must come back untouched.
+        assertEquals("Toronto",    LocationCorpusRepository.leadingPlace("Toronto"));
+        assertEquals("New York",   LocationCorpusRepository.leadingPlace("  New York  "));
+        assertNull(LocationCorpusRepository.leadingPlace(null));
+
+        /*
+          A COMMA WITH NOTHING AFTER IT is somebody mid-keystroke. It must read as the place, not
+          as a place that stated an empty qualifier.
+        */
+        assertEquals("Paris",      LocationCorpusRepository.leadingPlace("Paris,"));
+        assertEquals("Paris",      LocationCorpusRepository.leadingPlace("Paris, "));
+    }
 }

@@ -309,14 +309,26 @@ public class CompanyReviewRepository {
      *
      * @return the company whose average changed, if anything was removed
      */
-    public Future<Optional<Long>> deleteAnonymousByToken(SqlClient conn, UUID draftToken) {
+    /*
+      ISSUE 33: SCOPED TO THE SUBJECT, not to the token alone.
+
+      This used to match on draft_token by itself. The two guards were user_id IS NULL, so a real
+      person's rating could not be destroyed, and deleted_at IS NULL, so a moderator's removal
+      stayed removed. Neither said anything about which company was being rated, and this is a
+      hard DELETE: a token arriving on a submission for a different company deleted the wrong
+      publication. Adding the company makes the scope provable rather than merely improbable, and
+      it is strictly narrowing, so it cannot refuse a resolution that was already correct.
+    */
+    public Future<Optional<Long>> deleteAnonymousByToken(SqlClient conn, UUID draftToken,
+                                                        long companyId) {
         if (draftToken == null) return Future.succeededFuture(Optional.empty());
         return conn.preparedQuery("""
                 DELETE FROM company_reviews
-                 WHERE draft_token = $1 AND user_id IS NULL AND deleted_at IS NULL
+                 WHERE draft_token = $1 AND company_id = $2
+                   AND user_id IS NULL AND deleted_at IS NULL
                 RETURNING company_id
                 """)
-            .execute(Tuple.of(draftToken))
+            .execute(Tuple.of(draftToken, companyId))
             .map(rs -> rs.iterator().hasNext()
                 ? Optional.of(rs.iterator().next().getLong("company_id"))
                 : Optional.empty());

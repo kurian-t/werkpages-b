@@ -39,4 +39,37 @@ public final class ReviewSql {
     public static String live(String alias) {
         return alias + ".disposition = 'live' AND " + alias + ".deleted_at IS NULL";
     }
+
+    /**
+     * A review that counts toward genuine statistics.
+     *
+     * <p>{@link #live} plus "written by a person". A platform-generated example is a demonstration
+     * tile: it is shown, deliberately, but it contributes nothing to a manager's average, its
+     * rating count, category scores, company or industry statistics, rankings, weighted opinions,
+     * contributor participation or profile-unlocking eligibility. A manager with one example and
+     * zero genuine ratings has zero genuine ratings and no genuine average.
+     *
+     * <p><b>Why this is a fragment and not a filter applied at each call site.</b> Company and
+     * industry statistics are not computed from {@code reviews} at all - {@code
+     * company_stats_expected} aggregates {@code SUM(m.reviews_count)} and {@code
+     * AVG(m.overall_rating)} off the MANAGER cache, which {@code recalculate} writes. So excluding
+     * examples here, in the one query that feeds that cache, propagates through V89/V90's trigger
+     * machinery to every downstream projection without a single trigger function changing. Get
+     * this fragment wrong and the error reaches company stats, industry stats and rankings
+     * silently.
+     *
+     * @param alias the table alias in the calling query
+     */
+    public static String genuine(String alias) {
+        return live(alias) + " AND " + alias + ".origin = 'contributor'";
+    }
+
+    /**
+     * Only the platform-generated examples, for the surfaces that show them as demonstrations.
+     *
+     * <p>Deliberately NOT {@code NOT genuine(...)}: that would also match held and deleted rows.
+     */
+    public static String example(String alias) {
+        return live(alias) + " AND " + alias + ".origin = 'platform_example'";
+    }
 }

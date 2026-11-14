@@ -58,10 +58,43 @@ public class Database {
                 System.out.println("✓ Database pool ready");
                 if (onReady != null) onReady.run();
             } else {
-                System.err.println("✗ Database init failed: " + res.cause().getMessage());
-                res.cause().printStackTrace();
+                failFast("Database init failed", res.cause());
             }
         });
+    }
+
+    /**
+     * How the process leaves when startup cannot complete.
+     *
+     * <p>Replaceable <b>only</b> so a regression test can observe the decision instead of killing
+     * the JVM that is asserting on it. Nothing in production ever reassigns it.
+     */
+    static java.util.function.IntConsumer exitProcess = System::exit;
+
+    /**
+     * Startup failed. Say why, and LEAVE.
+     *
+     * <p><b>This used to print and carry on,</b> and that was the single most dangerous line in
+     * the deployment. The HTTP server is constructed inside {@code init}'s success callback, so a
+     * failed migration produced a process that was alive, listening on nothing, and holding a
+     * stack trace nobody was watching. {@code docker compose up -d} reported success, a
+     * process-liveness check passed, and the deploy looked clean while the service was entirely
+     * absent. A container that is wrong must die so that something notices.
+     *
+     * <p>It is deliberately the same exit for every boot failure - migrations, JWKS, the router
+     * factory, the listen call - because they share the consequence. One place owns "boot failed"
+     * rather than four places each deciding to shrug.
+     *
+     * <p>The streams are flushed first. {@code System.exit} does not flush them for you, and a
+     * diagnosis that never reached the log is the same as no diagnosis.
+     */
+    public static void failFast(String what, Throwable cause) {
+        System.err.println("✗ " + what + ": "
+            + (cause == null ? "(no cause reported)" : String.valueOf(cause.getMessage())));
+        if (cause != null) cause.printStackTrace();
+        System.out.flush();
+        System.err.flush();
+        exitProcess.accept(1);
     }
 
     public static SqlClient getClient() {

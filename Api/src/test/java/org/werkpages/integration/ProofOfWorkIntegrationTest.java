@@ -48,6 +48,7 @@ class ProofOfWorkIntegrationTest {
     static ConfidenceRepository     confidence;
     static UserRepository           users;
     static ManagerRepository        managers;
+    static org.werkpages.service.ManagerMergeService merges;
 
     @BeforeAll
     static void setUpAll() {
@@ -65,13 +66,16 @@ class ProofOfWorkIntegrationTest {
         confidence = new ConfidenceRepository(pool);
         users      = new UserRepository(pool, null);
         managers   = new ManagerRepository(pool);
+        merges     = new org.werkpages.service.ManagerMergeService(pool);
     }
 
     @BeforeEach
     void cleanDb() throws Exception {
         await(pool.query(
             "TRUNCATE manager_proof_challenges, high_profile_figures, user_confidence_events, "
-            + "reviews, managers, companies, users CASCADE").execute().mapEmpty());
+            // capture_attempts and managers reference each other, so they are named together
+            // rather than left to CASCADE to decide.
+            + "reviews, capture_attempts, managers, companies, users CASCADE").execute().mapEmpty());
     }
 
     @AfterAll
@@ -611,7 +615,7 @@ class ProofOfWorkIntegrationTest {
         await(pool.preparedQuery("UPDATE reviews SET deleted_at = now(), user_id = NULL WHERE id = $1")
             .execute(Tuple.of(softDeleted)).mapEmpty());
 
-        assertEquals(2, await(managers.mergeInto(keep, dup)).getInteger("moved"), "both reviews move");
+        assertEquals(2, merge(keep, dup).getInteger("moved"), "both reviews move");
 
         Long onKeep = await(pool.preparedQuery("SELECT COUNT(*) AS c FROM reviews WHERE manager_id = $1")
             .execute(Tuple.of(keep)).map(rows -> rows.iterator().next().getLong("c")));
@@ -639,23 +643,51 @@ class ProofOfWorkIntegrationTest {
         insertReview(keep, author);   // same author, same company and title
         insertReview(dup,  author);
 
-        // The count is reported, so an admin can be told a review was set aside rather than
+        // The count is reported, so an admin can be told a rating was set aside rather than
         // watching one disappear.
-        io.vertx.core.json.JsonObject counts = await(managers.mergeInto(keep, dup));
+        io.vertx.core.json.JsonObject counts = merge(keep, dup);
         assertEquals(1, counts.getInteger("parked"), "the collision is reported, not silent");
 
-        Long onKeep = await(pool.preparedQuery(
-                "SELECT COUNT(*) AS c FROM reviews WHERE manager_id = $1 AND weight = FALSE")
-            .execute(Tuple.of(keep)).map(rows -> rows.iterator().next().getLong("c")));
-        assertEquals(1L, onKeep, "one opinion, stated once");
+        /*
+          REWRITTEN IN PHASE 3, because the behaviour it pinned was itself the defect.
+          The old assertions were:
 
-        // And the losing copy is soft-deleted, not destroyed. A review somebody wrote is only
-        // ever marked deleted; the row survives, which is also why the merged-away manager is
-        // kept rather than deleted - deleting it would cascade and take this with it.
-        Long parked = await(pool.preparedQuery(
-                "SELECT COUNT(*) AS c FROM reviews WHERE manager_id = $1 AND deleted_at IS NOT NULL")
+              onKeep == 1    one opinion, stated once
+              parked == 1    counted as "manager_id = dup AND deleted_at IS NOT NULL" - that is,
+                             the loser STAYS on the absorbed profile, SOFT-DELETED
+
+          Rev 268 names that as the serious failure: "a parked review is a real opinion taken out
+          of public view by a conflict nobody was shown". A soft-deleted rating is invisible
+          everywhere, counts nowhere, and nothing records what it collided with.
+
+          Now both contributions are preserved. The loser MOVES to the survivor with everything
+          else, is HELD rather than deleted, is marked merge_duplicate_of naming the rating it
+          collided with, and carries legacy_dedup_state 'held_duplicate' - which is what takes it
+          out of the narrowed legacy unique index while keeping the row. A moderator then either
+          confirms the duplicate or answers 'cleared_distinct' and publishes it, because a shared
+          display name is not proof of one person.
+        */
+        Long liveOnKeep = await(pool.preparedQuery(
+                "SELECT COUNT(*) AS c FROM reviews WHERE manager_id = $1 AND weight = FALSE "
+                + "AND disposition = 'live'")
+            .execute(Tuple.of(keep)).map(rows -> rows.iterator().next().getLong("c")));
+        assertEquals(1L, liveOnKeep, "one opinion is public, stated once");
+
+        Row loser = await(pool.preparedQuery(
+                "SELECT manager_id, disposition, deleted_at, merge_duplicate_of, "
+                + "legacy_dedup_state FROM reviews "
+                + "WHERE manager_id = $1 AND weight = FALSE AND disposition = 'held'")
+            .execute(Tuple.of(keep)).map(rows -> rows.iterator().next()));
+        assertEquals(keep, loser.getLong("manager_id"), "the loser moved with everything else");
+        assertNull(loser.getOffsetDateTime("deleted_at"), "and it is NOT deleted");
+        assertNotNull(loser.getUUID("merge_duplicate_of"), "it names what it collided with");
+        assertEquals("held_duplicate", loser.getString("legacy_dedup_state"),
+            "which is the mark that excludes it from the legacy unique index");
+
+        Long leftBehind = await(pool.preparedQuery(
+                "SELECT COUNT(*) AS c FROM reviews WHERE manager_id = $1")
             .execute(Tuple.of(dup)).map(rows -> rows.iterator().next().getLong("c")));
-        assertEquals(1L, parked, "the duplicate is soft-deleted, and still there");
+        assertEquals(0L, leftBehind, "nothing is left stranded on the absorbed profile");
 
         Row merged = await(pool.preparedQuery(
                 "SELECT approval_status, merged_into FROM managers WHERE id = $1")
@@ -751,20 +783,27 @@ class ProofOfWorkIntegrationTest {
     }
 
     @Test
-    void submittingAdoptsTheCaptureLeftBehindInsteadOfFilingASecondPerson() throws Exception {
+    void submittingAdoptsTheCaptureItsOwnAttemptLeftBehindInsteadOfFilingASecondPerson() throws Exception {
         /*
          * One attempt to add a manager produced two rows: the capture the form posts when step one
          * is valid, under a prefix of the company ("Mi"), and the submission that followed under
          * the finished name ("Microsoft"). Two managers, one person, differing only by how much had
          * been typed when the capture fired.
+         *
+         * PHASE 1 changed WHICH ROW is adopted, not that one is. This test used to call
+         * adoptCapture("Eddie Junior", "Microsoft", "Director", submitter, full) and let the
+         * repository find the row by description. The attempt's token identifies it now.
          */
         long partial = insertCompany("Mi");
         long full    = insertCompany("Microsoft");
-        Row capture = await(managers.createCapturedDraft(
-            "Eddie Junior", "Mi", "Engineer", "US", null, null, null, partial));
+        UUID token   = anAttempt();
+        Row capture = await(managers.insertCapturedDraft(null,
+            "Eddie Junior", "Mi", "Engineer", "US", null, null, null, partial,
+            "eddie-junior-pending", token));
+        await(linkAttempt(token, capture.getLong("id")));
         UUID submitter = insertUser("auth0|adopt-capture");
 
-        var adopted = await(managers.adoptCapture("Eddie Junior", "Microsoft", "Director", submitter, full));
+        var adopted = await(managers.adoptCaptureByToken(token, "Microsoft", "Director", submitter, full));
 
         assertTrue(adopted.isPresent(), "the capture is adopted, not left behind");
         assertEquals(capture.getLong("id"), adopted.get().getLong("id"), "same row, updated");
@@ -779,15 +818,51 @@ class ProofOfWorkIntegrationTest {
 
     @Test
     void adoptionWillNotSwallowADifferentPersonSharingAName() throws Exception {
-        // Tight on purpose: same name, captured company a prefix of the submitted one, still
-        // unsubmitted, and recent. A capture at an unrelated company is somebody else.
-        long other = insertCompany("Trellis Health");
-        await(managers.createCapturedDraft(
-            "Eddie Junior", "Trellis Health", "Nurse", "US", null, null, null, other));
+        /*
+         * PHASE 1 made this stronger, and the previous version of it is worth keeping in view.
+         *
+         * It used to assert that a capture at an UNRELATED company was not adopted - "different
+         * company, different person" - because the old predicate required the captured company to
+         * be a prefix of the submitted one. That left the case it could not see: a namesake
+         * captured at a company whose name DOES start the same way, which satisfied every clause
+         * and was adopted.
+         *
+         * Neither is adopted now, and for the same reason: this submission's attempt did not
+         * create either row. The lookalike at "Micro" is the case the old predicate got wrong.
+         */
+        long unrelated = insertCompany("Trellis Health");
+        await(managers.insertCapturedDraft(null,
+            "Eddie Junior", "Trellis Health", "Nurse", "US", null, null, null, unrelated,
+            "eddie-junior-pending", null));
 
-        var adopted = await(managers.adoptCapture("Eddie Junior", "Microsoft", "Director",
+        long lookalike = insertCompany("Micro");
+        UUID strangers = anAttempt();
+        Row strangersDraft = await(managers.insertCapturedDraft(null,
+            "Eddie Junior", "Micro", "Engineer", "US", null, null, null, lookalike,
+            "eddie-junior-pending-2", strangers));
+        await(linkAttempt(strangers, strangersDraft.getLong("id")));
+
+        var adopted = await(managers.adoptCaptureByToken(anAttempt(), "Microsoft", "Director",
             insertUser("auth0|adopt-nomatch"), insertCompany("Microsoft Corp")));
-        assertTrue(adopted.isEmpty(), "different company, different person");
+        assertTrue(adopted.isEmpty(), "a different attempt's draft is a different attempt's draft");
+
+        assertNull(await(pool.preparedQuery("SELECT submitted_by FROM managers WHERE id = $1")
+                .execute(Tuple.of(strangersDraft.getLong("id")))
+                .map(r -> r.iterator().next().getUUID("submitted_by"))),
+            "and the lookalike the old predicate would have taken is untouched");
+    }
+
+    /** A claimed attempt with nothing linked to it yet. */
+    private UUID anAttempt() throws Exception {
+        UUID token = UUID.randomUUID();
+        await(pool.preparedQuery("INSERT INTO capture_attempts (token) VALUES ($1)")
+            .execute(Tuple.of(token)).mapEmpty());
+        return token;
+    }
+
+    private Future<Void> linkAttempt(UUID token, long managerId) {
+        return pool.preparedQuery("UPDATE capture_attempts SET manager_id = $2 WHERE token = $1")
+            .execute(Tuple.of(token, managerId)).mapEmpty();
     }
 
     @Test
@@ -920,7 +995,7 @@ class ProofOfWorkIntegrationTest {
         await(pool.preparedQuery("UPDATE managers SET approval_status = 'approved' WHERE id IN ($1, $2)")
             .execute(Tuple.of(keep, gone)).mapEmpty());
 
-        await(managers.mergeInto(keep, gone));
+        merge(keep, gone);
 
         assertEquals(keep, await(managers.findByIdFollowingMerges(gone)).orElseThrow().getLong("id"),
             "the old id lands on the surviving manager");
@@ -936,7 +1011,7 @@ class ProofOfWorkIntegrationTest {
         String oldSlug = await(pool.preparedQuery("SELECT slug FROM managers WHERE id = $1")
             .execute(Tuple.of(gone)).map(r -> r.iterator().next().getString("slug")));
 
-        await(managers.mergeInto(keep, gone));
+        merge(keep, gone);
 
         assertEquals(keep, await(managers.findBySlugFollowingMerges(oldSlug)).orElseThrow().getLong("id"),
             "a bookmarked URL still reaches the person");
@@ -952,8 +1027,8 @@ class ProofOfWorkIntegrationTest {
         await(pool.preparedQuery("UPDATE managers SET approval_status = 'approved' WHERE id IN ($1,$2,$3)")
             .execute(Tuple.of(finalKeep, middle, first)).mapEmpty());
 
-        await(managers.mergeInto(middle, first));
-        await(managers.mergeInto(finalKeep, middle));
+        merge(middle, first);
+        merge(finalKeep, middle);
 
         assertEquals(finalKeep, await(managers.findByIdFollowingMerges(first)).orElseThrow().getLong("id"),
             "two merges deep still resolves");
@@ -1704,7 +1779,11 @@ class ProofOfWorkIntegrationTest {
             users, managers, new org.werkpages.repository.ReviewRepository(pool), null,
             new org.werkpages.repository.NotificationRepository(pool),
             new org.werkpages.repository.CompanyRepository(pool),
-            new org.werkpages.repository.MergeSuggestionsRepository(pool));
+            new org.werkpages.repository.MergeSuggestionsRepository(pool),
+            // The pool, which this used to leave out. A merge is a transaction over six tables
+            // now, so AdminService builds its ManagerMergeService from the client, and without
+            // one the merge reports that it cannot run rather than half-doing it.
+            pool);
     }
 
     @Test
@@ -1776,6 +1855,17 @@ class ProofOfWorkIntegrationTest {
 
     private static <T> T await(Future<T> f) throws Exception {
         return f.toCompletionStage().toCompletableFuture().get(30, TimeUnit.SECONDS);
+    }
+
+    /**
+     * A merge, as an administrator.
+     *
+     * <p>{@code manager_merge_events.merged_by} is NOT NULL and references {@code users}, so every
+     * merge is attributable to somebody. That is the point of the table.
+     */
+    private io.vertx.core.json.JsonObject merge(long keep, long gone) throws Exception {
+        UUID admin = insertUser("auth0|merge-admin-" + keep + "-" + gone);
+        return await(merges.mergeManagers(keep, gone, admin));
     }
 
     private UUID insertUser(String auth0Id) throws Exception {

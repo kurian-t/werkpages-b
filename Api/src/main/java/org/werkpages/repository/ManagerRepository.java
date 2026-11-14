@@ -104,9 +104,60 @@ public class ManagerRepository {
                         ),
                         'managerCompany', manager_company, 'managerTitle', manager_title,
                         'text', text, 'verified', verified, 'helpfulCount', helpful_count,
-                        'createdAt', created_at, 'workedFrom', worked_from, 'workedUntil', worked_until
-                    ) ORDER BY created_at DESC) AS reviews
-                FROM reviews WHERE deleted_at IS NULL GROUP BY manager_id
+                        'createdAt', created_at, 'workedFrom', worked_from, 'workedUntil', worked_until,
+                        /*
+                          Whether this one is public yet, so the page can say so and put it first.
+                          Without it the client had no way to tell a published review from one
+                          waiting on a moderator, and sorted them as though they were the same.
+                        */
+                        'published', (disposition = 'live'),
+                        /*
+                          WHETHER THIS ONE IS A PLATFORM EXAMPLE, which the client needs and was
+                          never sent.
+
+                          `isExample` was produced in exactly one place, ManagerService's row
+                          mapper, and the profile does not go through it: the reviews array is
+                          built here, by this json_agg, which projected no provenance at all. So
+                          every example arrived at the browser indistinguishable from a genuine
+                          rating, and the label the client renders for one could never appear on a
+                          profile. The feature was complete on both sides and disconnected in the
+                          middle.
+
+                          THE WEIGHT PAIR, NOT `origin`, and the choice is about deployability
+                          rather than taste. `origin` is the durable classification and the row
+                          mapper rightly prefers it, but that column ARRIVES WITH V106: this is raw
+                          SQL in the profile query, so naming a column that does not exist yet does
+                          not fail closed to false the way the mapper does, it fails the entire
+                          manager profile endpoint. `weight` and `user_id` predate V106, are never
+                          written after insert anywhere in either product, and select exactly the
+                          same rows, because V106's own backfill classified precisely the set
+                          `user_id IS NULL AND weight = TRUE`.
+                        */
+                        'isExample', (weight AND user_id IS NULL)
+                    /*
+                      UNPUBLISHED FIRST, then newest to oldest.
+
+                      The one somebody is waiting on is the one they came back to look at. After
+                      that, recency. FALSE sorts before TRUE in Postgres, so ordering on the
+                      published flag ascending puts the held ones on top without a CASE.
+                    */
+                    ) ORDER BY (disposition = 'live'), created_at DESC) AS reviews
+                FROM reviews
+                /*
+                  LIVE FOR EVERYONE, PLUS THE VIEWER'S OWN.
+
+                  This filtered on deleted_at alone, so every held and rejected review on a profile
+                  - including other people's, with their text - was served to anyone who asked.
+                  Every other surface in this codebase goes through ReviewSql.live; this one was
+                  the exception, and nothing in the client was hiding them either.
+
+                  A contributor still sees their OWN unpublished review, which is the thing they
+                  came back to check on. $2 is their user id, null when nobody is signed in.
+                */
+                 WHERE deleted_at IS NULL
+                   AND (disposition = 'live'
+                        OR ($2::uuid IS NOT NULL AND user_id = $2::uuid))
+                 GROUP BY manager_id
             ) r ON r.manager_id = m.id
             WHERE m.id = $1
             LIMIT 1
@@ -137,17 +188,51 @@ public class ManagerRepository {
             LEFT JOIN career_history ch ON ch.manager_id = m.id
             """;
 
-    private final SqlClient db;
+    /**
+     * A Pool rather than a SqlClient, because three of the career writes below must be
+     * transactional with the status resolution that follows them.
+     *
+     * <p>{@code Database.getPool()} exists for exactly this: "the few callers that need a
+     * connection rather than a query". An accepted employment committed with an unresolved status
+     * is the drift the reconciliation query hunts for, and creating it one statement at a time
+     * would be manufacturing the thing being guarded against.
+     */
+    private final Pool db;
 
-    public ManagerRepository(SqlClient db) {
+    public ManagerRepository(Pool db) {
         this.db = db;
     }
 
     // ── Read ──────────────────────────────────────────────────────────────────
 
     public Future<Optional<Row>> findById(long id) {
+        return findById(id, null);
+    }
+
+    /**
+     * The profile, with the reviews this VIEWER may see.
+     *
+     * @param viewerId the signed-in user, or null. Their own unpublished reviews come back; nobody
+     *                 else's ever do.
+     */
+    public Future<Optional<Row>> findById(long id, UUID viewerId) {
+        /*
+          BUILT EXPLICITLY, because Tuple.of(id, viewerId) did not survive a null viewer.
+
+          GET_BY_ID_SQL takes two parameters; with no signed-in viewer the driver was handed a
+          tuple of ONE and refused the query:
+
+              The number of parameters to execute should be consistent with the expected number
+              of parameters = [2] but the actual number is [1]
+
+          Which is every anonymous visit to a manager profile, by id or by slug. Caught by
+          SlugIntegrationTest and CareerHistoryAdminIntegrationTest, which were red.
+
+          addUUID(null) keeps the arity at two and tells the driver the column's type, so there is
+          no overload resolution to reason about and no untyped null to infer.
+        */
         return db.preparedQuery(GET_BY_ID_SQL)
-            .execute(Tuple.of(id))
+            .execute(Tuple.tuple().addLong(id).addUUID(viewerId))
             .map(rows -> {
                 Iterator<Row> it = rows.iterator();
                 return it.hasNext() ? Optional.of(it.next()) : Optional.empty();
@@ -178,19 +263,29 @@ public class ManagerRepository {
 
     /** {@link #findById}, but an id that was merged away resolves to the manager it was merged into. */
     public Future<Optional<Row>> findByIdFollowingMerges(long id) {
+        return findByIdFollowingMerges(id, null);
+    }
+
+    /** {@link #findByIdFollowingMerges(long)}, showing this viewer their own unpublished reviews. */
+    public Future<Optional<Row>> findByIdFollowingMerges(long id, UUID viewerId) {
         return db.preparedQuery(RESOLVE_MERGE_SQL.formatted("id = $1"))
             .execute(Tuple.of(id))
             .compose(rows -> rows.iterator().hasNext()
-                ? findById(rows.iterator().next().getLong("id"))
+                ? findById(rows.iterator().next().getLong("id"), viewerId)
                 : Future.succeededFuture(Optional.empty()));
     }
 
     /** {@link #findBySlug}, but a slug that was merged away resolves to the surviving manager. */
     public Future<Optional<Row>> findBySlugFollowingMerges(String slug) {
+        return findBySlugFollowingMerges(slug, null);
+    }
+
+    /** {@link #findBySlugFollowingMerges(String)}, with this viewer's own unpublished reviews. */
+    public Future<Optional<Row>> findBySlugFollowingMerges(String slug, UUID viewerId) {
         return db.preparedQuery(RESOLVE_MERGE_SQL.formatted("slug = $1"))
             .execute(Tuple.of(slug))
             .compose(rows -> rows.iterator().hasNext()
-                ? findById(rows.iterator().next().getLong("id"))
+                ? findById(rows.iterator().next().getLong("id"), viewerId)
                 : Future.succeededFuture(Optional.empty()));
     }
 
@@ -395,7 +490,7 @@ public class ManagerRepository {
     public Future<RowSet<Row>> findGhostForAdmin(int limit, int offset) {
         return db.preparedQuery("""
                 SELECT m.id, m.name, m.company, m.title, m.image, m.overall_rating,
-                       m.reviews_count, m.created_at, m.company_logo_url
+                       m.reviews_count, m.created_at, m.company_logo_url, m.company_id
                 FROM managers m
                 WHERE m.approval_status = 'ghost'
                 ORDER BY m.created_at DESC
@@ -419,6 +514,10 @@ public class ManagerRepository {
     public Future<RowSet<Row>> findPendingForAdmin(int limit, int offset) {
         return db.preparedQuery("""
                 SELECT m.id, m.name, m.company, m.title, m.image, m.created_at,
+                       -- THE COMPANY'S OWN IDENTITY, so the edit form can show its logo.
+                       -- Only the NAME was selected, so re-opening an edit had nothing to render
+                       -- but an initial, and a logo an admin had just changed was invisible here.
+                       m.company_id, m.company_logo_url,
                        u.username AS submitted_by_username,
                        (m.search_created_by_user_id IS NOT NULL OR m.submitted_by IS NULL) AS is_auto_created,
                        -- Where the manager works, so the queue can show it and an admin can fix it.
@@ -556,123 +655,26 @@ public class ManagerRepository {
                 : Optional.empty());
     }
 
-    /**
-     * Merges one manager into another, or refuses. Never destroys a review.
-     *
-     * <p>What this replaces did three things wrong at once. It moved whatever it could, threw away
-     * the count of what it had moved, then ran {@code DELETE FROM reviews WHERE manager_id = ...}
-     * over the remainder - so every review the move had skipped was destroyed, silently, with no
-     * transaction and no undo. Soft-deleted reviews were the sharpest case: those are waiting out
-     * the three-day restore window, so a merge quietly deleted reviews that were coming back.
-     *
-     * <p>Now a review can only disappear if it is a synthetic placeholder, or a provable duplicate
-     * of one already on the surviving manager - same person, same role - which the unique role
-     * indexes forbid keeping twice and which says nothing the survivor does not already say.
-     * Anything else this code cannot account for rolls the whole merge back, because a refusal an
-     * admin can act on beats a deletion nobody can undo.
-     *
-     * <p>One transaction, so a half-merged manager is not a state this can end in.
-     *
-     * @return {@code {moved, parked}} - what came across, and what could not and was set aside.
-     *         The caller has to be able to say so: a merge that silently picks a winner between
-     *         two reviews looks exactly like a merge that lost one.
-     */
-    public Future<io.vertx.core.json.JsonObject> mergeInto(long keepId, long mergeId) {
-        return ((io.vertx.sqlclient.Pool) db).withTransaction(conn ->
-            // Soft-deleted reviews move too. They belong to the surviving manager, and the restore
-            // job will bring them back there.
-            conn.preparedQuery("""
-                    UPDATE reviews SET manager_id = $1
-                    WHERE manager_id = $2
-                      -- Two unique indexes guard a role, not one: the same role on the same
-                      -- manager is unique per user_id AND per author name. Checking only the
-                      -- first is what let a merge die on a raw constraint violation instead of
-                      -- refusing cleanly - and a soft-deleted review has its user_id cleared, so
-                      -- the author name is the only thing left that identifies it at all.
-                      AND NOT EXISTS (
-                          SELECT 1 FROM reviews t
-                          WHERE t.manager_id = $1
-                            AND t.weight = FALSE AND reviews.weight = FALSE
-                            AND LOWER(TRIM(COALESCE(t.manager_company, ''))) = LOWER(TRIM(COALESCE(reviews.manager_company, '')))
-                            AND LOWER(TRIM(COALESCE(t.manager_title, '')))   = LOWER(TRIM(COALESCE(reviews.manager_title, '')))
-                            AND (
-                                (t.user_id IS NOT NULL AND t.user_id = reviews.user_id)
-                                OR LOWER(TRIM(t.author)) = LOWER(TRIM(reviews.author))
-                            )
-                      )
-                      AND (weight = FALSE OR NOT EXISTS (
-                          SELECT 1 FROM reviews WHERE manager_id = $1 AND weight = TRUE
-                      ))
-                    """)
-                .execute(Tuple.of(keepId, mergeId))
-                .compose(moved -> conn.preparedQuery("""
-                        -- Seeded placeholders are removed outright: weight = TRUE with no author,
-                        -- written to fill an empty profile, nobody's contribution.
-                        DELETE FROM reviews r
-                        WHERE r.manager_id = $1 AND r.weight = TRUE AND r.user_id IS NULL
-                        """)
-                    .execute(Tuple.of(mergeId))
-                    .compose(ignored -> conn.preparedQuery("""
-                        -- Everything a person wrote is soft-deleted, never removed.
-                        --
-                        -- These are the true duplicates: the surviving manager already holds a
-                        -- review of the same role by the same person, and the unique role indexes
-                        -- forbid holding two, so this one cannot follow it across. It stays here,
-                        -- on the merged-away row, marked deleted - which is why that row is now
-                        -- kept rather than deleted. Deleting it would cascade and destroy this.
-                        UPDATE reviews r
-                        SET deleted_at = now()
-                        WHERE r.manager_id = $2
-                          AND r.deleted_at IS NULL
-                          AND EXISTS (
-                                  SELECT 1 FROM reviews t
-                                  WHERE t.manager_id = $1
-                                    AND t.weight = FALSE AND r.weight = FALSE
-                                    AND LOWER(TRIM(COALESCE(t.manager_company, ''))) = LOWER(TRIM(COALESCE(r.manager_company, '')))
-                                    AND LOWER(TRIM(COALESCE(t.manager_title, '')))   = LOWER(TRIM(COALESCE(r.manager_title, '')))
-                                    AND (
-                                        (t.user_id IS NOT NULL AND t.user_id = r.user_id)
-                                        OR LOWER(TRIM(t.author)) = LOWER(TRIM(r.author))
-                                    )
-                          )
-                        """)
-                    .execute(Tuple.of(keepId, mergeId)))
-                    .compose(parked -> conn.preparedQuery(
-                            "SELECT COUNT(*) AS remaining FROM reviews "
-                            + "WHERE manager_id = $1 AND deleted_at IS NULL")
-                        .execute(Tuple.of(mergeId))
-                        .map(rows -> new Object[]{ rows, parked.rowCount() }))
-                    .compose(pair -> {
-                        @SuppressWarnings("unchecked")
-                        RowSet<Row> rows = (RowSet<Row>) pair[0];
-                        int parkedCount  = (int) pair[1];
-                        long remaining = rows.iterator().next().getLong("remaining");
-                        if (remaining > 0) {
-                            // Rolls the whole thing back. The duplicate keeps its reviews and the
-                            // admin gets a sentence explaining why, instead of a silent loss.
-                            // Nothing should reach here: everything either moved or was a
-                            // placeholder or a provable duplicate. If something does, it is a
-                            // review this code cannot account for, and the honest response is to
-                            // roll the merge back rather than delete data it does not understand.
-                            return Future.failedFuture(new IllegalStateException(
-                                remaining + " review(s) on the duplicate could not be moved and are"
-                                + " not duplicates of anything on the manager you are keeping."
-                                + " The merge was cancelled so nothing is lost."));
-                        }
-                        // Kept, not deleted. The cascade on reviews.manager_id is exactly what
-                        // used to destroy the reviews that could not move, and 'rejected' is
-                        // already filtered out of every public surface.
-                        return conn.preparedQuery("""
-                                UPDATE managers
-                                SET approval_status = 'rejected', merged_into = $2, updated_at = now()
-                                WHERE id = $1
-                                """)
-                            .execute(Tuple.of(mergeId, keepId))
-                            .map(ignored -> new io.vertx.core.json.JsonObject()
-                                .put("moved", moved.rowCount())
-                                .put("parked", parkedCount));
-                    })));
-    }
+    /*
+      mergeInto lived here until phase 3 and is deliberately GONE rather than deprecated.
+
+      It repointed reviews.manager_id at the survivor, soft-deleted whatever would collide on
+      company, title and user-or-author, and touched career_history zero times. Two things make
+      keeping it unacceptable rather than merely redundant:
+
+        - it took real opinions out of public view over a collision nobody was shown, which is
+          the defect rev 268 names;
+        - it becomes UNSAFE the moment any rating carries a claim. reviews_claim_is_the_managers
+          is DEFERRABLE INITIALLY IMMEDIATE, so moving a rating without moving its claim and its
+          role is refused outright by the database.
+
+      The whole operation now lives in ManagerMergeService, which moves the employment history
+      and the claims, canonicalizes equivalent roles with an audit, holds and marks duplicate
+      contributions instead of deleting them, folds the absorbed profile's moderation tasks, and
+      recalculates both managers - in one transaction. mergeInlineRecalculate went with it: it was
+      a merge helper, and the merge now recalculates on its own connection inside the transaction
+      rather than afterwards and only for the survivor.
+    */
 
     /**
      * Removes a manager, keeping every review a person wrote.
@@ -870,20 +872,37 @@ public class ManagerRepository {
 
     public Future<Void> insertCareerEntry(long managerId, String company, String title,
                                            OffsetDateTime startDate, OffsetDateTime endDate, Long companyId) {
-        return db.preparedQuery("""
+        // The row and its employment status in ONE transaction. A career entry carrying an end
+        // date IS ended employment the moment it exists, and nothing downstream has to remember
+        // to say so.
+        return db.withTransaction(tx -> tx.preparedQuery("""
                 INSERT INTO career_history(manager_id, company, title, start_date, end_date, company_id)
                 VALUES ($1, $2, $3, $4, $5, $6)
+                RETURNING id
                 """)
             .execute(Tuple.of(managerId, company, title, startDate, endDate, companyId))
-            .mapEmpty();
+            .compose(rs -> EmploymentStatusResolver.resolveRole(
+                tx, rs.iterator().next().getLong("id"))));
     }
 
     public Future<Integer> closeOpenCareerEntry(long managerId, OffsetDateTime endDate) {
         // Only close entries whose start_date <= endDate to avoid violating the CHECK (end_date >= start_date) constraint.
         // If the current open entry started after endDate (e.g. inserting a historical position), it stays open.
-        return db.preparedQuery("UPDATE career_history SET end_date = $1 WHERE manager_id = $2 AND end_date IS NULL AND start_date <= $1")
+        // RETURNING id, because this closes however many entries were open and every one of
+        // them has just become ended employment. Resolving the rows it actually touched beats
+        // resolving the manager: it is the same work for one row and less for the common case.
+        return db.withTransaction(tx -> tx.preparedQuery(
+                "UPDATE career_history SET end_date = $1 WHERE manager_id = $2 "
+                + "AND end_date IS NULL AND start_date <= $1 RETURNING id")
             .execute(Tuple.of(endDate, managerId))
-            .map(RowSet::rowCount);
+            .compose(rs -> {
+                Future<Void> chain = Future.succeededFuture();
+                for (Row r : rs) {
+                    long id = r.getLong("id");
+                    chain = chain.compose(v -> EmploymentStatusResolver.resolveRole(tx, id));
+                }
+                return chain.map(v -> rs.rowCount());
+            }));
     }
 
     /**
@@ -957,14 +976,21 @@ public class ManagerRepository {
     public Future<Integer> updateCareerEntry(long entryId, long managerId, String company, String title,
                                               OffsetDateTime startDate, OffsetDateTime endDate,
                                               Long companyId) {
-        return db.preparedQuery("""
+        // An edit can set an end date, change one, or clear one, and the stored status follows
+        // the record in all three cases. Clearing one is the case worth naming: without the
+        // resolution the row would go on asserting that employment finished.
+        return db.withTransaction(tx -> tx.preparedQuery("""
                 UPDATE career_history
                 SET company = $3, title = $4, start_date = $5, end_date = $6,
                     company_id = COALESCE($7::BIGINT, company_id), updated_at = now()
                 WHERE id = $1 AND manager_id = $2
+                RETURNING id
                 """)
             .execute(Tuple.of(entryId, managerId, company, title, startDate, endDate, companyId))
-            .map(RowSet::rowCount);
+            .compose(rs -> rs.rowCount() == 0
+                ? Future.succeededFuture(0)
+                : EmploymentStatusResolver.resolveRole(tx, rs.iterator().next().getLong("id"))
+                    .map(v -> rs.rowCount())));
     }
 
     /**
@@ -1116,7 +1142,20 @@ public class ManagerRepository {
         );
     }
 
+    /**
+     * The manager's cached rating and count, recomputed on a connection the caller chooses.
+     *
+     * <p>{@code on} is the pool for every form path, which is what this always used. It is the
+     * CALLER'S CONNECTION when the recomputation must happen inside a transaction that is still
+     * open: the admin queue writes a review and then recalculates, and doing the second half on a
+     * different connection waits for locks the first half is still holding. The symptom was not an
+     * error but a hang, and then every later test timing out on TRUNCATE.
+     */
     public Future<Void> recalculate(long managerId) {
+        return recalculate(db, managerId);
+    }
+
+    public Future<Void> recalculate(io.vertx.sqlclient.SqlClient on, long managerId) {
         String recalcSql = """
             SELECT
                 COUNT(*)::INTEGER AS reviews_count,
@@ -1137,16 +1176,36 @@ public class ManagerRepository {
             -- predicate comes from ReviewSql rather than being retyped at each site.
             FROM reviews r
             WHERE
-            """ + ReviewSql.live("r") + """
+            """ + ReviewSql.genuine("r") + """
               AND manager_id = $1
-              -- Same filter the review list and count use. Without it the cached reviews_count and
-              -- overall_rating kept counting placeholder reviews whose 14-day weight had expired,
-              -- while the list below them had already stopped showing those reviews. The number on
-              -- the card and the reviews on the page were answering different questions.
-              AND (weight = FALSE OR weight_expires_on IS NULL OR weight_expires_on > CURRENT_DATE)
             """;
+        /*
+          GENUINE, NOT live. The weight/expiry clause that used to be here is GONE, and both
+          changes are the same decision.
 
-        return db.preparedQuery(recalcSql)
+          It read:
+              AND (weight = FALSE OR weight_expires_on IS NULL OR weight_expires_on > CURRENT_DATE)
+
+          which counted a platform-generated seed toward the manager's cached average and count
+          while its weighting window was open, then stopped. That was the mechanism that put a
+          rating on a brand-new ghost manager's tile. An example must now contribute nothing, ever,
+          so the exclusion is by provenance and the window is irrelevant: a row is either a
+          person's rating or it is a demonstration.
+
+          Two consequences, both intended:
+
+            * a manager with one example and no genuine ratings now has reviews_count 0 and a NULL
+              overall_rating - a genuine zero, which is the point;
+            * the gated tile therefore cannot take its number from this cache any more. It renders
+              from the example ROW, which the profile payload still carries, flagged as an example.
+              The blurred appearance is unchanged; what changed is where the number comes from.
+
+          company_stats_expected aggregates SUM(m.reviews_count) and AVG(m.overall_rating) off this
+          cache, so company, industry and ranking statistics inherit the exclusion through the
+          existing V89/V90 triggers without a trigger function changing.
+        */
+
+        return on.preparedQuery(recalcSql)
             .execute(Tuple.of(managerId))
             .compose(rows -> {
                 Row stats = rows.iterator().next();
@@ -1166,7 +1225,7 @@ public class ManagerRepository {
                         .put("Perceived Professional Demeanor",   nullSafe(stats.getBigDecimal("perceived_professional_demeanor")))
                         .put("Overall Working Experience",        nullSafe(stats.getBigDecimal("overall_working_experience")));
                 }
-                return db.preparedQuery("""
+                return on.preparedQuery("""
                         UPDATE managers SET overall_rating = $1, reviews_count = $2,
                                category_averages = $3, updated_at = now()
                         WHERE id = $4
@@ -1186,37 +1245,6 @@ public class ManagerRepository {
         return db.preparedQuery("SELECT COUNT(*) FROM managers WHERE submitted_by = $1 AND created_at >= current_date")
             .execute(Tuple.of(userId))
             .map(rows -> rows.iterator().next().getLong(0));
-    }
-
-    // ── Merge helpers ─────────────────────────────────────────────────────────
-
-    public Future<Void> mergeInlineRecalculate(long keepId) {
-        String sql = """
-            UPDATE managers SET
-                reviews_count     = sub.cnt,
-                overall_rating    = sub.overall_rating,
-                category_averages = sub.cats::jsonb
-            FROM (
-                SELECT
-                    COUNT(*)::INTEGER AS cnt,
-                    ROUND(AVG(overall_rating)::NUMERIC, 1) AS overall_rating,
-                    json_build_object(
-                        'Communication Style',               ROUND(AVG(communication_style)::NUMERIC,1),
-                        'Perceived Approachability',         ROUND(AVG(perceived_approachability)::NUMERIC,1),
-                        'Perceived Clarity of Expectations', ROUND(AVG(perceived_clarity_of_expectations)::NUMERIC,1),
-                        'Feedback Style',                    ROUND(AVG(feedback_style)::NUMERIC,1),
-                        'Perceived Supportiveness',          ROUND(AVG(perceived_supportiveness)::NUMERIC,1),
-                        'Decision Making Style',             ROUND(AVG(decision_making_style)::NUMERIC,1),
-                        'Organization and Planning Style',   ROUND(AVG(organization_and_planning_style)::NUMERIC,1),
-                        'Delegation Style',                  ROUND(AVG(delegation_style)::NUMERIC,1),
-                        'Perceived Professional Demeanor',   ROUND(AVG(perceived_professional_demeanor)::NUMERIC,1),
-                        'Overall Working Experience',        ROUND(AVG(overall_working_experience)::NUMERIC,1)
-                    )::text AS cats
-                FROM reviews WHERE manager_id = $1 AND deleted_at IS NULL
-            ) sub
-            WHERE managers.id = $1
-            """;
-        return db.preparedQuery(sql).execute(Tuple.of(keepId)).mapEmpty();
     }
 
     // ── Admin direct edit (cascading) ─────────────────────────────────────────
@@ -1393,38 +1421,60 @@ public class ManagerRepository {
      * back as an existing match.
      */
     /**
-     * Adopts the capture a submission left behind, instead of filing a second person.
+     * Adopts the capture THIS attempt left behind, instead of filing a second person.
      *
      * <p>The add-manager form posts a capture as soon as its first step is valid, which is before
      * the company box is finished. So one attempt to add "Eddie Junior at Microsoft" left a
      * capture at "Mi", and the submission that followed created a second row - two managers for
      * one person, differing only by how much of the company name had been typed.
      *
-     * <p>Matching is deliberately tight: the same name, the captured company a prefix of the
-     * submitted one, still unsubmitted, and captured within the hour. That is the shape this
-     * specific race produces. Anything looser starts merging people who happen to share a name.
+     * <h2>PHASE 1: by token, never by resemblance</h2>
      *
-     * @return the adopted row, or empty when there is nothing to adopt
+     * <p>This used to find the row by description - the same name, the captured company a prefix
+     * of the submitted one, no submitter yet, under an hour old - and that predicate was called
+     * "deliberately tight". It is tight about the right race and it is still a guess: it also
+     * describes a <em>different</em> Eddie Junior whom somebody else happened to half-type at a
+     * company whose name starts the same way, minutes earlier. That row was then rewritten to the
+     * adopter's company and handed to the adopter's account. One attempt's work silently became
+     * another's, and the person who typed it first lost their draft.
+     *
+     * <p>The client now mints a token when step one first posts and presents the same token at
+     * submit, so the row is identified rather than recognised. {@code capture_token} is written by
+     * {@link #createCapturedDraft} inside the transaction that claims the attempt, which is what
+     * makes it trustworthy here.
+     *
+     * <p>The three remaining conditions are not resemblance, they are eligibility:
+     * <ul>
+     *   <li>still {@code pending_approval} - a published manager is nobody's draft to adopt;</li>
+     *   <li>no submitter yet - a draft already claimed is not reassigned;</li>
+     *   <li>the attempt is unresolved - a spent token never adopts again, which is what makes a
+     *       replay harmless.</li>
+     * </ul>
+     *
+     * <p>What it still writes is what the submission legitimately knows about its own draft: the
+     * finished company name and its id, the title when one was supplied, and the submitter. The
+     * name is not among them - see the Phase 0 note on {@code updateForAttach}.
+     *
+     * @return the adopted row, or empty when this attempt has no draft left to adopt
      */
-    public Future<Optional<Row>> adoptCapture(String fullName, String company, String title,
-                                              UUID submittedBy, Long companyId) {
+    public Future<Optional<Row>> adoptCaptureByToken(UUID captureToken, String company, String title,
+                                                     UUID submittedBy, Long companyId) {
+        if (captureToken == null) return Future.succeededFuture(Optional.empty());
         return db.preparedQuery("""
                 UPDATE managers m
                 SET company = $2, title = COALESCE($3, m.title), company_id = COALESCE($5, m.company_id),
                     submitted_by = $4, updated_at = now()
-                WHERE m.id = (
-                    SELECT c.id FROM managers c
-                    WHERE LOWER(TRIM(c.name)) = LOWER(TRIM($1))
-                      AND c.approval_status = 'pending_approval'
-                      AND c.submitted_by IS NULL
-                      AND c.created_at > now() - INTERVAL '1 hour'
-                      AND LOWER(TRIM($2)) LIKE LOWER(TRIM(c.company)) || '%'
-                    ORDER BY c.created_at DESC
-                    LIMIT 1
-                )
+                WHERE m.capture_token = $1
+                  AND m.approval_status = 'pending_approval'
+                  AND m.submitted_by IS NULL
+                  AND EXISTS (
+                        SELECT 1 FROM capture_attempts a
+                         WHERE a.token = m.capture_token
+                           AND a.resolved_at IS NULL
+                      )
                 RETURNING *
                 """)
-            .execute(Tuple.of(fullName, company, title, submittedBy, companyId))
+            .execute(Tuple.of(captureToken, company, title, submittedBy, companyId))
             .map(rows -> rows.iterator().hasNext()
                 ? Optional.of(rows.iterator().next())
                 : Optional.empty());
@@ -1684,33 +1734,85 @@ public class ManagerRepository {
     public Future<Row> createCapturedDraft(String name, String company, String title,
                                    String country, String state, String city, String logoUrl, Long companyId) {
         return generatePendingSlug(name).compose(slug ->
-            db.preparedQuery("""
+            insertCapturedDraft(null, name, company, title, country, state, city, logoUrl,
+                                companyId, slug, null));
+    }
+
+    /**
+     * The same capture, written on a transaction the caller holds and stamped with the attempt
+     * that produced it.
+     *
+     * <p>PHASE 1. {@code captureToken} is how this row is found again. The submission that
+     * follows adopts <em>this</em> manager because it presents the same token, rather than
+     * because some row resembles what was typed - see {@link #adoptCaptureByToken}.
+     *
+     * <p>{@code conn} is not optional in spirit even though it is in type: the ledger row and this
+     * insert have to commit together, or the token is consumed with nothing behind it.
+     *
+     * <p><b>The slug arrives already decided, and that is not tidiness.</b> Generating it reads
+     * {@code managers} on whatever client it is given; asking the POOL for that while holding a
+     * transaction borrows a second connection, and enough concurrent captures doing that at once
+     * exhaust the pool with every holder waiting for a connection none of them will release.
+     * {@code createManager} generates its slug outside its transaction for the same reason.
+     */
+    public Future<Row> insertCapturedDraft(io.vertx.sqlclient.SqlClient conn,
+                                   String name, String company, String title,
+                                   String country, String state, String city, String logoUrl,
+                                   Long companyId, String slug, UUID captureToken) {
+        io.vertx.sqlclient.SqlClient target = conn == null ? db : conn;
+        return target.preparedQuery("""
                     INSERT INTO managers
                     (name, company, title, status, approval_status, country, state, city,
                      overall_rating, reviews_count, category_averages,
-                     company_logo_url, company_id, slug, created_at, updated_at)
+                     company_logo_url, company_id, slug, capture_token, created_at, updated_at)
                     VALUES ($1,$2,$3,'active','pending_approval',$4,$5,$6,
                             0,0,'{}'::jsonb,
-                            $7,$8,$9,now(),now())
+                            $7,$8,$9,$10,now(),now())
                     RETURNING *
                     """)
-                .execute(Tuple.of(name, company.trim(), title.trim(), country.trim(), state, city, logoUrl, companyId, slug))
-                .map(rows -> rows.iterator().next()));
+            .execute(Tuple.of(name, company.trim(), title.trim(), country.trim(), state, city, logoUrl, companyId, slug, captureToken))
+            .map(rows -> rows.iterator().next());
     }
 
     /** Creates a pending_approval manager record (no auth required) for drop-off draft capture. */
     public Future<Row> createPending(String name, String company, String title,
                                       String status, String country, String state,
                                       String logoUrl, Long companyId) {
+        /*
+          No submitter, deliberately.
+
+          This overload is the drop-off capture, which runs for somebody who has not signed in.
+          An ownerless pending row is refused to EVERYBODY by enforceSubmitterAccess until a
+          moderator approves it, which is the intended treatment for a row nobody has claimed.
+        */
+        return createPending(db, name, company, title, status, country, state, logoUrl, companyId,
+                             null);
+    }
+
+    /**
+     * The same insert, on a CALLER'S CONNECTION, so it can live inside somebody else's transaction.
+     *
+     * <p>Path 3 of the role-aware submission needs exactly this: the contributor said "none of
+     * these people", so the manager and the rating have to be written together or not at all. On
+     * the pool they were two transactions, and a submission that failed after the manager was
+     * created left a pending person nobody had rated. See issue 34.
+     *
+     * <p>The slug is still resolved on the pool. A slug race is caught by the unique index exactly
+     * as it was before, and reading availability inside the transaction would make it no more
+     * reliable: the answer can go stale between the read and the insert either way.
+     */
+    public Future<Row> createPending(SqlClient conn, String name, String company, String title,
+                                      String status, String country, String state,
+                                      String logoUrl, Long companyId, UUID submittedBy) {
         return generatePendingSlug(name).compose(slug ->
-            db.preparedQuery("""
+            conn.preparedQuery("""
                     INSERT INTO managers
                     (name, company, title, status, approval_status, country, state,
                      overall_rating, reviews_count, category_averages,
-                     company_logo_url, company_id, slug, created_at, updated_at)
+                     company_logo_url, company_id, slug, submitted_by, created_at, updated_at)
                     VALUES ($1,$2,$3,$4,'pending_approval',$5,$6,
                             0,0,'{}'::jsonb,
-                            $7,$8,$9,now(),now())
+                            $7,$8,$9,$10,now(),now())
                     RETURNING *
                     """)
                 // Null-safe: a captured partial search may carry no country (geolocation failed)
@@ -1720,7 +1822,8 @@ public class ManagerRepository {
                                   title   != null ? title.trim()   : "",
                                   status,
                                   country != null ? country.trim() : "",
-                                  state, logoUrl, companyId, slug))
+                                  state, logoUrl, companyId, slug)
+                             .addValue(submittedBy))
                 .map(rows -> rows.iterator().next()));
     }
 
@@ -1784,21 +1887,37 @@ public class ManagerRepository {
             .map(rs -> rs.iterator().hasNext() ? Optional.of(rs.iterator().next()) : Optional.empty());
     }
 
-    /** Updates a ghost manager with richer data from the add-manager form. */
-    public Future<Optional<Row>> updateForAttach(long id, String name, String title,
-                                                  String status, String country,
-                                                  String linkedinUrl, String logoUrl,
-                                                  UUID submittedBy) {
+    /**
+     * Enriches a ghost manager with the detail an add-manager submission supplies, WITHOUT
+     * touching anything that says who the manager is.
+     *
+     * <p>PHASE 0 of the manager-identity redesign. This statement used to read
+     * {@code SET name = $1, title = $2, ..., linkedin_url = $5}, and its caller attaches a review
+     * to whichever existing manager at that company has a name within Damerau-Levenshtein 1 of
+     * the one typed. So rating "Emma Davies" renamed a live, publicly visible "Emma Davis",
+     * retitled her, and wrote a stranger's LinkedIn URL onto her profile - and
+     * {@code syncSlugToName} then moved her URL to match. One person's spelling rewrote who a
+     * published page says it is about, with no review and no record of who did it.
+     *
+     * <p>A name, a title and a LinkedIn URL are identity: together they assert which real human
+     * the page is about. A submission may no longer write any of them. Renaming still exists as
+     * {@link #adminEdit}, which is the reviewed path and records the previous values.
+     *
+     * <p>What it still writes is detail that is not an identity claim: employment status, country,
+     * and the company logo. {@code submitted_by} is COALESCEd, never overwritten, so a manager
+     * somebody else submitted keeps its original submitter and only a gap is filled.
+     */
+    public Future<Optional<Row>> updateForAttach(long id, String status, String country,
+                                                  String logoUrl, UUID submittedBy) {
         return db.preparedQuery("""
                 UPDATE managers
-                SET name = $1, title = $2, status = $3, country = $4,
-                    linkedin_url = $5, company_logo_url = $6,
-                    submitted_by = COALESCE(submitted_by, $7),
+                SET status = $1, country = $2, company_logo_url = $3,
+                    submitted_by = COALESCE(submitted_by, $4),
                     updated_at = now()
-                WHERE id = $8
+                WHERE id = $5
                 RETURNING *
                 """)
-            .execute(Tuple.of(name, title, status, country, linkedinUrl, logoUrl, submittedBy, id))
+            .execute(Tuple.of(status, country, logoUrl, submittedBy, id))
             .map(rows -> rows.iterator().hasNext()
                 ? Optional.of(rows.iterator().next())
                 : Optional.empty());
@@ -1819,13 +1938,62 @@ public class ManagerRepository {
             .map(rows -> rows.iterator().next().getLong(0) > 0);
     }
 
-    /** Deletes one fake (seed_*) manager — fewest reviews first — and all its cascaded data. */
+    /**
+     * Accepted employment whose stored status does not follow from the record itself.
+     *
+     * <p>Delegates to the one place the rules live. Exposed here because the maintenance sweep
+     * talks to repositories and the resolver is where the query belongs.
+     */
+    public Future<java.util.List<Long>> driftingEmploymentStatuses() {
+        return EmploymentStatusResolver.drifting(db);
+    }
+
+    /**
+     * Deletes one fake (seed_*) manager, fewest reviews first, and all its cascaded data.
+     *
+     * <h2>Why the selection carries five NOT EXISTS clauses</h2>
+     *
+     * <p>Deleting a manager cascades to {@code career_history}, and several tables refuse to let
+     * that happen: {@code employment_status_events} and {@code claim_resolution_events} and
+     * {@code role_corrections} reference roles with ON DELETE RESTRICT, and
+     * {@code role_claims.manager_id} and {@code reviews.original_manager_id} are ON DELETE NO
+     * ACTION. All of them are deliberate. This project's first principle is that history is
+     * preserved, and deleting a manager must not erase the record that their employment was ever
+     * resolved, corrected or disputed.
+     *
+     * <p>Without these clauses the consequence is worse than a failed delete. The ordering is
+     * deterministic, so the same manager is chosen every time: the job would pick it, be refused,
+     * print one line to stderr, and pick the same one again on the next call, for ever, while the
+     * seed population it exists to drain never shrinks by a single row. A cleanup that cannot
+     * delete anything and reports a one-line warning is indistinguishable from one that is
+     * working.
+     *
+     * <p>So the query asks for a manager it can actually delete. One whose history makes deletion
+     * impermissible is skipped deliberately, and the next candidate is tried instead.
+     */
     public void deleteFakeManagerInBackground() {
         db.query("""
-                SELECT id FROM managers
-                WHERE external_id LIKE 'seed_%'
-                  AND approval_status IN ('approved', 'ghost')
-                ORDER BY COALESCE(reviews_count, 0) ASC, created_at ASC
+                SELECT m.id FROM managers m
+                WHERE m.external_id LIKE 'seed_%'
+                  AND m.approval_status IN ('approved', 'ghost')
+                  AND NOT EXISTS (
+                        SELECT 1 FROM role_claims rc
+                         WHERE rc.manager_id = m.id OR rc.original_manager_id = m.id
+                        UNION ALL
+                        SELECT 1 FROM reviews r WHERE r.original_manager_id = m.id
+                        UNION ALL
+                        SELECT 1 FROM employment_status_events e
+                          JOIN career_history ch ON ch.id = e.role_id
+                         WHERE ch.manager_id = m.id
+                        UNION ALL
+                        SELECT 1 FROM claim_resolution_events ce
+                          JOIN career_history ch ON ch.id IN (ce.from_role_id, ce.to_role_id)
+                         WHERE ch.manager_id = m.id
+                        UNION ALL
+                        SELECT 1 FROM role_corrections rk
+                          JOIN career_history ch ON ch.id = rk.role_id
+                         WHERE ch.manager_id = m.id)
+                ORDER BY COALESCE(m.reviews_count, 0) ASC, m.created_at ASC
                 LIMIT 1
                 """)
             .execute()
@@ -1936,44 +2104,6 @@ public class ManagerRepository {
                 .execute(Tuple.of(managerId, newSlug))
                 .mapEmpty());
         });
-    }
-
-    /**
-     * Brings a manager's slug back in step with its name.
-     *
-     * <p>{@code updateForAttach} is the one path that rewrites a name - the add form supplying
-     * richer detail for a row the search created - and it never touched the slug. So correcting
-     * "Emma D" to "Emma Davis" renamed the person and left them on {@code emma-d}, and the row
-     * then approved under a name derived from a truncation somebody had typed.
-     *
-     * <p>Composed from the pieces that already exist rather than repeating them: the target slug
-     * is whatever that row's status is entitled to, and {@link #reslug} records the outgoing URL.
-     * Declines when the name resolves to a slug something else holds - that is a merge decision,
-     * and quietly appending to dodge it is what produced the mangled slugs in the first place.
-     */
-    public Future<Boolean> syncSlugToName(long managerId) {
-        return db.preparedQuery("SELECT name, slug, approval_status FROM managers WHERE id = $1")
-            .execute(Tuple.of(managerId))
-            .compose(rows -> {
-                if (!rows.iterator().hasNext()) return Future.succeededFuture(false);
-                Row row = rows.iterator().next();
-                String name    = row.getString("name");
-                String current = row.getString("slug");
-                String status  = row.getString("approval_status");
-                if (name == null || current == null) return Future.succeededFuture(false);
-
-                boolean hidden = "pending_approval".equals(status);
-                Future<String> target = hidden
-                    ? generatePendingSlug(name)
-                    : Future.succeededFuture(cleanSlugFor(name));
-
-                return target.compose(want -> {
-                    if (want.equals(current)) return Future.succeededFuture(false);
-                    return slugAvailable(want).compose(free -> free
-                        ? reslug(managerId, want).map(v -> true)
-                        : Future.succeededFuture(false));
-                });
-            });
     }
 
     /**
@@ -2181,8 +2311,32 @@ public class ManagerRepository {
     /** Looks up a manager by their globally unique slug.
      *  Joins to companies so the caller can read company_slug for redirect checks. */
     public Future<Optional<Row>> findBySlug(String slug) {
+        return findBySlug(slug, null);
+    }
+
+    /**
+     * The profile by slug, with the reviews this VIEWER may see.
+     *
+     * <p><b>The viewer parameter is not optional any more, and that is what was wrong here.</b>
+     * This method reuses {@code GET_BY_ID_SQL} with its WHERE swapped, and that statement gained a
+     * second parameter when "show a viewer their own held reviews" was added. The swap was updated;
+     * the argument list was not. So every by-slug lookup failed:
+     *
+     * <pre>
+     *   The number of parameters to execute should be consistent with the expected number of
+     *   parameters = [2] but the actual number is [1]
+     * </pre>
+     *
+     * <p>By-slug is the canonical URL, which is what every shared link uses. Caught by
+     * SlugIntegrationTest and CareerHistoryAdminIntegrationTest, both of which were red before
+     * this fix and are the regression coverage for it.
+     *
+     * <p>The tuple is built with typed adders rather than {@code Tuple.of}, so a null viewer keeps
+     * the arity at two and the driver is told the column's type instead of inferring it.
+     */
+    public Future<Optional<Row>> findBySlug(String slug, UUID viewerId) {
         return db.preparedQuery(GET_BY_ID_SQL.replace("WHERE m.id = $1", "WHERE m.slug = $1"))
-            .execute(Tuple.of(slug))
+            .execute(Tuple.tuple().addString(slug).addUUID(viewerId))
             .map(rows -> rows.iterator().hasNext()
                 ? Optional.of(rows.iterator().next())
                 : Optional.empty());
@@ -2307,6 +2461,105 @@ public class ManagerRepository {
                 SELECT ch.manager_id, ch.company_id, ch.company, ch.title
                   FROM career_history ch
                  WHERE ch.manager_id = ANY($1)
+                """)
+            .execute(Tuple.tuple().addArrayOfLong(managerIds.toArray(new Long[0])));
+    }
+
+
+    /**
+     * Employments a contributor may SELECT, with the identity each selection needs.
+     *
+     * <p>Separate from {@link #findEmployments}, which answers "does what they typed match this
+     * person at all" and therefore needs only company and title. A contributor choosing which job
+     * they worked under needs more: the {@code career_history.id} to put in
+     * {@code role_claims.selected_role_id}, the state so the form can say whether a rating will
+     * publish at once or wait for a moderator, and the period so two spells in the same job are
+     * distinguishable.
+     *
+     * <p><b>The manager's current role has no {@code career_history} row</b>, and that is not an
+     * oversight: {@code createAutoApproved}, {@code createSearchPending} and
+     * {@code createCapturedDraft} write none. It is returned with a null {@code role_id} and is
+     * therefore NOT selectable as a resolved employment - choosing it is the "employment missing"
+     * path, which proposes the role. Returning it anyway matters, because it is often the only
+     * employment a search-created manager has, and hiding it would make the person look like they
+     * had never worked anywhere.
+     *
+     * <p>Rejected and superseded roles are excluded. A contributor must not be offered an
+     * employment a moderator has already refused, which is the reuse that quietly undid a
+     * rejection.
+     */
+
+    /**
+     * Whether this manager is one a contributor may legitimately rate.
+     *
+     * <p>The same visibility rule the public directory uses: {@code approved} or {@code ghost}, and
+     * nothing else. A {@code pending_approval} row is in the admin queue and a {@code rejected} one
+     * has been refused, so neither is reachable from any public surface - which means an id naming
+     * one did not come from a contributor looking at the product.
+     *
+     * <p>Exists because a manager id in a request body is an assertion, not a fact. Our own form
+     * putting it there is no evidence: anybody can post that body.
+     */
+    public Future<Boolean> findPubliclyVisibleId(long managerId) {
+        return db.preparedQuery(
+                "SELECT 1 FROM managers WHERE id = $1 "
+                + "AND approval_status IN ('approved','ghost')")
+            .execute(Tuple.of(managerId))
+            .map(rs -> rs.rowCount() == 1);
+    }
+
+    public Future<RowSet<Row>> findSelectableEmployments(java.util.List<Long> managerIds) {
+        if (managerIds == null || managerIds.isEmpty()) {
+            return db.preparedQuery("SELECT 1 WHERE false").execute();
+        }
+        return db.preparedQuery("""
+                SELECT ch.manager_id,
+                       ch.id          AS role_id,
+                       ch.company_id,
+                       ch.company,
+                       ch.title,
+                       ch.state,
+                       ch.start_date,
+                       ch.end_date,
+                       ch.period_known,
+                       FALSE          AS is_current_role_without_record,
+                       /*
+                         THE EMPLOYER'S OWN LOGO IDENTITY, so a selection screen can draw the
+                         company rather than the first letter of its name. Guessing a domain from
+                         the name is what makes a wrong logo look like a working one, so the three
+                         fields the renderer actually resolves are carried instead.
+                       */
+                       cc.domain              AS company_domain,
+                       cc.logo_url            AS company_logo_url,
+                       cc.brandfetch_icon_url AS company_brandfetch_icon_url
+                  FROM career_history ch
+                  LEFT JOIN companies cc ON cc.id = ch.company_id
+                 WHERE ch.manager_id = ANY($1)
+                   AND ch.state IN ('proposed','accepted')
+                UNION ALL
+                SELECT m.id,
+                       NULL::BIGINT   AS role_id,
+                       m.company_id,
+                       m.company,
+                       m.title,
+                       'accepted'     AS state,
+                       NULL::DATE     AS start_date,
+                       NULL::DATE     AS end_date,
+                       FALSE          AS period_known,
+                       TRUE           AS is_current_role_without_record,
+                       mc.domain              AS company_domain,
+                       COALESCE(m.company_logo_url, mc.logo_url) AS company_logo_url,
+                       mc.brandfetch_icon_url AS company_brandfetch_icon_url
+                  FROM managers m
+                  LEFT JOIN companies mc ON mc.id = m.company_id
+                 WHERE m.id = ANY($1)
+                   AND NOT EXISTS (
+                       SELECT 1 FROM career_history c2
+                        WHERE c2.manager_id = m.id
+                          AND c2.company_id IS NOT DISTINCT FROM m.company_id
+                          AND normalise_title(c2.title) = normalise_title(m.title)
+                          AND c2.state IN ('proposed','accepted'))
+                 ORDER BY manager_id, role_id NULLS LAST, start_date NULLS LAST
                 """)
             .execute(Tuple.tuple().addArrayOfLong(managerIds.toArray(new Long[0])));
     }

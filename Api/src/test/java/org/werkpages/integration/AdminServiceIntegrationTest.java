@@ -13,6 +13,7 @@ import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.werkpages.repository.CompanyRepository;
 import org.werkpages.repository.EditRepository;
 import org.werkpages.repository.ManagerRepository;
 import org.werkpages.repository.NotificationRepository;
@@ -65,7 +66,16 @@ class AdminServiceIntegrationTest {
         ReviewRepository       reviewRepo = new ReviewRepository(pool);
         EditRepository         editRepo   = new EditRepository(pool);
         NotificationRepository notifRepo  = new NotificationRepository(pool);
-        service = new AdminService(userRepo, managerRepo, reviewRepo, editRepo, notifRepo);
+        // With a CompanyRepository, because approval now has to give a career entry an employer:
+        // V99 made career_history.company_id NOT NULL. Production has always passed one here (see
+        // MainVerticle); the five-argument constructor exists for tests, and a test that leaves it
+        // out is asserting against a wiring the product does not have.
+        CompanyRepository      companyRepo = new CompanyRepository(pool);
+        // With the pool, because the merge is a transaction over six tables and AdminService
+        // builds its ManagerMergeService from the client. Without one it reports that merging is
+        // unavailable rather than half-doing it.
+        service = new AdminService(userRepo, managerRepo, reviewRepo, editRepo, notifRepo,
+                                   companyRepo, null, pool);
     }
 
     @BeforeEach
@@ -437,8 +447,8 @@ class AdminServiceIntegrationTest {
         // Insert an open career entry that started recently (now), simulating the manager's
         // current Google position
         await(pool.preparedQuery(
-            "INSERT INTO career_history(manager_id, company, title, start_date) VALUES ($1,'Google','Engineer',now())")
-            .execute(Tuple.of(managerId)));
+            "INSERT INTO career_history(manager_id, company, title, start_date, company_id) VALUES ($1,'Google','Engineer',now(),$2)")
+            .execute(Tuple.of(managerId, fixtureCompanyId("Google"))));
 
         // Approve an edit inserting Amazon (2020-2026) — careerStart is before the Google entry
         UUID editId = insertPendingEditWithDates(managerId, userId, "Amazon", "Director",
@@ -478,8 +488,8 @@ class AdminServiceIntegrationTest {
             .execute()
             .map(rs -> rs.iterator().next().getLong("id")));
         await(pool.preparedQuery(
-                "INSERT INTO career_history(manager_id, company, title, start_date) VALUES ($1,'NowCo','Engineer','2020-01-01 00:00:00+00')")
-            .execute(Tuple.of(managerId)));
+                "INSERT INTO career_history(manager_id, company, title, start_date, company_id) VALUES ($1,'NowCo','Engineer','2020-01-01 00:00:00+00',$2)")
+            .execute(Tuple.of(managerId, fixtureCompanyId("NowCo"))));
 
         // Edit adds an OLDER role (starts 2015, no end date) at OldCo.
         UUID editId = insertPendingEditWithDates(managerId, userId, "OldCo", "Intern", "active",
@@ -531,8 +541,8 @@ class AdminServiceIntegrationTest {
         long managerId = insertApprovedManager("Ben Newer", "OldCo", "Engineer");
         // Existing current role started in 2010.
         await(pool.preparedQuery(
-                "INSERT INTO career_history(manager_id, company, title, start_date) VALUES ($1,'OldCo','Engineer','2010-01-01 00:00:00+00')")
-            .execute(Tuple.of(managerId)));
+                "INSERT INTO career_history(manager_id, company, title, start_date, company_id) VALUES ($1,'OldCo','Engineer','2010-01-01 00:00:00+00',$2)")
+            .execute(Tuple.of(managerId, fixtureCompanyId("OldCo"))));
 
         // Edit moves to NewCo starting 2020 (after 2010), no end date — a genuine current change.
         UUID editId = insertPendingEditWithDates(managerId, userId, "NewCo", "Director", "active",
@@ -868,11 +878,39 @@ class AdminServiceIntegrationTest {
 
         await(service.mergeManagers(adminAuth0, keepId, mergeId));
 
-        long keepReviews = await(pool
-            .preparedQuery("SELECT COUNT(*) FROM reviews WHERE manager_id = $1 AND weight = FALSE")
+        /*
+          REWRITTEN IN PHASE 3. The old assertion counted every non-seed rating on the survivor
+          and required exactly 1, which was true only because the loser was SOFT-DELETED and left
+          on the absorbed profile. Rev 268 calls that the defect: a real opinion taken out of
+          public view over a collision nobody was shown.
+
+          The intent survives exactly - one opinion in public, not two - but it is now about
+          disposition rather than existence. Both rows are kept, both move, one is held, and the
+          held one records what it collided with.
+        */
+        long livePublic = await(pool
+            .preparedQuery("SELECT COUNT(*) FROM reviews WHERE manager_id = $1 "
+                + "AND weight = FALSE AND disposition = 'live'")
             .execute(Tuple.of(keepId))
             .map(rs -> rs.iterator().next().getLong(0)));
-        assertEquals(1L, keepReviews, "True duplicate (same user+company+title) must not be duplicated");
+        assertEquals(1L, livePublic,
+            "True duplicate (same user+company+title) is stated once in public");
+
+        long heldAndMarked = await(pool
+            .preparedQuery("SELECT COUNT(*) FROM reviews WHERE manager_id = $1 "
+                + "AND disposition = 'held' AND deleted_at IS NULL "
+                + "AND merge_duplicate_of IS NOT NULL "
+                + "AND legacy_dedup_state = 'held_duplicate'")
+            .execute(Tuple.of(keepId))
+            .map(rs -> rs.iterator().next().getLong(0)));
+        assertEquals(1L, heldAndMarked,
+            "and the other is kept, held, moved, and says what it duplicates");
+
+        long strandedOnAbsorbed = await(pool
+            .preparedQuery("SELECT COUNT(*) FROM reviews WHERE manager_id = $1")
+            .execute(Tuple.of(mergeId))
+            .map(rs -> rs.iterator().next().getLong(0)));
+        assertEquals(0L, strandedOnAbsorbed, "nothing is left on the absorbed profile");
     }
 
     // ══════════════════════════════════════════════════════════════════════════
@@ -1011,8 +1049,8 @@ class AdminServiceIntegrationTest {
         long managerId   = insertApprovedManager("Manager C", "OldCorp", "OldTitle");
         // Insert a career_history entry with the old values
         await(pool.preparedQuery(
-            "INSERT INTO career_history(manager_id, company, title, start_date) VALUES ($1,$2,$3,now())")
-            .execute(Tuple.of(managerId, "OldCorp", "OldTitle")));
+            "INSERT INTO career_history(manager_id, company, title, start_date, company_id) VALUES ($1,$2,$3,now(),$4)")
+            .execute(Tuple.of(managerId, "OldCorp", "OldTitle", fixtureCompanyId("OldCorp"))));
 
         await(service.adminEditManager(adminAuth, managerId, null, "NewTitle", "NewCorp", null));
 
@@ -1501,4 +1539,19 @@ class AdminServiceIntegrationTest {
             .execute(Tuple.of(companyName))
             .map(rs -> rs.iterator().hasNext() ? rs.iterator().next().getLong("id") : null));
     }
+
+    /**
+     * A real employer for a fixture role. {@code career_history.company_id} is NOT NULL as of V99,
+     * so a career row has to name one. findOrCreate by name, which is the rule the product itself
+     * uses, so a fixture mentioning one company twice gets one company row.
+     */
+    private long fixtureCompanyId(String name) throws Exception {
+        return await(pool.preparedQuery("""
+                INSERT INTO companies (name, slug, status)
+                VALUES ($1, 'fixture-' || md5(lower(btrim($1))), 'ghost')
+                ON CONFLICT ((LOWER(TRIM(name)))) DO UPDATE SET updated_at = now()
+                RETURNING id
+                """).execute(Tuple.of(name)).map(rs -> rs.iterator().next().getLong("id")));
+    }
+
 }

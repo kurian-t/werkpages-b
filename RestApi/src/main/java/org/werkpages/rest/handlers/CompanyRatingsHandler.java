@@ -45,6 +45,22 @@ public class CompanyRatingsHandler {
             .onFailure(err -> ManagersHandler.handleError(ctx, err));
     }
 
+    // ── POST /api/companies/{companySlug}/rating/autosave ─────────────────────
+
+    /**
+     * The form's answers as they stand, saved while it is still being filled in.
+     *
+     * <p>Always answers 200, even when nothing was stored. A refused autosave - below the
+     * meaningful-progress floor, a stale revision, a draft an admin already resolved - is not
+     * something the person typing can act on, and surfacing it as an error would put a failure
+     * in front of somebody who is mid-sentence.
+     */
+    public void handleAutosave(RoutingContext ctx) {
+        service.autosaveDraft(ctx.pathParam("companySlug"), ctx.body().asJsonObject())
+            .onSuccess(json -> respond(ctx, 200, json))
+            .onFailure(err -> ManagersHandler.handleError(ctx, err));
+    }
+
     // ── GET /api/companies/{companySlug}/rating ───────────────────────────────
 
     public void handleGetMine(RoutingContext ctx) {

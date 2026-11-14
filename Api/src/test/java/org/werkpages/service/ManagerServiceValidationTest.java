@@ -94,6 +94,9 @@ class ManagerServiceValidationTest {
             returning double for a Future-typed method will always do.
         */
         when(managerRepo.recalculate(anyLong())).thenReturn(Future.succeededFuture());
+        // The connection-bound overload, taken whenever the insert runs inside a transaction the
+        // caller already holds - the admin queue, and now an author's own replacement.
+        when(managerRepo.recalculate(any(), anyLong())).thenReturn(Future.succeededFuture());
         doNothing().when(managerRepo).recalculateInBackground(anyLong());
         when(reviewRepo.deleteSeedReview(anyLong())).thenReturn(Future.succeededFuture());
         // createReview now starts the placeholder's countdown after a successful insert, so the
@@ -562,7 +565,21 @@ class ManagerServiceValidationTest {
      * that successfully inserts a review, finds it as the most current, and updates
      * the manager profile.
      */
+    /**
+     * Just enough transaction for a path that fails before it writes anything: the function is
+     * applied to a bare connection. The replacement's authorization read happens INSIDE its
+     * transaction now, so a 404 or a 403 has to get that far.
+     */
+    private void stubBareTransaction() {
+        SqlConnection conn = mock(SqlConnection.class);
+        when(pool.withTransaction(any())).thenAnswer(inv -> {
+            Function<SqlConnection, Future<Row>> fn = inv.getArgument(0);
+            return fn.apply(conn);
+        });
+    }
+
     private void stubHappyPathTransaction() {
+
         SqlConnection conn = mock(SqlConnection.class);
         UUID newId = UUID.randomUUID();
 
@@ -1160,7 +1177,10 @@ class ManagerServiceValidationTest {
     @Test
     void replaceReview_reviewNotFound_returns404() {
         UUID oldId = UUID.randomUUID();
-        when(reviewRepo.findOwnerUserId(oldId, MANAGER_ID))
+        // The ownership read moved inside the replacement's transaction and takes FOR UPDATE, so
+        // it is lockForReplacement rather than findOwnerUserId. Empty still means 404.
+        stubBareTransaction();
+        when(reviewRepo.lockForReplacement(any(), eq(oldId), eq(MANAGER_ID)))
             .thenReturn(Future.succeededFuture(Optional.empty()));
 
         ServiceException ex = assertServiceFails(
@@ -1172,7 +1192,8 @@ class ManagerServiceValidationTest {
     void replaceReview_notOwner_returns403() {
         UUID oldId     = UUID.randomUUID();
         UUID otherUser = UUID.randomUUID();
-        when(reviewRepo.findOwnerUserId(oldId, MANAGER_ID))
+        stubBareTransaction();
+        when(reviewRepo.lockForReplacement(any(), eq(oldId), eq(MANAGER_ID)))
             .thenReturn(Future.succeededFuture(Optional.of(otherUser)));
 
         ServiceException ex = assertServiceFails(
@@ -1183,9 +1204,18 @@ class ManagerServiceValidationTest {
     @Test
     void replaceReview_success_noCooldownRecorded() throws Exception {
         UUID oldId = UUID.randomUUID();
-        when(reviewRepo.findOwnerUserId(oldId, MANAGER_ID))
+        // One transaction now: the original is locked, superseded as 'replaced_by_author' so it
+        // can never be restored and so it leaves the legacy dedup index, and the replacement is
+        // inserted on the same connection. The assertions below are unchanged.
+        when(reviewRepo.lockForReplacement(any(), eq(oldId), eq(MANAGER_ID)))
             .thenReturn(Future.succeededFuture(Optional.of(USER_ID)));
-        when(reviewRepo.delete(oldId, MANAGER_ID)).thenReturn(Future.succeededFuture(null));
+        when(reviewRepo.deleteAsReplacedByAuthor(any(), eq(oldId), eq(MANAGER_ID), eq(USER_ID)))
+            .thenReturn(Future.succeededFuture(true));
+        // Pre-created before any when/thenReturn: rowSetOf() builds mocks, and building one
+        // inside a stubbing expression leaves Mockito mid-stub. The base setup says so too.
+        RowSet<Row> noPriorRatings = rowSetOf();
+        when(reviewRepo.findByUserForValidation(any(), eq(USER_ID), anyString()))
+            .thenReturn(Future.succeededFuture(noPriorRatings));
         stubHappyPathTransaction();
 
         Row result = await(service.replaceReview(AUTH0_ID, MANAGER_ID, oldId, validBody(), null));
@@ -1286,7 +1316,7 @@ class ManagerServiceValidationTest {
     void createEditRequest_managerNotFound_returns404() {
         when(editRepo.countSubmittedTodayByUser(USER_ID)).thenReturn(Future.succeededFuture(0L));
         when(managerRepo.findById(MANAGER_ID)).thenReturn(Future.succeededFuture(Optional.empty()));
-        when(managerRepo.findByIdFollowingMerges(MANAGER_ID)).thenReturn(Future.succeededFuture(Optional.empty()));
+        when(managerRepo.findByIdFollowingMerges(eq(MANAGER_ID), any())).thenReturn(Future.succeededFuture(Optional.empty()));
         JsonObject body = new JsonObject().put("company", "NewCo");
         ServiceException ex = assertServiceFails(service.createEditRequest(AUTH0_ID, MANAGER_ID, body));
         assertEquals(404, ex.getStatusCode());
@@ -1300,7 +1330,7 @@ class ManagerServiceValidationTest {
         when(editRepo.countSubmittedTodayByUser(USER_ID)).thenReturn(Future.succeededFuture(0L));
         Row managerRow = mock(Row.class);
         when(managerRepo.findById(MANAGER_ID)).thenReturn(Future.succeededFuture(Optional.of(managerRow)));
-        when(managerRepo.findByIdFollowingMerges(MANAGER_ID)).thenReturn(Future.succeededFuture(Optional.of(managerRow)));
+        when(managerRepo.findByIdFollowingMerges(eq(MANAGER_ID), any())).thenReturn(Future.succeededFuture(Optional.of(managerRow)));
         Row editRow = mock(Row.class);
         when(editRow.getUUID("id")).thenReturn(editId);
         when(editRow.getOffsetDateTime("created_at")).thenReturn(createdAt);
@@ -1426,7 +1456,7 @@ class ManagerServiceValidationTest {
     @Test
     void getManagerById_notFound_returns404() {
         when(managerRepo.findById(MANAGER_ID)).thenReturn(Future.succeededFuture(Optional.empty()));
-        when(managerRepo.findByIdFollowingMerges(MANAGER_ID)).thenReturn(Future.succeededFuture(Optional.empty()));
+        when(managerRepo.findByIdFollowingMerges(eq(MANAGER_ID), any())).thenReturn(Future.succeededFuture(Optional.empty()));
         ServiceException ex = assertServiceFails(service.getManagerById(MANAGER_ID, null));
         assertEquals(404, ex.getStatusCode());
     }
@@ -1436,7 +1466,7 @@ class ManagerServiceValidationTest {
         Row managerRow = mock(Row.class);
         when(managerRow.getString("approval_status")).thenReturn("approved");
         when(managerRepo.findById(MANAGER_ID)).thenReturn(Future.succeededFuture(Optional.of(managerRow)));
-        when(managerRepo.findByIdFollowingMerges(MANAGER_ID)).thenReturn(Future.succeededFuture(Optional.of(managerRow)));
+        when(managerRepo.findByIdFollowingMerges(eq(MANAGER_ID), any())).thenReturn(Future.succeededFuture(Optional.of(managerRow)));
 
         Row result = await(service.getManagerById(MANAGER_ID, null));
         assertNotNull(result);
@@ -1448,7 +1478,7 @@ class ManagerServiceValidationTest {
         when(managerRow.getString("approval_status")).thenReturn("pending_approval");
         when(managerRow.getUUID("submitted_by")).thenReturn(USER_ID);
         when(managerRepo.findById(MANAGER_ID)).thenReturn(Future.succeededFuture(Optional.of(managerRow)));
-        when(managerRepo.findByIdFollowingMerges(MANAGER_ID)).thenReturn(Future.succeededFuture(Optional.of(managerRow)));
+        when(managerRepo.findByIdFollowingMerges(eq(MANAGER_ID), any())).thenReturn(Future.succeededFuture(Optional.of(managerRow)));
         when(userRepo.findIdByAuth0Id(AUTH0_ID)).thenReturn(Future.succeededFuture(Optional.of(USER_ID)));
 
         Row result = await(service.getManagerById(MANAGER_ID, AUTH0_ID));
@@ -1461,7 +1491,7 @@ class ManagerServiceValidationTest {
         when(managerRow.getString("approval_status")).thenReturn("pending_approval");
         when(managerRow.getUUID("submitted_by")).thenReturn(UUID.randomUUID());
         when(managerRepo.findById(MANAGER_ID)).thenReturn(Future.succeededFuture(Optional.of(managerRow)));
-        when(managerRepo.findByIdFollowingMerges(MANAGER_ID)).thenReturn(Future.succeededFuture(Optional.of(managerRow)));
+        when(managerRepo.findByIdFollowingMerges(eq(MANAGER_ID), any())).thenReturn(Future.succeededFuture(Optional.of(managerRow)));
         when(userRepo.findIdByAuth0Id(AUTH0_ID)).thenReturn(Future.succeededFuture(Optional.of(USER_ID)));
 
         ServiceException ex = assertServiceFails(service.getManagerById(MANAGER_ID, AUTH0_ID));
@@ -1474,7 +1504,7 @@ class ManagerServiceValidationTest {
         when(managerRow.getString("approval_status")).thenReturn("pending_approval");
         when(managerRow.getUUID("submitted_by")).thenReturn(USER_ID);
         when(managerRepo.findById(MANAGER_ID)).thenReturn(Future.succeededFuture(Optional.of(managerRow)));
-        when(managerRepo.findByIdFollowingMerges(MANAGER_ID)).thenReturn(Future.succeededFuture(Optional.of(managerRow)));
+        when(managerRepo.findByIdFollowingMerges(eq(MANAGER_ID), any())).thenReturn(Future.succeededFuture(Optional.of(managerRow)));
 
         ServiceException ex = assertServiceFails(service.getManagerById(MANAGER_ID, null));
         assertEquals(404, ex.getStatusCode());
@@ -1486,7 +1516,10 @@ class ManagerServiceValidationTest {
         when(managerRow.getString("approval_status")).thenReturn("rejected");
         when(managerRow.getUUID("submitted_by")).thenReturn(USER_ID);
         when(managerRepo.findById(MANAGER_ID)).thenReturn(Future.succeededFuture(Optional.of(managerRow)));
-        when(managerRepo.findByIdFollowingMerges(MANAGER_ID)).thenReturn(Future.succeededFuture(Optional.of(managerRow)));
+        when(managerRepo.findByIdFollowingMerges(eq(MANAGER_ID), any())).thenReturn(Future.succeededFuture(Optional.of(managerRow)));
+        // The profile query is now viewer-aware, so the service resolves the caller's user id
+        // before reading the manager. Without this stub the mock returns null and the chain NPEs.
+        when(userRepo.findIdByAuth0Id(AUTH0_ID)).thenReturn(Future.succeededFuture(Optional.of(USER_ID)));
 
         ServiceException ex = assertServiceFails(service.getManagerById(MANAGER_ID, AUTH0_ID));
         assertEquals(404, ex.getStatusCode());
@@ -1497,7 +1530,7 @@ class ManagerServiceValidationTest {
         Row managerRow = mock(Row.class);
         when(managerRow.getString("approval_status")).thenReturn("rejected");
         when(managerRepo.findById(MANAGER_ID)).thenReturn(Future.succeededFuture(Optional.of(managerRow)));
-        when(managerRepo.findByIdFollowingMerges(MANAGER_ID)).thenReturn(Future.succeededFuture(Optional.of(managerRow)));
+        when(managerRepo.findByIdFollowingMerges(eq(MANAGER_ID), any())).thenReturn(Future.succeededFuture(Optional.of(managerRow)));
 
         ServiceException ex = assertServiceFails(service.getManagerById(MANAGER_ID, null));
         assertEquals(404, ex.getStatusCode());

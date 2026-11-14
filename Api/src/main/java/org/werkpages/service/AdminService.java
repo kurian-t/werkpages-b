@@ -45,8 +45,21 @@ public class AdminService {
      * repair. Guarded like the repositories below: several constructors are used by unit tests
      * with no client at all.
      */
+    /**
+     * The manager and role merge, rebuilt in phase 3. Guarded like the collaborators below:
+     * several constructors are used by unit tests with no client at all.
+     */
+    private final ManagerMergeService  mergeService;
     private final CompanyReviewService companyRatings;
     private final InterviewService     interviewReviews;
+    /**
+     * For publishing a captured MANAGER rating, which the queue could read but never publish.
+     *
+     * <p>Built here the same way the two above are, and for the same reason: this service owns the
+     * publish decision and the validators belong to the forms, so it reaches for the form's own
+     * code rather than reimplementing what "complete" means.
+     */
+    private final ManagerService       managerRatings;
 
     private final UserRepository              userRepo;
     private final ManagerRepository           managerRepo;
@@ -83,6 +96,17 @@ public class AdminService {
                         ReviewRepository reviewRepo, EditRepository editRepo,
                         NotificationRepository notifRepo, CompanyRepository companyRepo,
                         MergeSuggestionsRepository mergeSuggestionsRepo, SqlClient db) {
+        this(userRepo, managerRepo, reviewRepo, editRepo, notifRepo, companyRepo,
+             mergeSuggestionsRepo, db, db == null ? null : new ManagerMergeService(db));
+    }
+
+    /** With the merge service supplied, which is the seam a unit test injects a double through. */
+    public AdminService(UserRepository userRepo, ManagerRepository managerRepo,
+                        ReviewRepository reviewRepo, EditRepository editRepo,
+                        NotificationRepository notifRepo, CompanyRepository companyRepo,
+                        MergeSuggestionsRepository mergeSuggestionsRepo, SqlClient db,
+                        ManagerMergeService mergeService) {
+        this.mergeService         = mergeService;
         this.userRepo             = userRepo;
         this.managerRepo          = managerRepo;
         this.reviewRepo           = reviewRepo;
@@ -104,6 +128,15 @@ public class AdminService {
             new org.werkpages.repository.CompanyReviewRepository(db), companyRepo, userRepo);
         this.interviewReviews = !canPublish ? null : new InterviewService(
             new org.werkpages.repository.InterviewRepository(db), companyRepo, userRepo);
+        /*
+          reviewRepo and editRepo come from the caller; a ReportRepository is only used by paths
+          this never touches, and the logo resolver is the no-op one because publishing resolves
+          no logo - the manager row already carries its company's.
+        */
+        this.managerRatings = !canPublish || reviewRepo == null || editRepo == null ? null
+            : new ManagerService(managerRepo, reviewRepo, userRepo, editRepo,
+                                 new org.werkpages.repository.ReportRepository(db),
+                                 companyRepo, db, company -> null);
     }
 
     // ── Guard: verify admin ───────────────────────────────────────────────────
@@ -137,6 +170,7 @@ public class AdminService {
                         .put("id",           row.getLong("id"))
                         .put("name",         row.getString("name"))
                         .put("company",      row.getString("company"))
+                        .put("companyId",    row.getLong("company_id"))
                         .put("title",        row.getString("title"))
                         .put("logoUrl",      row.getString("company_logo_url"))
                         .put("overallRating", row.getBigDecimal("overall_rating"))
@@ -172,6 +206,9 @@ public class AdminService {
                         .put("id", row.getLong("id"))
                         .put("name", row.getString("name"))
                         .put("company", row.getString("company"))
+                        .put("companyId", row.getLong("company_id"))
+                        /* Named logoUrl to match the ghost listing, which already sends it. */
+                        .put("logoUrl", row.getString("company_logo_url"))
                         .put("title", row.getString("title"))
                         .put("image", row.getString("image"))
                         .put("submittedBy", row.getString("submitted_by_username"))
@@ -838,11 +875,15 @@ public class AdminService {
                                     boolean correctingCurrentRole = openOpt.isPresent()
                                         && effectiveCo.equalsIgnoreCase(openOpt.get().getString("company"))
                                         && effectiveTit.equalsIgnoreCase(openOpt.get().getString("title"));
+                                    // The INSERT needs a company id and the UPDATE does not: the
+                                    // update statement COALESCEs a null onto the row's existing
+                                    // value, so it cannot blank one. See companyIdForCareerEntry.
                                     Future<?> entry = correctingCurrentRole
                                         ? managerRepo.updateCareerEntry(openOpt.get().getLong("id"), managerId,
                                               effectiveCo, effectiveTit, careerStart, newEndDate, newCompanyId)
-                                        : managerRepo.insertCareerEntry(managerId, effectiveCo, effectiveTit,
-                                              careerStart, newEndDate, newCompanyId);
+                                        : companyIdForCareerEntry(newCompanyId, effectiveCo).compose(coId ->
+                                              managerRepo.insertCareerEntry(managerId, effectiveCo, effectiveTit,
+                                                  careerStart, newEndDate, coId));
                                     return entry.compose(v -> applyEditAndApprove(managerId, editId,
                                         newCompany, newCompanyLogoUrl, newTitle, newStatus, newCountry,
                                         newState, newCity, newCompanyLocationId,
@@ -858,7 +899,8 @@ public class AdminService {
                               OffsetDateTime currentStart = curStartOpt.orElse(row.getOffsetDateTime("manager_created_at"));
                               boolean isHistorical = newStartDate != null && currentStart != null && newStartDate.isBefore(currentStart);
                               if (isHistorical) {
-                                  return managerRepo.insertCareerEntry(managerId, effectiveCo, effectiveTit, careerStart, currentStart, newCompanyId)
+                                  return companyIdForCareerEntry(newCompanyId, effectiveCo)
+                                      .compose(coId -> managerRepo.insertCareerEntry(managerId, effectiveCo, effectiveTit, careerStart, currentStart, coId))
                                       .compose(v -> applyEditAndApprove(managerId, editId, null, null, null, newStatus, newCountry, newState, newCity, newCompanyLocationId, newLinkedinUrl, effectiveCo, effectiveTit, adminId, now, proposedBy, managerName, null));
                               }
                               return managerRepo.closeOpenCareerEntry(managerId, careerStart)
@@ -870,16 +912,17 @@ public class AdminService {
                                         // If careerStart < oldStart the new position predates the manager record; skip archival
                                         // to avoid violating the CHECK (end_date >= start_date) constraint.
                                         if (oldStart != null && !careerStart.isBefore(oldStart)) {
-                                            archiveOld = managerRepo.insertCareerEntry(managerId, currentCompany, currentTitle, oldStart, careerStart, currentCompanyId);
+                                            archiveOld = companyIdForCareerEntry(currentCompanyId, currentCompany)
+                                                .compose(coId -> managerRepo.insertCareerEntry(managerId, currentCompany, currentTitle, oldStart, careerStart, coId));
                                         } else {
                                             archiveOld = Future.succeededFuture();
                                         }
                                     } else {
                                         archiveOld = Future.succeededFuture();
                                     }
-                                    return archiveOld.compose(v ->
-                                        managerRepo.insertCareerEntry(managerId, effectiveCo, effectiveTit, careerStart, null, newCompanyId)
-                                    );
+                                    return archiveOld
+                                        .compose(v -> companyIdForCareerEntry(newCompanyId, effectiveCo))
+                                        .compose(coId -> managerRepo.insertCareerEntry(managerId, effectiveCo, effectiveTit, careerStart, null, coId));
                                 })
                                 .compose(v -> applyEditAndApprove(managerId, editId, newCompany, newCompanyLogoUrl, newTitle, newStatus, newCountry, newState, newCity, newCompanyLocationId, newLinkedinUrl, effectiveCo, effectiveTit, adminId, now, proposedBy, managerName, newCompanyId))
                                 .compose(result -> {
@@ -1052,8 +1095,9 @@ public class AdminService {
         if (reason == null || reason.isBlank()) return Future.failedFuture(ServiceException.badRequest("Ban reason is required"));
         if (reason.length() > 500) return Future.failedFuture(ServiceException.badRequest("Reason must be at most 500 characters"));
         final String trimmed = reason.trim();
+        final UUID[] actor = new UUID[1];
         return requireAdmin(auth0Id)
-            .compose(adminId -> userRepo.findUsernameByAuth0Id(auth0Id))
+            .compose(adminId -> { actor[0] = adminId; return userRepo.findUsernameByAuth0Id(auth0Id); })
             .compose(adminUsername ->
                 userRepo.banUser(targetUserId, trimmed, adminUsername)
                     .compose(success -> {
@@ -1062,9 +1106,70 @@ public class AdminService {
                             "Account Suspended",
                             "Your account has been suspended. Reason: " + trimmed +
                             "\n\nIf you believe this was a mistake, you may appeal by emailing contact@werkpages.com");
-                        return Future.succeededFuture(new JsonObject().put("success", true));
+                        /*
+                          A ban that leaves the person signed in is a ban with a hole in it.
+
+                          Every write path checks the ban already, so a banned account cannot
+                          contribute - but it can still READ, including the analytics that are
+                          gated on having contributed, for as long as the session lives. Ending the
+                          sessions is what makes a suspension take effect now rather than within a
+                          fortnight.
+
+                          Composed rather than fired and forgotten, because an administrator who is
+                          told the ban worked must not have to wonder whether half of it did.
+                        */
+                        return revokeSessionsOf(targetUserId, "banned", actor[0])
+                            .map(count -> new JsonObject()
+                                .put("success", true)
+                                .put("sessionsRevoked", count))
+                            .recover(err -> Future.failedFuture(ServiceException.conflict(
+                                "The ban is recorded but the user's sessions could not be ended. "
+                              + "Use Revoke sessions on that account to finish the suspension.")));
                     })
             );
+    }
+
+    /**
+     * Ends every session an account holds, without banning it.
+     *
+     * <p>Separate from the ban on purpose, and not only because an administrator sometimes wants
+     * one without the other. The ban is recorded first and the revocation follows it, so a
+     * revocation failure leaves a ban in place that a retry cannot repeat - the retry is refused as
+     * "already banned". This is the endpoint that finishes the job in that case, and it is
+     * idempotent, so it can be used as many times as it takes.
+     *
+     * <p>Also the honest answer to "this person's laptop was stolen", which is not a ban.
+     */
+    public Future<JsonObject> revokeUserSessions(String auth0Id, UUID targetUserId) {
+        return requireAdmin(auth0Id)
+            .compose(adminId -> revokeSessionsOf(targetUserId, "admin_revoked", adminId))
+            .map(count -> new JsonObject().put("success", true).put("sessionsRevoked", count));
+    }
+
+    /**
+     * Zero when sessions are not wired, rather than a failure.
+     *
+     * <p>The repository is injected through a setter, so a unit test that constructs this service
+     * directly has none. Reporting zero revoked is accurate in that case - there are no sessions
+     * to revoke, because nothing issues them - and it keeps the ban working in every existing
+     * test without each one having to know sessions exist.
+     */
+    private Future<Integer> revokeSessionsOf(UUID targetUserId, String reason, UUID actorId) {
+        if (sessionRepo == null) return Future.succeededFuture(0);
+        return sessionRepo.revokeAllForUser(targetUserId, reason, actorId);
+    }
+
+    /**
+     * Injected rather than taken as a constructor argument.
+     *
+     * <p>This class already has five telescoping constructors; a sixth parameter would have to be
+     * threaded through all of them and through every test that calls one. The setter follows the
+     * pattern AuthHandler already uses for its id-token validator.
+     */
+    private org.werkpages.repository.SessionRepository sessionRepo;
+
+    public void setSessionRepository(org.werkpages.repository.SessionRepository repo) {
+        this.sessionRepo = repo;
     }
 
     public Future<JsonObject> unbanUser(String auth0Id, UUID targetUserId) {
@@ -1153,8 +1258,11 @@ public class AdminService {
     public Future<JsonObject> mergeManagers(String auth0Id, long keepId, long mergeId) {
         if (keepId == mergeId) return Future.failedFuture(ServiceException.badRequest("Cannot merge a manager into itself"));
         return requireAdmin(auth0Id)
-            .compose(adminId -> managerRepo.countExistingById(new Long[]{keepId, mergeId}))
-            .compose(count -> {
+            .compose(adminId -> managerRepo.countExistingById(new Long[]{keepId, mergeId})
+                                           .map(count -> new Object[]{adminId, count}))
+            .compose(pair -> {
+                UUID adminId = (UUID) pair[0];
+                int count    = (int)  pair[1];
                 if (count < 2) return Future.failedFuture(ServiceException.notFound("One or both managers not found"));
                 // Neither side may already have been merged away. A merge retires the row it
                 // absorbs rather than deleting it, so without this a retired manager stayed a
@@ -1169,9 +1277,15 @@ public class AdminService {
                                 "That duplicate has already been merged."));
                         return Future.succeededFuture();
                     })
-                    .compose(v -> doMerge(keepId, mergeId));
+                    .compose(v -> doMerge(keepId, mergeId, adminId));
             })
-            .compose(counts -> managerRepo.mergeInlineRecalculate(keepId).map(v -> counts))
+            /*
+              No separate recalculation step any more. It used to run here, after the merge
+              committed, and only for the survivor - so the absorbed profile kept the cached
+              figures it had before losing its ratings, and a failure between the two left the
+              survivor's aggregates stale with nothing to notice it. Phase 3 recalculates BOTH
+              managers inside the merge transaction, on its own connection.
+            */
             /*
               The duplicate held the plain name slug, or forced the survivor onto a
               collision-breaker; either way the merge is what frees it. Nothing recomputed slugs
@@ -1195,13 +1309,26 @@ public class AdminService {
             });
     }
 
-    /** Moves the reviews and retires the duplicate in one transaction, or refuses and leaves both
-     *  untouched. It will not delete a review somebody wrote. */
-    private Future<JsonObject> doMerge(long keepId, long mergeId) {
-        return managerRepo.mergeInto(keepId, mergeId)
-            .recover(err -> Future.failedFuture(err instanceof IllegalStateException
-                ? ServiceException.conflict(err.getMessage())
-                : err));
+    /**
+     * The whole merge, in one transaction, or nothing.
+     *
+     * <p>Phase 3 moved this out of {@code ManagerRepository.mergeInto}, which repointed ratings
+     * and touched {@code career_history} zero times. {@link ManagerMergeService} moves the
+     * employment history and the claims with them, canonicalizes equivalent roles with an audit,
+     * reconciles duplicate contributions by holding and marking them rather than soft-deleting
+     * them, folds the absorbed profile's moderation tasks into the survivor's, and recalculates
+     * both managers' aggregates - all inside the transaction.
+     */
+    private Future<JsonObject> doMerge(long keepId, long mergeId, UUID adminId) {
+        if (mergeService == null) {
+            return Future.failedFuture(ServiceException.conflict(
+                "Merging is unavailable because this service was built without a database client."));
+        }
+        return mergeService.mergeManagers(keepId, mergeId, adminId)
+            .recover(err -> Future.failedFuture(
+                err instanceof IllegalStateException || err instanceof IllegalArgumentException
+                    ? ServiceException.conflict(err.getMessage())
+                    : err));
     }
 
     // ── Company admin operations ──────────────────────────────────────────────
@@ -1551,6 +1678,38 @@ public class AdminService {
     }
 
     /**
+     * The company id a career entry must carry, for a caller that may not have one.
+     *
+     * <p>V99 makes {@code career_history.company_id} NOT NULL, so an insert that passes null stops
+     * being a dangling row and becomes a constraint violation. This is the lockstep application
+     * half of that migration, which CLAUDE.md section 10 requires: both backends write this table,
+     * and RMM runs whatever code is deployed at the moment Werkpages applies the migration.
+     *
+     * <p>Resolving by NAME here does not reopen the V56 decision above. {@code newCompanyId} is
+     * null only when the request carried no identity AND the manager has none, and a company that
+     * is CHANGING without an identity is already refused further up. So the name resolved here is
+     * the manager's own unchanged company text, never a new one somebody typed.
+     *
+     * <p>It fails rather than returning null, because a named refusal an admin can act on beats a
+     * raw constraint violation naming a table they have never heard of.
+     */
+    private Future<Long> companyIdForCareerEntry(Long known, String companyText) {
+        if (known != null) return Future.succeededFuture(known);
+        if (companyText == null || companyText.isBlank()) {
+            return Future.failedFuture(ServiceException.badRequest(
+                "This role cannot be recorded because it names no company. Set the company on the "
+                + "manager, then approve the request again."));
+        }
+        return resolveCompanyForCareerEntry(null, companyText, null)
+            .compose(id -> id != null
+                ? Future.succeededFuture(id)
+                : Future.failedFuture(ServiceException.badRequest(
+                    "This role cannot be recorded because \"" + companyText + "\" could not be "
+                    + "resolved to a company. Set the company on the manager, then approve the "
+                    + "request again.")));
+    }
+
+    /**
      * Records that one company is part of another. Not a merge: both keep their pages, managers
      * and ratings, and the child stays independently searchable.
      */
@@ -1736,9 +1895,34 @@ public class AdminService {
             .map(count -> new JsonObject().put("success", true).put("updated", count));
     }
 
+    /**
+     * A protected employment cannot be deleted, and now says why.
+     *
+     * <p>{@code role_corrections.role_id} is ON DELETE RESTRICT, so once an administrator has
+     * corrected an employment the database refuses to delete it: the record of what was changed
+     * has to outlive the row it describes, or the audit could be erased by removing its subject.
+     *
+     * <p>Without this the refusal reached the client as a raw foreign-key error naming
+     * {@code role_corrections_role_id_fkey}, which section 27 forbids and which tells a moderator
+     * nothing about what to do instead. Deleting the history to make the delete succeed is not an
+     * option: that is the one thing the constraint exists to prevent.
+     */
+    private Future<Integer> deleteCareerEntryGuarded(long entryId, long managerId) {
+        return managerRepo.deleteCareerEntry(entryId, managerId)
+            .recover(err -> {
+                if (String.valueOf(err.getMessage()).contains("role_corrections")) {
+                    return Future.failedFuture(ServiceException.conflict(
+                        "This employment has a correction history, so it cannot be deleted. The "
+                        + "record of what was corrected has to outlive the employment it "
+                        + "describes. Reject the employment instead, which keeps both."));
+                }
+                return Future.failedFuture(err);
+            });
+    }
+
     public Future<JsonObject> adminDeleteCareerEntry(String auth0Id, long managerId, long entryId) {
         return requireAdmin(auth0Id)
-            .compose(adminId -> managerRepo.deleteCareerEntry(entryId, managerId))
+            .compose(adminId -> deleteCareerEntryGuarded(entryId, managerId))
             // Same reason as the update above: removing the current role must not leave the header
             // advertising it.
             .compose(count -> managerRepo.syncHeadlineFromCareerHistory(managerId).map(v -> count))
@@ -1821,7 +2005,7 @@ public class AdminService {
                               on the chart, which is the thing being removed.
                             */
                             Future<Integer> entryWork = entryId.isPresent()
-                                ? managerRepo.deleteCareerEntry(entryId.get(), managerId)
+                                ? deleteCareerEntryGuarded(entryId.get(), managerId)
                                 : Future.succeededFuture(0);
                             return entryWork.map(deletedEntries -> new int[]{ affected, deletedEntries });
                         });
@@ -1903,6 +2087,17 @@ public class AdminService {
     private static Optional<String> publicationBlocker(Row draftRow) {
         JsonObject payload = draftRow.getJsonObject("payload");
         if (payload == null) return Optional.of("This draft holds no answers.");
+        /*
+          A MANAGER rating hangs off a manager, not a company, so the company check below does not
+          apply to it: company and title travel in the payload as the reviewer knew them, and the
+          manager row is what the rating attaches to.
+        */
+        if (CapturedDraftRepository.MANAGER_REVIEW.equals(draftRow.getString("kind"))) {
+            if (draftRow.getLong("manager_id") == null) {
+                return Optional.of("The manager this was about is no longer here.");
+            }
+            return ManagerService.publicationBlocker(payload);
+        }
         if (draftRow.getLong("company_id") == null) {
             /*
               A capture can arrive with no company: the form names one that does not exist yet,
@@ -1949,7 +2144,8 @@ public class AdminService {
      * one state that produces a duplicate, so it cannot be a state this method can end in.
      */
     public Future<JsonObject> publishCapturedDraft(String auth0Id, long draftId) {
-        if (db == null || companyRatings == null || interviewReviews == null) {
+        if (db == null || companyRatings == null || interviewReviews == null
+                || managerRatings == null) {
             return Future.failedFuture(ServiceException.forbidden("DB not configured"));
         }
         return requireAdmin(auth0Id).compose(adminId ->
@@ -1973,7 +2169,16 @@ public class AdminService {
                         return Future.failedFuture(ServiceException.badRequest(blocked.get()));
                     }
 
-                    long companyId   = draft.getLong("company_id");
+                    /*
+                      A BOXED Long, deliberately.
+
+                      This was `long companyId`, read before the dispatch. A manager rating hangs
+                      off a manager and carries no company id, so publishing one unboxed a null
+                      and threw a NullPointerException - which compiles perfectly and fails only
+                      at the moment an admin presses the button. The two company-shaped kinds are
+                      guaranteed non-null by the blocker above and read it inside their branch.
+                    */
+                    Long companyId     = draft.getLong("company_id");
                     JsonObject payload = draft.getJsonObject("payload");
                     UUID draftToken  = draft.getUUID("draft_token");
                     String kind      = draft.getString("kind");
@@ -1989,6 +2194,9 @@ public class AdminService {
                             companyRatings.publishAnonymously(conn, companyId, payload, draftToken);
                         case CapturedDraftRepository.INTERVIEW ->
                             interviewReviews.publishAnonymously(conn, companyId, payload, draftToken);
+                        case CapturedDraftRepository.MANAGER_REVIEW ->
+                            managerRatings.publishAnonymously(conn, draft.getLong("manager_id"),
+                                                              payload, draftToken);
                         default -> Future.failedFuture(
                             ServiceException.badRequest("This kind of draft cannot be published."));
                     };

@@ -111,7 +111,13 @@ public class ReviewRepository {
             String sql = String.format(
                 "SELECT r.*, " + EFFECTIVE_WORKED_UNTIL
                 + " FROM reviews r WHERE r.manager_id = $1 AND r.deleted_at IS NULL "
-                + "AND (r.weight = FALSE OR r.weight_expires_on IS NULL OR r.weight_expires_on > CURRENT_DATE) "
+                // A platform example is PERMANENT and always shown (blurred when gated, labelled
+                // when unlocked). The weight-window clause below only ever gated seeds; now that
+                // examples are retained as demonstrations, origin keeps them visible after the
+                // 14-day window the old seed lifecycle used. Stats are unaffected: recalculate
+                // excludes examples by origin, not by presence in this list.
+                + "AND (r.origin = 'platform_example' "
+                + "     OR r.weight = FALSE OR r.weight_expires_on IS NULL OR r.weight_expires_on > CURRENT_DATE) "
                 + "AND (r.disposition = 'live' OR $4 = TRUE OR ($5::uuid IS NOT NULL AND r.user_id = $5)) "
                 + "ORDER BY %s LIMIT $2 OFFSET $3", orderBy.replace("created_at", "r.created_at")
                     .replace("helpful_count", "r.helpful_count").replace("overall_rating", "r.overall_rating"));
@@ -319,7 +325,23 @@ public class ReviewRepository {
      * No JOIN, no large text columns.
      */
     public Future<RowSet<Row>> findByUserForValidation(UUID userId, String author) {
-        return db.preparedQuery(
+        return findByUserForValidation(db, userId, author);
+    }
+
+    /**
+     * As above, on a connection the caller already holds.
+     *
+     * <p><b>It has to be the caller's connection when there is one.</b> This reads a contributor's
+     * existing ratings to reject a duplicate, and a replacement supersedes the original inside its
+     * own transaction before the insert runs. Read on the pool, this query sees the committed
+     * state - the original still live - and the replacement is refused as
+     * {@code already_reviewed_this_role}, against the very rating it is replacing. That is what
+     * happened the first time replaceReview became transactional, and it is the same mistake as a
+     * detector keyed differently from the index it enforces: two readers of one fact, disagreeing
+     * about which transaction they are in.
+     */
+    public Future<RowSet<Row>> findByUserForValidation(SqlClient conn, UUID userId, String author) {
+        return conn.preparedQuery(
                 "SELECT id, manager_id, manager_title, manager_company, worked_from, worked_until, " +
                 "manager_role_start, manager_role_end " +
                 "FROM reviews WHERE (user_id = $1 OR (author = $2 AND user_id IS NULL)) AND deleted_at IS NULL AND weight = FALSE")
@@ -523,17 +545,38 @@ public class ReviewRepository {
                 : Optional.empty());
     }
 
-    /** Returns true if the review was found and belonged to the user. */
+    /**
+     * The account that owns this rating, if any.
+     *
+     * <p>Empty means two different things and callers treat them the same way, correctly: the
+     * rating does not exist, or it exists and has no owner.
+     *
+     * <p><b>{@code ofNullable}, not {@code of}.</b> It was {@code Optional.of(...)}, which throws
+     * NullPointerException the moment the row exists with a NULL {@code user_id} - which is the
+     * normal state of every anonymised rating, every rating the restoration sweep has brought
+     * back, and now every unlinked one. So acting on one of those returned HTTP 500 where it
+     * should have returned 404, and the stack trace blamed the repository rather than the missing
+     * owner. Found by {@code UnlinkRatingIntegrationTest#theContributorCanNoLongerEditIt}, which
+     * asks for the owner of a rating it has just unlinked.
+     */
     public Future<Optional<UUID>> findOwnerUserId(UUID reviewId, long managerId) {
         return db.preparedQuery("SELECT user_id FROM reviews WHERE id = $1 AND manager_id = $2")
             .execute(Tuple.of(reviewId, managerId))
             .map(rows -> rows.iterator().hasNext()
-                ? Optional.of(rows.iterator().next().getUUID("user_id"))
+                ? Optional.ofNullable(rows.iterator().next().getUUID("user_id"))
                 : Optional.empty());
     }
 
-    /** Soft-deletes a review: hides it from public queries and strips user_id immediately.
-     *  After 3 days the review resurfaces as anonymous via {@link #restoreExpiredDeletions()}. */
+    /**
+     * Soft-deletes a review: hides it from public queries immediately, and after 3 days the review
+     * resurfaces as anonymous via {@link #restoreExpiredDeletions()}.
+     *
+     * <p><b>"strips user_id immediately" was true and is no longer.</b> A LEGACY rating is still
+     * severed here; a CLAIMED one keeps its contributor until the window expires, because the
+     * claim tombstone cannot be written without the claim the rating points at. The detail is on
+     * the overload below, where the SQL is. Corrected rather than left, because a one-line summary
+     * that contradicts the statement underneath it is worse than no summary.
+     */
     public Future<Void> delete(UUID reviewId, long managerId) {
         return delete(db, reviewId, managerId);
     }
@@ -550,13 +593,133 @@ public class ReviewRepository {
      * <p>Set here rather than in the restore sweep, for the same reason {@code user_id} is: the
      * decision belongs to the act of withdrawing, and a flag set at delete time travels with the
      * row however it later comes back.
+     *
+     * <p><b>A CLAIMED rating keeps its contributor through the window</b>, and only a legacy one
+     * is severed here. That is rev 268's lifecycle: the pending row retains {@code user_id},
+     * {@code claim_id}, {@code draft_token}, {@code role_basis} and its attribution, and
+     * {@link #restoreExpiredDeletions} performs the severance and the basis transition when the
+     * window expires. The row is hidden either way, so nothing is published by holding it; what it
+     * buys is that one place owns the whole transition, including the claim tombstone, which
+     * cannot be written without the claim the rating points at.
      */
     public Future<Void> delete(SqlClient conn, UUID reviewId, long managerId) {
-        return conn.preparedQuery(
-                "UPDATE reviews SET deleted_at = now(), user_id = NULL, dates_hidden = TRUE "
-              + "WHERE id = $1 AND manager_id = $2")
+        return conn.preparedQuery("""
+                UPDATE reviews SET
+                    deleted_at   = now(),
+                    dates_hidden = TRUE,
+                    -- A LEGACY rating is severed here, exactly as before: there is no claim, so
+                    -- this is the whole of anonymisation and the decision belongs to the act of
+                    -- withdrawing.
+                    --
+                    -- A CLAIMED rating KEEPS its contributor through the window, which is rev
+                    -- 268's lifecycle (delete_review, "identity KEPT"). The row is invisible
+                    -- either way, so nothing is published by holding it; what it buys is that the
+                    -- claim can still be reached from the rating when the window expires, so the
+                    -- tombstone, the severance and the basis transition all happen in one place
+                    -- instead of half at each end.
+                    user_id      = CASE WHEN role_basis = 'claimed' THEN user_id ELSE NULL END
+                 WHERE id = $1 AND manager_id = $2
+                """)
             .execute(Tuple.of(reviewId, managerId))
             .mapEmpty();
+    }
+
+
+    /**
+     * Soft-deletes a rating its own author has just superseded, so that it never comes back.
+     *
+     * <p><b>Issue 37.</b> {@link #delete} sets no {@code deleted_reason}, because an author's
+     * withdrawal has none - a reason means an administrator decided - and
+     * {@link #restoreExpiredDeletions} restores exactly the rows that carry no reason. A replaced
+     * original satisfied that predicate, so three days after any edit it returned: live,
+     * anonymous, and counting toward the manager's average beside its own replacement. By then
+     * {@code user_id} was gone, so nothing could tell the two rows came from one person.
+     *
+     * <p>{@code replaced_by_author} is what keeps it dead. The restoration predicate is not
+     * relaxed, because it is the only thing separating a withdrawal from a moderator's removal.
+     *
+     * <p><b>Issue 38, and why the reason has to be set in THIS statement.</b>
+     * {@code idx_reviews_author_manager_role_legacy} is unique on the author, manager, title and
+     * employer of an indexed legacy rating and has no {@code deleted_at} predicate, so a
+     * soft-deleted row keeps occupying its slot - deliberately, because a withdrawn row is coming
+     * back in three days and the restoration sweep is one bulk UPDATE that would abort for its
+     * whole batch on a collision. V111 narrows the index with {@code deleted_reason IS NULL}, so a
+     * row that can never return leaves it. Setting the reason as part of the delete therefore
+     * frees the slot before the replacement is inserted; setting it afterwards would be too late.
+     *
+     * <p><b>The claimed case, in the same statement because the fields are interdependent.</b>
+     * {@code reviews_basis_matches_claim} is {@code (role_basis = 'claimed') = (claim_id IS NOT
+     * NULL)}, so clearing the claim demands the basis move with it. A replaced original is never
+     * coming back, so it takes the same anonymising transition restoration performs and keeps the
+     * employment it was attributed to in {@code withdrawn_role_id}, which is the route a withdrawn
+     * rating reaches its role by. No disposition handling is needed: a claim with no resolved role
+     * cannot have a live rating, because {@code reviews_live_is_resolved} refuses one, so
+     * {@code reviews_withdrawn_keeps_its_role} is already satisfied either way.
+     *
+     * <p><b>{@code role_exemption} is deliberately not set</b>, although rev 268's transition sets
+     * it to {@code 'author_withdrawn'}. The column does not exist: it belongs to the S4
+     * post-cutover enforcement block, which is unimplemented on purpose and must not run before
+     * Phase 6 is authorised. Writing it here would mean adding that block early. When S4 lands,
+     * this statement and the restoration sweep both gain the column together.
+     *
+     * <p>A legacy original keeps its basis and attribution untouched, which is every rating in
+     * production today.
+     *
+     * @return true when exactly one row was superseded. False means the caller does not own it, it
+     *         is already deleted, or it is not on this manager - and the caller must then abort
+     *         rather than insert a replacement, or the author would lose both.
+     */
+    public Future<Boolean> deleteAsReplacedByAuthor(SqlClient conn, UUID reviewId, long managerId,
+                                                    UUID ownerId) {
+        return conn.preparedQuery("""
+                UPDATE reviews r SET
+                    deleted_at     = now(),
+                    deleted_reason = 'replaced_by_author',
+                    dates_hidden   = TRUE,
+                    user_id        = NULL,
+                    draft_token    = NULL,
+                    role_required  = FALSE,
+                    role_basis     = CASE WHEN r.claim_id IS NOT NULL
+                                          THEN 'withdrawn' ELSE r.role_basis END,
+                    withdrawn_role_id = CASE WHEN r.claim_id IS NOT NULL
+                                             THEN (SELECT c.resolved_role_id FROM role_claims c
+                                                    WHERE c.id = r.claim_id)
+                                             ELSE r.withdrawn_role_id END,
+                    attribution_basis = CASE
+                        WHEN r.claim_id IS NULL THEN r.attribution_basis
+                        WHEN (SELECT c.resolved_role_id FROM role_claims c
+                               WHERE c.id = r.claim_id) IS NULL THEN 'unresolved'
+                        ELSE 'withdrawn_role' END,
+                    attributed_company_id = CASE WHEN r.claim_id IS NOT NULL
+                                                 THEN NULL ELSE r.attributed_company_id END,
+                    claim_id       = NULL
+                 WHERE r.id = $1 AND r.manager_id = $2 AND r.user_id = $3
+                   AND r.deleted_at IS NULL
+                """)
+            .execute(Tuple.of(reviewId, managerId, ownerId))
+            .map(rs -> rs.rowCount() == 1);
+    }
+
+    /**
+     * Locks one rating for a replacement, and reports who owns it.
+     *
+     * <p>{@code FOR UPDATE} is what makes two simultaneous replacements of the same rating safe:
+     * the second waits, then finds {@code deleted_at} already set and
+     * {@link #deleteAsReplacedByAuthor} matches no row, so it aborts with the original already
+     * superseded by the first rather than superseding it twice and inserting two replacements.
+     *
+     * <p>It also settles the race with the restoration sweep. The sweep is a single UPDATE keyed
+     * on {@code deleted_reason IS NULL}; blocked on this row it re-evaluates its predicate when
+     * the lock lifts, by which point the reason is set, and skips it.
+     */
+    public Future<Optional<UUID>> lockForReplacement(SqlClient conn, UUID reviewId, long managerId) {
+        return conn.preparedQuery(
+                "SELECT user_id FROM reviews WHERE id = $1 AND manager_id = $2 "
+              + "AND deleted_at IS NULL FOR UPDATE")
+            .execute(Tuple.of(reviewId, managerId))
+            .map(rows -> rows.iterator().hasNext()
+                ? Optional.ofNullable(rows.iterator().next().getUUID("user_id"))
+                : Optional.empty());
     }
 
     /**
@@ -573,12 +736,169 @@ public class ReviewRepository {
      * reason means an author withdrew.
      */
     public Future<Integer> restoreExpiredDeletions() {
-        return db.preparedQuery(
-                "UPDATE reviews SET deleted_at = NULL " +
-                "WHERE deleted_at IS NOT NULL AND deleted_at < now() - INTERVAL '3 days' " +
-                "AND deleted_reason IS NULL")
-            .execute()
-            .map(RowSet::rowCount);
+        // The eligibility predicate, written once and restated in every statement below, so a row
+        // that stops qualifying between them - a replacement naming it, a moderator reaching it -
+        // is skipped rather than half-transitioned.
+        final String eligible = """
+                 r.deleted_at IS NOT NULL
+                 AND r.deleted_at < now() - INTERVAL '3 days'
+                 AND r.deleted_reason IS NULL
+                """;
+        return ((io.vertx.sqlclient.Pool) db).withTransaction(tx ->
+            // 1. THE CLAIM TOMBSTONE, marked HERE and not at withdrawal (V111).
+            //    The claim keeps user_id and finalized_at and ends up pointing at no rating:
+            //    a finalized, owned, non-duplicate claim with no rating. That shape is not
+            //    corruption, it is the tombstone, and it is what stops the same contributor
+            //    rating that employment twice. Revival clears it.
+            tx.preparedQuery("""
+                    UPDATE role_claims c SET withdrawn_at = now()
+                      FROM reviews r
+                     WHERE r.claim_id = c.id
+                       AND r.role_basis = 'claimed'
+                       AND c.withdrawn_at IS NULL
+                       AND""" + eligible + """
+                    RETURNING c.resolved_role_id
+                    """)
+                .execute()
+                /*
+                  1a. THE EMPLOYMENT THAT CLAIM WAS GROUNDING, RECOMPUTED HERE.
+
+                  A withdrawn claim is not evidence: the tombstone exists to stop the same
+                  contributor rating that employment twice and to keep the audit trail, not to go
+                  on asserting on their behalf after they withdrew. EmploymentStatusResolver
+                  excludes it for that reason.
+
+                  Excluding it from the derivation is only half of the rule. The other half is
+                  that the derivation has to be RE-RUN when eligibility changes, or the role keeps
+                  the answer the claim gave it: an 'ongoing' status whose status_claim_id points at
+                  a claim that is no longer allowed to ground anything, sitting there until some
+                  unrelated acceptance or correction happens to touch the same role. That is a
+                  stale assertion about somebody's present employment, which is the one thing this
+                  model exists to avoid.
+
+                  In THIS transaction, with the tombstone, because the two are one change. If the
+                  recompute fails the withdrawal does not happen either.
+
+                  Resolving may legitimately find the role still 'ongoing': another contributor's
+                  claim can assert the same thing, and then the status stands on that one instead
+                  and records a new evidence pointer. It may also find 'ended' from the record, or
+                  nothing at all, in which case the role reads unknown.
+                */
+                .compose(tombstoned -> {
+                    java.util.LinkedHashSet<Long> grounded = new java.util.LinkedHashSet<>();
+                    for (Row row : tombstoned) {
+                        Long roleId = row.getLong("resolved_role_id");
+                        if (roleId != null) grounded.add(roleId);
+                    }
+                    Future<Void> recompute = Future.succeededFuture();
+                    for (Long roleId : grounded) {
+                        recompute = recompute.compose(
+                            v -> EmploymentStatusResolver.resolveRole(tx, roleId));
+                    }
+                    return recompute;
+                })
+                // 2. THE CAPTURED DRAFT THAT BECAME THIS RATING.
+                //    captured_drafts carries user_id AND resolved_id, which is a contributor
+                //    identity in the same row as a rating id - the exact shape the lifecycle
+                //    forbids, and the one execution caught once already. The publication path
+                //    closes it at publication time (forgetSubmitter); this closes it for a rating
+                //    that reached a draft row by any other route before being anonymised.
+                .compose(v -> tx.preparedQuery("""
+                        UPDATE captured_drafts d SET user_id = NULL
+                          FROM reviews r
+                         WHERE d.resolved_id = r.id
+                           AND d.user_id IS NOT NULL
+                           AND""" + eligible)
+                    .execute())
+                // 3. THE ANONYMISATION AND BASIS TRANSITION that withdrawal no longer performs.
+                //
+                //    A LEGACY rating has no claim, so severing user_id is the whole of it and
+                //    every other arm is a no-op: that is every rating in production today.
+                //
+                //    A CLAIMED rating loses its claim, and the basis has to move with it because
+                //    reviews_basis_matches_claim is (role_basis = 'claimed') = (claim_id IS NOT
+                //    NULL). It keeps the employment it was attributed to in withdrawn_role_id,
+                //    which is the second route a rating reaches its role by - the one
+                //    ModerationService and the merge both traverse precisely because a withdrawn
+                //    rating has no claim_id.
+                //
+                //    After this the rating is anonymous and unlinkable: no user_id, no claim_id,
+                //    no draft_token, and its period withheld. What it keeps is the manager, their
+                //    title, their employer and the workplace - facts about the SUBJECT, which
+                //    stay public, because hiding them would conceal the employment record the
+                //    redesign exists to build.
+                //
+                //    role_exemption is not set, although rev 268's transition sets it: that
+                //    column belongs to the S4 post-cutover block, which is unimplemented on
+                //    purpose and must not run before Phase 6.
+                .compose(v -> tx.preparedQuery("""
+                        UPDATE reviews r SET
+                            deleted_at   = NULL,
+                            dates_hidden = TRUE,
+                            user_id      = NULL,
+                            draft_token  = NULL,
+                            role_required = FALSE,
+                            role_basis   = CASE WHEN r.claim_id IS NOT NULL
+                                                THEN 'withdrawn' ELSE r.role_basis END,
+                            withdrawn_role_id = CASE WHEN r.claim_id IS NOT NULL
+                                                     THEN (SELECT c.resolved_role_id
+                                                             FROM role_claims c
+                                                            WHERE c.id = r.claim_id)
+                                                     ELSE r.withdrawn_role_id END,
+                            attribution_basis = CASE
+                                WHEN r.claim_id IS NULL THEN r.attribution_basis
+                                WHEN (SELECT c.resolved_role_id FROM role_claims c
+                                       WHERE c.id = r.claim_id) IS NULL THEN 'unresolved'
+                                ELSE 'withdrawn_role' END,
+                            attributed_company_id = CASE WHEN r.claim_id IS NOT NULL
+                                                         THEN NULL
+                                                         ELSE r.attributed_company_id END,
+                            claim_id     = NULL
+                         WHERE""" + eligible + """
+                        RETURNING r.id, r.role_basis
+                        """)
+                    .execute())
+                .compose(restored -> {
+                    java.util.List<UUID> withdrawn = new java.util.ArrayList<>();
+                    for (Row row : restored) {
+                        if ("withdrawn".equals(row.getString("role_basis"))) {
+                            withdrawn.add(row.getUUID("id"));
+                        }
+                    }
+                    int n = restored.rowCount();
+                    if (withdrawn.isEmpty()) return Future.succeededFuture(n);
+                    /*
+                      A RESTORED RATING MUST NOT BECOME PUBLICLY ELIGIBLE BECAUSE IT WAS RESTORED.
+
+                      Its employment may have been rejected, or may still only be proposed, while
+                      the rating was hidden. rating_role_is_publishable is asked AFTER the
+                      transition on purpose: before it, the row still has a claim and the function
+                      answers the claimed question - claim resolved, role accepted, no blocking
+                      conflict citing the claim. A withdrawn rating has no claim, so the question
+                      is only whether the role it kept is accepted, and those two answers differ
+                      exactly when a conflict cited the claim that no longer exists.
+
+                      disposition, live_since and gate_eligible move together because
+                      reviews_state_coherent requires it: 'live' demands a live_since, and
+                      anything else demands none and no gate eligibility.
+
+                      reviews_live_is_resolved is DEFERRABLE INITIALLY DEFERRED, which is what
+                      makes the intermediate state legal and this statement's correctness
+                      checkable: get it wrong and the COMMIT fails rather than publishing a rating
+                      against an employment nobody accepted.
+                    */
+                    return tx.preparedQuery("""
+                            UPDATE reviews SET
+                                disposition   = 'held',
+                                live_since    = NULL,
+                                gate_eligible = FALSE
+                             WHERE id = ANY($1)
+                               AND disposition = 'live'
+                               AND NOT rating_role_is_publishable(id)
+                            """)
+                        .execute(Tuple.of(withdrawn.toArray(new UUID[0])))
+                        .map(held -> n);
+                }));
     }
 
     /**
@@ -761,13 +1081,19 @@ public class ReviewRepository {
                     organization_and_planning_style, delegation_style, perceived_professional_demeanor,
                     overall_working_experience, manager_company, manager_title,
                     worked_from, verified, helpful_count, weight,
-                    created_at, updated_at
+                    created_at, updated_at, origin
                 )
                 VALUES ($1, NULL, $2, $3,
                         $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
                         $14, $15, $16,
                         true, 0, true,
-                        $17, $17)
+                        $17, $17,
+                        -- A NEW SEED IS A PLATFORM EXAMPLE, marked at insert.
+                        -- Without this it would take the column default 'contributor' (V106) and
+                        -- be counted as a genuine rating by recalculate()/ReviewSql.genuine(),
+                        -- which excludes examples by origin. The V106 backfill only classified
+                        -- EXISTING seeds; this keeps every future one classified too.
+                        'platform_example')
                 RETURNING *
                 """)
             .execute(Tuple.of(
@@ -822,13 +1148,36 @@ public class ReviewRepository {
     public Future<Integer> deleteExpiredSeedReviews() {
         return db.preparedQuery(
                 "DELETE FROM reviews WHERE weight = TRUE AND user_id IS NULL "
+              // Examples are retained as demonstrations (Part 3); the expiry sweep must not reap
+              // them. All current seeds are origin='platform_example', so this now deletes
+              // nothing in practice, but the predicate states the rule rather than relying on it.
+              + "AND origin <> 'platform_example' "
               + "AND weight_expires_on IS NOT NULL AND weight_expires_on <= CURRENT_DATE")
             .execute()
             .map(RowSet::rowCount);
     }
 
+    /**
+     * Removes a manager's placeholder, called the moment a genuine rating lands on them.
+     *
+     * <p><b>{@code user_id IS NULL} is a deliberate second lock on the door</b>, for the same
+     * reason {@link #deleteExpiredSeedReviews} carries it and stated it. A placeholder is defined
+     * by {@code weight = TRUE} and that alone is sufficient today: the column is
+     * {@code NOT NULL DEFAULT FALSE}, the real review INSERT never names it, no UPDATE anywhere
+     * sets it, and both the generator and the V33 backfill write {@code user_id = NULL}. The pair
+     * is here because this statement now runs on <em>every</em> rating submission rather than
+     * occasionally, so if that invariant were ever broken by a migration or a manual fix the cost
+     * would be somebody's real rating deleted by the act of somebody else rating the same manager.
+     * The guard makes such a row survive instead. That sibling method's javadoc claimed "the other
+     * seed deletes in this codebase already pair them"; this one did not, and now does.
+     *
+     * <p>Deliberately NOT restricted to {@code origin = 'platform_example'}. Legacy placeholders
+     * predate that column's values and are still placeholders, and both callers that preceded this
+     * one spoke of deleting "any legacy seed".
+     */
     public Future<Void> deleteSeedReview(long managerId) {
-        return db.preparedQuery("DELETE FROM reviews WHERE manager_id = $1 AND weight = TRUE")
+        return db.preparedQuery(
+                "DELETE FROM reviews WHERE manager_id = $1 AND weight = TRUE AND user_id IS NULL")
             .execute(Tuple.of(managerId))
             .mapEmpty();
     }
@@ -862,5 +1211,138 @@ public class ReviewRepository {
                 """)
             .execute(Tuple.of(managerId))
             .map(rows -> rows.iterator().hasNext() ? rows.iterator().next() : null);
+    }
+
+    /**
+     * UNLINK: sever a contributor from their rating, permanently, without unpublishing it.
+     *
+     * <h2>Why this is not {@link #delete}</h2>
+     *
+     * <p>Withdrawal hides the rating and {@link #restoreExpiredDeletions} brings it back anonymous
+     * three days later. Unlinking is the opposite shape: the rating <b>never leaves
+     * publication</b> and the severance happens at once. The scores keep counting toward the
+     * manager's average throughout - there is no three-day dip, no republication event, and
+     * nothing for the restoration sweep to do.
+     *
+     * <h2>The end state is the sweep's end state</h2>
+     *
+     * <p>Deliberately the same column-for-column transition {@code restoreExpiredDeletions}
+     * performs, because it is the same destination: no {@code user_id}, no {@code claim_id}, no
+     * {@code draft_token}, period withheld, the claim tombstoned, and the attribution basis moved
+     * to {@code withdrawn_role} or {@code unresolved} as the claim's resolution dictates. Writing
+     * a second, subtly different severance is how the two drift apart, and the one that drifted
+     * would be the one nobody tested.
+     *
+     * <p>What it keeps is what that transition keeps: the manager, the title, the employer and the
+     * workplace. Those are facts about the SUBJECT and stay public, because hiding them would
+     * conceal the employment record the redesign exists to build.
+     *
+     * <h2>Concurrency and repetition</h2>
+     *
+     * <p>{@code AND r.user_id = $3} is the whole guard. Two simultaneous unlinks race for one row:
+     * the first severs it, the second matches nothing and reports {@code false}. A repeat request
+     * from a contributor who pressed twice behaves identically. No lock, no read-then-write, and
+     * no window in which both can succeed - because after the first commit there is no row with
+     * that owner to find.
+     *
+     * <p>The participation record is written in the SAME transaction, before the severance, so the
+     * duplicate-prevention fact can never be lost to a failure between the two. Written with
+     * {@code ON CONFLICT} so it is idempotent and so a {@code gate_eligible} that was already true
+     * is never downgraded.
+     *
+     * @return true when this call performed the severance; false when the row was not theirs, did
+     *         not exist, or had already been unlinked
+     */
+    public Future<Boolean> unlinkByOwner(SqlClient conn, UUID reviewId, long managerId, UUID userId) {
+        /*
+          1. THE PARTICIPATION RECORD FIRST.
+
+          It outlives the rating's ownership and is what stops this account rating this manager
+          again. Taking gate_eligible from the rating itself means a held or rejected contribution
+          does not buy profile access, matching what the live gate query already decided.
+        */
+        return conn.preparedQuery("""
+                INSERT INTO rating_participation (user_id, subject_type, subject_id,
+                                                  gate_eligible, unlinked_at)
+                SELECT r.user_id, 'manager', r.manager_id,
+                       r.gate_eligible AND r.disposition = 'live' AND r.deleted_at IS NULL,
+                       now()
+                  FROM reviews r
+                 WHERE r.id = $1 AND r.manager_id = $2 AND r.user_id = $3
+                ON CONFLICT (user_id, subject_type, subject_id) DO UPDATE
+                   SET gate_eligible = rating_participation.gate_eligible OR excluded.gate_eligible,
+                       -- First relinquishment wins; a second unlink on the same subject must not
+                       -- move the date it already recorded.
+                       unlinked_at   = COALESCE(rating_participation.unlinked_at, excluded.unlinked_at)
+                """)
+            .execute(Tuple.of(reviewId, managerId, userId))
+            // 2. THE CLAIM TOMBSTONE, before the claim_id is cleared - it cannot be written once
+            //    the rating no longer points at the claim. Same ordering the sweep uses, and for
+            //    the same reason.
+            .compose(v -> conn.preparedQuery("""
+                    UPDATE role_claims c SET withdrawn_at = now()
+                      FROM reviews r
+                     WHERE r.claim_id = c.id
+                       AND r.role_basis = 'claimed'
+                       AND r.id = $1 AND r.manager_id = $2 AND r.user_id = $3
+                       AND c.withdrawn_at IS NULL
+                    """).execute(Tuple.of(reviewId, managerId, userId)))
+            // 3. The captured draft, which carries user_id AND resolved_id and would otherwise
+            //    recover the author of the rating it resolved to.
+            .compose(v -> conn.preparedQuery("""
+                    UPDATE captured_drafts d SET user_id = NULL
+                      FROM reviews r
+                     WHERE d.resolved_id = r.id
+                       AND d.user_id IS NOT NULL
+                       AND r.id = $1 AND r.manager_id = $2 AND r.user_id = $3
+                    """).execute(Tuple.of(reviewId, managerId, userId)))
+            // 4. The severance itself.
+            //
+            //    role_exemption is NOT set, although rev 268's transition sets it: that column
+            //    belongs to the S4 post-cutover block, which is unimplemented on purpose and must
+            //    not run before Phase 6.
+            .compose(v -> conn.preparedQuery("""
+                    UPDATE reviews r SET
+                        unlinked_at  = now(),
+                        dates_hidden = TRUE,
+                        user_id      = NULL,
+                        draft_token  = NULL,
+                        role_required = FALSE,
+                        role_basis   = CASE WHEN r.claim_id IS NOT NULL
+                                            THEN 'withdrawn' ELSE r.role_basis END,
+                        withdrawn_role_id = CASE WHEN r.claim_id IS NOT NULL
+                                                 THEN (SELECT c.resolved_role_id
+                                                         FROM role_claims c
+                                                        WHERE c.id = r.claim_id)
+                                                 ELSE r.withdrawn_role_id END,
+                        attribution_basis = CASE
+                            WHEN r.claim_id IS NULL THEN r.attribution_basis
+                            WHEN (SELECT c.resolved_role_id FROM role_claims c
+                                   WHERE c.id = r.claim_id) IS NULL THEN 'unresolved'
+                            ELSE 'withdrawn_role' END,
+                        attributed_company_id = CASE WHEN r.claim_id IS NOT NULL
+                                                     THEN NULL
+                                                     ELSE r.attributed_company_id END,
+                        claim_id     = NULL
+                     WHERE r.id = $1 AND r.manager_id = $2 AND r.user_id = $3
+                       AND r.origin = 'contributor'
+                    """).execute(Tuple.of(reviewId, managerId, userId)))
+            .map(rows -> rows.rowCount() > 0);
+    }
+
+    /**
+     * Has this account RELINQUISHED its claim on this manager, so it may never rate them again?
+     *
+     * <p>Deliberately not "has it ever rated them": Rev 268 allows two ratings of one subject, for
+     * a contributor with two separate employments under one manager. Only an unlink forfeits that.
+     */
+    public Future<Boolean> hasRelinquishedManager(SqlClient conn, UUID userId, long managerId) {
+        return conn.preparedQuery("""
+                SELECT EXISTS(SELECT 1 FROM rating_participation p
+                               WHERE p.user_id = $1 AND p.subject_type = 'manager'
+                                 AND p.subject_id = $2 AND p.unlinked_at IS NOT NULL) AS rated
+                """)
+            .execute(Tuple.of(userId, managerId))
+            .map(rows -> rows.iterator().next().getBoolean("rated"));
     }
 }

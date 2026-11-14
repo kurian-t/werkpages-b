@@ -77,6 +77,18 @@ public class InterviewsHandler {
      * <p>Deliberately open: the person this exists for is the one with no account yet, who filled
      * the form in and is about to be sent to sign in.
      */
+    /**
+     * The interview form's answers as they stand, while it is still being filled in.
+     *
+     * <p>Always 200. A refused autosave, below the floor or carrying a stale revision, is not
+     * something the person typing can act on.
+     */
+    public void handleAutosave(RoutingContext ctx) {
+        service.autosaveDraft(ctx.pathParam("companySlug"), ctx.body().asJsonObject())
+            .onSuccess(json -> ctx.response().putHeader("Content-Type", "application/json").end(json.encode()))
+            .onFailure(err -> ManagersHandler.handleError(ctx, err));
+    }
+
     public void handleCaptureInterviewDraft(RoutingContext ctx) {
         service.captureDraft(ctx.pathParam("companySlug"), ctx.body().asJsonObject())
             .onSuccess(json -> respond(ctx, 200, json))

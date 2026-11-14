@@ -1,6 +1,7 @@
 package org.werkpages.repository;
 
 import io.vertx.core.Future;
+import io.vertx.core.json.JsonObject;
 import io.vertx.sqlclient.Pool;
 import io.vertx.sqlclient.Row;
 import io.vertx.sqlclient.RowSet;
@@ -128,6 +129,94 @@ public class CompanyRepository {
      * Matches on the normalised form, so "Acme, Inc." finds "Acme" rather than adding a near-twin.
      * Distinct from findByName, which matches the raw name exactly and would miss that.
      */
+    /**
+     * The ten manager-rating categories, in the order the profile shows them, paired with the
+     * label the API publishes.
+     *
+     * <p>The same mapping as {@code ManagerRepository.recalculate}, which is a duplication worth
+     * naming: the labels are part of the API contract and both places have to agree. Centralising
+     * them is a separate change and is recorded rather than bundled in here.
+     */
+    private static final java.util.List<String[]> EMPLOYMENT_CATEGORIES = java.util.List.of(
+        new String[] { "communication_style",               "Communication Style" },
+        new String[] { "perceived_approachability",          "Perceived Approachability" },
+        new String[] { "perceived_clarity_of_expectations",  "Perceived Clarity of Expectations" },
+        new String[] { "feedback_style",                     "Feedback Style" },
+        new String[] { "perceived_supportiveness",           "Perceived Supportiveness" },
+        new String[] { "decision_making_style",              "Decision Making Style" },
+        new String[] { "organization_and_planning_style",    "Organization and Planning Style" },
+        new String[] { "delegation_style",                   "Delegation Style" },
+        new String[] { "perceived_professional_demeanor",    "Perceived Professional Demeanor" },
+        new String[] { "overall_working_experience",         "Overall Working Experience" });
+
+    /**
+     * The company's EMPLOYMENT-ATTRIBUTED figures: experiences people had working under managers
+     * at this company, as opposed to the affiliation figures beside them.
+     *
+     * <h2>Why these are a different question from total_reviews</h2>
+     *
+     * <p>{@code total_reviews} and {@code avg_rating} answer "who works here": they sum and average
+     * the cached per-manager values of the managers currently linked to this company. When a manager
+     * changes employer, those figures move with them, which is correct for a directory and wrong for
+     * a page promising "what it was like to work for them HERE".
+     *
+     * <p>These figures stay put. Bob received ten ratings at Adobe and then joined MSN: Adobe keeps
+     * all ten, MSN inherits none, and the directory still shows Bob at both.
+     *
+     * <h2>One population, read twice</h2>
+     *
+     * <p>The counts and the average come from {@code company_stats_live}, maintained
+     * transactionally by V101's triggers. The per-category averages are computed here, from the
+     * SAME eligible attributed population, by a function that carries the eligibility rule so the
+     * two readings can never describe different sets of ratings. The function returns that
+     * population's size as {@code rating_count}, and the caller can assert it matches.
+     *
+     * <p>Each category has its own denominator: {@code AVG} ignores nulls, so a rating that
+     * answered eight of the ten contributes to those eight and is absent from the other two rather
+     * than counting as a zero. A category nobody answered comes back null and is omitted rather
+     * than published.
+     */
+    public Future<JsonObject> findEmploymentStats(long companyId) {
+        String categoryColumns = EMPLOYMENT_CATEGORIES.stream()
+            .map(c -> "cat." + c[0]).collect(java.util.stream.Collectors.joining(", "));
+        return db.preparedQuery("""
+                SELECT s.employment_reviews, s.employment_avg_rating, s.employment_manager_count,
+                       cat.rating_count, """ + categoryColumns + """
+                  FROM company_stats_live s
+                  CROSS JOIN company_employment_category_averages(s.company_id) cat
+                 WHERE s.company_id = $1
+                """)
+            .execute(Tuple.of(companyId))
+            .map(rs -> {
+                JsonObject out = new JsonObject();
+                if (!rs.iterator().hasNext()) {
+                    // No projection row yet, which is a company nobody has rated. Explicit zeros,
+                    // because "nobody has rated working here" is an answer and the page shows it.
+                    return out.put("employmentReviews", 0)
+                              .put("employmentAvgRating", (Object) null)
+                              .put("employmentManagerCount", 0)
+                              .put("employmentCategoryAverages", new JsonObject());
+                }
+                Row row = rs.iterator().next();
+                java.math.BigDecimal avg = row.getBigDecimal("employment_avg_rating");
+                JsonObject categories = new JsonObject();
+                for (String[] c : EMPLOYMENT_CATEGORIES) {
+                    java.math.BigDecimal v = row.getBigDecimal(c[0]);
+                    // Omitted rather than published as null: a category nobody answered is not a
+                    // score of nothing, and the Strongest and Weakest panels rank what is present.
+                    if (v != null) categories.put(c[1], v.doubleValue());
+                }
+                return out
+                    .put("employmentReviews",      row.getLong("employment_reviews"))
+                    .put("employmentAvgRating",    avg == null ? null : avg.doubleValue())
+                    .put("employmentManagerCount", row.getLong("employment_manager_count"))
+                    .put("employmentCategoryAverages", categories)
+                    // The population the categories were drawn from, so a caller or a test can
+                    // assert it is the same one the headline count reports.
+                    .put("employmentCategoryPopulation", row.getLong("rating_count"));
+            });
+    }
+
     public Future<Optional<Row>> findByNormalizedName(String name) {
         return db.preparedQuery(
                 "SELECT * FROM companies WHERE normalized_name = normalize_company_name($1) LIMIT 1")
@@ -945,6 +1034,27 @@ public class CompanyRepository {
                 )
                 SELECT DISTINCT m.id, m.name, m.title, m.image, m.overall_rating, m.reviews_count,
                        m.company_logo_url, m.category_averages, m.company, m.slug, m.approval_status,
+                       /*
+                         CURRENT, FORMER OR UNKNOWN, for THIS manager at THIS company.
+
+                         Rev 268 puts the label here and not on a career row, because a career row
+                         is one episode and the reader is asking about the person: several periods
+                         at one employer are one answer, and somebody who left and returned is
+                         Current if the later episode is asserted and Unknown if it is not.
+
+                         employment_label reads ACCEPTED employment only, which is what makes the
+                         four ways a manager reaches this page unequal: a career_history row the
+                         platform accepted is evidence, while managers.company_id, the company
+                         string and reviews.manager_company put a tile on the page and establish
+                         nothing. A manager who arrives here only by one of those three has no
+                         accepted employment for this company and the function answers 'unknown' by
+                         construction rather than by a special case.
+
+                         Computed at READ time, with the freshness window as a parameter, so an
+                         'ongoing' assertion that has gone stale presents as Unknown without any
+                         sweep rewriting the row that recorded it.
+                       */
+                       employment_label(m.id, $1, $2) AS employment_status,
                        -- Every manager on this page works at THIS company, so its resolved
                        -- identity is theirs. Without it each card fell back to a letter on a
                        -- page that was already showing the company's own logo.
@@ -970,7 +1080,7 @@ public class CompanyRepository {
                   )
                 ORDER BY m.reviews_count DESC NULLS LAST, m.overall_rating DESC NULLS LAST, m.name ASC
                 """)
-            .execute(Tuple.of(companyId));
+            .execute(Tuple.of(companyId, EmploymentStatusResolver.FRESHNESS_MONTHS));
     }
 
     public Future<Boolean> updateLogo(long id, String logoUrl) {
@@ -1478,6 +1588,33 @@ public class CompanyRepository {
                         .compose(v -> conn.preparedQuery("UPDATE interview_review_deletions SET company_id = $1 WHERE company_id = $2")
                             .execute(Tuple.of(keepId, mergeId)))
 
+                        /*
+                          EMPLOYMENT ATTRIBUTION moves too, and it was missed for a long time.
+
+                          V97 added reviews.attributed_company_id and this merge was never taught
+                          about it, because at the time nothing wrote to it. V102 now writes it for
+                          every legacy rating whose employer it can derive, which turned the
+                          omission into a real defect: a merge left those ratings pointing at the
+                          retired company, and company_employment_stats_expected groups by that id,
+                          so they were counted under a company that appears in no listing and no
+                          search. The surviving company's employment figures came out quietly short
+                          and nothing in the database looked wrong.
+
+                          Recorded under its own entity type rather than reusing 'review', which
+                          already means "manager_company text was rewritten". The two are different
+                          facts about the same row - one display text, one a foreign key - and an
+                          undo has to be able to reverse either without assuming the other.
+                        */
+                        .compose(v -> conn.preparedQuery("""
+                                INSERT INTO company_merge_records (merge_id, entity_type, record_id, old_company_id, new_company_id)
+                                SELECT $1, 'review_attribution', r.id::TEXT, $3, $2
+                                FROM reviews r WHERE r.attributed_company_id = $3
+                                """)
+                            .execute(Tuple.of(mergeUuid, keepId, mergeId)))
+                        .compose(v -> conn.preparedQuery(
+                                "UPDATE reviews SET attributed_company_id = $1 WHERE attributed_company_id = $2")
+                            .execute(Tuple.of(keepId, mergeId)))
+
                         // Company ratings move like everything else. Safe because previewMerge
                         // has already refused the merge if anyone rated both, so no two of these
                         // can land on the same company for the same person.
@@ -1789,6 +1926,17 @@ public class CompanyRepository {
                                 WHERE rec.merge_id = $1 AND rec.entity_type = 'review'
                                   AND r.id = rec.record_id::UUID
                                   AND rec.old_company_text IS NOT NULL
+                                """)
+                            .execute(Tuple.of(mergeRecordId)))
+
+                        // Employment attribution goes back to the company it was derived for.
+                        // Only the rows this merge actually moved, so a rating attributed to the
+                        // survivor before the merge - or by a backfill after it - stays put.
+                        .compose(v -> conn.preparedQuery("""
+                                UPDATE reviews r SET attributed_company_id = rec.old_company_id
+                                FROM company_merge_records rec
+                                WHERE rec.merge_id = $1 AND rec.entity_type = 'review_attribution'
+                                  AND r.id = rec.record_id::UUID
                                 """)
                             .execute(Tuple.of(mergeRecordId)))
 

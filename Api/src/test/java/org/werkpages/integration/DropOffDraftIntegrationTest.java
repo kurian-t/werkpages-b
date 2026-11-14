@@ -75,8 +75,17 @@ class DropOffDraftIntegrationTest {
 
     @BeforeEach
     void cleanDb() throws Exception {
-        // Delete in FK order (child → parent) to avoid deadlock with background recalculate/scheduleSeedExpiry queries
+        // Delete in FK order (child -> parent) to avoid deadlock with background recalculate/scheduleSeedExpiry queries
         await(pool.query("DELETE FROM reviews").execute());
+        // V112. Deleting a manager cascades to career_history, and employment_status_events
+        // references those roles with ON DELETE RESTRICT so that deleting a manager cannot erase
+        // the record that their employment was ever resolved. This flow now creates those events,
+        // so the cleanup has to clear them first. Nothing asserted here changes.
+        //
+        // TRUNCATE, not DELETE: the log is append-only and its trigger refuses a DELETE outright.
+        // TRUNCATE does not fire row-level triggers, which is why every other test class in this
+        // suite clears the audit tables that way.
+        await(pool.query("TRUNCATE employment_status_events").execute());
         await(pool.query("DELETE FROM review_deletions").execute());
         await(pool.query("DELETE FROM managers").execute());
         await(pool.query("DELETE FROM companies").execute());

@@ -29,6 +29,7 @@ public class CapturedDraftRepository {
 
     public static final String COMPANY_RATING = "company_rating";
     public static final String INTERVIEW      = "interview";
+    public static final String MANAGER_REVIEW = "manager_review";
 
     public static final String PUBLISHED  = "published";
     public static final String DISMISSED  = "dismissed";
@@ -40,23 +41,124 @@ public class CapturedDraftRepository {
         this.db = db;
     }
 
+    public static final String ACTIVE    = "active";
+    public static final String ABANDONED = "abandoned";
+    public static final String RESOLVED  = "resolved";
+
     /**
-     * Records what a form held.
+     * Records what a form holds, now, and again every few seconds while it is being filled in.
      *
-     * <p>A plain insert, so somebody bounced twice leaves two rows holding the same token. That is
-     * deliberate: capturing happens while a person is already walking away, and an upsert keyed on
-     * a client-generated token would make the courtesy conditional on a write succeeding against a
-     * constraint. The consequence is handled where it matters rather than here, in
-     * {@link #supersedeSiblings} and in the unique index on a published rating's {@code
-     * draft_token}, so one form can only ever become one rating however many times it was kept.
+     * <p><b>An upsert on the form's token, and that is the whole deduplication story.</b> Autosave
+     * fires on a debounce, so a single rating produces dozens of these. Without a unique token the
+     * queue would fill with one row per pause in typing, and the aggregate statistics this data
+     * exists to feed would count one person's single opinion dozens of times over.
+     *
+     * <p>Three conditions on the update, each refusing a specific way this could corrupt data:
+     *
+     * <ul>
+     *   <li><b>{@code revision <}</b> - an autosave delayed in flight cannot replace newer answers
+     *       with older ones. Two tabs on one form share a token, so without this the tab that
+     *       happened to arrive last would win, which is not the same as the newest answer winning.
+     *   <li><b>{@code resolution IS NULL}</b> - a draft an admin published or dismissed carries
+     *       their decision and the record of what it became. A late autosave must not quietly
+     *       reopen it.
+     *   <li><b>{@code state} set back to active</b> - somebody who returns to an unfinished form
+     *       takes it out of the approval queue again. Abandonment is an observation about silence,
+     *       not a verdict.
+     * </ul>
+     *
+     * <p>No row is touched when none of those hold, and the caller is told nothing, deliberately:
+     * a refused autosave is not an error anybody can act on, and the person is still typing.
+     *
+     * <p>{@code revision} comes from the browser and is trusted for ordering alone. Nothing about
+     * correctness depends on its honesty: the worst a bad value does is make one contributor's own
+     * later answers lose to their earlier ones.
+     */
+    public Future<Void> autosave(String kind, Long companyId, Long managerId, UUID userId,
+                                 UUID draftToken, JsonObject payload, long revision) {
+        if (draftToken == null) return Future.succeededFuture();
+        return db.preparedQuery("""
+                INSERT INTO captured_drafts
+                    (kind, company_id, manager_id, user_id, draft_token, payload, revision, state)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, 'active')
+                ON CONFLICT (draft_token) DO UPDATE
+                   SET payload    = EXCLUDED.payload,
+                       revision   = EXCLUDED.revision,
+                       company_id = COALESCE(EXCLUDED.company_id, captured_drafts.company_id),
+                       manager_id = COALESCE(EXCLUDED.manager_id, captured_drafts.manager_id),
+                       user_id    = COALESCE(EXCLUDED.user_id,    captured_drafts.user_id),
+                       state      = 'active',
+                       updated_at = now()
+                 WHERE captured_drafts.revision < EXCLUDED.revision
+                   AND captured_drafts.resolution IS NULL
+                """)
+            .execute(Tuple.of(kind, companyId, managerId, userId, draftToken, payload, revision))
+            .mapEmpty();
+    }
+
+    /**
+     * Moves drafts nobody has touched lately out of 'active' so the queue can show them.
+     *
+     * <p>Run from the maintenance sweep. The window is an inactivity timeout rather than a
+     * judgement: a contributor who comes back resumes the same token and {@link #autosave} puts it
+     * straight back to active.
+     *
+     * <p>Leaves resolved rows alone, so an admin's decision is never relabelled.
+     */
+    public Future<Integer> markAbandoned(int minutesIdle) {
+        return db.preparedQuery("""
+                UPDATE captured_drafts
+                   SET state = 'abandoned'
+                 WHERE state = 'active'
+                   AND resolution IS NULL
+                   AND updated_at < now() - make_interval(mins => $1)
+                """)
+            .execute(Tuple.of(minutesIdle))
+            .map(io.vertx.sqlclient.SqlResult::rowCount);
+    }
+
+    /**
+     * Records what a form held, in one shot, at submit.
+     *
+     * <p>A later capture of the same form REPLACES the unreviewed one before it. This used to be a
+     * plain insert, which was tolerable while the form captured once, at submit; it is not now
+     * that it captures on every attempt so a partial answer survives. One person's single opinion
+     * must be one row in the queue.
      */
     public Future<Void> capture(String kind, Long companyId, Long managerId,
                                 UUID userId, UUID draftToken, JsonObject payload) {
+        /*
+          THE SAME UPSERT AUTOSAVE USES, and for the same reasons.
+
+          This used to delete the unreviewed row and insert a fresh one. That worked while the
+          token index was non-unique; V97 made it unique, and a capture arriving after an admin
+          had published the draft then hit a duplicate key, because the delete correctly skipped
+          the resolved row and the insert collided with it.
+
+          An upsert guarded on `resolution IS NULL` is the honest behaviour: a form session that
+          has already become a published or dismissed rating is finished, and a late capture under
+          its token is ignored rather than being allowed to reopen it. The client mints a new
+          token for a genuinely new attempt, because submitting clears the stored draft.
+
+          Capture carries no revision of its own - it IS the newest state by definition, arriving
+          at submit - so it takes the clock, which is always ahead of any autosave before it.
+        */
         return db.preparedQuery("""
-                INSERT INTO captured_drafts (kind, company_id, manager_id, user_id, draft_token, payload)
-                VALUES ($1, $2, $3, $4, $5, $6)
+                INSERT INTO captured_drafts
+                    (kind, company_id, manager_id, user_id, draft_token, payload, revision, state)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, 'abandoned')
+                ON CONFLICT (draft_token) DO UPDATE
+                   SET payload    = EXCLUDED.payload,
+                       revision   = EXCLUDED.revision,
+                       company_id = COALESCE(EXCLUDED.company_id, captured_drafts.company_id),
+                       manager_id = COALESCE(EXCLUDED.manager_id, captured_drafts.manager_id),
+                       user_id    = COALESCE(EXCLUDED.user_id,    captured_drafts.user_id),
+                       state      = 'abandoned',
+                       updated_at = now()
+                 WHERE captured_drafts.resolution IS NULL
                 """)
-            .execute(Tuple.of(kind, companyId, managerId, userId, draftToken, payload))
+            .execute(Tuple.of(kind, companyId, managerId, userId, draftToken, payload,
+                              System.currentTimeMillis()))
             .mapEmpty();
     }
 
@@ -116,7 +218,8 @@ public class CapturedDraftRepository {
                                    UUID resolvedId, UUID resolvedBy) {
         return conn.preparedQuery("""
                 UPDATE captured_drafts
-                   SET reviewed_at = now(), resolution = $2, resolved_id = $3, resolved_by = $4
+                   SET reviewed_at = now(), resolution = $2, resolved_id = $3, resolved_by = $4,
+                       state = 'resolved', updated_at = now()
                  WHERE id = $1 AND reviewed_at IS NULL
                 """)
             .execute(Tuple.of(id, resolution, resolvedId, resolvedBy))
@@ -158,7 +261,8 @@ public class CapturedDraftRepository {
         if (draftToken == null) return Future.succeededFuture();
         return conn.preparedQuery("""
                 UPDATE captured_drafts
-                   SET reviewed_at = now(), resolution = 'superseded', resolved_id = $3
+                   SET reviewed_at = now(), resolution = 'superseded', resolved_id = $3,
+                       state = 'resolved', updated_at = now()
                  WHERE draft_token = $1 AND id <> $2 AND reviewed_at IS NULL
                 """)
             .execute(Tuple.of(draftToken, publishedId, resolvedId))
@@ -207,10 +311,20 @@ public class CapturedDraftRepository {
             .mapEmpty();
     }
 
-    /** The queue, newest first. Resolved drafts are kept but not shown. */
+    /**
+     * The queue: drafts nobody is editing right now, newest activity first.
+     *
+     * <p><b>'active' is excluded, and that is the point of the state column.</b> Forms autosave
+     * every few seconds, so without this an admin would watch new items appear and change under
+     * them as somebody typed, and would be reviewing a rating that was still being written.
+     *
+     * <p>Ordered by {@code updated_at} rather than {@code created_at}: when a draft last changed
+     * is what says how stale it is, and a resumed form that has just gone quiet again is more
+     * interesting than one started first.
+     */
     public Future<RowSet<Row>> findUnreviewed(int limit, int offset) {
         return db.preparedQuery("""
-                SELECT d.id, d.kind, d.payload, d.created_at,
+                SELECT d.id, d.kind, d.payload, d.created_at, d.updated_at, d.state,
                        d.company_id, c.name AS company_name, c.slug AS company_slug,
                        d.manager_id, m.name AS manager_name,
                        u.username AS author_username
@@ -219,14 +333,17 @@ public class CapturedDraftRepository {
                   LEFT JOIN managers  m ON m.id = d.manager_id
                   LEFT JOIN users     u ON u.id = d.user_id
                  WHERE d.reviewed_at IS NULL
-                 ORDER BY d.created_at DESC
+                   AND d.state <> 'active'
+                 ORDER BY d.updated_at DESC
                  LIMIT $1 OFFSET $2
                 """)
             .execute(Tuple.of(limit, offset));
     }
 
     public Future<Long> countUnreviewed() {
-        return db.preparedQuery("SELECT count(*) AS c FROM captured_drafts WHERE reviewed_at IS NULL")
+        return db.preparedQuery(
+                "SELECT count(*) AS c FROM captured_drafts "
+              + "WHERE reviewed_at IS NULL AND state <> 'active'")
             .execute()
             .map(rs -> rs.iterator().next().getLong("c"));
     }
@@ -240,7 +357,8 @@ public class CapturedDraftRepository {
     public Future<Boolean> dismiss(long id, UUID adminUserId) {
         return db.preparedQuery("""
                 UPDATE captured_drafts
-                   SET reviewed_at = now(), resolution = 'dismissed', resolved_by = $2
+                   SET reviewed_at = now(), resolution = 'dismissed', resolved_by = $2,
+                       state = 'resolved', updated_at = now()
                  WHERE id = $1 AND reviewed_at IS NULL
                 """)
             .execute(Tuple.of(id, adminUserId))

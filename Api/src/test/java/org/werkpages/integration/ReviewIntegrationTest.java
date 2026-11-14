@@ -892,11 +892,12 @@ class ReviewIntegrationTest {
         await(service.createReview(auth0, mgr, validBody("CappedCorp", "CappedTitle", "2021-01", null), null));
         // The manager, however, left that role in June 2022.
         await(pool.preparedQuery(
-                "INSERT INTO career_history(manager_id, company, title, start_date, end_date) "
-              + "VALUES ($1, 'CappedCorp', 'CappedTitle', $2, $3)")
+                "INSERT INTO career_history(manager_id, company, title, start_date, end_date, company_id) "
+              + "VALUES ($1, 'CappedCorp', 'CappedTitle', $2, $3, $4)")
             .execute(Tuple.of(mgr,
                 java.time.OffsetDateTime.parse("2021-01-01T00:00:00Z"),
-                java.time.OffsetDateTime.parse("2022-06-01T00:00:00Z")))
+                java.time.OffsetDateTime.parse("2022-06-01T00:00:00Z"),
+                fixtureCompanyId("CappedCorp")))
             .mapEmpty());
 
         io.vertx.core.json.JsonObject result =
@@ -951,11 +952,12 @@ class ReviewIntegrationTest {
         // The manager left that role in 2019 - BEFORE the invented start, which is what produced
         // the backwards range.
         await(pool.preparedQuery(
-                "INSERT INTO career_history(manager_id, company, title, start_date, end_date) "
-              + "VALUES ($1, 'SeedCorp', 'SeedTitle', $2, $3)")
+                "INSERT INTO career_history(manager_id, company, title, start_date, end_date, company_id) "
+              + "VALUES ($1, 'SeedCorp', 'SeedTitle', $2, $3, $4)")
             .execute(Tuple.of(mgr,
                 java.time.OffsetDateTime.parse("2013-08-01T00:00:00Z"),
-                java.time.OffsetDateTime.parse("2019-01-01T00:00:00Z")))
+                java.time.OffsetDateTime.parse("2019-01-01T00:00:00Z"),
+                fixtureCompanyId("SeedCorp")))
             .mapEmpty());
 
         io.vertx.core.json.JsonObject result =
@@ -1249,4 +1251,19 @@ class ReviewIntegrationTest {
         assertEquals(0L, stats.getLong("weightedOpinions"),
             "weightedOpinions must not count expired seeds");
     }
+
+    /**
+     * A real employer for a fixture role. {@code career_history.company_id} is NOT NULL as of V99,
+     * so a career row has to name one. findOrCreate by name, which is the rule the product itself
+     * uses, so a fixture mentioning one company twice gets one company row.
+     */
+    private long fixtureCompanyId(String name) throws Exception {
+        return await(pool.preparedQuery("""
+                INSERT INTO companies (name, slug, status)
+                VALUES ($1, 'fixture-' || md5(lower(btrim($1))), 'ghost')
+                ON CONFLICT ((LOWER(TRIM(name)))) DO UPDATE SET updated_at = now()
+                RETURNING id
+                """).execute(Tuple.of(name)).map(rs -> rs.iterator().next().getLong("id")));
+    }
+
 }

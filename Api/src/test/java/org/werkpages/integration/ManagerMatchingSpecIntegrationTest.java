@@ -957,6 +957,479 @@ class ManagerMatchingSpecIntegrationTest {
     // ── fixtures and helpers ─────────────────────────────────────────────────
 
     /** The production record: live ghost at QuadReal, career history at Warrington, one review. */
+
+    // ── identifyManager: the contributor decides (phase 4B) ──────────────────
+    //
+    // The endpoint the new contribution form calls. It answers "who might you mean, and which jobs
+    // could you pick", and it decides NOTHING. The legacy path decided: it attached a rating to
+    // whichever manager was within one edit of what was typed, and that is how Aaron Yip ended up
+    // with eight rows and twenty-one people ended up with two public profiles each.
+
+    @Test
+    void identifyReturnsTheRealPersonWithEveryEmploymentAndCreatesNothing() throws Exception {
+        long aaron = seedAaronYip();
+        long managersBefore = countRows("managers");
+
+        // Searching at the PREVIOUS employer, which is the search that used to create a duplicate.
+        JsonObject result = await(service.identifyManager(
+            "Aaron", "Yip", WARRINGTON, "Divisional Controller", null));
+
+        assertEquals("CONFIRMED", result.getString("nameClass"));
+        JsonArray candidates = result.getJsonArray("candidates");
+        assertEquals(1, candidates.size(), "one person, not a second row");
+        JsonObject c = candidates.getJsonObject(0);
+        assertEquals(aaron, (long) c.getLong("id"));
+
+        // BOTH employments, so the contributor can pick the one they actually worked under. The
+        // company page listed him at Warrington the whole time while no matching query did; this
+        // is the response that finally shows a contributor what the platform already knew.
+        JsonArray employments = c.getJsonArray("employments");
+        assertEquals(2, employments.size());
+        java.util.Set<String> titles = new java.util.HashSet<>();
+        for (int i = 0; i < employments.size(); i++) {
+            JsonObject e = employments.getJsonObject(i);
+            titles.add(e.getString("title"));
+            assertNotNull(e.getLong("roleId"), "a career record is selectable, so it has an id");
+            assertTrue(e.getBoolean("selectable"));
+        }
+        assertEquals(java.util.Set.of("Controller, Property Accounting", "Divisional Controller"),
+                     titles);
+
+        // AND NOTHING WAS CREATED. Not a manager, not a company, not a claim, not a review.
+        assertEquals(managersBefore, countRows("managers"));
+        assertEquals(0, countRows("role_claims"));
+        assertEquals(0, countRows("reviews"));
+    }
+
+    @Test
+    void identifyOffersAPlausibleCandidateWithoutChoosingIt() throws Exception {
+        long aaron = seedAaronYip();
+
+        // Half a surname. Under the legacy path this was within one edit and the rating was
+        // attached silently; "Aaron Yi" must never become "Aaron Yip".
+        JsonObject result = await(service.identifyManager(
+            "Aaron", "Yi", QUADREAL, "Controller, Property Accounting", null));
+
+        assertEquals("PLAUSIBLE", result.getString("nameClass"),
+            "reported so the client can show it differently, NOT so it can act on it");
+        JsonArray candidates = result.getJsonArray("candidates");
+        assertEquals(1, candidates.size());
+        assertEquals(aaron, (long) candidates.getJsonObject(0).getLong("id"));
+
+        // Offered, not chosen, and nothing published. A plausible name may never create a ghost.
+        assertEquals(1, countRows("managers"));
+        assertEquals(0, countRows("reviews"));
+    }
+
+    @Test
+    void identifyReturnsNoCandidatesForSomebodyWeDoNotHold() throws Exception {
+        seedAaronYip();
+
+        JsonObject result = await(service.identifyManager(
+            "Rosalind", "Okonjo", "Halverson Logistics", "Dispatch Lead", null));
+
+        // The third Rev 268 path: nobody matched, so the form offers to add the manager. Still
+        // nothing created by ASKING - creation is a separate, explicit act.
+        assertEquals(0, result.getJsonArray("candidates").size());
+        assertEquals("NONE", result.getString("nameClass"));
+        assertEquals(1, countRows("managers"));
+    }
+
+    @Test
+    void identifyNeverFiltersCandidatesOutByCompany() throws Exception {
+        long aaron = seedAaronYip();
+
+        // Corpus rule 1: company and title classify and RANK, they never filter. A contributor who
+        // remembers the name and misremembers the employer must still find the person.
+        JsonObject result = await(service.identifyManager(
+            "Aaron", "Yip", "A Company He Never Worked For", "Some Other Title", null));
+
+        assertEquals(1, result.getJsonArray("candidates").size(),
+            "a public profile with a matching name is never hidden because the employer differs");
+        assertEquals(aaron, (long) result.getJsonArray("candidates").getJsonObject(0).getLong("id"));
+    }
+
+    @Test
+    void aCurrentRoleWithNoCareerRecordIsOfferedButIsNotSelectable() throws Exception {
+        // What createAutoApproved, createSearchPending and createCapturedDraft all produce: a
+        // manager whose only employment is the one on `managers`, with no career_history row.
+        long id = seedManager("Priya Raghunathan", "Halverson Logistics", "Dispatch Lead", "ghost");
+
+        JsonObject result = await(service.identifyManager(
+            "Priya", "Raghunathan", "Halverson Logistics", "Dispatch Lead", null));
+
+        JsonArray employments = result.getJsonArray("candidates").getJsonObject(0)
+                                      .getJsonArray("employments");
+        assertEquals(1, employments.size(),
+            "it is still SHOWN: hiding it would make the person look like they had never worked");
+        JsonObject e = employments.getJsonObject(0);
+        assertNull(e.getLong("roleId"));
+        assertFalse(e.getBoolean("selectable"),
+            "there is no career record to resolve a claim to, so picking it PROPOSES the role");
+        assertTrue(e.getBoolean("isCurrentRoleWithoutRecord"));
+        assertEquals(id, (long) result.getJsonArray("candidates").getJsonObject(0).getLong("id"));
+    }
+
+    @Test
+    void aRejectedEmploymentIsNeverOffered() throws Exception {
+        long id = seedManager("Priya Raghunathan", "Halverson Logistics", "Dispatch Lead", "ghost");
+        long companyId = seedCompany("Halverson Logistics");
+        insertCareer(id, "Halverson Logistics", companyId, "Depot Lead",
+                     java.time.OffsetDateTime.parse("2023-01-01T00:00:00Z"), null);
+        await(pool.query("UPDATE career_history SET state = 'rejected' WHERE title = 'Depot Lead'")
+            .execute());
+
+        JsonObject result = await(service.identifyManager(
+            "Priya", "Raghunathan", "Halverson Logistics", "Depot Lead", null));
+
+        JsonArray employments = result.getJsonArray("candidates").getJsonObject(0)
+                                      .getJsonArray("employments");
+        for (int i = 0; i < employments.size(); i++) {
+            assertNotEquals("Depot Lead", employments.getJsonObject(i).getString("title"),
+                "offering a refused employment is the reuse that quietly undoes a rejection");
+        }
+    }
+
+    private long countRows(String table) throws Exception {
+        return await(pool.query("SELECT COUNT(*) AS c FROM " + table).execute()
+            .map(rs -> rs.iterator().next().getLong("c")));
+    }
+
+
+    // ── submitRoleAwareRating: the three paths, through the real service ─────
+    //
+    // The form's submit. These assert the property the whole phase is for: the rating lands on the
+    // manager the CONTRIBUTOR chose, and on no other.
+
+    @Test
+    void pathOneRatesTheSelectedPersonAndTheSelectedJob() throws Exception {
+        long aaron = seedAaronYip();
+        long roleId = await(pool.preparedQuery(
+                "SELECT id FROM career_history WHERE manager_id = $1 AND title = $2")
+            .execute(Tuple.of(aaron, "Divisional Controller"))
+            .map(rs -> rs.iterator().next().getLong("id")));
+
+        JsonObject out = await(service.submitRoleAwareRating(null, submission(aaron, roleId)
+            .put("company", WARRINGTON).put("title", "Divisional Controller")));
+
+        // The claim resolved to the employment they picked, and to nothing else.
+        assertEquals("linked", out.getString("resolution"));
+        assertEquals(roleId, (long) out.getLong("roleId"));
+        assertEquals(aaron, ratedManagerOf(out.getString("reviewId")));
+
+        // No second profile. That is the regression: the old path compared names and attached.
+        assertEquals(1, countRows("managers"));
+        assertEquals(1, countRows("role_claims"));
+    }
+
+    @Test
+    void pathTwoKeepsThePersonAndProposesTheMissingJob() throws Exception {
+        long aaron = seedAaronYip();
+
+        // No selectedRoleId: they said "I worked for them in a different job".
+        JsonObject out = await(service.submitRoleAwareRating(null, submission(aaron, null)
+            .put("company", QUADREAL).put("title", "Night Operations Lead")
+            .put("startDate", "2022-05-01")));
+
+        assertEquals("created", out.getString("resolution"), "a new employment, not a guessed one");
+        assertEquals(aaron, ratedManagerOf(out.getString("reviewId")),
+            "and still the person they picked");
+        assertEquals(1, countRows("managers"), "proposing a job never creates a second person");
+
+        // Held, because the employment is only proposed. Said in advance by the form, not sprung
+        // on them afterwards.
+        assertFalse(out.getBoolean("live"));
+        assertNotNull(out.getString("heldBecause"));
+    }
+
+    @Test
+    void pathThreeCreatesTheManagerWithoutConsultingTheMatcher() throws Exception {
+        // A person whose name is one edit from somebody we already hold. Under the legacy path
+        // findFuzzyNameMatch attached the rating to the existing manager; here the contributor has
+        // already said "none of these", and overruling that with a similarity comparison is
+        // precisely the defect being removed.
+        long existing = seedManager("Aaron Yip", QUADREAL, "Controller, Property Accounting", "ghost");
+
+        JsonObject out = await(service.submitRoleAwareRating(null,
+            new JsonObject()
+                .put("firstName", "Aaron").put("lastName", "Yi")
+                .put("company", QUADREAL).put("title", "Controller, Property Accounting")
+                .put("author", "anon-tester").put("overallRating", 4.0)
+                .put("ratings", tenRatings(4.0))
+                .put("startDate", "2023-02-01")
+                .put("proposalKey", java.util.UUID.randomUUID().toString())
+                .put("revision", 1)));
+
+        long rated = ratedManagerOf(out.getString("reviewId"));
+        assertNotEquals(existing, rated,
+            "an explicit 'none of these' must not be overruled by name similarity");
+        assertEquals(2, countRows("managers"), "a second person, because they said so");
+        assertEquals("pending_approval", approvalStatusOf(rated),
+            "contributor-added managers reach the admin queue, not the directory");
+    }
+
+    /**
+     * The response names the manager, on every path, including the one that had nobody to name.
+     *
+     * <p>The form has to send the contributor somewhere once they have finished, and on the
+     * propose-manager path it sent a null manager id because there was nobody to name yet. It then
+     * had nothing to navigate to and sent them to {@code /manager/} - a 404 at the end of a
+     * completed contribution, with ten ratings written and nothing on screen to show for it.
+     *
+     * <p>Asserted on all three paths together, because "the client already knows" is true for two
+     * of them and is exactly the reasoning that left the third broken.
+     */
+    @Test
+    void everySubmissionNamesTheManagerItLandedOn() throws Exception {
+        long aaron = seedAaronYip();
+        long roleId = await(pool.preparedQuery(
+                "SELECT id FROM career_history WHERE manager_id = $1 AND title = $2")
+            .execute(Tuple.of(aaron, "Divisional Controller"))
+            .map(rs -> rs.iterator().next().getLong("id")));
+
+        JsonObject selected = await(service.submitRoleAwareRating(null, submission(aaron, roleId)
+            .put("company", WARRINGTON).put("title", "Divisional Controller")));
+        assertEquals(aaron, (long) selected.getLong("managerId"), "path 1: the person they picked");
+
+        JsonObject proposedJob = await(service.submitRoleAwareRating(null, submission(aaron, null)
+            .put("company", QUADREAL).put("title", "Night Operations Lead")
+            .put("startDate", "2022-05-01")));
+        assertEquals(aaron, (long) proposedJob.getLong("managerId"),
+            "path 2: still the person they picked, with the new job proposed under them");
+
+        JsonObject proposedPerson = await(service.submitRoleAwareRating(null,
+            new JsonObject()
+                .put("firstName", "Marguerite").put("lastName", "Okonkwo")
+                .put("company", QUADREAL).put("title", "Site Supervisor")
+                .put("author", "anon-tester").put("overallRating", 4.0)
+                .put("ratings", tenRatings(4.0))
+                .put("startDate", "2023-02-01")
+                .put("proposalKey", java.util.UUID.randomUUID().toString())
+                .put("revision", 1)));
+        Long created = proposedPerson.getLong("managerId");
+        assertNotNull(created, "path 3: the row this submission created, which the client cannot "
+            + "know any other way - it sent a null manager id precisely because there was nobody "
+            + "to name");
+        assertEquals(created.longValue(), ratedManagerOf(proposedPerson.getString("reviewId")),
+            "and it is the manager the rating is actually against, not some other row");
+        assertEquals("pending_approval", approvalStatusOf(created),
+            "so the profile they land on is the one carrying the under-review banner");
+    }
+
+    /**
+     * The profile they are sent to is one the server will serve them.
+     *
+     * <p>Two halves of the same 404, and the second is the one that hid behind the first. The
+     * response now names the manager it created, so the form has somewhere to navigate - and a
+     * {@code pending_approval} row is refused by {@code enforceSubmitterAccess} to everybody
+     * except its submitter, which nothing was setting on this path. So the contributor finished
+     * ten ratings, was sent to the profile they had just created, and was told it did not exist.
+     *
+     * <p>Rev 268's rule for tiles is the same rule: a destination is only offered for a row the
+     * profile page will actually serve.
+     */
+    @Test
+    void theContributorCanOpenTheProfileTheyJustCreated() throws Exception {
+        String contributor = insertUser("auth0|lands-on-profile", "lands");
+
+        JsonObject out = await(service.submitRoleAwareRating(contributor,
+            new JsonObject()
+                .put("firstName", "Marguerite").put("lastName", "Okonkwo")
+                .put("company", QUADREAL).put("title", "Site Supervisor")
+                .put("author", "anon-tester").put("overallRating", 4.0)
+                .put("ratings", tenRatings(4.0))
+                .put("startDate", "2023-02-01")
+                .put("proposalKey", java.util.UUID.randomUUID().toString())
+                .put("revision", 1)));
+
+        long created = out.getLong("managerId");
+        assertEquals("pending_approval", approvalStatusOf(created), "fixture: still awaiting review");
+
+        // THE POINT: the person who just created it can open it, and sees the under-review banner.
+        io.vertx.sqlclient.Row profile = await(service.getManagerById(created, contributor));
+        assertEquals(created, profile.getLong("id"));
+        assertEquals("pending_approval", profile.getString("approval_status"));
+
+        // And nobody else can, which is the rule this path was quietly opting out of.
+        String stranger = insertUser("auth0|stranger", "stranger");
+        try {
+            await(service.getManagerById(created, stranger));
+            fail("a pending profile is readable by its submitter, not by anyone who has the id");
+        } catch (Exception expected) {
+            assertTrue(("" + expected.getMessage() + expected.getCause()).contains("not found"),
+                "refused, but check it was refused as not-found: " + expected.getMessage());
+        }
+        try {
+            await(service.getManagerById(created, null));
+            fail("and not anonymously either");
+        } catch (Exception expected) {
+            assertTrue(("" + expected.getMessage() + expected.getCause()).contains("not found"),
+                "refused, but check it was refused as not-found: " + expected.getMessage());
+        }
+    }
+
+    /*
+      THE COUNTRY THE CONTRIBUTOR WORKED IN: a tie-break, and only ever a tie-break.
+
+      The search screen asks for a name and, optionally, a country. Rule 1 of the matching spec is
+      that a public profile whose name matches is never hidden because an employer differs, and the
+      identical argument holds here: people relocate, the column is often empty, and a manager's
+      recorded country is where their CURRENT employer is rather than where this contributor worked
+      with them. So these four tests are mostly about what country must NOT do.
+    */
+    @Test
+    void theCountryOrdersEquallyGoodCandidates() throws Exception {
+        // Two people of the same name, nothing else to tell them apart. Neither company nor title
+        // is given, so the matcher rates them identically and the country is the only signal.
+        long abroad = seedManagerIn("Rosalind Achebe", "Northwind Trading", "Depot Lead", "Ireland");
+        long home   = seedManagerIn("Rosalind Achebe", "Baytree Dental", "Practice Manager", "Canada");
+
+        JsonObject result = await(service.identifyManager(
+            "Rosalind", "Achebe", null, null, null, "Canada"));
+
+        JsonArray candidates = result.getJsonArray("candidates");
+        assertEquals(2, candidates.size(), "both are still offered");
+        assertEquals(home, (long) candidates.getJsonObject(0).getLong("id"),
+            "the one in the country they named comes first");
+        assertEquals(abroad, (long) candidates.getJsonObject(1).getLong("id"));
+    }
+
+    @Test
+    void aNameMatchInAnotherCountryIsNeverHidden() throws Exception {
+        // The failure this test exists to prevent: somebody who moved, searched for in the country
+        // they worked in, and simply not shown - so the contributor adds a duplicate of them.
+        long moved = seedManagerIn("Rosalind Achebe", "Northwind Trading", "Depot Lead", "Ireland");
+
+        JsonObject result = await(service.identifyManager(
+            "Rosalind", "Achebe", null, null, null, "Canada"));
+
+        JsonArray candidates = result.getJsonArray("candidates");
+        assertEquals(1, candidates.size(), "a country is not a filter");
+        assertEquals(moved, (long) candidates.getJsonObject(0).getLong("id"));
+        assertEquals("CONFIRMED", result.getString("nameClass"),
+            "and the name class is untouched by it");
+    }
+
+    @Test
+    void theCountryCannotOutrankTheMatchItself() throws Exception {
+        // A candidate whose employer AND title match is the better answer even from another
+        // country. Country breaks ties inside a band; it must never lift a candidate across one,
+        // or a stranger in the right country beats the right person in the wrong one.
+        long rightPerson = seedManagerIn("Rosalind Achebe", QUADREAL, "Site Supervisor", "Ireland");
+        seedManagerIn("Rosalind Achebe", "Baytree Dental", "Practice Manager", "Canada");
+
+        JsonObject result = await(service.identifyManager(
+            "Rosalind", "Achebe", QUADREAL, "Site Supervisor", null, "Canada"));
+
+        assertEquals(rightPerson, (long) result.getJsonArray("candidates").getJsonObject(0).getLong("id"),
+            "the employer-and-title match leads, whatever country was typed");
+    }
+
+    @Test
+    void withNoCountryTheOrderIsExactlyWhatItWas() throws Exception {
+        // The regression guard for every existing caller: all of them pass no country, and their
+        // ordering - review count, then id - must not move.
+        long first  = seedManagerIn("Rosalind Achebe", "Northwind Trading", "Depot Lead", "Ireland");
+        long second = seedManagerIn("Rosalind Achebe", "Baytree Dental", "Practice Manager", "Canada");
+
+        JsonArray candidates = await(service.identifyManager("Rosalind", "Achebe", null, null, null))
+            .getJsonArray("candidates");
+
+        assertEquals(first, (long) candidates.getJsonObject(0).getLong("id"), "id order, as before");
+        assertEquals(second, (long) candidates.getJsonObject(1).getLong("id"));
+    }
+
+    @Test
+    void resubmittingTheSameFormChangesNothing() throws Exception {
+        long aaron = seedAaronYip();
+        long roleId = await(pool.preparedQuery(
+                "SELECT id FROM career_history WHERE manager_id = $1 AND title = $2")
+            .execute(Tuple.of(aaron, "Divisional Controller"))
+            .map(rs -> rs.iterator().next().getLong("id")));
+        JsonObject body = submission(aaron, roleId)
+            .put("company", WARRINGTON).put("title", "Divisional Controller");
+
+        JsonObject first = await(service.submitRoleAwareRating(null, body));
+        JsonObject again = await(service.submitRoleAwareRating(null, body.copy()));
+
+        // A dropped response or a double tap must not cost a contribution and must not make two.
+        assertTrue(again.getBoolean("replayed"));
+        assertEquals(first.getString("reviewId"), again.getString("reviewId"));
+        assertEquals(1, countRows("reviews"));
+    }
+
+    @Test
+    void aSelectedRoleIdIsNeverInventedWhenTheClientOmitsIt() throws Exception {
+        long id = seedManager("Priya Raghunathan", "Halverson Logistics", "Dispatch Lead", "ghost");
+        long companyId = seedCompany("Halverson Logistics");
+        insertCareer(id, "Halverson Logistics", companyId, "Dispatch Lead",
+                     java.time.OffsetDateTime.parse("2021-01-01T00:00:00Z"), null);
+
+        // The fixture's period has to be KNOWN for this to be the test it claims to be.
+        // career_unique_known_employment is partial on period_known, so an unknown-period row sits
+        // outside the index entirely and is never deduplicated - which is deliberate, because an
+        // unknown date is not evidence of sameness. Without this the proposal correctly creates its
+        // own role and the test was asserting the wrong rule.
+        await(pool.query("UPDATE career_history SET period_known = TRUE WHERE title = 'Dispatch Lead'")
+            .execute());
+
+        // An employment exists whose key matches exactly what was typed, and selectedRoleId is
+        // omitted. The contributor is PROPOSING, not selecting.
+        JsonObject out = await(service.submitRoleAwareRating(null, submission(id, null)
+            .put("company", "Halverson Logistics").put("title", "Dispatch Lead")
+            .put("startDate", "2021-01-01")));
+
+        // It LINKS to the canonical row rather than duplicating it. This is the one case where
+        // rows are shared, and it is exact agreement on a key that identifies an employment
+        // episode by definition - the same person cannot begin the same job at the same employer
+        // twice on the same date. Nothing here is decided by resemblance.
+        assertEquals("linked", out.getString("resolution"));
+        assertEquals(1, countRoles(id), "and no second employment record was created");
+    }
+
+    private JsonObject submission(long managerId, Long selectedRoleId) {
+        return new JsonObject()
+            .put("firstName", "Aaron").put("lastName", "Yip")
+            .put("managerId", managerId)
+            .put("selectedRoleId", selectedRoleId)
+            .put("author", "anon-tester")
+            .put("overallRating", 4.0)
+            .put("ratings", tenRatings(4.0))
+            .put("startDate", "2023-01-01")
+            .put("proposalKey", java.util.UUID.randomUUID().toString())
+            .put("revision", 1);
+    }
+
+    private static JsonObject tenRatings(double v) {
+        JsonObject r = new JsonObject();
+        for (String k : new String[]{"communicationStyle", "perceivedApproachability",
+                "perceivedClarityOfExpectations", "feedbackStyle", "perceivedSupportiveness",
+                "decisionMakingStyle", "organizationAndPlanningStyle", "delegationStyle",
+                "perceivedProfessionalDemeanor", "overallWorkingExperience"}) {
+            r.put(k, v);
+        }
+        return r;
+    }
+
+    private long ratedManagerOf(String reviewId) throws Exception {
+        return await(pool.preparedQuery("SELECT manager_id FROM reviews WHERE id = $1")
+            .execute(Tuple.of(java.util.UUID.fromString(reviewId)))
+            .map(rs -> rs.iterator().next().getLong("manager_id")));
+    }
+
+    private String approvalStatusOf(long managerId) throws Exception {
+        return await(pool.preparedQuery("SELECT approval_status FROM managers WHERE id = $1")
+            .execute(Tuple.of(managerId))
+            .map(rs -> rs.iterator().next().getString("approval_status")));
+    }
+
+    private int countRoles(long managerId) throws Exception {
+        return await(pool.preparedQuery(
+                "SELECT COUNT(*) AS c FROM career_history WHERE manager_id = $1")
+            .execute(Tuple.of(managerId))
+            .map(rs -> rs.iterator().next().getLong("c").intValue()));
+    }
+
     private long seedAaronYip() throws Exception {
         long id = seedManager("Aaron Yip", QUADREAL, "Controller, Property Accounting", "ghost");
         long warringtonId = seedCompany(WARRINGTON);
@@ -986,6 +1459,22 @@ class ManagerMatchingSpecIntegrationTest {
                         lower(regexp_replace($1 || '-' || $2, '[^a-zA-Z0-9]+', '-', 'g')), now(), now())
                 RETURNING id
                 """).execute(Tuple.of(name, company, companyId, title, status))).iterator().next();
+        return r.getLong("id");
+    }
+
+    /** The same seed, in a named country, for the rank-only country tie-break. */
+    private long seedManagerIn(String name, String company, String title, String country)
+            throws Exception {
+        long companyId = seedCompany(company);
+        Row r = await(pool.preparedQuery("""
+                INSERT INTO managers (name, company, company_id, title, status, approval_status,
+                                      country, slug, created_at, updated_at)
+                VALUES ($1, $2, $3, $4, 'active', 'ghost', $5,
+                        lower(regexp_replace($1 || '-' || $2 || '-' || $5,
+                                             '[^a-zA-Z0-9]+', '-', 'g')), now(), now())
+                RETURNING id
+                """).execute(Tuple.of(name, company, companyId, title).addValue(country)))
+            .iterator().next();
         return r.getLong("id");
     }
 

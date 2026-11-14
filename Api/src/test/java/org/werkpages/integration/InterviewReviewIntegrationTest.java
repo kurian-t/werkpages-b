@@ -89,7 +89,11 @@ class InterviewReviewIntegrationTest {
     void cleanDb() throws Exception {
         // interview_review_rounds references interview_reviews, so it has to go in the same
         // statement — TRUNCATE refuses to leave a referencing table behind.
-        await(pool.query("TRUNCATE captured_drafts, interview_review_rounds, interview_review_deletions, interview_reviews, company_interview_stats").execute());
+        // review_supersessions is in the list because V103 gave it a foreign key to
+        // captured_drafts, and TRUNCATE refuses to leave a referencing table behind. It is
+        // always empty here; naming it is cheaper than CASCADE, which would silently widen
+        // what this cleanup removes.
+        await(pool.query("TRUNCATE review_supersessions, captured_drafts, interview_review_rounds, interview_review_deletions, interview_reviews, company_interview_stats").execute());
         await(pool.query("TRUNCATE managers, users, companies CASCADE").execute());
     }
 

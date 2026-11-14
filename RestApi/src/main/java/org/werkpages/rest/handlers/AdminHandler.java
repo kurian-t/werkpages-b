@@ -459,6 +459,32 @@ public class AdminHandler {
             .onFailure(err -> ManagersHandler.handleError(ctx, err));
     }
 
+    // ── DELETE /api/admin/users/:userId/sessions ─────────────────────────────
+
+    /**
+     * Ends every session an account holds, without banning it.
+     *
+     * <p>Separate from the ban because the two are genuinely different decisions: "this person is
+     * misusing the product" and "this person's laptop was stolen" call for different actions, and
+     * only one of them should stop them contributing. It is also the recovery path when a ban was
+     * recorded but its session revocation failed, where a repeated ban would be refused as
+     * already banned.
+     *
+     * <p>Idempotent, so an administrator can press it twice without consequence.
+     */
+    public void handleRevokeUserSessions(RoutingContext ctx) {
+        String auth0Id = ctx.get("auth0Id");
+        UUID targetUserId;
+        try {
+            targetUserId = UUID.fromString(ctx.pathParam("userId"));
+        } catch (Exception e) {
+            bad(ctx, "Invalid user ID"); return;
+        }
+        service.revokeUserSessions(auth0Id, targetUserId)
+            .onSuccess(json -> ok(ctx, json))
+            .onFailure(err -> ManagersHandler.handleError(ctx, err));
+    }
+
     // ── PUT /api/admin/managers/:managerId ───────────────────────────────────
 
     public void handleAdminEditManager(RoutingContext ctx) {

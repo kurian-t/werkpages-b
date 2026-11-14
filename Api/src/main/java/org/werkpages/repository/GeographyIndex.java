@@ -213,6 +213,52 @@ public final class GeographyIndex implements AutoCloseable {
         }, false, 0);
     }
 
+    /**
+     * Rows whose name is EXACTLY what was typed, under the same scopes as {@link #byPrefix}.
+     *
+     * <h2>Why this exists separately when a prefix lookup already finds them</h2>
+     *
+     * <p>Every exact match is also a prefix match, so this returns nothing byPrefix could not
+     * reach. What it changes is that the exact ones cannot be truncated away before anybody ranks
+     * them, and that was a real, reported defect rather than a tidiness concern.
+     *
+     * <p>"Paris" offered eight rows and all eight were in France. Paris itself, then seven of its
+     * own arrondissements: Paris 15 Vaugirard, Paris 20 Menilmontant and the rest each score
+     * higher on importance than Paris, Texas (0.488) or Paris, Ontario (0.454), because they hold
+     * 180,000 people apiece. They all begin with "Paris", so a prefix read ordered by importance
+     * and cut at eight never reached a single one of the other Parises on earth. They are the
+     * same city as each other, and between them they made every other city of that name
+     * unreachable - the field could only offer a reader somewhere they had not asked for.
+     *
+     * <p>Richmond failed the same way through different rows: Richmond Hill, Ontario (0.589) and
+     * Richmond West, Florida (0.506) are genuinely different places, not subdivisions, and they
+     * still displaced the exactly-named Richmonds in South Africa, Australia and the UK.
+     *
+     * <p>Widening the prefix read instead was considered and rejected: there is no bound on how
+     * many "Paris..." rows outrank Paris, Texas, so any limit chosen would be a guess that the
+     * next crowded name defeats. An equality read is bounded by the thing asked for, and
+     * {@code entity(norm)} is indexed, so it costs one seek.
+     *
+     * <p>This method only RETRIEVES. Which of the two sets leads is the caller's decision, and
+     * LocationCorpusRepository makes it by score, so that a far more prominent prefix match can
+     * still come first.
+     */
+    public List<Hit> byName(String name, String countryScope, String stateScope, int limit) {
+        if (name == null || name.isEmpty()) return List.of();
+        StringBuilder sql = new StringBuilder(
+            "SELECT " + COLS + " FROM entity WHERE norm = ?");
+        if (countryScope != null) sql.append(" AND country_code = ?");
+        if (stateScope   != null) sql.append(" AND state_code = ?");
+        sql.append(" ORDER BY importance DESC, population DESC LIMIT ?");
+        return query(sql.toString(), ps -> {
+            int i = 1;
+            ps.setString(i++, name);
+            if (countryScope != null) ps.setString(i++, countryScope);
+            if (stateScope   != null) ps.setString(i++, stateScope);
+            ps.setInt(i, limit);
+        }, false, 0);
+    }
+
     /** Rows reached through an alias: ISO codes, "USA", "UK", a region's own abbreviation. */
     /**
      * One country's own row, by ISO code, with no scope applied.

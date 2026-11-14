@@ -359,7 +359,10 @@ class ManagerRepositoryCoverageIntegrationTest {
         OffsetDateTime start = OffsetDateTime.of(2020, 1, 1, 0, 0, 0, 0, ZoneOffset.UTC);
         OffsetDateTime end   = OffsetDateTime.of(2022, 6, 1, 0, 0, 0, 0, ZoneOffset.UTC);
 
-        await(managerRepo.insertCareerEntry(managerId, "PastCorp", "Junior Dev", start, end, null));
+        // career_history.company_id is NOT NULL as of V99, so a role has to name its employer.
+        // What this test asserts is unchanged: the entry persists and is readable back.
+        long pastCorpId = await(companyRepo.findOrCreate("PastCorp", null, null)).getLong("id");
+        await(managerRepo.insertCareerEntry(managerId, "PastCorp", "Junior Dev", start, end, pastCorpId));
 
         RowSet<Row> rows = await(managerRepo.getCareerHistory(managerId));
         List<String> companies = new ArrayList<>();
@@ -371,7 +374,8 @@ class ManagerRepositoryCoverageIntegrationTest {
     void closeOpenCareerEntry_closesEntryWithNullEndDate() throws Exception {
         long managerId = insertApprovedManager("Close Entry Manager", "Corp", "E");
         OffsetDateTime start = OffsetDateTime.of(2018, 1, 1, 0, 0, 0, 0, ZoneOffset.UTC);
-        await(managerRepo.insertCareerEntry(managerId, "OpenCorp", "Dev", start, null, null));
+        long openCorpId = await(companyRepo.findOrCreate("OpenCorp", null, null)).getLong("id");
+        await(managerRepo.insertCareerEntry(managerId, "OpenCorp", "Dev", start, null, openCorpId));
 
         OffsetDateTime closeDate = OffsetDateTime.of(2022, 1, 1, 0, 0, 0, 0, ZoneOffset.UTC);
         int closed = await(managerRepo.closeOpenCareerEntry(managerId, closeDate));
@@ -388,7 +392,8 @@ class ManagerRepositoryCoverageIntegrationTest {
     void closeOpenCareerEntry_doesNotCloseWhenStartAfterEndDate() throws Exception {
         long managerId = insertApprovedManager("No Close Manager", "Corp", "E");
         OffsetDateTime futureStart = OffsetDateTime.of(2025, 1, 1, 0, 0, 0, 0, ZoneOffset.UTC);
-        await(managerRepo.insertCareerEntry(managerId, "FutureCorp", "Dev", futureStart, null, null));
+        long futureCorpId = await(companyRepo.findOrCreate("FutureCorp", null, null)).getLong("id");
+        await(managerRepo.insertCareerEntry(managerId, "FutureCorp", "Dev", futureStart, null, futureCorpId));
 
         OffsetDateTime oldDate = OffsetDateTime.of(2020, 1, 1, 0, 0, 0, 0, ZoneOffset.UTC);
         int closed = await(managerRepo.closeOpenCareerEntry(managerId, oldDate));
@@ -399,7 +404,8 @@ class ManagerRepositoryCoverageIntegrationTest {
     void updateOpenCareerEntry_updatesCompanyAndTitle() throws Exception {
         long managerId = insertApprovedManager("Update Career Manager", "Corp", "E");
         OffsetDateTime start = OffsetDateTime.of(2020, 1, 1, 0, 0, 0, 0, ZoneOffset.UTC);
-        await(managerRepo.insertCareerEntry(managerId, "OldCorp", "OldTitle", start, null, null));
+        long oldCorpId = await(companyRepo.findOrCreate("OldCorp", null, null)).getLong("id");
+        await(managerRepo.insertCareerEntry(managerId, "OldCorp", "OldTitle", start, null, oldCorpId));
 
         await(managerRepo.updateOpenCareerEntry(managerId, "UpdatedCorp", "UpdatedTitle", null));
 
@@ -693,7 +699,8 @@ class ManagerRepositoryCoverageIntegrationTest {
     void hasCareerHistory_withHistory_returnsTrue() throws Exception {
         long managerId = insertApprovedManager("Has History", "Corp", "E");
         OffsetDateTime start = OffsetDateTime.of(2020, 1, 1, 0, 0, 0, 0, ZoneOffset.UTC);
-        await(managerRepo.insertCareerEntry(managerId, "PastCorp", "Dev", start, null, null));
+        long pastCorpId = await(companyRepo.findOrCreate("PastCorp", null, null)).getLong("id");
+        await(managerRepo.insertCareerEntry(managerId, "PastCorp", "Dev", start, null, pastCorpId));
 
         boolean has = await(managerRepo.hasCareerHistory(managerId));
         assertTrue(has);
@@ -798,25 +805,57 @@ class ManagerRepositoryCoverageIntegrationTest {
     // ══════════════════════════════════════════════════════════════════════════
 
     @Test
-    void updateForAttach_updatesManagerFields() throws Exception {
+    void updateForAttach_enrichesTheJobDetailASubmissionLegitimatelySupplies() throws Exception {
         long managerId = insertGhostManager("Ghost For Attach", "Corp", "OldTitle");
         UUID submitter = insertUser("auth0|attach01", "AttachUser01");
 
         Optional<Row> result = await(managerRepo.updateForAttach(managerId,
-            "Updated Name", "New Title", "retired", "CA",
-            "https://linkedin.com/in/attach", "https://logo.com/attach.png", submitter));
+            "retired", "CA", "https://logo.com/attach.png", submitter));
 
         assertTrue(result.isPresent());
-        assertEquals("Updated Name", result.get().getString("name"));
-        assertEquals("New Title", result.get().getString("title"));
+        assertEquals("retired", result.get().getString("status"));
         assertEquals("CA", result.get().getString("country"));
+        assertEquals("https://logo.com/attach.png", result.get().getString("company_logo_url"));
+        assertEquals(submitter, result.get().getUUID("submitted_by"),
+            "an ownerless row gets its submitter filled in, or enforceSubmitterAccess refuses it "
+            + "to the person who just submitted");
+    }
+
+    /*
+      PHASE 0 of the manager-identity redesign.
+
+      This test replaces one called updateForAttach_updatesManagerFields, which asserted
+      assertEquals("Updated Name", ...) and assertEquals("New Title", ...) - it pinned the defect
+      down as though it were the requirement. The caller attaches a review to whichever manager at
+      that company has a name within Damerau-Levenshtein 1 of the one typed, so those two
+      assertions meant: rating "Emma Davies" renames a live, public "Emma Davis" and retitles her.
+      The old assertions are inverted here rather than deleted, so the behaviour that shipped is
+      still described by the thing that now forbids it.
+    */
+    @Test
+    void updateForAttach_cannotRewriteWhoTheManagerIs() throws Exception {
+        long managerId = insertGhostManager("Emma Davis", "Corp", "Senior Manager");
+        await(pool.preparedQuery("UPDATE managers SET linkedin_url = $1 WHERE id = $2")
+            .execute(Tuple.of("https://www.linkedin.com/in/the-real-emma", managerId)));
+        UUID submitter = insertUser("auth0|attach03", "AttachUser03");
+
+        Optional<Row> result = await(managerRepo.updateForAttach(managerId,
+            "retired", "CA", "https://logo.com/attach.png", submitter));
+
+        assertTrue(result.isPresent());
+        assertEquals("Emma Davis", result.get().getString("name"),
+            "a submission may not rename the manager it attaches to");
+        assertEquals("Senior Manager", result.get().getString("title"),
+            "nor retitle them from its own form values");
+        assertEquals("https://www.linkedin.com/in/the-real-emma", result.get().getString("linkedin_url"),
+            "nor replace the link that says which real human the profile is about");
     }
 
     @Test
     void updateForAttach_nonExistentManager_returnsEmpty() throws Exception {
         UUID submitter = insertUser("auth0|attach02", "AttachUser02");
         Optional<Row> result = await(managerRepo.updateForAttach(999999L,
-            "Name", "Title", "active", "US", null, null, submitter));
+            "active", "US", null, submitter));
         assertTrue(result.isEmpty());
     }
 
