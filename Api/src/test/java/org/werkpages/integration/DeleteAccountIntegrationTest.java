@@ -137,7 +137,7 @@ class DeleteAccountIntegrationTest {
         String author = await(pool.preparedQuery("SELECT author FROM reviews WHERE manager_id = $1")
             .execute(Tuple.of(managerId))
             .map(rs -> rs.iterator().next().getString("author")));
-        assertEquals("Anonymous User", author, "Review author should be anonymized");
+        ErasedByline.assertMinted(author, "the anonymised review");
 
         Object reviewUserId = await(pool.preparedQuery("SELECT user_id FROM reviews WHERE manager_id = $1")
             .execute(Tuple.of(managerId))

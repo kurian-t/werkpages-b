@@ -430,13 +430,36 @@ class ManagerMergeIntegrationTest {
         UUID gone  = insertUser("auth0|erased-vs-live");
         UUID stays = insertUser("auth0|erased-vs-live-other");
         UUID erased = insertLegacyReview(survivor, "Halverson Logistics", "Dispatch Lead",
-            "Anonymous User", gone);
+            "Same Byline", gone);
         UUID live   = insertLegacyReview(absorbed, "Halverson Logistics", "Dispatch Lead",
-            "Anonymous User", stays);
+            "Same Byline", stays);
 
         await(users.deleteWithReviewAnonymization(gone));
         assertTrue(reviewRow(erased).getBoolean("author_erased"),
             "fixture check: the erasure flag is what takes it out of the index");
+
+        // THE TWO BYLINES HAVE TO MATCH WHEN THE DETECTOR RUNS, or this test proves nothing.
+        //
+        // Both rows were inserted under one byline so that moving the absorbed rating onto the
+        // survivor would be a genuine collision in idx_reviews_author_manager_role_legacy, leaving
+        // the erasure exemption as the only reason no supersession is filed. The erasure now mints
+        // a fresh handle on the row it anonymises, so by this point the two authors differ and the
+        // collision the test is built around cannot happen for a reason that has nothing to do
+        // with the exemption. The assertions below would pass on a detector that ignored
+        // author_erased entirely.
+        //
+        // The fixture previously used the literal 'Anonymous User' for both, which worked only
+        // because erasure used to write that same string back. Re-reading the minted byline and
+        // giving it to the live row restores the premise without depending on what mint() picked.
+        // Safe against the index itself: the two rows are still on different managers until the
+        // merge, which is the whole scenario.
+        String mintedByline = reviewRow(erased).getString("author");
+        ErasedByline.assertMinted(mintedByline, "the erased rating");
+        await(pool.preparedQuery("UPDATE reviews SET author = $1 WHERE id = $2")
+            .execute(Tuple.of(mintedByline, live)).mapEmpty());
+        assertEquals(mintedByline, reviewRow(live).getString("author"),
+            "fixture check: the live rating now shares the erased one's byline, so only the "
+            + "exemption can stop the detector pairing them");
 
         merge();
 

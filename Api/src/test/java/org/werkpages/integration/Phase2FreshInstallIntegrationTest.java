@@ -115,7 +115,21 @@ class Phase2FreshInstallIntegrationTest {
         // and it is deliberately INERT. s4_enforced() is false, the trigger returns immediately,
         // and the frozen exemption set is empty, so applying it changes no behaviour at all.
         // Activation is a separate, authorized decision - see PHASE6_S4_RUNTIME.md.
-        assertEquals("105", await(pool.query("""
+        //
+        // V106 (unlink rating, and platform-generated examples) moved it to 106 on 2026-11-13.
+        // Acknowledged: it adds reviews.origin, reviews.unlinked_at and rating_participation.
+        // `origin` is the one with reach, because it is what finally tells a contributor's rating
+        // apart from a platform example without overloading the `user_id IS NULL AND weight` pair
+        // that already meant two other things. Every genuine calculation keys on it now.
+        //
+        // V107 (retire stranded examples, relabel erased bylines) moved it to 107 on 2026-11-13.
+        // Acknowledged, and unlike every entry above it this one is a DATA correction rather than
+        // a structural change: it deletes examples left sitting beside a genuine rating, and it
+        // replaces the 'Anonymous User' byline that account erasure used to write. That literal
+        // was worn by no live account, so it disclosed which ratings belonged to somebody who had
+        // deleted themselves, which is the one fact the erasure exists to remove. It is scoped by
+        // the condition it removes, so re-running it changes nothing.
+        assertEquals("107", await(pool.query("""
                 SELECT version FROM flyway_schema_history
                  WHERE success AND version IS NOT NULL
                  ORDER BY installed_rank DESC LIMIT 1

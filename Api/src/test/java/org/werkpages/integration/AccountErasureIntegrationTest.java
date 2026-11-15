@@ -149,7 +149,7 @@ class AccountErasureIntegrationTest {
         // every opinion the person contributed.
         Row review = reviewRow(out.reviewId());
         assertNull(review.getUUID("user_id"));
-        assertEquals("Anonymous User", review.getString("author"));
+        ErasedByline.assertMinted(review.getString("author"), "the anonymised rating");
         assertEquals("live", review.getString("disposition"));
         assertEquals(1, (int) reviewsCountOf(managerId), "still publicly counted");
 
@@ -167,7 +167,8 @@ class AccountErasureIntegrationTest {
 
         assertEquals(0, countWhere("users", "id = '" + contributor + "'"));
         assertNull(reviewRow(legacy).getUUID("user_id"));
-        assertEquals("Anonymous User", reviewRow(legacy).getString("author"));
+        ErasedByline.assertMinted(reviewRow(legacy).getString("author"),
+            "a legacy rating whose author erased themselves");
         assertEquals("live", reviewRow(legacy).getString("disposition"),
             "a legacy rating needs no claim and no role, so deletion cannot change its standing");
     }
@@ -535,7 +536,8 @@ class AccountErasureIntegrationTest {
         // the other possible.
         for (UUID r : List.of(adasRating, beasRating)) {
             assertNull(reviewRow(r).getUUID("user_id"));
-            assertEquals("Anonymous User", reviewRow(r).getString("author"));
+            ErasedByline.assertMinted(reviewRow(r).getString("author"),
+                "both surviving opinions");
             assertTrue(reviewRow(r).getBoolean("author_erased"));
             assertEquals("live", reviewRow(r).getString("disposition"));
             assertNull(reviewRow(r).getOffsetDateTime("deleted_at"));
@@ -582,6 +584,49 @@ class AccountErasureIntegrationTest {
         assertEquals(4, countRows("reviews WHERE author_erased AND manager_id = " + managerId));
     }
 
+    /**
+     * ONE NAME PER ROW, not one per account, which is the property the byline change exists for.
+     *
+     * <p>Nothing covered this. Every other erasure test here gives an account a single rating, so
+     * a per-account handle and a per-row handle are indistinguishable to all of them, and the
+     * implementation could regress to one {@code UPDATE ... SET author = <one minted name>} with
+     * the whole suite still green. That regression is attractive, too: it is simpler code than the
+     * batch, and the batch comment in {@code UserRepository} exists precisely because the single
+     * statement cannot produce a per-row value.
+     *
+     * <p>What a shared handle would cost: a reader of six profiles could see that one person rated
+     * all six, which is a fact the erasure removed everywhere else. The account is gone, so the
+     * link is no longer provable, but it is still visible, and "these six opinions are one
+     * person's" is most of what the identity was.
+     *
+     * <p>Six ratings on six managers rather than six on one, because the legacy dedup index is
+     * keyed on (author, manager_id, role) and six rows sharing an author on one manager could not
+     * be inserted in the first place.
+     */
+    @Test
+    void oneAccountsRatingsDoNotAllEraseToTheSameHandle() throws Exception {
+        UUID prolific = insertUser("auth0|prolific");
+        List<UUID> ratings = new ArrayList<>();
+        for (int i = 0; i < 6; i++) {
+            long subject = insertManager("Erasure Subject " + i, "erasure-subject-" + i);
+            ratings.add(insertLegacyReview(subject, "Prolific Rater", prolific));
+        }
+
+        await(users.deleteWithReviewAnonymization(prolific));
+
+        List<String> bylines = new ArrayList<>();
+        for (UUID r : ratings) {
+            bylines.add(reviewRow(r).getString("author"));
+        }
+        ErasedByline.assertNotAllIdentical(bylines, "six ratings from one erased account");
+
+        // The opinions all survive. Varying the byline is not allowed to cost a contribution, and
+        // author_erased still goes on every row: that flag, not the name, is what holds them out
+        // of the legacy dedup index.
+        assertEquals(0, countWhere("users", "id = '" + prolific + "'"));
+        assertEquals(6, countRows("reviews WHERE author_erased AND user_id IS NULL"));
+    }
+
     @Test
     void deletingAnAccountTwiceIsHarmless() throws Exception {
         UUID ada = insertUser("auth0|ada3");
@@ -593,7 +638,8 @@ class AccountErasureIntegrationTest {
         await(users.deleteWithReviewAnonymization(ada));
 
         assertEquals(0, countWhere("users", "id = '" + ada + "'"));
-        assertEquals("Anonymous User", reviewRow(adasRating).getString("author"));
+        ErasedByline.assertMinted(reviewRow(adasRating).getString("author"),
+            "the rating after a retried deletion");
         assertEquals(1, livePublicRatings(managerId));
         assertTrue(reviewRow(adasRating).getBoolean("author_erased"),
             "and the row is still exempt from the dedup key, not re-entered by the second pass");
@@ -651,7 +697,9 @@ class AccountErasureIntegrationTest {
 
         // The opinion is still there, which is the point of anonymising rather than deleting.
         assertNotNull(after.getValue("overallRating"));
-        assertEquals("Anonymous User", after.getString("author"));
+        // The byline in the PUBLIC body matters more than the one in the row: this is the value a
+        // reader actually sees, and it is the last place the erasure could leak through.
+        ErasedByline.assertMinted(after.getString("author"), "the public response");
 
         // And no date survives anywhere in the serialized body under another name. A field added
         // later that happens to carry the period fails this without anybody remembering to extend
@@ -818,7 +866,8 @@ class AccountErasureIntegrationTest {
         // The authorized path does set it, so the authorization is not so tight that the real
         // operation cannot perform it. That is the failure mode of a guard like this.
         assertTrue(reviewRow(owned).getBoolean("author_erased"));
-        assertEquals("Anonymous User", reviewRow(owned).getString("author"));
+        ErasedByline.assertMinted(reviewRow(owned).getString("author"),
+            "the rating erased through the authorized path");
 
         // The bystanding anonymous rating is untouched, and still protected.
         assertFalse(reviewRow(anon).getBoolean("author_erased"));
@@ -829,19 +878,37 @@ class AccountErasureIntegrationTest {
     @Test
     void theBackfillClaimsOnlyRatingsErasedByTheOldCode() throws Exception {
         // The migration's backfill predicate is author = 'Anonymous User' AND user_id IS NULL.
-        // This asserts the premise that makes it safe: that byline is written in exactly one place,
-        // the account-deletion path, and an anonymous-from-the-start rating never carries it
-        // because generatePseudonym() produces Adjective + Animal + two digits.
+        // This asserts the premise that makes it safe: an anonymous-from-the-start rating never
+        // carries that byline, because the forms hand anonymous contributors a minted handle of
+        // the Adjective + Animal + two digits shape instead.
         UUID anon = insertLegacyReview(managerId, "WarmWolf61", null);
         assertFalse(reviewRow(anon).getBoolean("author_erased"),
             "a generated pseudonym is not the erasure byline, so the backfill cannot claim it");
 
-        // A rating erased by the CURRENT path carries both the byline and the flag, so the backfill
-        // would be a no-op for it. That is what `AND NOT author_erased` in the migration is for.
+        // A RATING ERASED BY THE CURRENT PATH IS OUT OF THE BACKFILL'S REACH TWICE OVER, and it
+        // used to be only once. The migration excludes it with `AND NOT author_erased`, which is
+        // still the guard that matters because the flag is what the backfill is trying to add.
+        // On top of that the current path no longer writes the literal at all, so the predicate's
+        // first half misses the row as well.
+        //
+        // This is the half of the test the byline change rewrote. It previously asserted that a
+        // freshly erased rating DOES carry 'Anonymous User', which was the premise that the one
+        // string identified the erasure path. That premise is now the opposite: the string
+        // identifies only rows erased by the OLD code, which is exactly what makes it a safe
+        // backfill predicate for rows the flag cannot find.
         UUID owned = insertLegacyReview(managerId, "Ada Lovelace", contributor);
         await(users.deleteWithReviewAnonymization(contributor));
-        assertEquals("Anonymous User", reviewRow(owned).getString("author"));
+        ErasedByline.assertMinted(reviewRow(owned).getString("author"),
+            "a rating erased by the current path");
         assertTrue(reviewRow(owned).getBoolean("author_erased"));
+
+        // AND THE LITERAL SURVIVES AS LEGACY DATA, which is the whole reason the migration has a
+        // backfill. A row erased before author_erased existed carries the byline and not the flag,
+        // and it is the only population the predicate is allowed to claim.
+        UUID legacyErased = insertLegacyReview(managerId, ErasedByline.OLD_DISCLOSING_LITERAL, null);
+        assertFalse(reviewRow(legacyErased).getBoolean("author_erased"),
+            "fixture check: an old-code erasure has the byline and no flag, so the backfill is "
+            + "what has to give it one");
     }
 
     @Test

@@ -600,7 +600,8 @@ class RoleAwareSubmissionIntegrationTest {
         assertEquals(role, claimRow(out.claimId()).getLong("resolved_role_id"),
             "and the employment record it carries is not");
         assertEquals("live", dispositionOf(out.reviewId()), "their rating is still published");
-        assertEquals("Anonymous User", reviewRow(out.reviewId()).getString("author"));
+        ErasedByline.assertMinted(reviewRow(out.reviewId()).getString("author"),
+            "a role-aware submission whose author erased themselves");
     }
 
     // -- fixtures --------------------------------------------------------------
