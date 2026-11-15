@@ -1529,6 +1529,37 @@ public class LocationCorpusRepository {
                 statement.execute("CREATE OR REPLACE SECRET corpus (TYPE s3, "
                     + "PROVIDER credential_chain, REGION '" + region + "', "
                     + "SCOPE 's3://" + bucket + "')");
+            } catch (SQLException noCredentials) {
+                /*
+                  TOLERATED, for exactly the reason the tuning loop above is tolerated: letting it
+                  escape aborts the whole setup, and here it aborted it even when nothing about
+                  S3 was needed.
+
+                  credential_chain validates EAGERLY, so on a host carrying no AWS credentials at
+                  all this throws "Secret Validation Failure: Credential Chain" and the engine
+                  never opens at all. That took out every local-only use of the corpus, and there
+                  are two: a pinned release never reads current.json (see activeRelease, which
+                  returns before any S3 statement), and a geography file already on disk is read
+                  by read_parquet from a local path. Neither needs a secret, a bucket or a network.
+
+                  The three cold-start tests that construct precisely that case - synthetic parquet
+                  rows in a temp dir, release pinned by property, no network - therefore failed on
+                  any machine without ~/.aws/credentials, and passed on developer machines only
+                  because the file happened to be sitting there. They were asserting that the
+                  corpus works offline while depending on a credential to prove it.
+
+                  WHAT CONTINUING DOES NOT COST. Nothing that previously worked: an S3 read now
+                  fails on its own rather than being prevented by a closed engine, and that path
+                  is already bounded twice over, by http_retries=1 with the 10s http_timeout set
+                  just above and then by CorpusBreaker, which stops probing after two consecutive
+                  failures. Production is untouched, because the instance role is present and the
+                  secret is created exactly as before.
+
+                  WARNING, not fine(): on a host that is supposed to reach the bucket, this is the
+                  one line that explains why nothing is ever found.
+                */
+                LOG.log(Level.WARNING, "corpus S3 credentials unavailable; the engine will open "
+                    + "for local data only, and any S3 read will fail", noCredentials);
             }
             secretMs = (System.nanoTime() - openedAt) / 1_000_000 - engineMs - tuningMs;
             // The first S3 round trip: a listing of the corpus root, over the network.
