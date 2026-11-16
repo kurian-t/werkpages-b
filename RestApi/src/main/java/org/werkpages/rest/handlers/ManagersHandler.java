@@ -115,6 +115,16 @@ public class ManagersHandler {
                     .put("image", row.getString("image"))
                     .put("overallRating", row.getBigDecimal("overall_rating"))
                     .put("reviews", row.getInteger("reviews_count"))
+                    /*
+                      The platform example's own numbers, beside the genuine ones.
+
+                      A ghost holding only an example has overall_rating NULL and reviews_count 0,
+                      correctly: an example is outside every statistic by provenance. The tile read
+                      only those and drew an empty space where the rating goes. Separate keys, so
+                      nothing that ranks or compares managers can pick them up by accident.
+                    */
+                    .put("exampleRating", exampleNumber(row, "example_rating"))
+                    .put("exampleReviews", exampleCount(row, "example_reviews"))
                     .put("bio", row.getString("bio"))
                     .put("status", row.getString("status"))
                     .put("approvalStatus", row.getString("approval_status"))
@@ -178,6 +188,23 @@ public class ManagersHandler {
             .onFailure(err -> handleError(ctx, err));
     }
 
+    /**
+     * The example columns, tolerating a projection that omits them.
+     *
+     * <p>Vert.x throws {@code NoSuchElementException} for an absent column rather than returning
+     * null, and not every row reaching these builders comes from a query that selects them.
+     */
+    private static java.math.BigDecimal exampleNumber(io.vertx.sqlclient.Row row, String column) {
+        int index = row.getColumnIndex(column);
+        return index < 0 ? null : row.getBigDecimal(index);
+    }
+
+    /** See {@link #exampleNumber}. */
+    private static Integer exampleCount(io.vertx.sqlclient.Row row, String column) {
+        int index = row.getColumnIndex(column);
+        return index < 0 ? null : row.getInteger(index);
+    }
+
     private JsonObject buildManagerResponse(Row row, boolean hasReported, boolean contributed) {
         String company = row.getString("company");
         String logoUrl = row.getString("company_logo_url");
@@ -193,6 +220,16 @@ public class ManagersHandler {
             .put("title", row.getString("title"))
             .put("image", row.getString("image"))
             .put("overallRating", row.getBigDecimal("overall_rating"))
+            /*
+              The example's own score, so the headline can show it labelled rather than show "-".
+
+              The profile already renders the example REVIEW with its pill, and already counts it
+              from the rows it was handed, but the big number beside those pills came from the
+              cache - which an example is deliberately absent from - so a ghost's profile read
+              "Example score" next to a dash while the card below it showed 3.5.
+            */
+            .put("exampleRating", exampleNumber(row, "example_rating"))
+            .put("exampleReviews", exampleCount(row, "example_reviews"))
             .put("reviews", row.getJsonArray("reviews"))
             .put("bio", row.getString("bio"))
             .put("status", row.getString("status"))

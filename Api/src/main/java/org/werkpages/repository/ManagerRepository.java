@@ -23,6 +23,39 @@ public class ManagerRepository {
 
     // ── SQL constants ─────────────────────────────────────────────────────────
 
+    /**
+     * The platform example's OWN rating and count, for the surfaces that must show them.
+     *
+     * <p><b>Why these are separate columns and not folded into {@code overall_rating}.</b> A
+     * generated example is deliberately outside every statistic: {@code recalculate} writes the
+     * cache from {@link ReviewSql#genuine}, and {@code company_stats_live} aggregates that cache,
+     * so letting an example reach {@code overall_rating} would put fabricated numbers into company
+     * statistics, industry statistics and rankings. That exclusion is the whole point of
+     * {@code reviews.origin} and must not be undone to fix a display problem.
+     *
+     * <p><b>But the display problem is real.</b> A newly created ghost holds exactly one example,
+     * so its cached rating is correctly NULL - and the tile and the profile headline took their
+     * number from that cache and drew nothing. Reported in production: "a user searched, the
+     * profile was auto-created, and the tile came back with an empty space where the rating goes."
+     * The row was there the whole time, which is what made it look random.
+     *
+     * <p>So the example's number travels beside the genuine one, flagged, and each surface decides
+     * what to do with it: shown with an "Example" pill where a reader is looking at this one
+     * manager, ignored wherever numbers are compared or ranked.
+     *
+     * <p>Scalar subqueries rather than a join, because {@code SELECT_BODY} already groups by
+     * {@code m.id} and a lateral would have to be added to its GROUP BY. {@code reviews} is
+     * indexed on {@code manager_id}, and {@code reviews_published} is a partial index over exactly
+     * the live rows these read.
+     */
+    private static final String EXAMPLE_COLUMNS =
+          "                (SELECT ROUND(AVG(r.overall_rating)::NUMERIC, 1) FROM reviews r\n"
+        + "                  WHERE r.manager_id = m.id AND " + ReviewSql.example("r")
+        + ") AS example_rating,\n"
+        + "                (SELECT COUNT(*)::INTEGER FROM reviews r\n"
+        + "                  WHERE r.manager_id = m.id AND " + ReviewSql.example("r")
+        + ") AS example_reviews,\n";
+
     public static final String GET_BY_ID_SQL = """
             SELECT
                 m.id, m.name, m.company, m.title, m.image, m.overall_rating,
@@ -54,6 +87,7 @@ public class ManagerRepository {
                 c.domain AS company_domain,
                 c.brandfetch_icon_url AS company_brandfetch_icon_url,
                 c.industry AS industry,
+                """ + EXAMPLE_COLUMNS + """
                 COALESCE(ch.career_history, '[]') AS career_history,
                 COALESCE(r.reviews, '[]') AS reviews
             FROM managers m
@@ -175,6 +209,7 @@ public class ManagerRepository {
                 c.domain AS company_domain,
                 c.brandfetch_icon_url AS company_brandfetch_icon_url,
                 c.industry AS industry,
+                """ + EXAMPLE_COLUMNS + """
                 COALESCE(
                     json_agg(json_build_object(
                         'id', ch.id, 'company', ch.company, 'title', ch.title,
@@ -925,7 +960,10 @@ public class ManagerRepository {
      */
     public Future<java.util.Optional<Row>> findCareerEntry(long entryId, long managerId) {
         return db.preparedQuery(
-                "SELECT company, title FROM career_history WHERE id = $1 AND manager_id = $2")
+                // company_id travels with it because a role merge may only join two employments
+                // at the SAME employer, and the caller has to be able to tell before it tries.
+                "SELECT company, title, company_id FROM career_history "
+                + "WHERE id = $1 AND manager_id = $2")
             .execute(Tuple.of(entryId, managerId))
             .map(rows -> rows.size() == 0
                 ? java.util.Optional.<Row>empty()
@@ -994,6 +1032,32 @@ public class ManagerRepository {
     }
 
     /**
+     * The predicate that identifies ONE role's ratings, keyed exactly as the trajectory groups.
+     *
+     * <p>Every statement below used to match on the COMPANY alone, which is wrong the moment a
+     * manager holds two roles at one employer: "Director" and "VP" at the same company are two
+     * stages on the chart, and an admin removing one of them was deleting the ratings under both.
+     * The destructive case is the one that matters - {@code DELETE FROM reviews WHERE
+     * manager_company = ...} destroyed a sibling role's genuine opinions, and nothing on screen
+     * said so.
+     *
+     * <p>Normalised the same way {@code ReviewRepository.SEGMENTS_SQL} groups: whitespace stripped
+     * from the company, collapsed to one space in the title, both lower-cased. That is not a
+     * stylistic choice. If this matched differently from the chart then what an admin was shown
+     * and what the statement touched would be two different sets of ratings, which is the whole
+     * class of bug being fixed.
+     *
+     * <p>Binds {@code $2} to the company and {@code $3} to the title, so every caller passes
+     * {@code (managerId, company, title)} in that order.
+     */
+    private static final String REVIEW_ROLE_MATCH = """
+              AND REGEXP_REPLACE(LOWER(TRIM(COALESCE(manager_company, ''))), '\\s+', '', 'g')
+                = REGEXP_REPLACE(LOWER(TRIM($2::text)), '\\s+', '', 'g')
+              AND REGEXP_REPLACE(LOWER(TRIM(COALESCE(manager_title, ''))), '\\s+', ' ', 'g')
+                = REGEXP_REPLACE(LOWER(TRIM($3::text)), '\\s+', ' ', 'g')
+            """;
+
+    /**
      * What a career stage is actually made of, so an admin is told before they destroy it.
      *
      * <p>A stage on the trajectory is not necessarily a {@code career_history} row. Most are not:
@@ -1006,7 +1070,7 @@ public class ManagerRepository {
      * actions. Deleting placeholders is housekeeping. Deleting somebody's genuine review is not,
      * and an admin pressing a button on a chart should be told which one they are about to do.
      */
-    public Future<Row> describeCareerStage(long managerId, String company) {
+    public Future<Row> describeCareerStage(long managerId, String company, String title) {
         return db.preparedQuery("""
                 SELECT
                     COUNT(*)::INTEGER AS total_reviews,
@@ -1014,26 +1078,25 @@ public class ManagerRepository {
                     COUNT(*) FILTER (WHERE NOT (user_id IS NULL AND weight = TRUE))::INTEGER AS real_reviews
                 FROM reviews
                 WHERE manager_id = $1
-                  AND LOWER(TRIM(COALESCE(manager_company, ''))) = LOWER(TRIM($2))
-                """)
-            .execute(Tuple.of(managerId, company))
+                """ + REVIEW_ROLE_MATCH)
+            .execute(Tuple.of(managerId, company, title))
             .map(rows -> rows.iterator().next());
     }
 
     /**
      * Removes every review belonging to one career stage.
      *
-     * <p>Matched on the trimmed, lower-cased company exactly as {@link #describeCareerStage}
-     * counts them, so what is deleted is what the admin was shown. Matching on the raw string
-     * would let "Ro " and "Ro" be counted together and deleted apart.
+     * <p>Matched on {@link #REVIEW_ROLE_MATCH}, exactly as {@link #describeCareerStage} counts
+     * them, so what is deleted is what the admin was shown. Matching the company alone deleted
+     * every role at that employer; matching the raw string would let "Ro " and "Ro" be counted
+     * together and deleted apart.
      */
-    public Future<Integer> deleteCareerStageReviews(long managerId, String company) {
+    public Future<Integer> deleteCareerStageReviews(long managerId, String company, String title) {
         return db.preparedQuery("""
                 DELETE FROM reviews
                 WHERE manager_id = $1
-                  AND LOWER(TRIM(COALESCE(manager_company, ''))) = LOWER(TRIM($2))
-                """)
-            .execute(Tuple.of(managerId, company))
+                """ + REVIEW_ROLE_MATCH)
+            .execute(Tuple.of(managerId, company, title))
             .map(SqlResult::rowCount);
     }
 
@@ -1050,31 +1113,89 @@ public class ManagerRepository {
      * effect is that the target stage may widen to cover the moved reviews' dates, which is
      * correct: those months are now claimed under that role.
      */
-    public Future<Integer> reassignCareerStageReviews(long managerId, String fromCompany,
+    public Future<Integer> reassignCareerStageReviews(long managerId,
+                                                      String fromCompany, String fromTitle,
                                                       String toCompany, String toTitle) {
         return db.preparedQuery("""
                 UPDATE reviews
-                SET manager_company = $3,
-                    manager_title   = COALESCE($4, manager_title),
+                SET manager_company = $4,
+                    manager_title   = COALESCE($5, manager_title),
                     updated_at      = now()
                 WHERE manager_id = $1
-                  AND LOWER(TRIM(COALESCE(manager_company, ''))) = LOWER(TRIM($2))
-                """)
-            .execute(Tuple.of(managerId, fromCompany, toCompany, toTitle))
+                """ + REVIEW_ROLE_MATCH)
+            .execute(Tuple.of(managerId, fromCompany, fromTitle, toCompany, toTitle))
             .map(SqlResult::rowCount);
     }
 
-    /** The career_history row for a stage, when one exists. Matched the same way as the reviews. */
-    public Future<java.util.Optional<Long>> findCareerEntryIdByCompany(long managerId, String company) {
+    /**
+     * The {@code career_history} rows behind one stage, matched the same way as its reviews.
+     *
+     * <h2>Why every id, and why not the newest one</h2>
+     *
+     * <p>This was {@code findCareerEntryIdByCompany}, which matched the company alone and then took
+     * {@code ORDER BY start_date DESC LIMIT 1}. For a manager with two roles at one employer that
+     * is a coin toss: an admin removing the earlier role had the LATER row deleted, and the role
+     * they meant to remove stayed on the chart. Being a lookup for a destructive action made it
+     * worse than merely wrong.
+     *
+     * <p>Several rows CAN legitimately back one stage, because the chart groups on the normalised
+     * pair: two spellings of one employer, or the same title recorded twice across a gap, collapse
+     * into a single tile. All of them belong to the stage the admin clicked, so all of them are
+     * returned and the caller acts on the set rather than picking from it.
+     */
+    public Future<java.util.List<Long>> findCareerEntryIdsByRole(long managerId, String company,
+                                                                 String title) {
+        return findCareerPeriodsByRole(managerId, company, title)
+            .map(rows -> {
+                java.util.List<Long> ids = new java.util.ArrayList<>();
+                for (Row r : rows) ids.add(r.getLong("id"));
+                return ids;
+            });
+    }
+
+    /**
+     * Every employment period recorded under one (company, title) stage, oldest first.
+     *
+     * <p>A STAGE IS NOT ALWAYS ONE JOB, and assuming it was is the second form of the defect this
+     * class's {@code REVIEW_ROLE_MATCH} fixes. Somebody can leave an employer and come back to the
+     * same title years later: two genuinely separate employments, identical (company, title), and
+     * the trajectory draws them as ONE tile because it groups on that pair. A destructive operation
+     * that took "the stage" would take both periods, and the admin was shown one.
+     *
+     * <p>So the rows come back as periods with their dates rather than as a bare id list, and the
+     * caller refuses to act on an ambiguous stage until the request names which period it means.
+     * The dates are here so the refusal can describe the choice instead of merely declining.
+     *
+     * <p>{@code state <> 'superseded'} matches {@code ReviewRepository.SEGMENTS_SQL}. Without it a
+     * role that {@link org.werkpages.service.ManagerMergeService#mergeRoles} has superseded still
+     * carries its old (company, title), so it would count as a second period here and make every
+     * later operation on the surviving role look ambiguous - a merge would poison the stage it had
+     * just repaired.
+     */
+    public Future<java.util.List<Row>> findCareerPeriodsByRole(long managerId, String company,
+                                                               String title) {
         return db.preparedQuery("""
-                SELECT id FROM career_history
-                WHERE manager_id = $1 AND LOWER(TRIM(company)) = LOWER(TRIM($2))
-                ORDER BY start_date DESC LIMIT 1
+                -- ::date deliberately. career_history.start_date is a TIMESTAMPTZ, and the
+                -- refusal message below renders these as the calendar days the schema's own
+                -- uniqueness key uses (start_day), not as instants in some timezone.
+                SELECT id, company, title, company_id,
+                       start_date::date AS start_date,
+                       end_date::date   AS end_date
+                FROM career_history
+                WHERE manager_id = $1
+                  AND state <> 'superseded'
+                  AND REGEXP_REPLACE(LOWER(TRIM(company)), '\\s+', '', 'g')
+                    = REGEXP_REPLACE(LOWER(TRIM($2::text)), '\\s+', '', 'g')
+                  AND REGEXP_REPLACE(LOWER(TRIM(COALESCE(title, ''))), '\\s+', ' ', 'g')
+                    = REGEXP_REPLACE(LOWER(TRIM($3::text)), '\\s+', ' ', 'g')
+                ORDER BY start_date NULLS FIRST, id
                 """)
-            .execute(Tuple.of(managerId, company))
-            .map(rows -> rows.iterator().hasNext()
-                ? java.util.Optional.of(rows.iterator().next().getLong("id"))
-                : java.util.Optional.<Long>empty());
+            .execute(Tuple.of(managerId, company, title))
+            .map(rows -> {
+                java.util.List<Row> out = new java.util.ArrayList<>();
+                for (Row r : rows) out.add(r);
+                return out;
+            });
     }
 
     public Future<Integer> deleteCareerEntry(long entryId, long managerId) {
@@ -1103,33 +1224,49 @@ public class ManagerRepository {
     // ── Stats recalculation ───────────────────────────────────────────────────
 
     /**
-     * Managers whose cached stats are stale because a placeholder review's weight has expired.
+     * Managers whose cached rating count disagrees with the ratings they actually hold.
      *
-     * Expiry is a date passing, not a write, so nothing in the request path ever fires for it. A
-     * manager rated only by an expired placeholder would otherwise keep showing that rating and
-     * that review count forever, while the reviews list beneath it showed nothing - until some
-     * unrelated write happened to recalculate them.
+     * <p>Nothing in the request path fires for this class of drift, so without a sweep the figures
+     * stay wrong indefinitely: a manager keeps showing a rating and a count while the list beneath
+     * it shows something else, until some unrelated write happens to recalculate them.
      *
-     * Compares the cached count against what the count should be, so a manager is returned only
-     * while it is actually wrong, and the job goes quiet once it has caught up.
+     * <p><b>This asks the cache's own question, and that is the fix.</b> It used to ask a different
+     * one: find managers holding a placeholder whose weight window had lapsed, then compare the
+     * cache against a count computed from that same window. Both halves described the lifecycle
+     * that {@code reviews.origin} replaced, and the mismatch had two consequences.
+     *
+     * <ul>
+     *   <li><b>It could not converge.</b> {@link #recalculate} writes the cache from
+     *       {@link ReviewSql#genuine}, so for a placeholder still classified
+     *       {@code origin = 'contributor'} - precisely the three rows found in production - the
+     *       cache was 1 and the window-based count was 0. The manager was reported stale, was
+     *       recalculated, came back 1 again, and was reported stale again. Every night, forever,
+     *       printing a line that said work had been done.</li>
+     *   <li><b>It was blind to every other cause.</b> Any drift not accompanied by an expired
+     *       weight window went unnoticed, which is most of them: an interrupted write, a manual
+     *       correction, a deployment whose arithmetic predated V106.</li>
+     * </ul>
+     *
+     * <p>Comparing the cache against the genuine count instead is self-correcting by construction:
+     * {@code recalculate} sets the cache to exactly this number, so a manager it has fixed cannot
+     * be returned again, and a manager it has not fixed is returned until it is. An example
+     * contributes to neither side, so a date passing no longer means anything here, which is the
+     * point: the example lifecycle has no clock in it.
      */
-    public Future<RowSet<Row>> findManagersWithExpiredWeights() {
+    public Future<RowSet<Row>> findManagersWithStaleRatingCache() {
         return db.query("""
                 SELECT m.id
                 FROM managers m
-                WHERE EXISTS (
-                    SELECT 1 FROM reviews r
-                    WHERE r.manager_id = m.id
-                      AND r.deleted_at IS NULL
-                      AND r.weight = TRUE
-                      AND r.weight_expires_on IS NOT NULL
-                      AND r.weight_expires_on <= CURRENT_DATE
-                )
-                AND m.reviews_count <> (
-                    SELECT COUNT(*) FROM reviews r2
-                    WHERE r2.manager_id = m.id
-                      AND r2.deleted_at IS NULL
-                      AND (r2.weight = FALSE OR r2.weight_expires_on IS NULL OR r2.weight_expires_on > CURRENT_DATE)
+                WHERE m.reviews_count <> (
+                    SELECT COUNT(*) FROM reviews r
+                    -- The predicate goes on its own line deliberately: a text block strips the
+                    -- trailing whitespace before its closing quotes, so "AND " followed by the
+                    -- fragment concatenates into "ANDr.disposition" and Postgres reports a syntax
+                    -- error at "ANDr". Ending the line after AND leaves the newline as the
+                    -- separator. recalculate() above splits its WHERE the same way, for the same
+                    -- reason.
+                    WHERE r.manager_id = m.id AND
+                """ + ReviewSql.genuine("r") + """
                 )
                 """)
             .execute();
@@ -1378,17 +1515,33 @@ public class ManagerRepository {
                     return conn.preparedQuery(sql.toString()).execute(Tuple.from(params))
                         .compose(v -> {
                             Future<Void> cascade = Future.succeededFuture();
-                            if (titleChanged) {
+                            /*
+                              BOTH HALVES OF THE PAIR, on every one of these statements.
+
+                              These two matched on one half each while the career_history statement
+                              below them matched on both. So correcting the headline of a manager
+                              who holds two roles at one employer rewrote the rating snapshots of
+                              the OTHER role as well - it shares the company - and the same for two
+                              employers sharing a title. The chart then drew one stage where there
+                              were two, with another role's opinions folded into it, while
+                              career_history still recorded both. A rating's snapshot is the record
+                              of which job it was written about; moving it to a different job is
+                              exactly the attribution loss this whole correction exists to prevent.
+
+                              The pair is the role, so the pair is what these match on.
+                            */
+                            if (titleChanged || companyChanged) {
                                 cascade = cascade.compose(x ->
-                                    conn.preparedQuery(
-                                        "UPDATE reviews SET manager_title = $1 WHERE manager_id = $2 AND manager_title = $3")
-                                        .execute(Tuple.of(effTitle, managerId, oldTitle)).mapEmpty());
-                            }
-                            if (companyChanged) {
-                                cascade = cascade.compose(x ->
-                                    conn.preparedQuery(
-                                        "UPDATE reviews SET manager_company = $1 WHERE manager_id = $2 AND manager_company = $3")
-                                        .execute(Tuple.of(effCompany, managerId, oldCompany)).mapEmpty());
+                                    conn.preparedQuery("""
+                                        UPDATE reviews
+                                           SET manager_title   = $1,
+                                               manager_company = $2
+                                         WHERE manager_id = $3
+                                           AND manager_title   = $4
+                                           AND manager_company = $5
+                                        """)
+                                        .execute(Tuple.of(effTitle, effCompany, managerId,
+                                                          oldTitle, oldCompany)).mapEmpty());
                             }
                             if (titleChanged || companyChanged) {
                                 cascade = cascade.compose(x ->
@@ -1544,6 +1697,48 @@ public class ManagerRepository {
                 """)
             .execute(Tuple.of(managerId, fullCompany.trim(), companyId))
             .mapEmpty();
+    }
+
+    /**
+     * This searcher's own queued row for the same manager, left behind mid-typing.
+     *
+     * <p>A debounced search fires while the employer is still being typed, so one person looking
+     * for "Bob Burgers at Netflix" queued a row at "Net" and then another at "Netflix" a second
+     * later. {@code search()} cannot see that the first is the second: it matches with
+     * {@code company ILIKE '%Netflix%'} against the stored {@code Net}, which tests containment in
+     * one direction only, so the finished search reads as a different employer.
+     *
+     * <p>Same fragment test as {@link #findCapturedByNameAndCompany}, including the three-character
+     * floor: one or two stored letters would match most employers on the site. {@code position}
+     * rather than a built LIKE pattern, so a company name containing % or _ cannot act as a
+     * wildcard.
+     *
+     * <p><b>Scoped to {@code search_created_by_user_id}, and that is the whole safety of it.</b>
+     * Folding against any matching pending row is what once rewrote a stranger's half-typed
+     * namesake to this submitter's company and handed it to their account. A row somebody else
+     * queued is not this searcher's to refine, so it is not a candidate.
+     */
+    public Future<Optional<Long>> findOwnRefinableSearchPending(String fullName, String typedCompany,
+                                                               UUID searcherId) {
+        if (searcherId == null || fullName == null || typedCompany == null) {
+            return Future.succeededFuture(Optional.empty());
+        }
+        return db.preparedQuery("""
+                SELECT m.id
+                  FROM managers m
+                 WHERE m.search_created_by_user_id = $3
+                   AND m.approval_status = 'pending_approval'
+                   AND m.name ILIKE $1
+                   AND length(btrim(m.company)) >= 3
+                   AND length(btrim(m.company)) < length(btrim($2))
+                   AND position(lower(btrim(m.company)) in lower($2)) > 0
+                 ORDER BY m.created_at DESC
+                 LIMIT 1
+                """)
+            .execute(Tuple.of(fullName, typedCompany.trim(), searcherId))
+            .map(rows -> rows.iterator().hasNext()
+                ? Optional.of(rows.iterator().next().getLong("id"))
+                : Optional.<Long>empty());
     }
 
     public Future<RowSet<Row>> findByNameAndCompany(String fullName, String company) {

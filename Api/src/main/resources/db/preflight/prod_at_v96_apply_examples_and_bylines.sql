@@ -1,4 +1,24 @@
 -- ─────────────────────────────────────────────────────────────────────────────
+-- SUPERSEDED, 2026-11-16. DO NOT RUN. The name of this file is a stale premise.
+--
+-- Production is NO LONGER at V96. It applied up to and including V107 on
+-- 2026-11-15, after a 50-minute outage, and a version recorded in
+-- flyway_schema_history cannot be rolled back.
+--
+-- So the two corrections this script makes by hand have been made by V107 itself,
+-- which is what its companion inspect script said was the right vehicle once the
+-- stream shipped. The stream has shipped.
+--
+-- Kept rather than deleted because it is the record of what was done to a V96
+-- production and why, and because the inspection queries in these scripts are
+-- still the right way to look at this data. The file name is left alone so the
+-- references to it in HANDOVER.md and MIGRATION_HISTORY.md still resolve.
+--
+-- Before running anything in this directory against production, read the
+-- current version out of flyway_schema_history rather than out of a filename.
+-- ─────────────────────────────────────────────────────────────────────────────
+
+-- ─────────────────────────────────────────────────────────────────────────────
 -- APPLY: retire stranded platform examples, relabel erased bylines.
 --
 -- ONE TRANSACTION. It lands completely or not at all.

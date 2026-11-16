@@ -124,7 +124,17 @@ public class AuthHandler {
     private final String clientSecret;
     private final String audience;
     private final WebClient webClient;
-    private final String turnstileSecretKey;
+    /**
+     * CAPTCHA verification, built from {@code TURNSTILE_SECRET_KEY}.
+     *
+     * <p>This was a bare {@code String} that nothing read: the secret was loaded, carried here
+     * and never used, so a configured key bought no protection at all. It is now a verifier that
+     * can actually refuse a token, and {@link org.werkpages.service.TurnstileVerifier} explains
+     * why no endpoint calls it yet and what choosing one involves. Holding the verifier rather
+     * than the key is the point: a reader can see whether verification exists without grepping
+     * for the string.
+     */
+    private final org.werkpages.service.TurnstileVerifier turnstile;
 
     /**
      * The HMAC key that signs the pre-auth cookie, and whether the code binding is MANDATORY.
@@ -174,10 +184,13 @@ public class AuthHandler {
         this.clientId          = clientId;
         this.clientSecret      = clientSecret;
         this.audience          = audience;
-        this.turnstileSecretKey= turnstileSecretKey;
+        this.turnstile         = new org.werkpages.service.TurnstileVerifier(turnstileSecretKey);
         this.webClient         = WebClient.create(vertx);
         this.auth0             = Auth0Http.https(vertx, auth0Domain);
     }
+
+    /** Whether CAPTCHA verification is configured, for the boot log and for tests. */
+    public boolean captchaVerificationEnabled() { return turnstile.isEnabled(); }
 
     // ── START: the server begins the login transaction ────────────────────────
 

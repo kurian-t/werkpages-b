@@ -536,6 +536,7 @@ public class MainVerticle extends AbstractVerticle {
                         routerFactory.addHandlerByOperationId("adminModerationLinkClaim",           moderationHandler::handleLinkClaim);
                         routerFactory.addHandlerByOperationId("adminModerationMergeRoles",          moderationHandler::handleMergeRoles);
                         routerFactory.addHandlerByOperationId("adminModerationHeldRatings",         moderationHandler::handleHeldRatings);
+                        routerFactory.addHandlerByOperationId("adminModerationPublishHeldRating",   moderationHandler::handlePublishHeldRating);
                         routerFactory.addHandlerByOperationId("approveManagerEdit",       adminHandler::handleApproveEdit);
                         routerFactory.addHandlerByOperationId("rejectManagerEdit",        adminHandler::handleRejectEdit);
                         routerFactory.addHandlerByOperationId("adminGetReviews",          adminHandler::handleGetReviews);
@@ -612,6 +613,16 @@ public class MainVerticle extends AbstractVerticle {
                             secrets.turnstileSecretKey,
                             vertx
                         );
+                        /*
+                          Said out loud, because the previous state of this was silent and wrong: the
+                          secret was loaded and never read, so "TURNSTILE_SECRET_KEY is set" and
+                          "CAPTCHAs are checked" were different facts and nothing in the logs
+                          distinguished them. See TurnstileVerifier for why no endpoint requires a
+                          token yet.
+                        */
+                        System.out.println(authHandler.captchaVerificationEnabled()
+                            ? "✓ Turnstile verification configured (no endpoint requires a token yet)"
+                            : "• Turnstile verification not configured");
                         routerFactory.addHandlerByOperationId("checkUsername",     authHandler::handleCheckUsername);
                         // Without this the callback refuses rather than falling back to an
                         // unverified decode. Fail closed, deliberately.

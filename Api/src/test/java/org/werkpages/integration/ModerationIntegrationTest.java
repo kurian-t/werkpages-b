@@ -146,6 +146,8 @@ class ModerationIntegrationTest {
         assertForbidden(() -> await(moderation.linkClaimToRole(ordinaryAuth0, claim, role)));
         assertForbidden(() -> await(moderation.mergeRoles(ordinaryAuth0, managerId, role, role + 1)));
         assertForbidden(() -> await(moderation.heldRatings(ordinaryAuth0, 50, 0)));
+        assertForbidden(() -> await(moderation.heldRatings(ordinaryAuth0, 50, 0, managerId)));
+        assertForbidden(() -> await(moderation.publishHeldRating(ordinaryAuth0, UUID.randomUUID())));
 
         // AND NOTHING MOVED. A refusal that still changed a row would be worse than no check.
         assertEquals("proposed", roleRow(role).getString("state"));
@@ -703,6 +705,123 @@ class ModerationIntegrationTest {
         // not a healthy queue, and the count alone hides that.
         assertNotNull(summary.getString("oldestEmploymentAt"));
         assertNotNull(summary.getString("oldestHeldRatingAt"));
+    }
+
+
+    // ── publishing one held rating ──────────────────────────────────────────
+
+    /**
+     * The action the queue's last branch always promised and nothing could perform.
+     *
+     * <p>{@code heldRatingJson} has a final branch reading "Nothing is blocking it any more." /
+     * "It can be published now.", and until now there was no endpoint that published one. Every
+     * release was a side effect of some other decision, so a rating whose obstacle had been
+     * cleared outside its own release scope sat held while the screen said it was ready.
+     *
+     * <p>The fixture reaches that state the way production does rather than by writing
+     * {@code disposition} by hand: the employment is accepted while a blocking conflict is open,
+     * so the release runs and correctly cannot take this rating; then the conflict is dismissed by
+     * a route that resolves it without sweeping this rating up. What is left is a publishable
+     * rating that is still held, which is the whole point.
+     */
+    @Test
+    void aPublishableHeldRatingCanBePublishedAndMovesTheManagersAverage() throws Exception {
+        RoleAwareSubmissionService.Outcome out = await(submissions.submit(
+            proposal("Depot Supervisor", LocalDate.parse("2023-03-01"), contributor)));
+        long conflict = openBlockingConflict(soleClaimId(), "possible_duplicate");
+        await(moderation.acceptEmployment(adminAuth0, out.roleId()));
+        assertEquals("held", dispositionOf(out.reviewId()), "precondition: still held");
+
+        // Close the conflict directly, so nothing releases the rating as a side effect.
+        await(pool.preparedQuery(
+                "UPDATE role_conflicts SET resolved_at = now(), resolution = 'dismissed' "
+              + "WHERE id = $1").execute(Tuple.of(conflict)).mapEmpty());
+
+        JsonObject ready = await(moderation.heldRatings(adminAuth0, 50, 0)).getJsonObject(0);
+        assertTrue(ready.getBoolean("wouldPublishNow"),
+            "the queue must agree it is ready, or this test is proving something else");
+        assertEquals("It can be published now.", ready.getString("actionToRelease"));
+
+        JsonObject result = await(moderation.publishHeldRating(adminAuth0, out.reviewId()));
+
+        assertTrue(result.getBoolean("published"));
+        assertEquals("live", dispositionOf(out.reviewId()));
+        assertTrue(await(moderation.heldRatings(adminAuth0, 50, 0)).isEmpty(),
+            "and it leaves the queue");
+
+        // The number above the list, not just the row. A publish that moved no average would
+        // leave the rating visible and absent from the figure printed over it.
+        Row cached = await(pool.preparedQuery(
+                "SELECT reviews_count, overall_rating FROM managers WHERE id = $1")
+            .execute(Tuple.of(managerId)).map(rs -> rs.iterator().next()));
+        assertEquals(1, cached.getInteger("reviews_count"),
+            "publishing must recalculate the manager cache, and through V89 the company figures");
+        assertNotNull(cached.getBigDecimal("overall_rating"));
+    }
+
+    /**
+     * A rating something is still holding is refused, and stays held.
+     *
+     * <p>409 rather than letting the write through and leaving the deferred role assertion to
+     * abort the commit: the database's message names a constraint, this one names the queue that
+     * explains the hold.
+     */
+    @Test
+    void publishingARatingThatIsStillBlockedIsRefusedAndChangesNothing() throws Exception {
+        RoleAwareSubmissionService.Outcome out = await(submissions.submit(
+            proposal("Depot Supervisor", LocalDate.parse("2023-03-01"), contributor)));
+
+        ServiceException refusal = assertThrows(ServiceException.class, () -> {
+            try {
+                await(moderation.publishHeldRating(adminAuth0, out.reviewId()));
+            } catch (Exception wrapped) {
+                throw wrapped.getCause() instanceof ServiceException se ? se : wrapped;
+            }
+        });
+        assertEquals(409, refusal.getStatusCode());
+        assertEquals("held", dispositionOf(out.reviewId()), "and it is still held");
+    }
+
+    /** Publishing twice is a conflict, not a second success: two moderators share this queue. */
+    @Test
+    void publishingAnAlreadyLiveRatingIsAConflictRatherThanASecondSuccess() throws Exception {
+        long role = insertRole(managerId, "Dispatch Lead", "2024-01-15", "proposed");
+        UUID withdrawn = insertWithdrawnHeldRating(role);
+        await(moderation.acceptEmployment(adminAuth0, role));
+        assertEquals("live", dispositionOf(withdrawn), "precondition: accepting released it");
+
+        ServiceException refusal = assertThrows(ServiceException.class, () -> {
+            try {
+                await(moderation.publishHeldRating(adminAuth0, withdrawn));
+            } catch (Exception wrapped) {
+                throw wrapped.getCause() instanceof ServiceException se ? se : wrapped;
+            }
+        });
+        assertEquals(409, refusal.getStatusCode());
+        assertTrue(refusal.getMessage().contains("already live"), refusal.getMessage());
+    }
+
+    /**
+     * The inline section on a manager's profile is the same query, narrowed.
+     *
+     * <p>Two queries would be two answers, and {@code whyHeld} is computed rather than stored, so
+     * a moderator seeing one reason on the profile and another in the queue would have no way to
+     * tell which was current.
+     */
+    @Test
+    void theQueueCanBeNarrowedToOneManagerForTheInlineProfileSection() throws Exception {
+        RoleAwareSubmissionService.Outcome out = await(submissions.submit(
+            proposal("Depot Supervisor", LocalDate.parse("2023-03-01"), contributor)));
+
+        JsonArray mine = await(moderation.heldRatings(adminAuth0, 50, 0, managerId));
+        assertEquals(1, mine.size());
+        assertEquals(out.reviewId().toString(), mine.getJsonObject(0).getString("reviewId"));
+        assertEquals(await(moderation.heldRatings(adminAuth0, 50, 0)).getJsonObject(0),
+                     mine.getJsonObject(0),
+                     "narrowed or not, the same rating must be described identically");
+
+        assertTrue(await(moderation.heldRatings(adminAuth0, 50, 0, managerId + 9_999)).isEmpty(),
+            "another manager's profile shows none of this one's held ratings");
     }
 
     // ── merging through the existing merge service ──────────────────────────

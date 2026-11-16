@@ -674,22 +674,22 @@ public class MaintenanceSweep {
     }
 
     /*
-        A placeholder review stops counting 14 days after a real one arrives, but that happens
-        because a date passes, not because anything writes. No request fires, so nothing
-        recalculated the manager and the cached rating and review count stayed at yesterday's
-        numbers indefinitely while the reviews list had already stopped showing those reviews.
+        Two pieces of housekeeping that no request path can do, chained in a fixed order.
 
-        The query returns only managers whose cached count actually disagrees with reality, so on
-        a normal day it finds nothing.
+        FIRST, reconcile any manager whose cached rating count disagrees with the ratings they
+        actually hold. Drift of this kind is caused by something not happening - an interrupted
+        write, a correction applied by hand, a deployment whose arithmetic predated V106 - so there
+        is no event to hang the repair on. The query asks the cache's own question and
+        recalculate writes exactly that answer, so the pass converges: a manager it has fixed
+        cannot come back, and the sweep is silent on a normal day.
 
-        The deletion is chained AFTER the recalculation, never beside it: that query finds managers
-        by EXISTS(expired placeholder), so deleting first would hide every manager whose cached
-        count had not caught up yet and leave their figures wrong for good. Deleting itself changes
-        no visible number - an expired placeholder is already out of the rating, the count and the
-        list - it removes the row, which nothing did before.
+        THEN delete any unclassified legacy placeholder whose countdown has run out. The order is
+        load-bearing, as it always was: a row the first step still needs to see must not be
+        deleted before it has seen it. Deleting changes no number anybody reads - an example is
+        already outside every statistic by provenance - it removes the row, which nothing else does.
     */
     private Future<Void> refreshExpiredPlaceholders() {
-        return managerRepo.findManagersWithExpiredWeights()
+        return managerRepo.findManagersWithStaleRatingCache()
             .compose(rows -> {
                 Future<Void> chain = Future.succeededFuture();
                 int stale = 0;
@@ -702,8 +702,21 @@ public class MaintenanceSweep {
                 final int total = stale;
                 return chain.map(v -> total);
             })
-            .onSuccess(n -> { if (n > 0) System.out.println("✓ Recalculated " + n + " manager(s) whose placeholder reviews expired"); })
-            .onFailure(err -> System.err.println("⚠ Expired-weight recalculation failed: " + err.getMessage()))
+            .onSuccess(n -> { if (n > 0) System.out.println("✓ Recalculated " + n + " manager(s) whose cached rating count had drifted"); })
+            .onFailure(err -> System.err.println("⚠ Stale rating-cache reconciliation failed: " + err.getMessage()))
+            /*
+              RECOVERED BEFORE THE CHAIN CONTINUES, and this is a fix rather than tidying.
+
+              onFailure only observes; the future stays failed, so compose used to short-circuit
+              and the deletion never ran. This class's own contract says every step is independent
+              and swallows its own failure "because they are unrelated pieces of maintenance that
+              happen to share a timer", and these two did not honour it.
+
+              Observed directly: a syntax error in the query above reported BOTH steps as failed,
+              with the second one quoting the first one's error message about a statement it never
+              executed. A reader would have been hunting a bug in the deletion that was not there.
+            */
+            .otherwise(0)
             .compose(ignored -> reviewRepo.deleteExpiredSeedReviews())
             .onSuccess(n -> { if (n > 0) System.out.println("✓ Deleted " + n + " expired placeholder review(s)"); })
             .onFailure(err -> System.err.println("⚠ Expired placeholder deletion failed: " + err.getMessage()))

@@ -204,8 +204,31 @@ public class ModerationHandler {
     // ── GET /api/admin/moderation/held-ratings ───────────────────────────────
 
     public void handleHeldRatings(RoutingContext ctx) {
-        service.heldRatings(ctx.get("auth0Id"), limit(ctx), offset(ctx))
+        // Optional. Present when the manager's own profile asks for its own held ratings, so the
+        // inline section and the global queue are answered by one query and cannot disagree.
+        String raw = ctx.queryParam("managerId").stream().findFirst().orElse(null);
+        Long managerId;
+        try {
+            managerId = (raw == null || raw.isBlank()) ? null : Long.valueOf(raw);
+        } catch (NumberFormatException notANumber) {
+            bad(ctx, "Invalid manager ID"); return;
+        }
+        service.heldRatings(ctx.get("auth0Id"), limit(ctx), offset(ctx), managerId)
             .onSuccess(rows -> okList(ctx, rows))
+            .onFailure(err -> ManagersHandler.handleError(ctx, err));
+    }
+
+    // ── POST /api/admin/moderation/held-ratings/{reviewId}/publish ───────────
+
+    public void handlePublishHeldRating(RoutingContext ctx) {
+        java.util.UUID reviewId;
+        try {
+            reviewId = java.util.UUID.fromString(ctx.pathParam("reviewId"));
+        } catch (IllegalArgumentException | NullPointerException notAUuid) {
+            bad(ctx, "Invalid rating ID"); return;
+        }
+        service.publishHeldRating(ctx.get("auth0Id"), reviewId)
+            .onSuccess(json -> ok(ctx, json))
             .onFailure(err -> ManagersHandler.handleError(ctx, err));
     }
 

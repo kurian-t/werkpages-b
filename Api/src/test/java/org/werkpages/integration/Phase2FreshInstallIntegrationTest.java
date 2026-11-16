@@ -129,7 +129,18 @@ class Phase2FreshInstallIntegrationTest {
         // was worn by no live account, so it disclosed which ratings belonged to somebody who had
         // deleted themselves, which is the one fact the erasure exists to remove. It is scoped by
         // the condition it removes, so re-running it changes nothing.
-        assertEquals("107", await(pool.query("""
+        //
+        // V108 (classify placeholder ratings in the database) moved it to 108 on 2026-11-16.
+        // Acknowledged, and this is the second DATA correction in a row rather than a structural
+        // change. Production was found holding three weighted, authorless rows still classified
+        // origin = 'contributor', which is the shape V106's backfill was written to catch: they
+        // were therefore written AFTER it ran, by a deployment whose createSeedReview predated the
+        // column. V108 backs those rows up, reclassifies them, recomputes every manager cache and
+        // company projection they touched, and then installs a BEFORE INSERT trigger so that a
+        // stale deployment writing one again has it classified rather than refused. Refusing would
+        // have broken ghost creation on the older build, which is the one thing worse than the
+        // defect.
+        assertEquals("108", await(pool.query("""
                 SELECT version FROM flyway_schema_history
                  WHERE success AND version IS NOT NULL
                  ORDER BY installed_rank DESC LIMIT 1

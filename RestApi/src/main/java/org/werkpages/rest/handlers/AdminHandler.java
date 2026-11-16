@@ -341,7 +341,13 @@ public class AdminHandler {
         } catch (Exception e) {
             bad(ctx, "Invalid edit ID"); return;
         }
-        service.approveEdit(auth0Id, editId)
+        /*
+          The body is OPTIONAL, and absent means "approve exactly what was asked for". An
+          administrator correcting one field before approving sends only that field, so the
+          contributor's other answers are never silently replaced by a form's defaults.
+        */
+        JsonObject corrections = ctx.body() != null ? ctx.body().asJsonObject() : null;
+        service.approveEdit(auth0Id, editId, corrections)
             .onSuccess(json -> {
                 String newCompany = json.getString("newCompany");
                 if (newCompany != null) {

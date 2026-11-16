@@ -3235,6 +3235,47 @@ paths:
                           type: object
                           additionalProperties:
                             type: number
+                        careerPeriods:
+                          type: array
+                          description: >-
+                            The same rows with the dates that distinguish them. One segment can be
+                            two separate JOBS: somebody can leave an employer and return to the
+                            same title, and career_unique_known_employment permits that whenever
+                            the start days differ. A destructive admin action on such a segment is
+                            refused until the request names the period, so the choice is sent with
+                            the segment rather than discovered one error message at a time.
+                          items:
+                            type: object
+                            properties:
+                              id:
+                                type: integer
+                                format: int64
+                              startDate:
+                                type: string
+                                format: date
+                                nullable: true
+                              endDate:
+                                type: string
+                                format: date
+                                nullable: true
+                        careerHistoryIds:
+                          type: array
+                          description: >-
+                            The career_history rows this segment is grouped from. Empty when the
+                            segment exists only because a rating names the role and nobody
+                            recorded the employment. Sent so a client never has to identify the
+                            row by company name, which picks the wrong one for a manager holding
+                            two roles at one employer.
+                          items:
+                            type: integer
+                            format: int64
+                        careerHistoryId:
+                          type: integer
+                          format: int64
+                          nullable: true
+                          description: >-
+                            The single row behind the segment, or null when there is none or more
+                            than one. The convenience form of careerHistoryIds.
         '400':
           description: Invalid manager ID
 
@@ -3419,7 +3460,15 @@ paths:
   /api/admin/pending-edits/{editId}/approve:
     post:
       operationId: approveManagerEdit
-      summary: Approve a pending manager edit (admin only)
+      summary: Approve a pending manager edit, optionally correcting it (admin only)
+      description: >-
+        Approve and Reject could not express the commonest case in this queue: the request is
+        right that the manager moved and wrong about one field. Corrections therefore ride on the
+        approval and the existing transaction applies them, so manager_edits keeps naming who
+        proposed it rather than the contribution being rejected and redone by hand.
+        The body is OPTIONAL. A field that is absent leaves the contributor's answer alone.
+        companyId is the one that unsticks a request naming a company with no row yet: identity
+        comes from a picker, never from re-resolving a typed name.
       tags:
         - Admin
       parameters:
@@ -3429,9 +3478,52 @@ paths:
           schema:
             type: string
             format: uuid
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                companyId:
+                  type: integer
+                  format: int64
+                  nullable: true
+                company:
+                  type: string
+                  nullable: true
+                companyLogoUrl:
+                  type: string
+                  nullable: true
+                title:
+                  type: string
+                  nullable: true
+                country:
+                  type: string
+                  nullable: true
+                state:
+                  type: string
+                  nullable: true
+                city:
+                  type: string
+                  nullable: true
+                linkedinUrl:
+                  type: string
+                  nullable: true
+                startDate:
+                  type: string
+                  nullable: true
+                  description: YYYY or YYYY-MM, widened to the start of the period
+                endDate:
+                  type: string
+                  nullable: true
+                  description: YYYY or YYYY-MM; explicit null clears it, meaning the role has not ended
       responses:
         '200':
           description: Edit approved and applied
+        '400':
+          description: A correction was not usable, for example an unparseable date
         '403':
           description: Forbidden
         '404':
@@ -4296,6 +4388,16 @@ paths:
           name: offset
           schema:
             type: integer
+        - in: query
+          name: managerId
+          description: >
+            Narrows the queue to one manager, which is what lets that manager's profile carry the
+            same list inline. One query answers both, deliberately: `whyHeld` and
+            `actionToRelease` are computed rather than stored, so two queries could disagree and a
+            moderator would have no way to tell which was current.
+          schema:
+            type: integer
+            format: int64
       responses:
         '200':
           description: Held ratings
@@ -4303,6 +4405,55 @@ paths:
           description: Unauthorized
         '403':
           description: Forbidden
+
+  /api/admin/moderation/held-ratings/{reviewId}/publish:
+    post:
+      operationId: adminModerationPublishHeldRating
+      summary: Publish one held rating, if the database says it may be
+      description: >
+        For the rating the queue reports as `wouldPublishNow`. Until this existed every release was
+        a side effect of some other decision - accepting an employment, linking a claim, resolving
+        a conflict - so a rating whose obstacle had been cleared outside its own scope stayed held
+        while the queue said it was ready.
+
+        `rating_role_is_publishable` is the only authority and is asked inside the transaction, so
+        the answer cannot change in the gap between the check and the write. A rating something is
+        still holding gets 409, not a database error at commit.
+      tags:
+        - Admin
+      parameters:
+        - in: path
+          name: reviewId
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Published
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  reviewId:
+                    type: string
+                    format: uuid
+                  managerId:
+                    type: integer
+                    format: int64
+                  published:
+                    type: boolean
+        '400':
+          description: Invalid rating ID
+        '401':
+          description: Unauthorized
+        '403':
+          description: Forbidden
+        '404':
+          description: No such rating
+        '409':
+          description: Something is still holding it, or it is no longer held
 
   /api/admin/pending-managers:
     get:
@@ -5139,7 +5290,7 @@ paths:
   /api/admin/managers/{managerId}/career-stage:
     post:
       operationId: adminResolveCareerStage
-      summary: Delete or reassign a career stage, including one with no career-history row (admin only)
+      summary: Delete, reassign or merge a career stage, including one with no career-history row (admin only)
       tags:
         - Admin
       parameters:
@@ -5155,21 +5306,66 @@ paths:
           application/json:
             schema:
               type: object
-              required: [action, company]
+              required: [action, company, title]
               properties:
                 action:
                   type: string
-                  enum: [delete, reassign]
+                  enum: [delete, reassign, merge]
+                  description: >-
+                    delete removes the stage's employment periods and, when the last one goes, its
+                    ratings. reassign moves the stage's RATINGS onto another role and touches no
+                    employment record at all. merge declares the two stages to be one employment
+                    recorded twice and is the only action that alters employment history: it
+                    supersedes the source role through ManagerMergeService.mergeRoles, redirecting
+                    its claims with an audit, and then moves the ratings. reassign used to merge or
+                    delete the source role on its own initiative; it no longer does, because
+                    correcting what a rating was filed under is not a statement about employment.
                 company:
                   type: string
                   description: The stage's company, as it appears on the trajectory.
+                title:
+                  type: string
+                  description: >-
+                    The stage's title, as it appears on the trajectory. Required, because a stage
+                    is the (company, title) pair the chart groups on and a manager can hold more
+                    than one role at one employer. Identifying a stage by its company alone made
+                    a delete take every role at that employer, ratings included.
                 toCompany:
                   type: string
                   nullable: true
-                  description: Required when reassigning. The role the reviews move onto.
+                  description: Required to reassign or merge. The company of the role on the other side.
                 toTitle:
                   type: string
                   nullable: true
+                  description: >-
+                    Required to reassign or merge. The title of the role on the other side. May
+                    share toCompany with the source: a promotion at one employer is two roles
+                    there, and moving ratings between them is the common case.
+                careerHistoryId:
+                  type: integer
+                  format: int64
+                  nullable: true
+                  description: >-
+                    Which employment period of the source stage to act on. A stage is a
+                    (company, title) pair and that pair is not unique: somebody can leave an
+                    employer and return to the same title, and the chart draws both periods as one
+                    tile. A destructive action on such a stage is refused until this names the
+                    period, and the refusal lists them with their dates. Required on a merge when
+                    the source stage covers more than one period.
+                toCareerHistoryId:
+                  type: integer
+                  format: int64
+                  nullable: true
+                  description: >-
+                    Which employment period of the target stage to merge into. Required on a merge
+                    when the target stage covers more than one period.
+                allPeriods:
+                  type: boolean
+                  nullable: true
+                  description: >-
+                    On a delete, says that every employment period behind the stage is meant rather
+                    than one of them. Without it a stage covering several periods is refused, so
+                    that two separate jobs are never removed by a request that named neither.
                 confirmRealReviews:
                   type: boolean
                   nullable: true
@@ -5184,10 +5380,38 @@ paths:
             application/json:
               schema:
                 type: object
+                properties:
+                  success:
+                    type: boolean
+                  action:
+                    type: string
+                  reviewsAffected:
+                    type: integer
+                    description: Ratings deleted, moved, or carried across by a merge.
+                  entriesDeleted:
+                    type: integer
+                    description: career_history periods removed. Always 0 for reassign and merge.
+                  rolesSuperseded:
+                    type: integer
+                    description: Roles mergeRoles superseded. Only ever nonzero for merge.
+                  merged:
+                    type: boolean
+                  sourceEmploymentKept:
+                    type: boolean
+                    description: >-
+                      True after a reassign, where the ratings moved and the source employment
+                      period deliberately stayed. The caller can say so rather than leaving an
+                      admin to wonder why the stage is still drawn.
         '400':
-          description: Bad request, or refused because the stage holds real reviews
+          description: >-
+            Bad request; refused because the stage holds real reviews; or refused because the stage
+            covers several employment periods and the request named none of them.
         '403':
           description: Forbidden
+        '409':
+          description: >-
+            The merge cannot be performed as asked - the two stages sit at different employers, or
+            a side has no employment record to supersede.
   /api/admin/managers/{managerId}/career-history/{entryId}:
     put:
       operationId: adminUpdateCareerEntry

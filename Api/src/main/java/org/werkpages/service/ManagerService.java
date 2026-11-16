@@ -249,14 +249,48 @@ public class ManagerService {
             });
     }
 
+    /**
+     * Who may see a {@code pending_approval} profile: its submitter, and an admin.
+     *
+     * <p><b>The admin arm is the fix, and it is not a loosening of the rule.</b> A pending profile
+     * must stay invisible to the public, and it still is: this needs a resolved account whose role
+     * is {@code admin}, so there is no path to it without a valid token. What it ends is a
+     * moderation dead end. Every admin control for a submission lives ON the profile page -
+     * approve, reject, edit the manager, and the whole career-history and career-stage toolset -
+     * and those endpoints are gated by {@code requireAdmin} and were working the entire time. The
+     * page that hosts them answered 404, so the only way to reach them was to construct the
+     * requests by hand. An admin could decide on a submission while being unable to look at it.
+     *
+     * <p><b>A 404 rather than a 403 for everybody else, deliberately.</b> Telling a stranger
+     * "forbidden" confirms that a manager by that name was submitted, which is exactly the fact a
+     * pending submission is withheld to protect. The not-found answer is the same one an
+     * unused id gives.
+     *
+     * <p>{@code findByAuth0IdWithBan} replaces {@code findIdByAuth0Id} because the role has to come
+     * back with the id, and this is the same lookup {@code getManagerReviews} already uses to
+     * decide the same question about held ratings. One query answers both halves.
+     *
+     * <p><b>A banned admin is refused.</b> {@code is_banned} comes back from that query and is
+     * checked here: a ban is a removal of trust, and leaving it unchecked would make this the one
+     * admin surface in the product that a banned account could still reach.
+     */
     private Future<Row> enforceSubmitterAccess(Row row, String auth0Id) {
         UUID submittedBy = row.getUUID("submitted_by");
-        if (auth0Id == null || submittedBy == null) {
+        if (auth0Id == null) {
             return Future.failedFuture(ServiceException.notFound("Manager not found"));
         }
-        return userRepo.findIdByAuth0Id(auth0Id)
+        return userRepo.findByAuth0IdWithBan(auth0Id)
             .compose(opt -> {
-                if (opt.isEmpty() || !opt.get().equals(submittedBy)) {
+                if (opt.isEmpty()) {
+                    return Future.failedFuture(ServiceException.notFound("Manager not found"));
+                }
+                Row viewer = opt.get();
+                boolean banned = Boolean.TRUE.equals(viewer.getBoolean("is_banned"));
+                if (!banned && "admin".equals(viewer.getString("role"))) {
+                    return Future.succeededFuture(row);
+                }
+                // A capture carries no submitted_by, so nobody owns it and only an admin sees it.
+                if (submittedBy == null || !submittedBy.equals(viewer.getUUID("id"))) {
                     return Future.failedFuture(ServiceException.notFound("Manager not found"));
                 }
                 return Future.succeededFuture(row);
@@ -3064,7 +3098,8 @@ public class ManagerService {
 
               The submitter is stamped on the way through. A capture this submission attached to
               rather than adopted carries no submitted_by, and enforceSubmitterAccess refuses an
-              ownerless pending row to everybody - so without this the person who just submitted
+              ownerless pending row to everybody but an admin - so without this the person who just
+              submitted
               is shown "Manager Not Found" straight after being told it went for review.
 
               COALESCE inside the update, so a manager somebody else submitted keeps its original
@@ -4244,6 +4279,27 @@ public class ManagerService {
 
                 LocalDate mrStart = row.getLocalDate("manager_role_start");
                 LocalDate mrEnd   = row.getLocalDate("manager_role_end");
+                /*
+                  THE ROWS BEHIND THIS TILE, named rather than left to be guessed at.
+
+                  The client worked out which career_history row a tile came from by matching the
+                  company NAME and breaking ties on the start month. A manager with two roles at
+                  one employer defeats that: it resolved to the wrong row, so Edit rewrote the
+                  other stretch of their history, or to no row, so the control vanished. The
+                  grouping in SEGMENTS_SQL already knows exactly which rows are in this group.
+
+                  Both shapes are sent. careerHistoryIds is the truth - a tile can be backed by
+                  more than one row when two spellings of an employer collapse into it - and
+                  careerHistoryId stays for the single-row case every existing caller reads, null
+                  when there is genuinely nothing to point at rather than a guess.
+                */
+                String periodsJson = row.getString("entry_periods");
+                JsonArray entryPeriods = periodsJson == null || periodsJson.isBlank()
+                    ? new JsonArray() : new JsonArray(periodsJson);
+                Long[] entryIds = row.getArrayOfLongs("entry_ids");
+                JsonArray entryIdArray = new JsonArray();
+                if (entryIds != null) for (Long id : entryIds) if (id != null) entryIdArray.add(id);
+
                 segments.add(new JsonObject()
                     .put("company",           row.getString("company"))
                     .put("role",              row.getString("role"))
@@ -4255,6 +4311,19 @@ public class ManagerService {
                     .put("categoryAverages",  categoryAverages)
                     .put("managerRoleStart",  mrStart != null ? mrStart.toString() : null)
                     .put("managerRoleEnd",    mrEnd   != null ? mrEnd.toString()   : null)
+                    .put("careerHistoryIds",  entryIdArray)
+                    .put("careerHistoryId",   entryIdArray.size() == 1
+                                                  ? entryIdArray.getLong(0) : null)
+                    /*
+                      AND THE SAME ROWS WITH THEIR DATES, because one tile can be two JOBS.
+
+                      A manager can leave an employer and return to the same title, and the
+                      trajectory draws both periods as one tile. An admin deleting such a tile is
+                      refused until the request names which period it means - and that refusal is
+                      only actionable if the admin can see the choice. So the periods, with the
+                      dates that distinguish them, travel with the tile.
+                    */
+                    .put("careerPeriods",     entryPeriods)
                     .put("logoUrl",           row.getString("logo_url")));
             }
             return new JsonObject()
@@ -5040,6 +5109,18 @@ public class ManagerService {
                               && "platform_example".equals(row.getString("origin")));
     }
 
+    /** Tolerates a projection that omits the column, for the reason {@link #optionalString} gives. */
+    private static java.math.BigDecimal optionalBigDecimal(Row row, String column) {
+        int index = row.getColumnIndex(column);
+        return index < 0 ? null : row.getBigDecimal(index);
+    }
+
+    /** Tolerates a projection that omits the column, for the reason {@link #optionalString} gives. */
+    private static Integer optionalInteger(Row row, String column) {
+        int index = row.getColumnIndex(column);
+        return index < 0 ? null : row.getInteger(index);
+    }
+
     /** Tolerates rows selected before V60, and rows from projections that omit the column. */
     private static String dispositionOf(Row row) {
         try {
@@ -5520,35 +5601,75 @@ public class ManagerService {
                     */
                     final String fState3 = trimmedState;
                     final String fCity3  = trimmedCity;
+                    /*
+                      REFINE THIS SEARCHER'S OWN FRAGMENT BEFORE QUEUEING ANOTHER ROW.
+
+                      The search is debounced, so it fires while the employer is still being
+                      typed: one person looking for "Bob Burgers at Netflix" queued a row at
+                      "Net" and another at "Netflix" one second later, and an admin saw two
+                      pending rows for one manager. search() cannot connect them, because it
+                      matches `company ILIKE '%Netflix%'` against the stored "Net" and so tests
+                      containment in one direction only.
+
+                      refineCapturedCompany is the add form's answer to the same problem, from
+                      phase 1. It lengthens the stored fragment in place, pending rows only, and
+                      only when the stored value really is contained in the new one - so a
+                      manager legitimately listed at a shorter employer is left alone. The search
+                      path simply never used it.
+
+                      Scoped to this searcher's own queued row by findOwnRefinableSearchPending.
+                      Folding against anybody's matching pending row is what once rewrote a
+                      stranger's half-typed namesake and handed it to this submitter.
+                    */
                     final java.util.function.Supplier<Future<JsonObject>> searchPending = () ->
                         companyRepo.resolve(companyIdSafe, company, null, resolvedLogoUrl)
-                            .compose(cRow -> managerRepo.createSearchPending(
-                                fullName, company, title, country,
-                                fState3, fCity3, resolvedLogoUrl, cRow.getLong("id"), userId))
-                            .map(row -> new JsonObject()
+                            .compose(cRow -> managerRepo
+                                .findOwnRefinableSearchPending(fullName, company, userId)
+                                .compose(mine -> mine.isPresent()
+                                    ? managerRepo.refineCapturedCompany(
+                                          mine.get(), company, cRow.getLong("id"))
+                                    : managerRepo.createSearchPending(
+                                          fullName, company, title, country,
+                                          fState3, fCity3, resolvedLogoUrl,
+                                          cRow.getLong("id"), userId).mapEmpty()))
+                            .map(v -> new JsonObject()
                                 .put("data", new JsonArray())
                                 .put("created", false)
                                 .put("hasContributed", contributed));
 
                     /*
-                      A GHOST IS FOR SOMEBODY WHO HAS NEVER RATED ANYBODY.
+                      ELIGIBILITY IS THE SEARCH OPPORTUNITY, NOT A LIFETIME CONTRIBUTION FLAG.
 
-                      Two conditions, both required: they have contributed nothing, and this is
-                      their first ever search. The slot alone used to decide it, so a contributor
-                      searching for the first time published a profile - and then saw it blurred,
-                      because the auto-created row carries only a platform example and the reader
-                      had already earned the unlock. A manager minted for somebody who does not
-                      need the crutch, and shown to them behind a gate they had already paid.
+                      What decides whether this search may publish a ghost is the once-ever slot
+                      below, plus the guards already applied above: the name class, the listed-name
+                      refusal, the company quota and the site-wide ceilings. Whether this person has
+                      ever rated somebody else is not one of those things, and
+                      `reference/features/manager-search-flow.md` section 9 says so: "logged in,
+                      slot unspent, name ordinary -> ghost created, tile, profile works".
 
-                      The slot is NOT claimed on this path. Spending it here would deny them the
-                      one auto-creation later, on a search that might genuinely need it.
+                      THIS USED TO REFUSE A CONTRIBUTOR OUTRIGHT:
 
-                      This is checked BEFORE the claim for exactly that reason, and it is why the
-                      two conditions are not folded into one expression.
+                          if (contributed) return searchPending.get();
+
+                      on the reasoning that an auto-created profile "carries only a platform
+                      example" and would be "shown behind a gate they had already paid". Both
+                      halves of that have stopped being true. The example now travels with its own
+                      rating and is labelled as a demonstration rather than blurred or blank, and
+                      a contributor has passed the contribution gate, so there is no gate left for
+                      them to meet - they see the labelled example plainly, which is the intended
+                      experience rather than a problem to be avoided.
+
+                      What the old guard actually cost was the opposite of what it set out to
+                      protect: the people who had already rated somebody - the most engaged users
+                      in the product - were the only ones who could not publish a profile from a
+                      search. They got a silent pending row and no tile, which reads as "no such
+                      manager" for a manager the product was perfectly willing to create for a
+                      stranger.
+
+                      `contributed` is still read, for `hasContributed` in the response. It decides
+                      what the reader may SEE, which is a different question from what this search
+                      may CREATE, and conflating the two is how the guard came about.
                     */
-                    if (contributed) {
-                        return searchPending.get();
-                    }
 
                     // Atomically claim the one-time ghost slot. Only one concurrent request wins;
                     // the loser gets empty results — no silent pending that could trigger a
@@ -5980,7 +6101,8 @@ public class ManagerService {
                         Undefined is not false, so the guard did not fire, and a clickable locked
                         tile was built pointing at a pending row. Clicking it reaches
                         getManagerById -> enforceSubmitterAccess, and a captured draft carries no
-                        submitted_by, so the server refuses it to everybody: "Manager Not Found".
+                        submitted_by, so the server refuses it to everybody but an admin:
+                        "Manager Not Found".
 
                         Reported three times from production. It only happens when somebody
                         searches a name that an earlier visitor had already half-typed into the add
@@ -6435,6 +6557,21 @@ public class ManagerService {
             .put("image",          row.getString("image"))
             .put("overallRating",  row.getBigDecimal("overall_rating"))
             .put("reviews",        row.getInteger("reviews_count"))
+            /*
+              THE EXAMPLE'S OWN NUMBERS, beside the genuine ones and never instead of them.
+
+              A newly created ghost holds one platform example, so overall_rating above is
+              correctly NULL and reviews_count 0 - an example is outside every statistic by
+              provenance. The tile read only those and therefore drew nothing, which is the
+              production report this answers: "the profile was auto-created and the tile came back
+              with an empty space where the rating goes."
+
+              Separate keys so no consumer can mistake one for the other. Whatever ranks, sorts or
+              compares managers keeps reading overallRating and keeps correctly seeing no rating;
+              a surface showing this one manager reads these and labels them as an example.
+            */
+            .put("exampleRating",  optionalBigDecimal(row, "example_rating"))
+            .put("exampleReviews", optionalInteger(row, "example_reviews"))
             .put("status",         row.getString("status"))
             .put("country",        row.getString("country"))
             .put("companyLogoUrl", row.getString("company_logo_url"))

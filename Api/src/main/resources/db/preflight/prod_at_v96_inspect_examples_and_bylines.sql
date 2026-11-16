@@ -1,4 +1,24 @@
 -- ─────────────────────────────────────────────────────────────────────────────
+-- SUPERSEDED, 2026-11-16. DO NOT RUN. The name of this file is a stale premise.
+--
+-- Production is NO LONGER at V96. It applied up to and including V107 on
+-- 2026-11-15, after a 50-minute outage, and a version recorded in
+-- flyway_schema_history cannot be rolled back.
+--
+-- So its "why V107 cannot be the vehicle today" reasoning no longer applies: V107
+-- has run. The queries below are still read-only and still worth running to see
+-- the state of examples and erased bylines; the conclusion drawn from them is not.
+--
+-- Kept rather than deleted because it is the record of what was done to a V96
+-- production and why, and because the inspection queries in these scripts are
+-- still the right way to look at this data. The file name is left alone so the
+-- references to it in HANDOVER.md and MIGRATION_HISTORY.md still resolve.
+--
+-- Before running anything in this directory against production, read the
+-- current version out of flyway_schema_history rather than out of a filename.
+-- ─────────────────────────────────────────────────────────────────────────────
+
+-- ─────────────────────────────────────────────────────────────────────────────
 -- INSPECT: stranded platform examples, and erased bylines.  READ ONLY.
 --
 -- Run this against production BEFORE the apply script beside it, and read the

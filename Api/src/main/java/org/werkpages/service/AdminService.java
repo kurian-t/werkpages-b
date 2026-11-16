@@ -788,7 +788,47 @@ public class AdminService {
             });
     }
 
+    /** Approves exactly what the contributor asked for. The long-standing form. */
     public Future<JsonObject> approveEdit(String auth0Id, UUID editId) {
+        return approveEdit(auth0Id, editId, null);
+    }
+
+    /**
+     * Approves an edit request, with corrections an administrator may supply.
+     *
+     * <h2>Why approve takes corrections rather than a separate edit endpoint</h2>
+     *
+     * <p>Approve and Reject were the only two actions, and between them they could not express the
+     * commonest case in this queue: the request is right about the manager having moved and wrong
+     * about one field. An administrator had to reject a legitimate contribution and then redo it by
+     * hand on the profile, which loses the contributor's attribution and the audit trail with it.
+     *
+     * <p>So the corrections ride on the approval and the existing transaction applies them. No new
+     * endpoint, no second code path that could disagree with this one about what approving means,
+     * and {@code manager_edits} keeps naming who proposed it.
+     *
+     * <h2>What this does to the company-identity refusal</h2>
+     *
+     * <p>Identity still never comes from re-resolving a typed name. It comes from
+     * {@code requested_company_id}, or now from the id an administrator picked, which is the same
+     * kind of evidence: a human resolved it through the picker.
+     *
+     * <p>That is what unsticks the requests reported on 2026-11-15. The guard refused whenever the
+     * company was changing and {@code requested_company_id} was null, on the reasoning that such a
+     * request predates V56 and is ambiguous. But a request naming a company that has <em>no row
+     * yet</em> also arrives null, because {@code createEditRequest} passes
+     * {@code body.getLong("companyId")} straight through and resolves nothing. Those are different
+     * situations and only the first deserves refusing; the message told the administrator the
+     * wrong cause and advised them to discard a real submission.
+     *
+     * @param overrides may be null. Recognised keys: {@code companyId}, {@code company},
+     *                  {@code companyLogoUrl}, {@code title}, {@code country}, {@code state},
+     *                  {@code city}, {@code linkedinUrl}, {@code startDate}, {@code endDate}.
+     *                  A key that is absent leaves the contributor's value alone; this is a
+     *                  correction, not a replacement of the request.
+     */
+    public Future<JsonObject> approveEdit(String auth0Id, UUID editId, JsonObject overrides) {
+        final JsonObject fix = overrides != null ? overrides : new JsonObject();
         return requireAdmin(auth0Id)
             .compose(adminId -> editRepo.findByIdWithManager(editId)
                 .compose(opt -> {
@@ -800,19 +840,19 @@ public class AdminService {
                     String currentCompany      = row.getString("current_company");
                     String currentTitle        = row.getString("current_title");
                     Long   currentCompanyId    = row.getLong("current_company_id");
-                    String newCompany          = row.getString("new_company");
-                    String newCompanyLogoUrl   = row.getString("new_company_logo_url");
-                    String newTitle            = row.getString("new_title");
+                    String newCompany          = fix.getString("company",        row.getString("new_company"));
+                    String newCompanyLogoUrl   = fix.getString("companyLogoUrl", row.getString("new_company_logo_url"));
+                    String newTitle            = fix.getString("title",          row.getString("new_title"));
                     String newStatus        = row.getString("new_status");
-                    String newCountry       = row.getString("new_country");
+                    String newCountry       = fix.getString("country", row.getString("new_country"));
                     // The location the editor actually gave. Approving used to apply the country
                     // and drop the rest, so an approved "Kitchener, Ontario" kept the old city.
-                    String newState         = row.getString("new_declared_state");
-                    String newCity          = row.getString("new_declared_city");
+                    String newState         = fix.getString("state", row.getString("new_declared_state"));
+                    String newCity          = fix.getString("city",  row.getString("new_declared_city"));
                     Long   newCompanyLocationId = row.getLong("new_company_location_id");
-                    String newLinkedinUrl   = row.getString("new_linkedin_url");
-                    OffsetDateTime newStartDate = row.getOffsetDateTime("new_start_date");
-                    OffsetDateTime newEndDate   = row.getOffsetDateTime("new_end_date");
+                    String newLinkedinUrl   = fix.getString("linkedinUrl", row.getString("new_linkedin_url"));
+                    OffsetDateTime newStartDate = correctedDate(fix, "startDate", row.getOffsetDateTime("new_start_date"));
+                    OffsetDateTime newEndDate   = correctedDate(fix, "endDate",   row.getOffsetDateTime("new_end_date"));
                     String effectiveCo      = newCompany != null ? newCompany : currentCompany;
                     String effectiveTit     = newTitle   != null ? newTitle   : currentTitle;
                     UUID   proposedBy       = row.getUUID("proposed_by");
@@ -827,7 +867,7 @@ public class AdminService {
                     // matching "Crumbl" to whichever row currently holds that string is the exact
                     // assumption that created duplicate companies. The admin resolves it once
                     // through the picker and re-approves.
-                    Long requestedCompanyId = row.getLong("requested_company_id");
+                    Long requestedCompanyId = fix.getLong("companyId", row.getLong("requested_company_id"));
                     boolean companyChanging = newCompany != null
                         && !newCompany.equalsIgnoreCase(currentCompany == null ? "" : currentCompany);
                     if (companyChanging && requestedCompanyId == null) {
@@ -1027,6 +1067,30 @@ public class AdminService {
             // The manager snapshot is already written; a company update that fails must not undo
             // the admin's action or fail their request.
             .otherwise((Void) null));
+    }
+
+    /**
+     * A date an administrator corrected on an edit request, or the contributor's own.
+     *
+     * <p>Accepts the two shapes the forms already send, {@code YYYY} and {@code YYYY-MM}, widened
+     * to the start of the period the same way {@code adminUpdateCareerEntry} widens them. An
+     * explicit JSON null clears the date, which is how an administrator says the role has not
+     * ended; a key that is absent leaves the contributor's value alone. Those are different
+     * instructions and {@code containsKey} is what tells them apart.
+     */
+    private static OffsetDateTime correctedDate(JsonObject fix, String key, OffsetDateTime fallback) {
+        if (!fix.containsKey(key)) return fallback;
+        String raw = fix.getString(key);
+        if (raw == null || raw.isBlank()) return null;
+        try {
+            return OffsetDateTime.parse(raw.length() == 4
+                ? raw + "-01-01T00:00:00Z"
+                : raw.length() == 7 ? raw + "-01T00:00:00Z" : raw);
+        } catch (Exception e) {
+            // A RuntimeException thrown inside the compose lambda fails the future, and
+            // ServiceException is what the handler turns into a 400 rather than a 500.
+            throw ServiceException.badRequest("Invalid " + key + ": " + raw);
+        }
     }
 
     public Future<JsonObject> rejectEdit(String auth0Id, UUID editId) {
@@ -1931,7 +1995,7 @@ public class AdminService {
 
 
     /**
-     * Resolves a career stage that should not be on the profile.
+     * Resolves a career stage that should not be on the profile as it stands.
      *
      * <h2>Why this exists separately from adminDeleteCareerEntry</h2>
      *
@@ -1946,16 +2010,51 @@ public class AdminService {
      * to remove it, because there was no row for the existing endpoint to delete. Fixing it took
      * hand-written SQL against production.
      *
-     * <h2>The two actions, and why both are needed</h2>
+     * <h2>The three actions, and why MOVING and MERGING are not the same action</h2>
      *
      * <ul>
-     *   <li>{@code delete} removes the stage: its {@code career_history} row if it has one, and the
-     *       reviews that put it on the chart. For a stage invented by a placeholder this is the
+     *   <li>{@code delete} removes the stage: the {@code career_history} periods behind it and the
+     *       ratings that put it on the chart. For a stage invented by a placeholder this is the
      *       whole repair.
-     *   <li>{@code reassign} moves the stage's reviews onto another role and removes the empty
-     *       stage. For when the company is wrong but the opinions are real: deleting them would
-     *       destroy somebody's genuine review to tidy up a chart.
+     *   <li>{@code reassign} moves the stage's RATINGS onto another role and touches no employment
+     *       record whatsoever. For when the company or title a rating was filed under is wrong but
+     *       the opinion is real.
+     *   <li>{@code merge} says the two stages are ONE employment recorded twice, and is the only
+     *       action that changes employment history: {@link ManagerMergeService#mergeRoles}
+     *       supersedes the source role, redirects its claims with an audit, and holds a duplicate
+     *       contributor's rating rather than doubling it. The ratings follow afterwards, because
+     *       {@code mergeRoles} deliberately does not touch the snapshots a chart groups on.
      * </ul>
+     *
+     * <h2>Moving ratings must not quietly rewrite employment, and used to</h2>
+     *
+     * <p>{@code reassign} previously did two further things on its own initiative. Where both
+     * stages were recorded employments at one employer it performed a role merge, superseding the
+     * source role; everywhere else it DELETED the source {@code career_history} row once the
+     * ratings had left. Both were decisions the caller never asked for, taken because an empty
+     * stage looks untidy on a chart. An admin correcting which job an opinion was filed under
+     * would find an employment period superseded or gone.
+     *
+     * <p>So moving and merging are now distinct, and only {@code merge} alters employment. After a
+     * reassign the source stage remains, with no ratings, and the response says so through
+     * {@code sourceEmploymentKept} - the admin can then remove the period explicitly, or leave it,
+     * which is a judgement about somebody's work history rather than about a chart.
+     *
+     * <h2>One stage can be two jobs</h2>
+     *
+     * <p>Every action identifies the stage by its (company, title) pair, because that is what the
+     * chart groups on; identifying it by company alone is what let one role's deletion destroy a
+     * sibling role's ratings. But the pair is not unique either. Somebody can leave an employer
+     * and return to the same title years later, and those two employments draw ONE tile.
+     *
+     * <p>A destructive action on such a stage is REFUSED until the request names the period, and
+     * the refusal lists them with their dates. {@code careerHistoryId} names one period;
+     * {@code allPeriods} says every period of the stage is meant. Nothing is guessed, and the
+     * guess that would otherwise be made - "they are all the same role" - is wrong.
+     *
+     * <p>Ratings are removed only when the delete removes the LAST period behind the stage. While
+     * another period at that (company, title) survives, the ratings still describe a job that is
+     * still in the history, and the pair is their only attribution.
      *
      * <p>A delete that would remove genuine reviews is refused unless {@code confirmRealReviews} is
      * set. The caller has to have been told what it is about to destroy, and say so. Placeholders
@@ -1964,55 +2063,98 @@ public class AdminService {
     public Future<JsonObject> adminResolveCareerStage(String auth0Id, long managerId, JsonObject body) {
         String action  = body.getString("action");
         String company = body.getString("company");
+        String title   = body.getString("title");
         if (company == null || company.isBlank())
             return Future.failedFuture(ServiceException.badRequest("company is required"));
-        if (!"delete".equals(action) && !"reassign".equals(action))
-            return Future.failedFuture(ServiceException.badRequest("action must be 'delete' or 'reassign'"));
+        boolean isDelete   = "delete".equals(action);
+        boolean isReassign = "reassign".equals(action);
+        boolean isMerge    = "merge".equals(action);
+        if (!isDelete && !isReassign && !isMerge)
+            return Future.failedFuture(ServiceException.badRequest(
+                "action must be 'delete', 'reassign' or 'merge'"));
+        /*
+          THE TITLE IS NOT OPTIONAL, and treating it as optional is what made this destructive.
+
+          A stage on the trajectory is a (company, title) pair - that is what the chart groups on.
+          Identifying one by its company alone names every role at that employer, so an admin
+          removing "Director" at Visa was issuing a delete that also took "VP Engineering" at Visa
+          with it, ratings and all, with nothing on screen saying so.
+
+          Required rather than inferred from "the only stage at that company", because a request
+          that cannot say which role it means is exactly the request that must not be guessed at.
+        */
+        if (title == null || title.isBlank())
+            return Future.failedFuture(ServiceException.badRequest(
+                "title is required: a role is identified by its company AND its title, and a "
+                + "manager can hold more than one role at one employer."));
 
         String toCompany = body.getString("toCompany");
         String toTitle   = body.getString("toTitle");
-        if ("reassign".equals(action) && (toCompany == null || toCompany.isBlank()))
-            return Future.failedFuture(ServiceException.badRequest("toCompany is required to reassign"));
-        if ("reassign".equals(action) && toCompany.trim().equalsIgnoreCase(company.trim()))
-            return Future.failedFuture(ServiceException.badRequest("Cannot reassign a stage onto itself"));
+        if (!isDelete && (toCompany == null || toCompany.isBlank()))
+            return Future.failedFuture(ServiceException.badRequest("toCompany is required to " + action));
+        if (!isDelete && (toTitle == null || toTitle.isBlank()))
+            return Future.failedFuture(ServiceException.badRequest("toTitle is required to " + action));
+        /*
+          Self-comparison is on the PAIR, for the same reason the match is.
+
+          This refused any reassign whose target company equalled the source company, which ruled
+          out the one case an admin most needs: a manager promoted at one employer has two roles
+          there, and moving a rating from the junior role to the senior one is a move between two
+          companies that are deliberately the same. Only the pair can be "itself".
+        */
+        if (!isDelete && sameRole(company, title, toCompany, toTitle))
+            return Future.failedFuture(ServiceException.badRequest(
+                "Cannot " + action + " a stage onto itself"));
 
         boolean confirmReal = Boolean.TRUE.equals(body.getBoolean("confirmRealReviews"));
+        boolean allPeriods  = Boolean.TRUE.equals(body.getBoolean("allPeriods"));
+        Long namedPeriod    = body.getLong("careerHistoryId");
+        Long namedTarget    = body.getLong("toCareerHistoryId");
 
-        return requireAdmin(auth0Id)
-            .compose(adminId -> managerRepo.describeCareerStage(managerId, company))
-            .compose(stage -> {
-                int realReviews = stage.getInteger("real_reviews");
-                if ("delete".equals(action) && realReviews > 0 && !confirmReal) {
+        return requireAdmin(auth0Id).compose(adminId ->
+            managerRepo.describeCareerStage(managerId, company, title)
+            .compose(stage -> managerRepo.findCareerPeriodsByRole(managerId, company, title)
+                .compose(fromPeriods -> {
+                    java.util.List<Long> scope;
+                    try {
+                        scope = sourceScope(action, fromPeriods, namedPeriod, allPeriods);
+                    } catch (ServiceException refusal) {
+                        return Future.failedFuture(refusal);
+                    }
+                    if (isReassign) {
+                        // Ratings only. No employment record is read, written or deleted.
+                        return moveRatingsOnly(managerId, company, title, toCompany, toTitle);
+                    }
+                    if (isMerge) {
+                        return mergeRecordedRoles(managerId, adminId, company, title,
+                                                  toCompany, toTitle, fromPeriods,
+                                                  namedPeriod, namedTarget);
+                    }
                     /*
-                      Refused rather than silently obeyed. The count travels in the message so the
-                      caller can put a number in front of the person pressing the button: "this
-                      removes 2 real reviews" is a decision, "are you sure?" is not.
+                      The ratings go only when the last period behind the stage goes with them.
+                      While a sibling period at this (company, title) survives, those ratings
+                      describe a job that is still in the history, and the pair is the only
+                      attribution they carry.
                     */
-                    return Future.failedFuture(ServiceException.badRequest(
-                        "This stage holds " + realReviews + " real review"
-                      + (realReviews == 1 ? "" : "s")
-                      + ". Reassign them to another role, or confirm the deletion."));
-                }
-                return managerRepo.findCareerEntryIdByCompany(managerId, company)
-                    .compose(entryId -> {
-                        Future<Integer> reviewWork = "delete".equals(action)
-                            ? managerRepo.deleteCareerStageReviews(managerId, company)
-                            : managerRepo.reassignCareerStageReviews(managerId, company, toCompany, toTitle);
-                        return reviewWork.compose(affected -> {
-                            /*
-                              The row goes in both cases. After a reassign the stage has no reviews
-                              left, so a surviving career_history row would redraw the empty stage
-                              on the chart, which is the thing being removed.
-                            */
-                            Future<Integer> entryWork = entryId.isPresent()
-                                ? deleteCareerEntryGuarded(entryId.get(), managerId)
-                                : Future.succeededFuture(0);
-                            return entryWork.map(deletedEntries -> new int[]{ affected, deletedEntries });
-                        });
-                    });
-            })
+                    boolean lastPeriodGoes = scope.size() >= fromPeriods.size();
+                    int realReviews = stage.getInteger("real_reviews");
+                    if (lastPeriodGoes && realReviews > 0 && !confirmReal) {
+                        /*
+                          Refused rather than silently obeyed. The count travels in the message so
+                          the caller can put a number in front of the person pressing the button:
+                          "this removes 2 real reviews" is a decision, "are you sure?" is not.
+                        */
+                        return Future.failedFuture(ServiceException.badRequest(
+                            "This stage holds " + realReviews + " real review"
+                          + (realReviews == 1 ? "" : "s")
+                          + ". Reassign them to another role, or confirm the deletion."));
+                    }
+                    return deleteStage(managerId, company, title, scope, lastPeriodGoes);
+                })))
             // The cached rating and count are not maintained by any trigger, so they are rebuilt
             // here. Without this the header keeps quoting a figure that included what was removed.
+            // A role merge recalculates on its own connection too; doing it twice costs one
+            // statement and guarantees it happened whichever branch ran.
             .compose(counts -> managerRepo.recalculate(managerId).map(v -> counts))
             // Removing the current role must not leave the header advertising it, exactly as the
             // single-entry delete above does.
@@ -2020,8 +2162,206 @@ public class AdminService {
             .map(counts -> new JsonObject()
                 .put("success", true)
                 .put("action", action)
-                .put("reviewsAffected", counts[0])
-                .put("entriesDeleted", counts[1]));
+                .put("reviewsAffected", counts.reviews)
+                .put("entriesDeleted", counts.entriesDeleted)
+                .put("rolesSuperseded", counts.rolesSuperseded)
+                .put("merged", counts.merged)
+                // So the caller can say "the ratings moved, the employment period is still there"
+                // rather than leaving an admin to wonder why the stage is still drawn.
+                .put("sourceEmploymentKept", counts.sourceEmploymentKept));
+    }
+
+    /** What one stage resolution did, so the response can say which route it took. */
+    private static final class StageOutcome {
+        int reviews, entriesDeleted, rolesSuperseded;
+        boolean merged;
+        boolean sourceEmploymentKept;
+    }
+
+    /**
+     * Which employment periods this request is allowed to touch.
+     *
+     * <p>Throws rather than returning an empty answer when the stage is ambiguous, because there is
+     * no safe default: acting on all of them destroys an employment the admin was never shown, and
+     * acting on one of them picks a job at random. The refusal carries the list so the caller can
+     * choose, which is the whole of requirement 4 - an ambiguous operation asks, it does not guess.
+     */
+    private static java.util.List<Long> sourceScope(String action, java.util.List<Row> fromPeriods,
+                                                    Long namedPeriod, boolean allPeriods) {
+        java.util.List<Long> all = new java.util.ArrayList<>();
+        for (Row r : fromPeriods) all.add(r.getLong("id"));
+
+        if (namedPeriod != null) {
+            if (!all.contains(namedPeriod))
+                throw ServiceException.badRequest(
+                    "careerHistoryId " + namedPeriod + " is not an employment period of this "
+                    + "stage. Its periods are: " + describePeriods(fromPeriods));
+            return java.util.List.of(namedPeriod);
+        }
+        // Moving ratings touches no employment record, so it is never ambiguous in this sense.
+        if ("reassign".equals(action)) return java.util.List.of();
+        if (all.size() <= 1 || allPeriods) return all;
+        throw ServiceException.badRequest(
+            "This stage covers " + all.size() + " separate employment periods at the same company "
+            + "and title, and the chart draws them as one. Name the period with careerHistoryId, "
+            + "or pass allPeriods to act on every one of them. The periods are: "
+            + describePeriods(fromPeriods));
+    }
+
+    /** "#412 (2019-01-01 to 2022-01-01)", so a refusal describes the choice it is asking for. */
+    private static String describePeriods(java.util.List<Row> periods) {
+        StringBuilder sb = new StringBuilder();
+        for (Row r : periods) {
+            if (sb.length() > 0) sb.append(", ");
+            java.time.LocalDate from = r.getLocalDate("start_date");
+            java.time.LocalDate to   = r.getLocalDate("end_date");
+            sb.append('#').append(r.getLong("id"))
+              .append(" (").append(from == null ? "no start date" : from.toString())
+              .append(" to ").append(to == null ? "present" : to.toString()).append(')');
+        }
+        return sb.toString();
+    }
+
+    /** The trajectory's own grouping key, so "is this the same role" is answered one way. */
+    private static String roleKey(String company, String title) {
+        String c = company == null ? "" : company.trim().toLowerCase().replaceAll("\\s+", "");
+        String t = title   == null ? "" : title.trim().toLowerCase().replaceAll("\\s+", " ");
+        // Length-prefixed rather than delimited, matching client/lib/careerRoles.ts, so no name
+        // containing the separator can make two different roles compare equal.
+        return c.length() + ":" + c + ":" + t;
+    }
+
+    private static boolean sameRole(String c1, String t1, String c2, String t2) {
+        return roleKey(c1, t1).equals(roleKey(c2, t2));
+    }
+
+    /** Removes the named employment periods, and the ratings only if none is left behind. */
+    private Future<StageOutcome> deleteStage(long managerId, String company, String title,
+                                             java.util.List<Long> scope, boolean lastPeriodGoes) {
+        StageOutcome out = new StageOutcome();
+        Future<Integer> ratings = lastPeriodGoes
+            ? managerRepo.deleteCareerStageReviews(managerId, company, title)
+            : Future.succeededFuture(0);
+        return ratings
+            .compose(affected -> { out.reviews = affected;
+                                   return deleteEntries(managerId, scope); })
+            .map(deleted -> { out.entriesDeleted = deleted; return out; });
+    }
+
+    /**
+     * Moves one role's ratings onto another role, and nothing else.
+     *
+     * <p>No {@code career_history} row is read or written. Both employments survive the move
+     * exactly as they were, which is the distinction between correcting an attribution and
+     * deciding that two employment records are one.
+     */
+    private Future<StageOutcome> moveRatingsOnly(long managerId,
+                                                 String company, String title,
+                                                 String toCompany, String toTitle) {
+        StageOutcome out = new StageOutcome();
+        out.sourceEmploymentKept = true;
+        return managerRepo.reassignCareerStageReviews(managerId, company, title, toCompany, toTitle)
+            .map(affected -> { out.reviews = affected; return out; });
+    }
+
+    /**
+     * Declares two stages to be one employment recorded twice.
+     *
+     * <h2>Why this is not a second merge implementation</h2>
+     *
+     * <p>{@link ManagerMergeService#mergeRoles} is the only thing that performs a role merge: the
+     * superseded role is kept and pointed at its replacement, claims are redirected with the
+     * canonicalization audited, and a contributor who already holds a claim on the keeper has their
+     * duplicate rating held rather than silently doubled. Writing any of that again here would be a
+     * second, untested merge. This method decides which rows are being merged and then calls it.
+     *
+     * <p>The rating snapshots still have to follow, because the chart groups on them and
+     * {@code mergeRoles} deliberately does not touch them - it moves employment and claims, not
+     * the text a reviewer's opinion was filed under. {@code moveReviewsBetweenRoles} is the same
+     * method the career-entry editor already uses for precisely this, keyed on the same pair.
+     *
+     * <h2>What it refuses, and why it refuses instead of falling back</h2>
+     *
+     * <p>A merge needs exactly one employment period on each side and one employer. Where a stage
+     * covers several periods the request must name one; where either stage has no employment record
+     * at all there is nothing to supersede, and where the two sit at different employers the merge
+     * is not a merge. Each is refused with its reason rather than quietly downgraded to a rating
+     * move, because an admin who asked to merge two employment records and got a snapshot edit has
+     * been told something untrue about their own data.
+     */
+    private Future<StageOutcome> mergeRecordedRoles(long managerId, UUID adminId,
+                                                    String company, String title,
+                                                    String toCompany, String toTitle,
+                                                    java.util.List<Row> fromPeriods,
+                                                    Long namedPeriod, Long namedTarget) {
+        if (mergeService == null) {
+            return Future.failedFuture(ServiceException.conflict(
+                "Merging is unavailable because this service was built without a database client."));
+        }
+        return managerRepo.findCareerPeriodsByRole(managerId, toCompany, toTitle)
+            .compose(toPeriods -> {
+                Long fromId, toId;
+                try {
+                    fromId = onePeriod(fromPeriods, namedPeriod, "careerHistoryId",
+                                       company + " / " + title);
+                    toId   = onePeriod(toPeriods,   namedTarget,  "toCareerHistoryId",
+                                       toCompany + " / " + toTitle);
+                } catch (ServiceException refusal) {
+                    return Future.failedFuture(refusal);
+                }
+                if (fromId.equals(toId))
+                    return Future.failedFuture(ServiceException.badRequest(
+                        "Cannot merge an employment period into itself"));
+                StageOutcome out = new StageOutcome();
+                out.merged = true;
+                return mergeService.mergeRoles(managerId, toId, fromId, adminId)
+                    // Same mapping as the manager merge: a refusal states its own reason, and an
+                    // admin told "these roles are at different employers" can act on it. A 500
+                    // cannot be acted on at all. mergeRoles enforces the one-employer rule itself,
+                    // so that check is not duplicated here.
+                    .recover(err -> Future.failedFuture(
+                        err instanceof IllegalStateException || err instanceof IllegalArgumentException
+                            ? ServiceException.conflict(err.getMessage())
+                            : err))
+                    .compose(result -> {
+                        out.rolesSuperseded = result.getInteger("rolesSuperseded", 0);
+                        // The snapshots follow the employment, or the chart goes on drawing the
+                        // role that was just superseded. Same call the career editor makes.
+                        return managerRepo.moveReviewsBetweenRoles(managerId, company, title,
+                                                                   toCompany, toTitle);
+                    })
+                    .map(moved -> { out.reviews = moved; return out; });
+            });
+    }
+
+    /** The one employment period a merge is to act on, or a refusal naming the choice. */
+    private static Long onePeriod(java.util.List<Row> periods, Long named,
+                                  String field, String which) {
+        if (named != null) {
+            for (Row r : periods) if (named.equals(r.getLong("id"))) return named;
+            throw ServiceException.badRequest(
+                field + " " + named + " is not an employment period of " + which + ". Its periods "
+                + "are: " + describePeriods(periods));
+        }
+        if (periods.isEmpty())
+            throw ServiceException.badRequest(
+                which + " has no employment record, so there is nothing to merge. A stage that "
+                + "exists only because a rating names it is not a job: move its ratings instead.");
+        if (periods.size() > 1)
+            throw ServiceException.badRequest(
+                which + " covers " + periods.size() + " separate employment periods. Name the one "
+                + "to merge with " + field + ". The periods are: " + describePeriods(periods));
+        return periods.get(0).getLong("id");
+    }
+
+    /** Every period named, not whichever row happened to start latest. */
+    private Future<Integer> deleteEntries(long managerId, java.util.List<Long> entryIds) {
+        Future<Integer> chain = Future.succeededFuture(0);
+        for (Long id : entryIds) {
+            chain = chain.compose(sofar -> deleteCareerEntryGuarded(id, managerId)
+                .map(n -> sofar + n));
+        }
+        return chain;
     }
 
     // ── Captured drafts ───────────────────────────────────────────────────────

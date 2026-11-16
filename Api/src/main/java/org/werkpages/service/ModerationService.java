@@ -1141,10 +1141,26 @@ public final class ModerationService {
      * alone hides that.
      */
     public Future<JsonArray> heldRatings(String auth0Id, int limit, int offset) {
-        return requireAdmin(auth0Id).compose(adminId -> heldRatingsImpl(limit, offset));
+        return heldRatings(auth0Id, limit, offset, null);
+    }
+
+    /**
+     * The same queue, optionally narrowed to one manager.
+     *
+     * <p>{@code managerId} is what lets the manager's own profile carry this section inline. The
+     * queue and the profile must answer from ONE query or they will disagree: a moderator who sees
+     * "nothing is blocking it any more" on the profile and a different reason in the queue has no
+     * way to tell which is current, and the reason is computed, not stored.
+     */
+    public Future<JsonArray> heldRatings(String auth0Id, int limit, int offset, Long managerId) {
+        return requireAdmin(auth0Id).compose(adminId -> heldRatingsImpl(limit, offset, managerId));
     }
 
     private Future<JsonArray> heldRatingsImpl(int limit, int offset) {
+        return heldRatingsImpl(limit, offset, null);
+    }
+
+    private Future<JsonArray> heldRatingsImpl(int limit, int offset, Long managerId) {
         return db.preparedQuery("""
                 SELECT r.id, r.created_at, r.manager_id, r.manager_title, r.manager_company,
                        r.overall_rating, r.role_basis,
@@ -1173,10 +1189,11 @@ public final class ModerationService {
                   LEFT JOIN career_history ch
                          ON ch.id = COALESCE(rc.resolved_role_id, r.withdrawn_role_id)
                  WHERE r.disposition = 'held' AND r.deleted_at IS NULL
+                   AND ($3::bigint IS NULL OR r.manager_id = $3)
                  ORDER BY r.created_at
                  LIMIT $1 OFFSET $2
                 """)
-            .execute(Tuple.of(limit, offset))
+            .execute(Tuple.of(limit, offset, managerId))
             .map(rs -> {
                 JsonArray out = new JsonArray();
                 for (Row r : rs) out.add(heldRatingJson(r));
@@ -1258,6 +1275,74 @@ public final class ModerationService {
             // The database's own answer, so a moderator is never promised a release the predicate
             // would refuse.
             .put("wouldPublishNow", r.getBoolean("would_publish"));
+    }
+
+
+    /**
+     * Publishes ONE held rating, and only if the database says it may be.
+     *
+     * <p><b>Why this had to exist.</b> The held-ratings queue already computed a last branch
+     * reading "Nothing is blocking it any more." / "It can be published now.", and nothing could
+     * do it. Every release until now was a side effect of some other decision - accepting an
+     * employment, linking a claim, resolving a conflict - so a rating whose obstacle had been
+     * cleared by one of those, without the release running or the rating being in its scope, sat
+     * held indefinitely while the queue told a moderator it was ready. That branch is not
+     * hypothetical: {@code releaseRatingsForConflict} reports {@code stillHeld} for exactly the
+     * ratings it could not take, and a later action can clear what was blocking them.
+     *
+     * <p><b>{@code rating_role_is_publishable} is the only authority, and it is asked inside the
+     * transaction.</b> The rule is never restated here. Asking before opening the transaction
+     * would be asking a question whose answer another moderator can change in the gap, and the
+     * deferred constraints would then abort the commit with a database message instead of this
+     * method's explanation.
+     *
+     * <p>Refuses with 409 and points at the queue rather than restating its reason. The reason is
+     * derived by {@code heldRatingJson} from several joins this statement does not make, and
+     * computing a second, shorter version of it here is how the two come to disagree. 409 rather
+     * than letting the write through: the deferred role assertion would otherwise abort the commit
+     * with a constraint name, which tells a moderator nothing they can act on.
+     */
+    public Future<JsonObject> publishHeldRating(String auth0Id, UUID reviewId) {
+        return requireAdmin(auth0Id).compose(adminId -> db.withTransaction(tx -> tx
+            .preparedQuery("""
+                SELECT r.id, r.manager_id, r.disposition, r.deleted_at,
+                       rating_role_is_publishable(r.id) AS ok
+                  FROM reviews r
+                 WHERE r.id = $1
+                 FOR UPDATE OF r
+                """)
+            .execute(Tuple.of(reviewId))
+            .compose(rs -> {
+                if (!rs.iterator().hasNext()) {
+                    return Future.failedFuture(ServiceException.notFound("Rating not found"));
+                }
+                Row row = rs.iterator().next();
+                if (row.getOffsetDateTime("deleted_at") != null) {
+                    return Future.failedFuture(ServiceException.notFound("Rating not found"));
+                }
+                if (!"held".equals(row.getString("disposition"))) {
+                    // Not an error worth a 409's ceremony either way, but it must not report
+                    // success: two moderators on the same queue is the ordinary case, and
+                    // "published" for a rating this call did not publish is a lie in an audit log.
+                    return Future.failedFuture(ServiceException.conflict(
+                        "That rating is already " + row.getString("disposition") + "."));
+                }
+                if (!Boolean.TRUE.equals(row.getBoolean("ok"))) {
+                    return Future.failedFuture(ServiceException.conflict(
+                        "That rating cannot be published yet. Something is still holding it; "
+                      + "the held-ratings list says what."));
+                }
+                long managerId = row.getLong("manager_id");
+                return dispositions.set(tx, reviewId, "live")
+                    // The manager cache, and through the V89 trigger on managers every company and
+                    // industry figure that reads it. A publish that moved no number would leave
+                    // the rating visible in the list and absent from the average above it.
+                    .compose(v -> recalculate(tx, managerId))
+                    .map(v -> new JsonObject()
+                        .put("reviewId",  reviewId.toString())
+                        .put("managerId", managerId)
+                        .put("published", true));
+            })));
     }
 
     // ── shared internals ─────────────────────────────────────────────────────
@@ -2016,7 +2101,22 @@ public final class ModerationService {
         return ids;
     }
 
-    /** The same recalculation every other path uses, on this connection, inside this transaction. */
+    /**
+     * The same recalculation every other path uses, on this connection, inside this transaction.
+     *
+     * <p><b>{@code origin = 'contributor'} is not optional here.</b> It was missing, and the claim
+     * in the line above was therefore false: {@code ManagerRepository.recalculate} excludes
+     * platform examples by provenance, this one counted them, and whichever ran last decided what
+     * the manager's profile said. The reachable case is not exotic - a merge holds a manager's
+     * ratings, the manager still carries its example because it has no live genuine rating, and
+     * accepting the employment published the rating and recomputed the average as the mean of a
+     * genuine rating and a fabricated one. That is the exact defect {@code reviews.origin} was
+     * added to end.
+     *
+     * <p>Not expressed through {@code ReviewSql.genuine} only because this statement already names
+     * {@code deleted_at} and {@code disposition} unaliased inside a subquery over {@code reviews};
+     * the predicate is the same one, clause for clause.
+     */
     private Future<Void> recalculate(SqlConnection tx, long managerId) {
         return tx.preparedQuery("""
                 UPDATE managers SET
@@ -2041,6 +2141,7 @@ public final class ModerationService {
                         )::text AS cats
                     FROM reviews
                      WHERE manager_id = $1 AND deleted_at IS NULL AND disposition = 'live'
+                       AND origin = 'contributor'
                 ) sub
                 WHERE managers.id = $1
                 """).execute(Tuple.of(managerId)).mapEmpty();

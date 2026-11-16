@@ -184,9 +184,58 @@ public class ReviewRepository {
                        MIN(start_date)::date AS start_date,
                        MAX(end_date)::date   AS end_date,
                        BOOL_OR(end_date IS NULL) AS is_current,
-                       MIN(company_id)      AS company_id
+                       MIN(company_id)      AS company_id,
+                       /*
+                         WHICH ROWS THIS TILE IS, so nobody has to work it out from the name.
+
+                         The client used to find the career_history row behind a tile by matching
+                         its company name and then breaking ties on the start month. For a manager
+                         with two roles at one employer that resolves to the wrong row or to none
+                         at all, so the Edit control either rewrote the other stretch of their
+                         history or silently disappeared. The grouping already knows the answer
+                         exactly - these are the rows in this group - so it is returned.
+
+                         An array because several rows can legitimately collapse into one tile:
+                         two spellings of an employer, or one title recorded twice across a gap.
+                       */
+                       ARRAY_AGG(id ORDER BY id) AS entry_ids,
+                       /*
+                         AND WHAT EACH OF THOSE ROWS IS, with dates.
+
+                         One tile can be two JOBS: somebody can leave an employer and come back to
+                         the same title years later, and career_unique_known_employment permits
+                         exactly that - it is UNIQUE on (manager_id, company_id, title_key,
+                         start_day), so two live periods under one title are legal when their start
+                         days differ.
+
+                         A destructive admin action on such a tile is refused until the request
+                         names which period it means. That refusal is only actionable if the admin
+                         can SEE the choice, so the periods travel with the tile rather than being
+                         discoverable one error message at a time.
+
+                         ::text, not json, because Row.getString is unambiguous across driver
+                         versions where the typed json accessors are not.
+                       */
+                       JSON_AGG(JSON_BUILD_OBJECT(
+                           'id',        id,
+                           'startDate', start_date,
+                           'endDate',   end_date
+                       ) ORDER BY start_date NULLS FIRST, id)::text AS entry_periods
                   FROM career_history
                  WHERE manager_id = $1
+                   /*
+                     A SUPERSEDED EMPLOYMENT IS NOT A JOB TO DRAW.
+
+                     A role merge keeps the absorbed row and points it at its replacement, because
+                     the record of the correction has to outlive the row it describes. Its ratings
+                     move to the keeper, so leaving it in here drew a second tile at the same
+                     employer with the same company and nothing under it - the merge would look
+                     like it had half worked.
+
+                     Only 'superseded' is excluded. 'rejected' is left in deliberately: that is a
+                     separate question about moderated employment and not this grouping's to answer.
+                   */
+                   AND state <> 'superseded'
                  GROUP BY 1, 2
             ),
             rv AS (
@@ -248,7 +297,9 @@ public class ReviewRepository {
                   the one the name resolves to - unique per companies_name_ci, so neither join
                   can multiply rows and the count above the panel stays honest.
                 */
-                COALESCE(picked_co.logo_url, named_co.logo_url) AS logo_url
+                COALESCE(picked_co.logo_url, named_co.logo_url) AS logo_url,
+                ch.entry_ids AS entry_ids,
+                ch.entry_periods AS entry_periods
               FROM ch FULL OUTER JOIN rv ON ch.ck = rv.ck AND ch.tk = rv.tk
               LEFT JOIN companies picked_co ON picked_co.id = ch.company_id
               LEFT JOIN companies named_co  ON LOWER(TRIM(named_co.name)) = COALESCE(ch.ck, rv.ck)
@@ -284,7 +335,16 @@ public class ReviewRepository {
         }
         return db.preparedQuery(
                 "SELECT COUNT(*) FROM reviews WHERE manager_id = $1 AND deleted_at IS NULL "
-                + "AND (weight = FALSE OR weight_expires_on IS NULL OR weight_expires_on > CURRENT_DATE) "
+                // The example clause must match findByManager's, clause for clause. This
+                // query is the number printed above that list, and the two disagreed: the
+                // list shows a platform example permanently, by origin, while this counted
+                // only rows inside the old weight window. An example whose legacy window had
+                // lapsed was therefore listed and not counted, so a profile showed one
+                // demonstration rating under a heading that said none. Reachable in
+                // production the moment V108 reclassifies a legacy placeholder whose window
+                // had already passed.
+                + "AND (origin = 'platform_example' "
+                + "     OR weight = FALSE OR weight_expires_on IS NULL OR weight_expires_on > CURRENT_DATE) "
                 + "AND (disposition = 'live' OR $2 = TRUE OR ($3::uuid IS NOT NULL AND user_id = $3))")
             .execute(Tuple.of(managerId, isAdmin, viewerId))
             .map(rows -> rows.iterator().next().getLong(0));
@@ -1113,6 +1173,17 @@ public class ReviewRepository {
      * manager receiving a review even occasionally kept its placeholder <em>forever</em> - the
      * countdown restarted before it could ever finish. The clock is meant to start when the first
      * real review arrives and then run down regardless of what else happens.
+     *
+     * <p><b>No submission path calls this any more, and that is the established lifecycle rather
+     * than an oversight.</b> A generated example exists to show what a profile looks like while
+     * nobody has rated the manager; the moment a genuine rating lands, {@code retireExampleRating}
+     * deletes it outright. There is nothing left for a countdown to do, and an example is outside
+     * every statistic by provenance from the instant it is written, so no clock gates anything.
+     * The method and the column remain the only way to start the LEGACY countdown, which still
+     * governs the one row shape that predates provenance: {@code weight = TRUE} with
+     * {@code origin = 'contributor'}. V108 reclassifies every such row, so after it has run this
+     * has no work in production either.
+     *
      */
     public Future<Void> scheduleSeedExpiry(long managerId) {
         return db.preparedQuery(
@@ -1144,6 +1215,15 @@ public class ReviewRepository {
      * finds managers by {@code EXISTS (expired placeholder)}, so deleting first would hide every
      * manager whose cached count had not yet caught up, and their figures would stay wrong with
      * nothing left to point at the problem.
+     *
+     * <p><b>What can still be here to delete, after V108.</b> V108 installs a BEFORE INSERT
+     * trigger that classifies any weighted authorless row as {@code platform_example}, so an
+     * INSERT can no longer create a row this statement would take. Two things still can: a row
+     * written before V108 ran, and an UPDATE, which the trigger does not see. This is therefore a
+     * backstop rather than routine housekeeping, and it is deliberately left as narrow as it was.
+     * Broadening it to "any unclassified placeholder" would make it delete rows whose countdown
+     * nothing ever started, which is every legacy placeholder in the table.
+     *
      */
     public Future<Integer> deleteExpiredSeedReviews() {
         return db.preparedQuery(

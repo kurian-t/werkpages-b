@@ -1226,8 +1226,108 @@ class ReviewIntegrationTest {
 
         assertEquals(1L, stats.getLong("realReviews"),
             "realReviews must exclude weight=true reviews");
-        assertEquals(1L, stats.getLong("weightedOpinions"),
-            "weightedOpinions must count active weight=true reviews");
+        /*
+          ZERO, AND THIS ASSERTION USED TO READ 1.
+
+          It was written before provenance had a column, when "weighted" and "example" were the
+          same thing and the tile was a count of demonstrations labelled as opinions. V106 split
+          them: an example is origin = 'platform_example', and the tile counts contributors.
+
+          The fixture above inserts a placeholder the way a pre-V106 backend does - weight TRUE,
+          no user_id, naming no origin at all. That is the exact shape found misclassified in
+          production on 2026-11-16. V108 makes the database classify it, so the row is stored as
+          an example and the tile reads 0. Asserting 1 here would be asserting that the defect is
+          still reachable.
+
+          realReviews above is the other half: it read 2 before V108, counting the placeholder as
+          somebody's rating.
+        */
+        assertEquals(0L, stats.getLong("weightedOpinions"),
+            "a placeholder is a demonstration however it was inserted, so the tile reads 0");
+    }
+
+    /**
+     * A PLACEHOLDER WRITTEN BY A BACKEND THAT HAS NEVER HEARD OF `origin` IS STILL CLASSIFIED.
+     *
+     * <p>Observed in production on 2026-11-16: three rows with
+     * {@code origin = 'contributor' AND weight = TRUE AND user_id IS NULL}, authors SwiftFinch38,
+     * CoolFinch57 and BoldHeron70 - the generated adjective-animal-number shape
+     * {@code createSeedReview} alone produces. They cannot predate V106's backfill, because its
+     * predicate is exactly the one that selects them.
+     *
+     * <p>They were inserted after it by a build older than the classification literal in
+     * {@code createSeedReview}. Two backends write to this one database and they deploy
+     * separately, so "the code is fixed" is a statement about a repository and not about what is
+     * running. {@code getStats_seedFromTheProductionPathIsNeitherRealNorWeighted} already proves
+     * the Java path classifies its row; no Java test can prove anything about a Java build that
+     * is not the one under test.
+     *
+     * <p>So V108 moved the guarantee into the database, and this is the test of it. The INSERT
+     * below is the pre-V106 statement in shape: it names no origin, so without the trigger the
+     * column default makes this invented 3.5-4.9 score a contributor's rating - and
+     * {@code ReviewSql.genuine} is {@code live AND origin = 'contributor'}, the predicate
+     * {@code recalculate()} uses, so it would reach the manager's cached average, company and
+     * industry statistics, rankings, and the public profile's {@code isExample} flag.
+     *
+     * <p>Verified to fail with {@code reviews_classify_placeholder} dropped.
+     */
+    @Test
+    void seedWrittenWithoutItsOriginIsClassifiedByTheDatabase() throws Exception {
+        long managerId = insertManager("Stale Build Mgr", "StaleBuildCorp", "Title");
+
+        await(pool.preparedQuery(
+                "INSERT INTO reviews (manager_id, author, overall_rating, " +
+                "communication_style, perceived_approachability, perceived_clarity_of_expectations, " +
+                "feedback_style, perceived_supportiveness, decision_making_style, " +
+                "organization_and_planning_style, delegation_style, perceived_professional_demeanor, " +
+                "overall_working_experience, manager_company, manager_title, worked_from, " +
+                "verified, helpful_count, weight, created_at, updated_at) " +
+                "VALUES ($1, 'StaleFinch42', 4.0, 4.0,4.0,4.0,4.0,4.0,4.0,4.0,4.0,4.0,4.0, " +
+                "'StaleBuildCorp', 'Title', '2022-01-01', true, 0, true, now(), now())")
+            .execute(Tuple.of(managerId)));
+
+        String origin = await(pool.preparedQuery("SELECT origin FROM reviews WHERE manager_id = $1")
+            .execute(Tuple.of(managerId))
+            .map(rs -> rs.iterator().next().getString("origin")));
+        assertEquals("platform_example", origin,
+            "the database classifies a placeholder at insert, so no deployment can fail to");
+
+        JsonObject stats = await(service.getStats());
+        assertEquals(0L, stats.getLong("weightedOpinions"),
+            "and the Weighted Opinions tile reads 0, which is what found the production rows");
+        assertEquals(0L, stats.getLong("realReviews"),
+            "a demonstration is not somebody's rating, whichever build inserted it");
+    }
+
+    /**
+     * A GENUINE ANONYMOUS RATING IS NOT TOUCHED BY THAT TRIGGER.
+     *
+     * <p>The guard rests on {@code weight = TRUE}, which {@code createSeedReview} alone sets - a
+     * genuine submission takes the column default FALSE. This is the assertion that the guard is
+     * not merely "has no user_id", because plenty of real ratings have no user_id: that is what
+     * leaving one anonymously means, and misclassifying an employee's opinion as a demonstration
+     * is far worse than the defect being fixed.
+     */
+    @Test
+    void anAnonymousGenuineRatingIsNotClassifiedAsAnExample() throws Exception {
+        long managerId = insertManager("Anon Rated Mgr", "AnonCorp", "Title");
+
+        await(pool.preparedQuery(
+                "INSERT INTO reviews (manager_id, author, overall_rating, " +
+                "communication_style, perceived_approachability, perceived_clarity_of_expectations, " +
+                "feedback_style, perceived_supportiveness, decision_making_style, " +
+                "organization_and_planning_style, delegation_style, perceived_professional_demeanor, " +
+                "overall_working_experience, manager_company, manager_title, worked_from, " +
+                "verified, helpful_count, created_at, updated_at) " +
+                "VALUES ($1, 'Anonymous', 3.0, 3.0,3.0,3.0,3.0,3.0,3.0,3.0,3.0,3.0,3.0, " +
+                "'AnonCorp', 'Title', '2022-01-01', true, 0, now(), now())")
+            .execute(Tuple.of(managerId)));
+
+        String origin = await(pool.preparedQuery("SELECT origin FROM reviews WHERE manager_id = $1")
+            .execute(Tuple.of(managerId))
+            .map(rs -> rs.iterator().next().getString("origin")));
+        assertEquals("contributor", origin,
+            "no user_id is not evidence of a placeholder. weight = TRUE is.");
     }
 
     @Test
@@ -1250,6 +1350,56 @@ class ReviewIntegrationTest {
 
         assertEquals(0L, stats.getLong("weightedOpinions"),
             "weightedOpinions must not count expired seeds");
+    }
+
+    /**
+     * A SEED WRITTEN BY THE PRODUCTION PATH IS NEITHER A REAL REVIEW NOR A WEIGHTED OPINION.
+     *
+     * <p>Observed in production on 2026-11-15, hours after V107 applied: the admin panel read
+     * "1 Weighted Opinion". The row behind it was a placeholder - anonymous, {@code weight = TRUE},
+     * author {@code SwiftFinch38}, the shape {@code createSeedReview} alone writes - and it carried
+     * {@code origin = 'contributor'}.
+     *
+     * <p>Post-V106 that combination is supposed to be unreachable. {@code origin} defaults to
+     * {@code 'contributor'}, V106 backfilled every seed that existed when it ran, and
+     * {@code createSeedReview} names the column so every later one is classified at insert. The
+     * production row came from a backend deployed before that change: it omits the column and so
+     * takes the default.
+     *
+     * <p><b>Why this is worse than a wrong tile.</b> {@code ReviewSql.genuine} is
+     * {@code live AND origin = 'contributor'}, and it is the predicate {@code recalculate} uses, so
+     * a misclassified placeholder reaches the manager's cached average and count and through the
+     * V89/V90 triggers reaches company statistics, industry statistics and rankings. On the profile
+     * {@code isExample} reads the same column, so an invented 3.5-4.9 score renders as an employee
+     * opinion instead of a labelled demonstration.
+     *
+     * <p><b>Why nothing caught it.</b> Every other test that wanted a classified seed wrote
+     * {@code 'platform_example'} into its own INSERT, which cannot catch the write path omitting it.
+     * This one goes through {@link ReviewRepository#createSeedReview} and asserts on the column it
+     * writes, so it fails if that classification is ever dropped from the insert again.
+     *
+     * <p>Verified to fail with the {@code 'platform_example'} literal removed from
+     * {@code createSeedReview}.
+     */
+    @Test
+    void getStats_seedFromTheProductionPathIsNeitherRealNorWeighted() throws Exception {
+        long managerId = insertManager("Seeded Ghost", "SeedCorp", "Title");
+
+        await(reviewRepo.createSeedReview(managerId, "SeedCorp", "Title"));
+
+        String origin = await(pool.preparedQuery("SELECT origin FROM reviews WHERE manager_id = $1")
+            .execute(Tuple.of(managerId))
+            .map(rs -> rs.iterator().next().getString("origin")));
+        assertEquals("platform_example", origin,
+            "createSeedReview must classify its row at insert. Left to the column default it is a "
+            + "contributor rating, and then every genuine figure counts a demonstration");
+
+        JsonObject stats = await(service.getStats());
+
+        assertEquals(0L, stats.getLong("weightedOpinions"),
+            "a placeholder is a demonstration, so the Weighted Opinions tile must read 0");
+        assertEquals(0L, stats.getLong("realReviews"),
+            "a placeholder must not be counted as a real review either");
     }
 
     /**

@@ -99,6 +99,20 @@ class FindOrCreateIntegrationTest {
      * <p>This asserts on the response object specifically. Querying the database afterwards would
      * pass either way - the row does get fixed a moment later - and would miss the bug entirely.
      * Verified to fail against the un-awaited version.
+     *
+     * <p><b>UPDATED for V106's provenance split, and the claim is unchanged.</b> The seed is a
+     * platform example, and an example contributes nothing to {@code managers.overall_rating} by
+     * design, so this used to assert {@code overallRating > 0} and began failing the day
+     * {@code recalculate} started excluding examples - correctly, on a payload that had then
+     * nothing for the tile to draw. The bug this test exists for had come back by a different
+     * route, with the rating missing for a new reason.
+     *
+     * <p>So the assertion now names where the number actually lives: {@code exampleRating} and
+     * {@code exampleReviews}, beside a genuine {@code overallRating} that is null because the
+     * manager genuinely has no rating. Both halves are asserted deliberately. The example's number
+     * must be present, or the tile draws nothing; and the genuine one must stay absent, or
+     * fabricated numbers are back in whatever sorts and ranks managers, which is the thing
+     * {@code reviews.origin} was added to prevent.
      */
     @Test
     void findOrCreate_firstSearch_returnedManagerCarriesItsSeededRating() throws Exception {
@@ -110,16 +124,27 @@ class FindOrCreateIntegrationTest {
         JsonObject manager = result.getJsonArray("data").getJsonObject(0);
 
         assertEquals("ghost", manager.getString("approvalStatus"));
-        assertNotNull(manager.getValue("overallRating"),
+
+        // The example's own number, which is what the tile draws for a manager nobody has rated.
+        assertNotNull(manager.getValue("exampleRating"),
             "the tile renders whatever this response says; a null rating draws nothing");
-        assertTrue(manager.getDouble("overallRating") > 0,
-            "the seed review gives the profile a real rating, so the response must show it");
-        // "reviews", not "reviewsCount" - rowToManagerJson emits that key, and it is the one
-        // ManagerCard reads as boss.reviews when it decides whether to draw the rating at all.
-        assertNotNull(manager.getInteger("reviews"),
+        assertTrue(manager.getDouble("exampleRating") > 0,
+            "the seeded example gives the profile a number to show, so the response must carry it");
+        assertNotNull(manager.getInteger("exampleReviews"),
             "the count the tile reads must be present on the returned manager");
-        assertTrue(manager.getInteger("reviews") >= 1,
-            "the seeded review must be counted on the manager that is returned");
+        assertTrue(manager.getInteger("exampleReviews") >= 1,
+            "the seeded example must be counted on the manager that is returned");
+
+        /*
+          And the GENUINE figures stay empty, which is the other half of the fix rather than an
+          incidental detail. This manager has not been rated by anybody. If the example's number
+          reached overallRating it would also reach sorting, the Top Rated pill and every
+          aggregate computed from the manager cache, which is exactly what origin exists to stop.
+        */
+        assertNull(manager.getValue("overallRating"),
+            "an example is not a rating: the genuine figure must stay null");
+        assertEquals(0, manager.getInteger("reviews"),
+            "and the genuine count stays zero");
     }
 
     /**
@@ -444,6 +469,162 @@ class FindOrCreateIntegrationTest {
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
+
+
+    // ── Eligibility is the search opportunity, not a lifetime contribution flag ──
+
+    /**
+     * Somebody who has already rated a manager can still publish a ghost from a search.
+     *
+     * <p><b>This is the rule the documented design states and the code briefly stopped following.</b>
+     * {@code reference/features/manager-search-flow.md} section 9: "logged in, slot unspent, name
+     * ordinary -> ghost created, tile, profile works", and {@code patterns/ghost-pattern.md}
+     * reduces the decision to the same thing - a listed name goes to
+     * {@code createSearchPending}, an ordinary one goes to {@code claimAutoCreatedManagerSlot}.
+     * Neither document mentions contribution.
+     *
+     * <p>A guard added on 2026-11-14 refused a contributor outright, on the reasoning that an
+     * auto-created profile carried only an unlabelled example and would be shown behind a gate the
+     * reader had already passed. It changed the rule without updating either document or either of
+     * the two tests that assert it, and left them failing. Both halves of its reasoning have since
+     * stopped being true: the example carries its own rating and is labelled as a demonstration.
+     *
+     * <p>The effect of the guard was the opposite of its intent. The people who had contributed -
+     * the most engaged users in the product - became the only ones who could not publish a profile
+     * from a search, and got a silent pending row and no tile, which reads as "no such manager" for
+     * a manager the product would happily have created for a stranger.
+     */
+    @Test
+    void aContributorWithAnUnspentOpportunityStillCreatesAGhost() throws Exception {
+        String auth0Id = insertUser("auth0|contrib-eligible", "contribeligible");
+        makeContributor(auth0Id, "Prior Manager", "PriorCorp");
+
+        JsonObject result = await(service.findOrCreate(
+            auth0Id, "Patricia", "Chen", "Manager", "NonExistentCo999", "US", null, null, null));
+
+        assertTrue(result.getBoolean("created"),
+            "a previous rating elsewhere must not make this search ineligible");
+        assertEquals(1, result.getJsonArray("data").size());
+        assertEquals("ghost", result.getJsonArray("data").getJsonObject(0).getString("approvalStatus"));
+        assertTrue(ghostSlotClaimed(findUserId(auth0Id)),
+            "and the opportunity is spent, exactly as it is for anybody else");
+    }
+
+    /**
+     * The ghost a contributor creates carries its example rating, and no paywall stands in the way.
+     *
+     * <p>Three claims, because the guard's stated reason was that this combination did not work.
+     * The example's number is on the payload, so the tile draws something; the GENUINE figures stay
+     * empty, so the example is not counted as an opinion; and {@code hasContributed} is true, so
+     * the reader is past the contribution gate and sees the labelled example rather than a blur.
+     * There is no second charge to make: the gate is passed once, by rating somebody, which this
+     * person has already done.
+     */
+    @Test
+    void theGhostAContributorCreatesCarriesALabelledExampleAndNoPaywall() throws Exception {
+        String auth0Id = insertUser("auth0|contrib-sees", "contribsees");
+        makeContributor(auth0Id, "Earlier Boss", "EarlierCorp");
+
+        JsonObject result = await(service.findOrCreate(
+            auth0Id, "Rowan", "Ashby", "Operations Lead", "Thornbury Freight", "US", null, null, null));
+        JsonObject manager = result.getJsonArray("data").getJsonObject(0);
+
+        assertTrue(result.getBoolean("hasContributed"),
+            "they are past the contribution gate, so the rating is theirs to see unblurred");
+        assertNotNull(manager.getValue("exampleRating"),
+            "the example's own number travels with the manager, or the tile draws nothing");
+        assertTrue(manager.getDouble("exampleRating") > 0);
+        assertNull(manager.getValue("overallRating"),
+            "and it is not a rating: the genuine figure stays null");
+        assertEquals(0, manager.getInteger("reviews"), "nor is it counted");
+    }
+
+    /**
+     * The opportunity is still once ever, for a contributor too.
+     *
+     * <p>Removing the contribution guard must not remove the rule that actually governs this. A
+     * second search by the same person gets a silent pending row and no tile, which is what
+     * section 9's "slot spent" row says and is the behaviour the product depends on to stop one
+     * account minting profiles indefinitely.
+     */
+    @Test
+    void aContributorsSecondSearchGetsNoTileOnceTheOpportunityIsSpent() throws Exception {
+        String auth0Id = insertUser("auth0|contrib-spent", "contribspent");
+        makeContributor(auth0Id, "First Boss", "FirstCorp");
+
+        await(service.findOrCreate(
+            auth0Id, "Imogen", "Fairweather", "Analyst", "Halloway Group", "US", null, null, null));
+
+        JsonObject second = await(service.findOrCreate(
+            auth0Id, "Desmond", "Ortega", "Planner", "Calder Freight", "US", null, null, null));
+
+        assertFalse(second.getBoolean("created"), "the opportunity was spent on the first search");
+        assertEquals(0, second.getJsonArray("data").size(), "and no tile is rendered");
+
+        long pending = await(pool.preparedQuery(
+                "SELECT COUNT(*) FROM managers WHERE name ILIKE 'Desmond Ortega' "
+              + "AND approval_status = 'pending_approval'")
+            .execute().map(rs -> rs.iterator().next().getLong(0)));
+        assertEquals(1, pending, "it is queued for an admin instead, silently");
+    }
+
+    /**
+     * Searching the same person twice returns the row the first search made.
+     *
+     * <p>Deduplication, asserted for a contributor specifically, because that is the path this
+     * change opened. A second ghost for one person is the failure the slot and the name matcher
+     * exist to prevent, and it would be invisible on the tile: two identical cards, and whichever
+     * one somebody rates is a coin toss.
+     */
+    @Test
+    void aContributorSearchingTheSamePersonTwiceGetsOneManager() throws Exception {
+        String auth0Id = insertUser("auth0|contrib-dedup", "contribdedup");
+        makeContributor(auth0Id, "Old Boss", "OldCorp");
+
+        JsonObject first = await(service.findOrCreate(
+            auth0Id, "Cressida", "Vance", "Director", "Marlowe Shipping", "US", null, null, null));
+        long firstId = first.getJsonArray("data").getJsonObject(0).getLong("id");
+
+        JsonObject again = await(service.findOrCreate(
+            auth0Id, "Cressida", "Vance", "Director", "Marlowe Shipping", "US", null, null, null));
+
+        assertFalse(again.getBoolean("created"), "nothing is created the second time");
+        assertEquals(1, again.getJsonArray("data").size());
+        assertEquals(firstId, (long) again.getJsonArray("data").getJsonObject(0).getLong("id"),
+            "the same manager comes back, not a second one");
+
+        long rows = await(pool.preparedQuery(
+                "SELECT COUNT(*) FROM managers WHERE name ILIKE 'Cressida Vance'")
+            .execute().map(rs -> rs.iterator().next().getLong(0)));
+        assertEquals(1, rows, "one person, one row");
+    }
+
+    /** Gives this user a rating on some other manager, so hasContributed is true. */
+    private void makeContributor(String auth0Id, String managerName, String company)
+            throws Exception {
+        long companyId = await(pool.preparedQuery(
+                "INSERT INTO companies(name,status,slug) VALUES ($1,'ghost',$2) RETURNING id")
+            .execute(Tuple.of(company, company.toLowerCase()))
+            .map(rs -> rs.iterator().next().getLong("id")));
+        long managerId = await(pool.preparedQuery(
+                "INSERT INTO managers(name, company, company_id, title, image, status, "
+              + "approval_status, overall_rating, reviews_count, category_averages, slug) "
+              + "VALUES ($1,$2,$3,'Manager','img','active','approved',4.0,1,'{}',$4) RETURNING id")
+            .execute(Tuple.of(managerName, company, companyId,
+                              managerName.toLowerCase().replaceAll("[^a-z0-9]+", "-")))
+            .map(rs -> rs.iterator().next().getLong("id")));
+        await(pool.preparedQuery("""
+                INSERT INTO reviews (manager_id, user_id, author, overall_rating,
+                                     communication_style, perceived_approachability,
+                                     perceived_clarity_of_expectations, feedback_style,
+                                     perceived_supportiveness, decision_making_style,
+                                     organization_and_planning_style, delegation_style,
+                                     perceived_professional_demeanor, overall_working_experience,
+                                     manager_company, manager_title, worked_from, weight)
+                VALUES ($1, (SELECT id FROM users WHERE auth0_id = $2), 'PriorAuthor', 4.0,
+                        4,4,4,4,4,4,4,4,4,4, $3, 'Manager', CURRENT_DATE - 100, FALSE)
+                """).execute(Tuple.of(managerId, auth0Id, company)).mapEmpty());
+    }
 
     private boolean ghostSlotClaimed(UUID userId) throws Exception {
         return await(pool.preparedQuery("SELECT has_auto_created_manager FROM users WHERE id = $1")

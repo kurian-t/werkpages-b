@@ -449,6 +449,69 @@ class ManagerServiceCoverage2IntegrationTest {
         assertEquals(0, result.getJsonArray("data").size());
     }
 
+    /**
+     * A HALF-TYPED COMPANY MUST NOT BECOME A SECOND QUEUED ROW.
+     *
+     * <p>Reported from the admin panel on 2026-11-15: one person searching for one manager left
+     * three pending rows one second apart. Two of them were the same name, with companies
+     * {@code Net} and {@code Netflix} - the debounced search firing while the employer was still
+     * being typed.
+     *
+     * <p>{@code search()} cannot see that the first is the second: it matches with
+     * {@code company ILIKE '%Netflix%'} against the stored {@code Net}, so containment is tested
+     * in one direction only and the finished search looks like a different employer.
+     *
+     * <p>The machinery to fold it already existed for the add form, which got a capture token in
+     * phase 1: {@code refineCapturedCompany} lengthens a stored fragment in place, pending rows
+     * only. The search path never got the equivalent.
+     *
+     * <p><b>Scoped to the searcher's own queued row, deliberately.</b> Adopting any matching
+     * pending row is what handed one visitor's half-typed namesake to another submitter, so this
+     * only ever refines a row carrying this user's {@code search_created_by_user_id}.
+     */
+    @Test
+    void findOrCreate_halfTypedCompany_refinesItsOwnQueuedRowInsteadOfAddingAnother()
+            throws Exception {
+        String auth0Id = insertUser("auth0|half-typed-co");
+        UUID userId = await(pool.preparedQuery("SELECT id FROM users WHERE auth0_id = $1")
+            .execute(Tuple.of(auth0Id)).map(rs -> rs.iterator().next().getUUID("id")));
+
+        // The slot is spent, so this search queues rather than publishing a ghost.
+        await(pool.preparedQuery("UPDATE users SET has_auto_created_manager = TRUE WHERE id = $1")
+            .execute(Tuple.of(userId)));
+
+        // The row the earlier keystroke left behind: the same name, at a fragment of the employer.
+        await(pool.preparedQuery(
+                "INSERT INTO managers(name, company, title, image, status, approval_status, "
+              + "overall_rating, reviews_count, category_averages, "
+              + "search_created_by_user_id, submitted_by) "
+              + "VALUES ($1,$2,$3,'img','active','pending_approval',0,0,'{}', $4, $4)")
+            .execute(Tuple.of("Bob Burgers", "Net", "Manager", userId)));
+
+        JsonObject result = await(service.findOrCreate(auth0Id,
+            "Bob", "Burgers", "Manager", "Netflix", "CA", null, null, null));
+
+        assertFalse(result.getBoolean("created"),
+            "a queued search publishes nothing");
+        assertEquals(0, result.getJsonArray("data").size(),
+            "a queued row is served to nobody, so there is no tile");
+
+        int rows = await(pool.preparedQuery(
+                "SELECT COUNT(*) AS c FROM managers WHERE name = $1")
+            .execute(Tuple.of("Bob Burgers"))
+            .map(rs -> rs.iterator().next().getInteger("c")));
+        assertEquals(1, rows,
+            "the finished search must refine the fragment it left a second ago, not queue a "
+          + "second row for the same manager");
+
+        String company = await(pool.preparedQuery(
+                "SELECT company FROM managers WHERE name = $1")
+            .execute(Tuple.of("Bob Burgers"))
+            .map(rs -> rs.iterator().next().getString("company")));
+        assertEquals("Netflix", company,
+            "and the row it keeps must carry the finished employer, not the fragment");
+    }
+
     @Test
     void findOrCreate_contributedUser_noMatch_createsGhost() throws Exception {
         String auth0Id = insertUser("auth0|foc-contributed");

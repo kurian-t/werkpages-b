@@ -1415,6 +1415,102 @@ class AdminServiceIntegrationTest {
         assertNotEquals(decoy, linked, "approval must not land on the similarly named company");
     }
 
+    /**
+     * AN EDIT REQUEST IS APPROVABLE AFTER AN ADMIN SUPPLIES THE COMPANY.
+     *
+     * <p>Reported from the admin panel on 2026-11-15, as a queue full of requests that could not
+     * be approved at all. The refusal above is right about a pre-V56 row, but it also caught every
+     * NEW request naming a company that has no row yet: {@code createEditRequest} passes
+     * {@code body.getLong("companyId")} straight through and resolves nothing, so the client has
+     * no id to send and {@code requested_company_id} arrives null either way. Two different
+     * situations, one null test, and the message advised discarding a real contribution.
+     *
+     * <p>Approve and Reject could not express the remedy, so corrections now ride on the approval
+     * and the existing transaction applies them. Identity still never comes from re-resolving a
+     * typed name: it comes from the id a human chose in the picker.
+     *
+     * <p>Asserts both halves, because the refusal is still wanted when nothing identifies the
+     * company. Verified to fail before the fix, with the correction ignored.
+     */
+    @Test
+    void approveEdit_acceptsTheCompanyAnAdminChoosesOnTheRequest() throws Exception {
+        String adminAuth0 = insertUser("auth0|admin_ci_fix", "AdminCIFix", "admin");
+        String userAuth   = insertUser("auth0|editor_ci_fix", "EditorCIFix", "user");
+        UUID   userId     = findUserId(userAuth);
+        long   managerId  = insertApprovedManager("Radia Perlman", "OldCorp", "Engineer");
+
+        // The shape the queue is full of: a company change carrying no identity, because the
+        // company did not exist when the request was written.
+        UUID editId = await(pool.preparedQuery(
+            "INSERT INTO manager_edits(manager_id, proposed_by, new_company, new_title) " +
+            "VALUES ($1,$2,$3,$4) RETURNING id")
+            .execute(Tuple.of(managerId, userId, "Unlisted Networks Inc.", "Principal Engineer"))
+            .map(rs -> rs.iterator().next().getUUID("id")));
+
+        // Without a correction it is still refused, and still writes nothing.
+        assertServiceException(service.approveEdit(adminAuth0, editId));
+        Long repointed = await(pool.preparedQuery("SELECT company_id FROM managers WHERE id = $1")
+            .execute(Tuple.of(managerId))
+            .map(rs -> rs.iterator().next().getLong("company_id")));
+        assertNotEquals(companyIdFor("Unlisted Networks Inc."), repointed,
+            "a refusal must not half-apply the request");
+
+        // The admin resolves it once, through the picker, and approves.
+        Long picked = companyIdFor("Unlisted Networks Inc.");
+        await(service.approveEdit(adminAuth0, editId,
+            new JsonObject().put("companyId", picked)));
+
+        Long linked = await(pool.preparedQuery("SELECT company_id FROM managers WHERE id = $1")
+            .execute(Tuple.of(managerId))
+            .map(rs -> rs.iterator().next().getLong("company_id")));
+        assertEquals(picked, linked,
+            "approval must land on the company the admin chose, so the contribution is kept "
+          + "rather than rejected and redone by hand");
+
+        String status = await(pool.preparedQuery("SELECT status FROM manager_edits WHERE id = $1")
+            .execute(Tuple.of(editId))
+            .map(rs -> rs.iterator().next().getString("status")));
+        assertEquals("approved", status, "and the request itself must be settled");
+    }
+
+    /**
+     * A CORRECTION MAY ALSO FIX A FIELD THE CONTRIBUTOR GOT WRONG.
+     *
+     * <p>The commonest case in this queue is a request that is right that the manager moved and
+     * wrong about one field. Rejecting it loses the contributor's attribution and the audit trail,
+     * so the correction is applied on the way through instead.
+     *
+     * <p>A key that is ABSENT must leave the contributor's answer alone. That is the difference
+     * between a correction and a form posting its own defaults over somebody's submission, and it
+     * is why the title below survives untouched.
+     */
+    @Test
+    void approveEdit_correctsOneFieldAndLeavesTheRestAsSubmitted() throws Exception {
+        String adminAuth0 = insertUser("auth0|admin_ci_one", "AdminCIOne", "admin");
+        String userAuth   = insertUser("auth0|editor_ci_one", "EditorCIOne", "user");
+        UUID   userId     = findUserId(userAuth);
+        long   managerId  = insertApprovedManager("Barbara Liskov", "OldCorp", "Engineer");
+        Long   picked     = companyIdFor("Correct Company Ltd");
+
+        UUID editId = await(pool.preparedQuery(
+            "INSERT INTO manager_edits(manager_id, proposed_by, new_company, requested_company_id, new_title) " +
+            "VALUES ($1,$2,$3,$4,$5) RETURNING id")
+            .execute(Tuple.of(managerId, userId, "Correct Company Ltd", picked, "Staff Enginer"))
+            .map(rs -> rs.iterator().next().getUUID("id")));
+
+        // Only the title is corrected. The company is not mentioned.
+        await(service.approveEdit(adminAuth0, editId,
+            new JsonObject().put("title", "Staff Engineer")));
+
+        String title = await(pool.preparedQuery("SELECT title FROM managers WHERE id = $1")
+            .execute(Tuple.of(managerId)).map(rs -> rs.iterator().next().getString("title")));
+        Long linkedCo = await(pool.preparedQuery("SELECT company_id FROM managers WHERE id = $1")
+            .execute(Tuple.of(managerId)).map(rs -> rs.iterator().next().getLong("company_id")));
+        assertEquals("Staff Engineer", title, "the corrected title must apply");
+        assertEquals(picked, linkedCo,
+            "and the company the contributor picked must survive a correction that never named it");
+    }
+
     @Test
     void approveEdit_refusesALegacyRequestWithNoCompanyIdentity() throws Exception {
         // Rows written before V56 carry only a name. Resolving it would be a guess, and guessing is
