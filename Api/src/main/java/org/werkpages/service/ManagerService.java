@@ -5,6 +5,7 @@ import io.vertx.core.Promise;
 import io.vertx.core.json.JsonArray;
 import io.vertx.core.json.JsonObject;
 import io.vertx.sqlclient.Pool;
+import io.vertx.sqlclient.SqlConnection;
 import io.vertx.sqlclient.Row;
 import io.vertx.sqlclient.RowSet;
 import io.vertx.sqlclient.SqlClient;
@@ -29,8 +30,10 @@ import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
 import java.time.format.DateTimeParseException;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Set;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Random;
@@ -76,6 +79,8 @@ public class ManagerService {
 
     /** Stateless: the claim rules live in the statements, not in the object. */
     private final RoleClaimService roleClaims = new RoleClaimService();
+    /** The same applier a moderator's approval uses; see submitCareerEdit. */
+    private final CareerChangeSetApplier careerApplier;
 
     private RoleAwareSubmissionService roleAwareSubmissions() {
         if (roleAwareSubmissionsOrNull == null) {
@@ -142,6 +147,7 @@ public class ManagerService {
         this.reviewRepo   = reviewRepo;
         this.userRepo     = userRepo;
         this.editRepo     = editRepo;
+        this.careerApplier = new CareerChangeSetApplier(editRepo);
         this.reportRepo   = reportRepo;
         this.companyRepo  = companyRepo;
         this.db           = db;
@@ -4567,59 +4573,26 @@ public class ManagerService {
 
     // ── Crossing the projection boundary ──────────────────────────────────────
 
-    /**
-     * Brings back ratings whose three-day delete window has expired, as anonymous.
-     *
-     * <p>A delete here hides a rating rather than destroying it, and after three days it
-     * resurfaces. That makes restoring a boundary crossing in the other direction, and the
-     * projection has to follow: subtracting on delete without adding back on restore would leave
-     * every restored rating permanently uncounted, silently and forever.
-     *
-     * <p>The ids are read first, because once {@code deleted_at} is cleared there is nothing left
-     * to identify which rows this run touched.
-     *
-     * @return how many were restored
-     */
-    public Future<Integer> restoreExpiredReviewDeletions() {
-        return ((Pool) db).withTransaction(conn ->
-            conn.preparedQuery("""
-                    SELECT id FROM reviews
-                     WHERE deleted_at IS NOT NULL AND deleted_at < now() - INTERVAL '3 days'
-                       -- A moderator's removal, a seed superseded by a merge and an author's own
-                       -- replacement all carry a reason and never come back. This SECOND
-                       -- implementation of the sweep did not say so. Only a test reaches it, but
-                       -- it would have resurrected every one of them, and a loaded gun in the
-                       -- tree is worth unloading while it is in hand.
-                       AND deleted_reason IS NULL
-                    """)
-                .execute()
-                .compose(rs -> {
-                    List<UUID> ids = new ArrayList<>();
-                    for (Row r : rs) ids.add(r.getUUID("id"));
-                    if (ids.isEmpty()) return Future.succeededFuture(0);
-                    return conn.preparedQuery("""
-                            UPDATE reviews SET deleted_at = NULL
-                             WHERE deleted_at IS NOT NULL AND deleted_at < now() - INTERVAL '3 days'
-                               AND deleted_reason IS NULL
-                            """)
-                        .execute()
-                        .compose(updated -> {
-                            // They were out of the projection while hidden, so each starts from
-                            // "contributing nothing" and is added back at whatever it now is.
-                            Future<Void> chain = Future.succeededFuture();
-                            for (UUID id : ids) {
-                                chain = chain.compose(v ->
-                                    locationStats.resyncManagerReview(conn, id, Optional.empty()));
-                            }
-                            return chain.map(ids.size());
-                        });
-                }));
-    }
+    /*
+      THE SECOND SWEEP AND THE SECOND DISPOSITION SETTER ARE GONE.
 
-    /** Holds, releases or rejects a rating. See {@link ReviewDisposition}. */
-    public Future<Void> setReviewDisposition(UUID reviewId, String disposition) {
-        return ((Pool) db).withTransaction(conn -> reviewDisposition.set(conn, reviewId, disposition));
-    }
+      restoreExpiredReviewDeletions() and setReviewDisposition() used to sit here. Neither had a
+      production caller: the restore that actually runs is ReviewRepository.restoreExpiredDeletions,
+      called from MaintenanceSweep, and the disposition that actually runs is ReviewDisposition.set,
+      called from ProofOfWorkService, AdminService, ModerationService and ManagerMergeService.
+
+      They were a second implementation of both, and the restore had already drifted: it had to be
+      taught that a moderator's deletion, a seed superseded by a merge and an author's replacement
+      all carry a reason and must never come back. Its own comment said so and called it a loaded
+      gun in the tree. It also knew nothing of the claim tombstone V111 introduced, so it would
+      have restored a rating while leaving the claim asserting an employment the contributor had
+      withdrawn.
+
+      Only LocationStatsIntegrationTest reached them. Those tests are still here and still assert
+      the same thing - that the projection follows a rating out of publication and back in - but
+      they now exercise the implementations production uses, which is the only version of that
+      assertion worth having.
+    */
 
     /**
      * UNLINK a rating: the contributor gives up the rating, the rating stays published.
@@ -4946,6 +4919,844 @@ public class ManagerService {
                                     );
                             }));
             });
+    }
+
+
+    // ── THE CAREER HISTORY EDITOR ───────────────────────────────────────────
+
+    /**
+     * Employment statuses a contributor may assert: in this role, or not in it.
+     *
+     * <p>`unknown` is refused along with `disputed`. "I'm not sure" produced a row with no stated
+     * end and no stated dates, which every display surface then had to guess about, and the guesses
+     * disagreed - putting older roles above newer ones because somebody did not know a date.
+     *
+     * <p>Both remain valid on {@code career_history}: `unknown` is that column's default and the
+     * state of every row written before this, and `disputed` is a moderation outcome. Neither is
+     * ever something one contributor asserts about somebody else's job.
+     */
+    private static final List<String> CONTRIBUTOR_STATUSES = List.of("ongoing", "ended");
+
+    private static final List<String> CHANGE_FIELDS = List.of(
+        EditRepository.EmploymentChange.TITLE,
+        EditRepository.EmploymentChange.COMPANY,
+        EditRepository.EmploymentChange.LOCATION,
+        EditRepository.EmploymentChange.START_DATE,
+        EditRepository.EmploymentChange.END_DATE,
+        EditRepository.EmploymentChange.PERIOD_KNOWN,
+        EditRepository.EmploymentChange.EMPLOYMENT_STATUS);
+
+    /**
+     * Submit a whole career's worth of corrections as ONE contribution.
+     *
+     * <h2>Why this exists beside {@link #createEditRequest} rather than replacing it</h2>
+     *
+     * <p>The old form could express exactly one position, because {@code manager_edits} is one flat
+     * row. Somebody who wanted to end a role and record its successor had to submit, leave and come
+     * back, and somebody who wanted to fix a historical title had no way to say which employment
+     * they meant. The legacy path stays because proposals written through it are still pending and
+     * must still be approvable; see {@code change_format}.
+     *
+     * <h2>What one submission may contain</h2>
+     *
+     * <p>A new name for the manager, and any number of positions, each one of:
+     *
+     * <ul>
+     *   <li>{@code correct} - this employment's record is wrong. Same employment, fixed values, and
+     *       every rating, claim and attribution stays exactly where it is.</li>
+     *   <li>{@code add} - an employment nobody had recorded. A DISTINCT employment: adding a
+     *       current role never ends another one. Somebody genuinely holding two jobs at once is
+     *       recorded as holding two jobs at once.</li>
+     *   <li>{@code supersede} - this employment names the wrong EMPLOYER. Not a correction, because
+     *       the employer is what ratings are attributed through, and not an addition, because the
+     *       person did not change jobs.</li>
+     * </ul>
+     *
+     * <h2>What it does not do</h2>
+     *
+     * <p>Nothing is applied. Every position here is a proposal, and the employment it refers to is
+     * untouched until a moderator approves the contribution. That is the whole reason the snapshot
+     * is taken: by the time anybody approves this, the employment may have moved.
+     */
+    public Future<JsonObject> createCareerEditRequest(String auth0Id, long managerId, JsonObject body) {
+        if (body == null) return Future.failedFuture(ServiceException.badRequest("Missing request body"));
+
+        String newName     = toNullIfBlank(body.getString("name"));
+        String explanation = body.getString("explanation");
+
+        if (explanation == null || explanation.isBlank()) {
+            return Future.failedFuture(ServiceException.badRequest(
+                "Say what you are correcting and how you know. One explanation covers the whole "
+                + "submission."));
+        }
+        if (explanation.length() > 2000) {
+            return Future.failedFuture(ServiceException.badRequest(
+                "Explanation must be at most 2000 characters"));
+        }
+        if (newName != null && newName.length() > 200) {
+            return Future.failedFuture(ServiceException.badRequest(
+                "Name must be at most 200 characters"));
+        }
+
+        JsonArray positions = body.getJsonArray("positions", new JsonArray());
+
+        // A submission that proposes nothing is a mistake, not an empty edit. A NAME-ONLY
+        // submission is legitimate and must survive: no positions at all is fine as long as the
+        // name is changing.
+        if (positions.isEmpty() && newName == null) {
+            return Future.failedFuture(ServiceException.badRequest(
+                "Nothing was changed, so there is nothing to submit."));
+        }
+
+        List<EditRepository.EmploymentChange> changes = new ArrayList<>();
+        // A corpus place travels beside its position rather than inside EmploymentChange: it is
+        // input to promotion, not something stored on the proposal, and after resolution only the
+        // resulting company_location_id matters.
+        List<CorpusPlace> places = new ArrayList<>();
+        // Which positions are the manager record's own, by index, for materialising on submit.
+        List<Boolean> fromRecord = new ArrayList<>();
+        Set<Long> targeted = new HashSet<>();
+        for (int i = 0; i < positions.size(); i++) {
+            JsonObject p = positions.getJsonObject(i);
+            if (p == null) {
+                return Future.failedFuture(ServiceException.badRequest("Position " + (i + 1) + " is empty"));
+            }
+            String intent = p.getString("intent");
+            if (!List.of(EditRepository.EmploymentChange.CORRECT,
+                         EditRepository.EmploymentChange.ADD,
+                         EditRepository.EmploymentChange.SUPERSEDE).contains(intent)) {
+                return Future.failedFuture(ServiceException.badRequest(
+                    "Position " + (i + 1) + " must say whether it corrects, adds or supersedes an "
+                    + "employment"));
+            }
+            boolean isAdd = EditRepository.EmploymentChange.ADD.equals(intent);
+            Long roleId = p.getLong("roleId");
+            /*
+              THE POSITION THE MANAGER RECORD ASSERTS, with no employment row behind it yet.
+
+              It arrives as an `add` with no roleId, because that is all the client can honestly
+              say. On submit the row is materialised from the manager record and the change is
+              applied to it as a CORRECTION, which is what it actually is: the employment existed
+              implicitly on the profile and is only now being written down.
+            */
+            boolean fromManagerRecord = Boolean.TRUE.equals(p.getBoolean("fromManagerRecord"));
+            if (fromManagerRecord && !isAdd) {
+                return Future.failedFuture(ServiceException.badRequest(
+                    "Position " + (i + 1) + " cannot both name an employment and come from the "
+                    + "manager record"));
+            }
+
+            // An existing employment is named by career_history.id and nothing else. Company name,
+            // or company plus title, cannot tell two spells at one employer apart and silently
+            // rewrites the wrong one when it guesses.
+            if (isAdd && roleId != null) {
+                return Future.failedFuture(ServiceException.badRequest(
+                    "Position " + (i + 1) + " adds an employment, so it must not name an existing one"));
+            }
+            if (!isAdd && roleId == null) {
+                return Future.failedFuture(ServiceException.badRequest(
+                    "Position " + (i + 1) + " changes an existing employment, so it must identify it"));
+            }
+            if (roleId != null && !targeted.add(roleId)) {
+                return Future.failedFuture(ServiceException.badRequest(
+                    "Two of these positions change the same employment, so the submission "
+                    + "contradicts itself."));
+            }
+
+            JsonArray fieldsJson = p.getJsonArray("changedFields", new JsonArray());
+            List<String> fields = new ArrayList<>();
+            for (int f = 0; f < fieldsJson.size(); f++) {
+                String name = fieldsJson.getString(f);
+                if (!CHANGE_FIELDS.contains(name)) {
+                    return Future.failedFuture(ServiceException.badRequest(
+                        "Position " + (i + 1) + " names an unknown field: " + name));
+                }
+                if (!fields.contains(name)) fields.add(name);
+            }
+            if (fields.isEmpty()) {
+                return Future.failedFuture(ServiceException.badRequest(
+                    "Position " + (i + 1) + " does not change anything"));
+            }
+
+            String title = toNullIfBlank(p.getString("title"));
+            if (fields.contains(EditRepository.EmploymentChange.TITLE) && title == null) {
+                return Future.failedFuture(ServiceException.badRequest(
+                    "Position " + (i + 1) + " needs a title"));
+            }
+            if (title != null && title.length() > 100) {
+                return Future.failedFuture(ServiceException.badRequest(
+                    "Position " + (i + 1) + ": title must be at most 100 characters"));
+            }
+
+            Long   companyId   = p.getLong("companyId");
+            String companyName = toNullIfBlank(p.getString("company"));
+            if (companyName != null && companyName.length() > 100) {
+                return Future.failedFuture(ServiceException.badRequest(
+                    "Position " + (i + 1) + ": company must be at most 100 characters"));
+            }
+            boolean companyGiven = companyId != null || companyName != null;
+            if (EditRepository.EmploymentChange.SUPERSEDE.equals(intent) && !companyGiven) {
+                return Future.failedFuture(ServiceException.badRequest(
+                    "Position " + (i + 1) + " replaces the employer, so it must name one"));
+            }
+            // A manager-record position is exempt: its company comes from the manager row, which
+            // is the only place it has ever been stated.
+            if (isAdd && !companyGiven && !fromManagerRecord) {
+                return Future.failedFuture(ServiceException.badRequest(
+                    "Position " + (i + 1) + " needs a company"));
+            }
+            // Correcting the employer in place would silently re-attribute every rating hung off
+            // that employment, so it is a supersession or it is nothing.
+            if (EditRepository.EmploymentChange.CORRECT.equals(intent)
+                    && fields.contains(EditRepository.EmploymentChange.COMPANY)) {
+                return Future.failedFuture(ServiceException.badRequest(
+                    "Changing which company an employment was at replaces that employment rather "
+                    + "than correcting it, because ratings are attributed through the employer."));
+            }
+
+            String status = toNullIfBlank(p.getString("employmentStatus"));
+            if (fields.contains(EditRepository.EmploymentChange.EMPLOYMENT_STATUS)) {
+                if (status == null) {
+                    return Future.failedFuture(ServiceException.badRequest(
+                        "Position " + (i + 1) + " needs an employment status"));
+                }
+                if (!CONTRIBUTOR_STATUSES.contains(status)) {
+                    return Future.failedFuture(ServiceException.badRequest(
+                        "Position " + (i + 1) + ": employment status must be either ongoing or "
+                        + "ended"));
+                }
+            }
+
+            LocalDate startLocal = parseYearMonth(p.getString("startDate"));
+            LocalDate endLocal   = parseYearMonth(p.getString("endDate"));
+            OffsetDateTime start = startLocal != null
+                ? startLocal.atStartOfDay(ZoneOffset.UTC).toOffsetDateTime() : null;
+            OffsetDateTime end   = endLocal != null
+                ? endLocal.atStartOfDay(ZoneOffset.UTC).toOffsetDateTime()   : null;
+            OffsetDateTime today = OffsetDateTime.now(ZoneOffset.UTC);
+            if (start != null && start.isAfter(today)) {
+                return Future.failedFuture(ServiceException.badRequest(
+                    "Position " + (i + 1) + ": a start date cannot be in the future"));
+            }
+            if (end != null && end.isAfter(today)) {
+                return Future.failedFuture(ServiceException.badRequest(
+                    "Position " + (i + 1) + ": an end date cannot be in the future"));
+            }
+            if (start != null && end != null && end.isBefore(start)) {
+                return Future.failedFuture(ServiceException.badRequest(
+                    "Position " + (i + 1) + ": the end date is before the start date"));
+            }
+            // An ended role with no end date is not a contradiction - plenty of people know they
+            // left and not when - but a role still held cannot have ended on a date.
+            if ("ongoing".equals(status) && end != null) {
+                return Future.failedFuture(ServiceException.badRequest(
+                    "Position " + (i + 1) + " says the role is still held, so it cannot also have "
+                    + "an end date."));
+            }
+
+            Boolean periodKnown = p.containsKey("periodKnown") ? p.getBoolean("periodKnown") : null;
+            if (fields.contains(EditRepository.EmploymentChange.PERIOD_KNOWN) && periodKnown == null) {
+                return Future.failedFuture(ServiceException.badRequest(
+                    "Position " + (i + 1) + " must say whether the dates are known"));
+            }
+            // career_period_known_has_a_date: claiming the period is known without a start date
+            // would be refused by the database on approval, so it is refused here where the
+            // message can say why.
+            if (Boolean.TRUE.equals(periodKnown) && start == null) {
+                return Future.failedFuture(ServiceException.badRequest(
+                    "Position " + (i + 1) + " says the dates are known but gives no start date."));
+            }
+
+            /*
+              NOT validated here, deliberately.
+
+              DeclaredLocation.validate() requires an id at `exact` precision, and a building
+              picked from the search corpus has no id until it is promoted - the corpus is Parquet
+              in S3, not a table. DeclaredLocationResolver promotes it and validates afterwards,
+              inside the submitting transaction, which is the same order every other form uses.
+            */
+            DeclaredLocation location = DeclaredLocation.fromBody(p);
+            places.add(CorpusPlace.fromBody(p));
+            fromRecord.add(fromManagerRecord);
+
+            changes.add(new EditRepository.EmploymentChange(
+                intent, roleId, fields, title, companyId, companyName,
+                start, end, periodKnown, status, location, null, i));
+        }
+
+        return userRepo.findByAuth0IdWithBan(auth0Id)
+            .compose(opt -> {
+                if (opt.isEmpty()) return Future.failedFuture(ServiceException.unauthorized("User not found"));
+                Row userRow = opt.get();
+                if (userRow.getBoolean("is_banned")) {
+                    return Future.failedFuture(ServiceException.forbidden("account_suspended"));
+                }
+                UUID userId = userRow.getUUID("id");
+                return editRepo.countSubmittedTodayByUser(userId)
+                    .compose(today -> SubmissionLimits.checkDailyLimit(today, SubmissionLimits.DAILY_EDITS))
+                    .compose(v -> ((Pool) db).withTransaction(tx ->
+                        submitCareerEdit(tx, managerId, userId, newName, explanation.trim(),
+                                         changes, places, fromRecord)));
+            });
+    }
+
+    /**
+     * The whole submission, in ONE transaction.
+     *
+     * <p>A change set written across several transactions could be read half-finished by a
+     * moderator, and a failure partway would leave a contribution proposing some of what somebody
+     * submitted. The parent row, the positions and every snapshot commit together or not at all.
+     */
+    private Future<JsonObject> submitCareerEdit(SqlConnection tx, long managerId, UUID userId,
+                                                String newName, String explanation,
+                                                List<EditRepository.EmploymentChange> changes,
+                                                List<CorpusPlace> places,
+                                                List<Boolean> fromRecord) {
+        // Set while the manager row is locked and read after the change set is written, so the
+        // decision is made from the state the transaction actually holds.
+        final boolean[] selfApplies = { false };
+        return tx.preparedQuery(
+                "SELECT id, name, approval_status, submitted_by FROM managers WHERE id = $1 FOR UPDATE")
+            .execute(Tuple.of(managerId))
+            .compose(found -> {
+                if (found.rowCount() == 0) {
+                    return Future.failedFuture(ServiceException.notFound("Manager not found"));
+                }
+                Row m = found.iterator().next();
+                /*
+                  THE SUBMITTER'S OWN UNPUBLISHED DRAFT APPLIES STRAIGHT AWAY.
+
+                  A manager still pending approval is not on the directory, so there is nothing for
+                  a moderator to protect: the person who submitted it is correcting their own
+                  unpublished submission, and that has always written through immediately. Queueing
+                  it for review instead would be a regression dressed up as caution.
+
+                  It goes through the SAME applier a moderator's approval goes through, so "end this
+                  role, add that one" cannot mean two different things depending on whether the
+                  manager happens to be approved yet.
+                */
+                selfApplies[0] = "pending_approval".equals(m.getString("approval_status"))
+                    && userId.equals(m.getUUID("submitted_by"));
+                return snapshotAll(tx, managerId, changes, places, fromRecord, 0, new ArrayList<>());
+            })
+            .compose(snapshotted -> editRepo.markCareerEditApply(tx)
+                .compose(v -> editRepo.upsertCareerEdit(tx, managerId, userId, newName, explanation))
+                .compose(parent -> {
+                    UUID editId = parent.getUUID("id");
+                    return editRepo.replaceChangeSet(tx, editId, snapshotted)
+                        .compose(v -> selfApplies[0]
+                            ? careerApplier.applyAndApprove(tx, managerId, editId, explanation,
+                                    userId, userId, newName, new JsonObject())
+                                .map(applied -> "applied")
+                            : Future.succeededFuture("pending"))
+                        .map(status -> new JsonObject()
+                            .put("id", editId.toString())
+                            .put("managerId", managerId)
+                            .put("newName", newName)
+                            .put("explanation", explanation)
+                            .put("positions", snapshotted.size())
+                            .put("changeFormat", "career_editor")
+                            .put("status", status)
+                            .put("createdAt", parent.getOffsetDateTime("created_at").toString()));
+                }));
+    }
+
+    /**
+     * Attach to each targeted position the employment as it stands right now, and refuse any that
+     * does not belong to this manager.
+     *
+     * <h2>The authorization this performs</h2>
+     *
+     * <p>{@code roleId} arrives from the client, so without this check a contributor could propose
+     * a change to an employment belonging to an entirely different manager and have a moderator
+     * approve it while reading this manager's page. The employment must be this manager's, and
+     * {@code career_identity UNIQUE (id, manager_id)} is the constraint that makes the pairing
+     * meaningful.
+     *
+     * <h2>Why a loop rather than one query</h2>
+     *
+     * <p>Each position needs its own row locked and read, and the number of positions in one
+     * contribution is small. Composing sequentially keeps the locks taken in a stable order, which
+     * is what stops two contributors submitting overlapping change sets from deadlocking.
+     */
+    private Future<List<EditRepository.EmploymentChange>> snapshotAll(
+            SqlConnection tx, long managerId, List<EditRepository.EmploymentChange> changes,
+            List<CorpusPlace> places, List<Boolean> fromRecord, int index,
+            List<EditRepository.EmploymentChange> out) {
+
+        if (index >= changes.size()) return Future.succeededFuture(out);
+        EditRepository.EmploymentChange c = changes.get(index);
+        CorpusPlace place = index < places.size() ? places.get(index) : null;
+
+        boolean isManagerRecord = index < fromRecord.size() && Boolean.TRUE.equals(fromRecord.get(index));
+
+        if (c.roleId() == null && isManagerRecord) {
+            /*
+              WRITE DOWN WHAT THE PROFILE ALREADY SAYS, then correct it.
+
+              Not inventing an employment: the manager row asserts this company and title, and the
+              profile has been displaying it. Materialising it gives the correction a real
+              career_history.id to name, which is the only identifier a change may use - and it
+              means everything downstream (the audit trail, the rating snapshot sync, staleness)
+              works on it exactly as it does on any other employment.
+            */
+            return materialiseManagerRecordEmployment(tx, managerId)
+                .compose(role -> {
+                    EditRepository.EmploymentSnapshot snap = new EditRepository.EmploymentSnapshot(
+                        role.getString("title"), role.getLong("company_id"),
+                        role.getOffsetDateTime("start_date"), role.getOffsetDateTime("end_date"),
+                        role.getBoolean("period_known"), role.getString("employment_status"),
+                        DeclaredLocation.NONE, role.getString("state"),
+                        role.getOffsetDateTime("updated_at"));
+                    EditRepository.EmploymentChange asCorrection =
+                        new EditRepository.EmploymentChange(
+                            EditRepository.EmploymentChange.CORRECT, role.getLong("id"),
+                            c.changedFields(), c.title(), c.companyId(), c.companyName(),
+                            c.startDate(), c.endDate(), c.periodKnown(), c.employmentStatus(),
+                            c.location(), snap, c.position());
+                    return resolveLocation(tx, asCorrection, place, role.getLong("company_id"))
+                        .compose(withLocation -> {
+                            out.add(withLocation);
+                            return snapshotAll(tx, managerId, changes, places, fromRecord,
+                                               index + 1, out);
+                        });
+                });
+        }
+
+        if (c.roleId() == null) {
+            // An addition is written against nothing, so there is no snapshot to take. Its
+            // location belongs to the company it names.
+            return resolveLocation(tx, c, place, c.companyId())
+                .compose(withLocation -> {
+                    out.add(withLocation);
+                    return snapshotAll(tx, managerId, changes, places, fromRecord, index + 1, out);
+                });
+        }
+        return editRepo.readEmploymentForSnapshot(tx, c.roleId())
+            .compose(opt -> {
+                if (opt.isEmpty()) {
+                    return Future.failedFuture(ServiceException.notFound(
+                        "That employment no longer exists, so it cannot be corrected. Reload the "
+                        + "profile and try again."));
+                }
+                Row r = opt.get();
+                if (r.getLong("manager_id") != managerId) {
+                    return Future.failedFuture(ServiceException.badRequest(
+                        "That employment belongs to a different manager."));
+                }
+                String state = r.getString("state");
+                if (!"accepted".equals(state) && !"proposed".equals(state)) {
+                    return Future.failedFuture(ServiceException.conflict(
+                        "That employment is " + state + ", so it cannot be corrected."));
+                }
+                EditRepository.EmploymentSnapshot snap = new EditRepository.EmploymentSnapshot(
+                    r.getString("title"),
+                    r.getLong("company_id"),
+                    r.getOffsetDateTime("start_date"),
+                    r.getOffsetDateTime("end_date"),
+                    r.getBoolean("period_known"),
+                    r.getString("employment_status"),
+                    new DeclaredLocation(
+                        r.getString("declared_country"), r.getString("declared_state"),
+                        r.getString("declared_city"), r.getString("declared_precision"),
+                        r.getLong("company_location_id"),
+                        r.getString("declared_source"), r.getString("declared_text")),
+                    state,
+                    r.getOffsetDateTime("updated_at"));
+
+                EditRepository.EmploymentChange withSnapshot = new EditRepository.EmploymentChange(
+                    c.intent(), c.roleId(), c.changedFields(), c.title(), c.companyId(),
+                    c.companyName(), c.startDate(), c.endDate(), c.periodKnown(),
+                    c.employmentStatus(), c.location(), snap, c.position());
+
+                /*
+                  WHICH COMPANY THE LOCATION BELONGS TO.
+
+                  A location is owned by exactly one company, and the resolver refuses one that
+                  belongs to another. Correcting where an existing employment was held means a
+                  place of the company it is ALREADY at; superseding means a place of the company
+                  it is moving TO. Using the wrong one here would reject a legitimate building or,
+                  worse, attach a company's facets to a contribution about somebody else.
+                */
+                Long locationCompany =
+                    EditRepository.EmploymentChange.SUPERSEDE.equals(c.intent())
+                        ? (c.companyId() != null ? c.companyId() : snap.companyId())
+                        : snap.companyId();
+
+                return resolveLocation(tx, withSnapshot, place, locationCompany)
+                    .compose(resolved -> {
+                        out.add(resolved);
+                        return snapshotAll(tx, managerId, changes, places, fromRecord, index + 1, out);
+                    });
+            });
+    }
+
+
+    /**
+     * Write the employment the manager record already asserts, or return the one that is already
+     * there.
+     *
+     * <p>Idempotent on {@code career_unique_known_employment}'s shape: if two people open the
+     * editor at once, the second finds the row the first created rather than adding a duplicate.
+     * {@code source = 'import'} because the statement came from the manager record rather than
+     * from the person submitting now.
+     */
+    private Future<Row> materialiseManagerRecordEmployment(SqlConnection tx, long managerId) {
+        return tx.preparedQuery("""
+                WITH existing AS (
+                    SELECT ch.* FROM career_history ch, managers m
+                     WHERE m.id = $1 AND ch.manager_id = m.id
+                       AND ch.state IN ('accepted', 'proposed')
+                       AND ch.company_id IS NOT DISTINCT FROM m.company_id
+                       AND ch.title_key = normalise_title(m.title)
+                     LIMIT 1
+                ), created AS (
+                    INSERT INTO career_history
+                        (manager_id, company, company_id, title, period_known, state, source,
+                         employment_status, status_basis, status_as_of, status_resolved_at,
+                         declared_country, declared_state, declared_city,
+                         declared_precision, company_location_id, declared_source, declared_text)
+                    SELECT m.id, m.company, m.company_id, m.title, FALSE, 'accepted', 'import',
+                           CASE WHEN m.status = 'active' THEN 'ongoing' ELSE 'unknown' END,
+                           /*
+                             employment_status_is_grounded wants a basis, an as-of and a
+                             resolved-at for any status that is not 'unknown', and it is a CHECK,
+                             so it fires on THIS insert - setting them afterwards is too late.
+                             'moderator' rather than 'contributor_claim', which
+                             employment_status_claim_basis_pairs would require a claim row for.
+                           */
+                           CASE WHEN m.status = 'active' THEN 'moderator' ELSE NULL END,
+                           CASE WHEN m.status = 'active' THEN now()       ELSE NULL END,
+                           CASE WHEN m.status = 'active' THEN now()       ELSE NULL END,
+                           m.declared_country, m.declared_state, m.declared_city,
+                           m.declared_precision, m.company_location_id, m.declared_source,
+                           m.declared_text
+                      FROM managers m
+                     WHERE m.id = $1
+                       AND m.company_id IS NOT NULL
+                       AND NOT EXISTS (SELECT 1 FROM existing)
+                    RETURNING *
+                )
+                SELECT * FROM existing UNION ALL SELECT * FROM created
+                """)
+            .execute(Tuple.of(managerId))
+            .compose(rs -> {
+                if (!rs.iterator().hasNext()) {
+                    return Future.failedFuture(ServiceException.badRequest(
+                        "This manager has no company on record, so its current position cannot be "
+                        + "written down yet. Add the position instead."));
+                }
+                return Future.succeededFuture(rs.iterator().next());
+            });
+    }
+
+    /**
+     * Promote and validate one position's location, leaving the position otherwise untouched.
+     *
+     * <p>Goes through {@link DeclaredLocationResolver}, the same component every other form uses,
+     * so a building picked from the corpus becomes a real {@code company_locations} row exactly
+     * once and a coarse answer stays coarse. A position that said nothing about location keeps
+     * saying nothing: {@code DeclaredLocation.NONE} resolves to itself, which is what preserves an
+     * unknown location as unknown.
+     */
+    private Future<EditRepository.EmploymentChange> resolveLocation(
+            SqlConnection tx, EditRepository.EmploymentChange c, CorpusPlace place, Long companyId) {
+
+        if (!c.changes(EditRepository.EmploymentChange.LOCATION)) {
+            return Future.succeededFuture(c);
+        }
+        return declaredLocations.resolve(tx, c.locationOrNone(), place, companyId)
+            .map(resolved -> new EditRepository.EmploymentChange(
+                c.intent(), c.roleId(), c.changedFields(), c.title(), c.companyId(),
+                c.companyName(), c.startDate(), c.endDate(), c.periodKnown(),
+                c.employmentStatus(), resolved, c.snapshot(), c.position()));
+    }
+
+
+    /**
+     * The manager's location as the profile actually displays it, for prefilling an employment that
+     * has none of its own.
+     *
+     * <h2>Why it reads two layers</h2>
+     *
+     * <p>{@code managers} carries BOTH a declared location ({@code declared_country} and friends,
+     * what somebody stated) and a resolved one ({@code country} / {@code state} / {@code city},
+     * what the platform holds). Location is mandatory to add or rate a manager, so every manager
+     * has one - but the older flows wrote the RESOLVED columns and left {@code declared_*} empty.
+     *
+     * <p>Reading only {@code declared_*} therefore reported "No location set" for exactly the
+     * managers whose profile was displaying a location, which is what this is here to stop.
+     *
+     * <p>The precision rule mirrors {@code visibleManagerLocation()} in the frontend's
+     * location library, deliberately and identically: a specific building is `exact`, then city,
+     * then state, then country, then nothing. If that one changes, this changes with it.
+     *
+     * <p>NULLIF on each part because the resolved columns hold '' in places, and an empty string
+     * would otherwise read as an answer and pick the wrong precision.
+     */
+    private static final String MANAGER_LOCATION_SQL = """
+            NULLIF(btrim(COALESCE(m.declared_country, m.country)), '') AS loc_country,
+            NULLIF(btrim(COALESCE(m.declared_state,   m.state)),   '') AS loc_state,
+            NULLIF(btrim(COALESCE(m.declared_city,    m.city)),    '') AS loc_city,
+            COALESCE(
+                m.declared_precision,
+                CASE
+                  WHEN m.company_location_id IS NOT NULL                                   THEN 'exact'
+                  WHEN NULLIF(btrim(COALESCE(m.declared_city,    m.city)),    '') IS NOT NULL THEN 'city'
+                  WHEN NULLIF(btrim(COALESCE(m.declared_state,   m.state)),   '') IS NOT NULL THEN 'state'
+                  WHEN NULLIF(btrim(COALESCE(m.declared_country, m.country)), '') IS NOT NULL THEN 'country'
+                END)                                                   AS loc_precision,
+            m.company_location_id                                      AS loc_location_id,
+            m.declared_source                                          AS loc_source,
+            m.declared_text                                            AS loc_text
+            """;
+
+    /**
+     * Every employment the career editor may show, each with the id that identifies it.
+     *
+     * <h2>Why a projection of its own rather than the trajectory the profile already sends</h2>
+     *
+     * <p>The trajectory is grouped for display: one tile can be two separate jobs at one employer,
+     * which is right for a timeline and wrong for an editor, where each employment has to be
+     * editable on its own. It also carries no employment status and no per-employment location,
+     * because nothing displayed them until now.
+     *
+     * <p>Public, and deliberately. A logged-out visitor must be able to open the form and fill it
+     * in - they are asked to sign in at submit, never before - so the editor cannot depend on a
+     * read that requires an account. Nothing here is more than the profile already publishes.
+     *
+     * <p>Rejected and superseded employments are left out. They are history, not something a
+     * contributor can correct, and the submission service refuses them anyway.
+     */
+    public Future<JsonArray> getEmploymentsForEditing(long managerId) {
+        return db.preparedQuery("""
+                SELECT ch.id, ch.title, ch.company, ch.company_id,
+                       ch.start_date, ch.end_date, ch.period_known,
+                       ch.employment_status, ch.state,
+                       /*
+                         THE CURRENT ROLE INHERITS THE MANAGER'S LOCATION WHEN IT HAS NONE.
+
+                         V109 gave employments their own location and deliberately backfilled
+                         nothing, so every role recorded before it has none - and the editor showed
+                         a blank location for the role the profile displays a location for.
+
+                         A blank field invites retyping, and a retyped location is a new assertion.
+                         Worse, somebody correcting a title would see an empty location sitting
+                         beside it with no way to tell whether submitting would clear it.
+
+                         ONLY the current role, and only when it has said nothing itself. A
+                         HISTORICAL role keeps its unknown location unknown: the manager's
+                         present-day location is not evidence about where a job was held years ago,
+                         which is the inference the declared/observed split exists to prevent.
+
+                         Prefilled into a VISIBLE field, which is this codebase's own test for the
+                         difference: a value somebody can see, change and submit unchanged is a
+                         declaration, where one attached behind their back is an inference.
+                       */
+                       COALESCE(ch.declared_country,   mgr.inherit_country)   AS declared_country,
+                       COALESCE(ch.declared_state,     mgr.inherit_state)     AS declared_state,
+                       COALESCE(ch.declared_city,      mgr.inherit_city)      AS declared_city,
+                       COALESCE(ch.declared_precision, mgr.inherit_precision) AS declared_precision,
+                       COALESCE(ch.company_location_id, mgr.inherit_location_id) AS company_location_id,
+                       COALESCE(ch.declared_source,    mgr.inherit_source)    AS declared_source,
+                       COALESCE(ch.declared_text,      mgr.inherit_text)      AS declared_text,
+                       (ch.declared_precision IS NULL AND ch.declared_text IS NULL
+                        AND ch.company_location_id IS NULL
+                        AND mgr.inherit_precision IS NOT NULL) AS location_from_manager,
+                       c.domain AS company_domain, c.logo_url AS company_logo_url,
+                       (SELECT COUNT(*) FROM role_claims rc
+                         WHERE rc.resolved_role_id = ch.id
+                           AND rc.resolution IN ('linked','created')) AS claim_count
+                FROM career_history ch
+                LEFT JOIN companies c ON c.id = ch.company_id
+                /*
+                  The manager's own location, offered ONLY to a current role that has none. The
+                  CASE is what scopes it: a previous role joins to all-nulls and inherits nothing.
+                */
+                LEFT JOIN LATERAL (
+                    SELECT CASE WHEN cur.is_current THEN loc.loc_country     END AS inherit_country,
+                           CASE WHEN cur.is_current THEN loc.loc_state       END AS inherit_state,
+                           CASE WHEN cur.is_current THEN loc.loc_city        END AS inherit_city,
+                           CASE WHEN cur.is_current THEN loc.loc_precision   END AS inherit_precision,
+                           CASE WHEN cur.is_current THEN loc.loc_location_id END AS inherit_location_id,
+                           CASE WHEN cur.is_current THEN loc.loc_source      END AS inherit_source,
+                           CASE WHEN cur.is_current THEN loc.loc_text        END AS inherit_text
+                      FROM managers m,
+                           LATERAL (SELECT
+                           """ + MANAGER_LOCATION_SQL + """
+                           ) loc,
+                           LATERAL (SELECT (ch.employment_status = 'ongoing'
+                                            OR (ch.end_date IS NULL
+                                                AND ch.employment_status <> 'ended')) AS is_current) cur
+                     WHERE m.id = ch.manager_id
+                ) mgr ON TRUE
+                WHERE ch.manager_id = $1
+                  AND ch.state IN ('accepted', 'proposed')
+                ORDER BY
+                  -- Current roles first, then previous ones most recent first, which is the order
+                  -- the editor lists them in. An employment with no end date and a status that is
+                  -- not 'ended' is current; one with neither dates nor a stated status sorts with
+                  -- the past rather than claiming to be current.
+                  (ch.employment_status = 'ongoing'
+                     OR (ch.end_date IS NULL AND ch.employment_status <> 'ended')) DESC,
+                  /*
+                     NULLS LAST on both, so an undated position sorts to the END of its group.
+                     This read NULLS FIRST on the end date, which put "they left, date unknown"
+                     ABOVE a role that ended last year - an unknown date presented as the most
+                     recent one. Unknown is not recent; it is unknown, and it sorts last.
+
+                     The same convention now applies to the trajectory and the manager detail, so
+                     the three surfaces agree instead of each answering differently.
+                  */
+                  ch.end_date DESC NULLS LAST,
+                  ch.start_date DESC NULLS LAST,
+                  ch.id DESC
+                """)
+            .execute(Tuple.of(managerId))
+            .compose(rows -> {
+                JsonArray out = new JsonArray();
+                for (Row r : rows) {
+                    String status = r.getString("employment_status");
+                    OffsetDateTime end = r.getOffsetDateTime("end_date");
+                    boolean current = "ongoing".equals(status)
+                        || (end == null && !"ended".equals(status));
+                    out.add(new JsonObject()
+                        .put("id",               r.getLong("id"))
+                        .put("title",            r.getString("title"))
+                        .put("company",          r.getString("company"))
+                        .put("companyId",        r.getLong("company_id"))
+                        .put("companyDomain",    r.getString("company_domain"))
+                        .put("companyLogoUrl",   r.getString("company_logo_url"))
+                        .put("startDate",        yearMonth(r.getOffsetDateTime("start_date")))
+                        .put("endDate",          yearMonth(end))
+                        .put("periodKnown",      r.getBoolean("period_known"))
+                        .put("employmentStatus", status)
+                        .put("state",            r.getString("state"))
+                        .put("isCurrent",        current)
+                        // How many contributors have a resolved claim on this employment. The
+                        // editor shows it beside a company correction, because superseding an
+                        // employment moves their claims with it and somebody deciding to do that
+                        // should know how many people it touches.
+                        .put("claimCount",       r.getLong("claim_count"))
+                        .put("declaredCountry",  r.getString("declared_country"))
+                        .put("declaredState",   r.getString("declared_state"))
+                        .put("declaredCity",     r.getString("declared_city"))
+                        .put("declaredPrecision",r.getString("declared_precision"))
+                        .put("companyLocationId",r.getLong("company_location_id"))
+                        .put("declaredSource",   r.getString("declared_source"))
+                        .put("declaredText",     r.getString("declared_text"))
+                        // Where that location came from, so the editor can say so rather than
+                        // presenting an inherited value as one somebody stated about this role.
+                        .put("locationFromManager",
+                             Boolean.TRUE.equals(r.getBoolean("location_from_manager"))));
+                }
+                return withManagerRecordPosition(managerId, out);
+            });
+    }
+
+    /**
+     * The position the MANAGER RECORD asserts, when no employment row has been written for it yet.
+     *
+     * <h2>Why this is needed at all</h2>
+     *
+     * <p>Every manager carries a {@code title} and a {@code company} on its own row, and most of
+     * them have no {@code career_history} row: a manager created by somebody searching for them
+     * has a current position stated on the profile and nothing in the employment table. The editor
+     * showed those managers "No positions are recorded yet", which is wrong on its face - the
+     * profile is displaying a position right above it - and left no way to correct the one title
+     * most likely to be wrong.
+     *
+     * <h2>It is a read, so nothing is written</h2>
+     *
+     * <p>The entry comes back with {@code id: null} and {@code fromManagerRecord: true}. Nothing is
+     * inserted while somebody merely opens the form; the row is materialised on SUBMIT, from the
+     * same manager record, and the change is then applied to it as an ordinary correction. A GET
+     * that creates rows would let anyone fill the table by loading pages.
+     *
+     * <h2>Suppressed once a real row exists</h2>
+     *
+     * <p>If an employment at the same company with the same normalised title is already recorded,
+     * that row IS this position and the synthetic one would be a duplicate of it.
+     */
+    private Future<JsonArray> withManagerRecordPosition(long managerId, JsonArray employments) {
+        return db.preparedQuery("""
+                SELECT m.title, m.company, m.company_id, m.status,
+                       """ + MANAGER_LOCATION_SQL + """
+                       , c.domain AS company_domain, c.logo_url AS company_logo_url,
+                       EXISTS (SELECT 1 FROM career_history ch
+                                WHERE ch.manager_id = m.id
+                                  AND ch.state IN ('accepted', 'proposed')
+                                  AND ch.company_id IS NOT DISTINCT FROM m.company_id
+                                  AND ch.title_key = normalise_title(m.title)) AS already_recorded
+                  FROM managers m
+                  LEFT JOIN companies c ON c.id = m.company_id
+                 WHERE m.id = $1
+                """)
+            .execute(Tuple.of(managerId))
+            .map(rows -> {
+                if (!rows.iterator().hasNext()) return employments;
+                Row m = rows.iterator().next();
+                if (m.getBoolean("already_recorded")) return employments;
+                String title = m.getString("title");
+                if (title == null || title.isBlank()) return employments;
+
+                // managers.status is itself binary - 'active' or 'retired' - and the status
+                // question is now binary too, so it maps straight across. It previously yielded
+                // `unknown` for a retired manager, which is no longer an answer anybody may give.
+                boolean active = "active".equals(m.getString("status"));
+
+                JsonArray out = new JsonArray()
+                    .add(new JsonObject()
+                        .put("id",               (Long) null)
+                        .put("fromManagerRecord", true)
+                        .put("title",            title)
+                        .put("company",          m.getString("company"))
+                        .put("companyId",        m.getLong("company_id"))
+                        .put("companyDomain",    m.getString("company_domain"))
+                        .put("companyLogoUrl",   m.getString("company_logo_url"))
+                        .put("startDate",        (String) null)
+                        .put("endDate",          (String) null)
+                        .put("periodKnown",      false)
+                        .put("employmentStatus", active ? "ongoing" : "ended")
+                        .put("state",            "accepted")
+                        .put("isCurrent",        active)
+                        .put("claimCount",       0L)
+                        // By definition: this entry IS the manager record, so its location came
+                        // from there. Real rows set the same flag when they inherit, and a caller
+                        // that wants to label an inherited location should not have to special-case
+                        // which of the two shapes it is looking at.
+                        .put("locationFromManager", true)
+                        .put("declaredCountry",  m.getString("loc_country"))
+                        .put("declaredState",    m.getString("loc_state"))
+                        .put("declaredCity",     m.getString("loc_city"))
+                        .put("declaredPrecision",m.getString("loc_precision"))
+                        .put("companyLocationId",m.getLong("loc_location_id"))
+                        .put("declaredSource",   m.getString("loc_source"))
+                        .put("declaredText",     m.getString("loc_text")));
+                if (active) {
+                    // Current, so it belongs at the front with the other current roles.
+                    employments.forEach(out::add);
+                    return out;
+                }
+                /*
+                  Not current, so it must NOT be prepended: a manager whose own status is not
+                  'active' would otherwise show a non-current position above their current ones.
+                  managers.status is the legacy combined field, so this yields `unknown` rather
+                  than asserting an end nobody stated, and an unknown position sorts with the past.
+                */
+                JsonObject synthetic = out.getJsonObject(0);
+                JsonArray ordered = new JsonArray();
+                employments.forEach(ordered::add);
+                ordered.add(synthetic);
+                return ordered;
+            });
+    }
+
+    /** A date as the year and month the form actually asks for, never a fabricated day. */
+    private static String yearMonth(OffsetDateTime t) {
+        if (t == null) return null;
+        LocalDate d = t.toLocalDate();
+        return String.format("%04d-%02d", d.getYear(), d.getMonthValue());
     }
 
     public Future<JsonObject> getPendingEditsForManager(long managerId, String auth0Id) {

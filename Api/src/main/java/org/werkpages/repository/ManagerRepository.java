@@ -114,7 +114,7 @@ public class ManagerRepository {
                         'companyDomain', cc.domain,
                         'companyBrandfetchIconUrl', cc.brandfetch_icon_url,
                         'companyLogoUrl', cc.logo_url
-                    ) ORDER BY ch2.start_date DESC) AS career_history
+                    ) ORDER BY ch2.start_date DESC NULLS LAST) AS career_history
                 FROM career_history ch2
                 LEFT JOIN companies cc ON cc.id = ch2.company_id
                 GROUP BY ch2.manager_id
@@ -214,7 +214,7 @@ public class ManagerRepository {
                     json_agg(json_build_object(
                         'id', ch.id, 'company', ch.company, 'title', ch.title,
                         'startDate', ch.start_date, 'endDate', ch.end_date
-                    ) ORDER BY ch.start_date DESC)
+                    ) ORDER BY ch.start_date DESC NULLS LAST)
                     FILTER (WHERE ch.id IS NOT NULL), '[]'
                 ) AS career_history
             FROM managers m

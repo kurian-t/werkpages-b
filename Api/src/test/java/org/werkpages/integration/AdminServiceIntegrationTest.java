@@ -13,6 +13,7 @@ import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.werkpages.repository.AnonymousGhostSlotRepository;
 import org.werkpages.repository.CompanyRepository;
 import org.werkpages.repository.EditRepository;
 import org.werkpages.repository.ManagerRepository;
@@ -1650,4 +1651,117 @@ class AdminServiceIntegrationTest {
                 """).execute(Tuple.of(name)).map(rs -> rs.iterator().next().getLong("id")));
     }
 
+
+    // ── Is automatic manager creation paused? ────────────────────────────
+
+    /*
+      WRITTEN 2026-11-16. This banner has existed here for some time and had NO coverage at all.
+
+      Anonymous searches publish managers, capped by two rolling site-wide ceilings. When either
+      holds, the searches fall back to the pending queue and NOBODY IS SHOWN AN ERROR - correct for
+      the searcher, and the reason a pause is otherwise completely invisible. The admin panel is
+      the only surface it reaches, which makes this reading the only indicator there is, and an
+      untested indicator is indistinguishable from the feature quietly not working.
+
+      The ceilings and the rows behind them are shared with the other brand, so this reports the
+      platform's rate rather than this product's share of it. The same tests exist in
+      RateMyManagers, where the banner was ported to at the same time.
+    */
+
+    @Test
+    void ghostCreationStatusReportsTheRateAgainstBothCeilings() throws Exception {
+        String adminAuth0 = insertUser("auth0|wp-ghost-status-1", "GhostStatus1", "admin");
+        insertGhostsCreatedMinutesAgo(3, 10);
+
+        JsonObject status = await(service.ghostCreationStatus(adminAuth0));
+
+        assertEquals(3L, status.getLong("lastHour"));
+        assertEquals(3L, status.getLong("lastDay"));
+        assertEquals(AnonymousGhostSlotRepository.MAX_PER_HOUR_SITE_WIDE,
+                     status.getInteger("maxPerHour").intValue(),
+                     "the ceiling is reported with the count, or the count means nothing");
+        assertEquals(AnonymousGhostSlotRepository.MAX_PER_DAY_SITE_WIDE,
+                     status.getInteger("maxPerDay").intValue());
+        assertFalse(status.getBoolean("paused"));
+        assertNull(status.getString("trippedBy"));
+    }
+
+    @Test
+    void aGhostOlderThanADayIsNotCountedAtAll() throws Exception {
+        /*
+          Rolling windows, not calendar buckets. A manager created last week says nothing about
+          whether creation is throttled now, and counting it would present a permanent false
+          reading that rises forever.
+        */
+        String adminAuth0 = insertUser("auth0|wp-ghost-status-2", "GhostStatus2", "admin");
+        insertGhostsCreatedMinutesAgo(2, 90);        // inside the day, outside the hour
+        insertGhostsCreatedMinutesAgo(4, 60 * 30);   // 30 hours ago, outside both
+
+        JsonObject status = await(service.ghostCreationStatus(adminAuth0));
+
+        assertEquals(0L, status.getLong("lastHour"), "90 minutes ago is not in the last hour");
+        assertEquals(2L, status.getLong("lastDay"), "and 30 hours ago is not in the last day");
+    }
+
+    @Test
+    void theHourlyCeilingPresentsAsPausedAndNamesItself() throws Exception {
+        /*
+          Which ceiling tripped is the actionable half. A burst that clears in an hour and a day
+          that is simply over its cap call for different responses, and "paused" alone cannot tell
+          an admin which one they are looking at.
+        */
+        String adminAuth0 = insertUser("auth0|wp-ghost-status-3", "GhostStatus3", "admin");
+        insertGhostsCreatedMinutesAgo(AnonymousGhostSlotRepository.MAX_PER_HOUR_SITE_WIDE, 5);
+
+        JsonObject status = await(service.ghostCreationStatus(adminAuth0));
+
+        assertTrue(status.getBoolean("paused"));
+        assertEquals("hourly", status.getString("trippedBy"));
+    }
+
+    @Test
+    void onlyGhostsCount() throws Exception {
+        /*
+          The ceiling is on AUTOMATIC public creation. An approved manager somebody submitted
+          deliberately is not that, and counting it would throttle the anonymous path for volume it
+          never produced.
+        */
+        String adminAuth0 = insertUser("auth0|wp-ghost-status-4", "GhostStatus4", "admin");
+        await(pool.query(
+                "INSERT INTO managers(name,company,title,status,approval_status,overall_rating,"
+                + "reviews_count,category_averages,created_at) "
+                + "VALUES ('Dee Liberate','Acme','Manager','active','approved',0,0,'{}'::jsonb,now())")
+            .execute().mapEmpty());
+
+        JsonObject status = await(service.ghostCreationStatus(adminAuth0));
+
+        assertEquals(0L, status.getLong("lastHour"));
+        assertEquals(0L, status.getLong("lastDay"));
+    }
+
+    @Test
+    void ghostCreationStatusIsAdminOnly() throws Exception {
+        // Backend authorization, not a hidden banner.
+        String plain = insertUser("auth0|wp-ghost-status-5", "GhostStatus5", "user");
+
+        assertThrows(Exception.class, () -> await(service.ghostCreationStatus(plain)));
+    }
+
+    /** Ghost managers backdated by {@code minutesAgo}, which is what the rolling windows read. */
+    private void insertGhostsCreatedMinutesAgo(int howMany, int minutesAgo) throws Exception {
+        await(pool.preparedQuery(
+                "INSERT INTO managers(name,company,title,status,approval_status,overall_rating,"
+                + "reviews_count,category_averages,created_at) "
+                /*
+                  $2 is cast explicitly, and the NAME no longer interpolates it. Used in both a
+                  text concatenation and make_interval, Postgres inferred text for the parameter
+                  and refused with "function make_interval(mins => text) does not exist" - the
+                  inference is per parameter, not per use.
+                */
+                + "SELECT 'Ghost ' || g || ' ' || clock_timestamp(), 'Acme', 'Manager', "
+                + "'active', 'ghost', 0, 0, '{}'::jsonb, "
+                + "now() - make_interval(mins => $2::int) "
+                + "FROM generate_series(1, $1::int) AS g")
+            .execute(Tuple.of(howMany, minutesAgo)).mapEmpty());
+    }
 }

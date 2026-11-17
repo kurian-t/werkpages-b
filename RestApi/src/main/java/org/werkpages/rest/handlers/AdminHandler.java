@@ -948,4 +948,28 @@ public class AdminHandler {
         try { return Math.min(max, Math.max(min, Integer.parseInt(raw))); }
         catch (NumberFormatException e) { return defaultVal; }
     }
+
+    // ── GET /api/admin/edits/:editId/change-set ───────────────────────────────
+
+    /**
+     * The complete set of changes behind one edit request.
+     *
+     * <p>Each position reports what the employment said when the contribution was written, what
+     * the contributor proposes, and what it says now, so a moderator can tell a correction from a
+     * revert and can see that somebody else has already changed it.
+     */
+    public void handleEditChangeSet(RoutingContext ctx) {
+        String auth0Id = ctx.get("auth0Id");
+        java.util.UUID editId;
+        try {
+            editId = java.util.UUID.fromString(ctx.pathParam("editId"));
+        } catch (IllegalArgumentException e) {
+            ctx.response().setStatusCode(400).putHeader("Content-Type", "application/json")
+               .end(new JsonObject().put("error", "Invalid edit id").encode());
+            return;
+        }
+        service.editChangeSet(auth0Id, editId)
+            .onSuccess(json -> ok(ctx, json))
+            .onFailure(err -> ManagersHandler.handleError(ctx, err));
+    }
 }

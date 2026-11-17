@@ -26,6 +26,7 @@ import org.werkpages.service.DeclaredLocation;
 import org.werkpages.service.LocationStatsProjector;
 import org.werkpages.service.LocationStatsRebuilder;
 import org.werkpages.service.ManagerService;
+import org.werkpages.service.ReviewDisposition;
 import org.werkpages.service.SubmissionContext;
 
 import java.math.BigDecimal;
@@ -54,6 +55,18 @@ class LocationStatsIntegrationTest {
     static Pool                  pool;
     static ManagerService        service;
     static LocationStatsRebuilder rebuilder;
+    /*
+      The repository and the disposition setter PRODUCTION uses.
+
+      These three tests used to call two methods on ManagerService that nothing else called -
+      a second restore sweep and a second disposition setter, both since deleted. Asserting
+      against a duplicate proves the duplicate works; this asserts against the code that runs.
+
+      restoreExpiredDeletions is what MaintenanceSweep calls. ReviewDisposition.set is what
+      ProofOfWorkService, AdminService, ModerationService and the merge all call.
+    */
+    static ReviewRepository      reviewRepo;
+    static ReviewDisposition     dispositions;
 
     @BeforeAll
     static void setUpAll() {
@@ -74,6 +87,8 @@ class LocationStatsIntegrationTest {
             new ManagerRepository(pool), new ReviewRepository(pool), new UserRepository(pool),
             new EditRepository(pool), new ReportRepository(pool), pool);
         rebuilder = new LocationStatsRebuilder(pool, new LocationStatsProjector());
+        reviewRepo   = new ReviewRepository(pool);
+        dispositions = new ReviewDisposition();
     }
 
     @BeforeEach
@@ -277,7 +292,7 @@ class LocationStatsIntegrationTest {
 
         // Age the deletion past the window, exactly as three days would.
         await(pool.query("UPDATE reviews SET deleted_at = now() - INTERVAL '4 days' WHERE deleted_at IS NOT NULL").execute());
-        await(service.restoreExpiredReviewDeletions());
+        await(reviewRepo.restoreExpiredDeletions());
 
         assertTrue(await(rebuilder.reconcile()).isEmpty(),
             "a restored rating is public again, so it must count again");
@@ -295,10 +310,10 @@ class LocationStatsIntegrationTest {
         rate("auth0|held", managerId, cityLevel("Canada", "Ontario", "Toronto"));
         UUID reviewId = ownReviewId("auth0|held", managerId);
 
-        await(service.setReviewDisposition(reviewId, "held"));
+        await(dispositions.set(pool, reviewId, "held"));
         assertTrue(await(rebuilder.reconcile()).isEmpty(), "held is not public, so it must not count");
 
-        await(service.setReviewDisposition(reviewId, "live"));
+        await(dispositions.set(pool, reviewId, "live"));
         assertTrue(await(rebuilder.reconcile()).isEmpty(), "released is public again, so it must count");
     }
 
@@ -308,7 +323,7 @@ class LocationStatsIntegrationTest {
         long managerId = ghost("Rex Rejected", companyId);
         rate("auth0|rej", managerId, cityLevel("Canada", "Ontario", "Toronto"));
 
-        await(service.setReviewDisposition(ownReviewId("auth0|rej", managerId), "rejected"));
+        await(dispositions.set(pool, ownReviewId("auth0|rej", managerId), "rejected"));
 
         assertTrue(await(rebuilder.reconcile()).isEmpty(),
             "a rejected rating is never published, so it must never count");

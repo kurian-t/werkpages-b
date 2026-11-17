@@ -519,6 +519,9 @@ public class MainVerticle extends AbstractVerticle {
                         routerFactory.addHandlerByOperationId("createDropOffReview",     managersHandler::handleDropOffReview);
                         routerFactory.addHandlerByOperationId("autosaveManagerReview",     managersHandler::handleAutosaveReview);
                         routerFactory.addHandlerByOperationId("createManagerEditRequest", managersHandler::handleCreateEditRequest);
+                        routerFactory.addHandlerByOperationId("getManagerEmployments", managersHandler::handleGetEmployments);
+                        routerFactory.addHandlerByOperationId("submitCareerEdit", managersHandler::handleCareerEdit);
+                        routerFactory.addHandlerByOperationId("getEditChangeSet", adminHandler::handleEditChangeSet);
                         routerFactory.addHandlerByOperationId("getManagerPendingEdits",   managersHandler::handleGetPendingEditsForManager);
                         routerFactory.addHandlerByOperationId("getAdminPendingEdits",     adminHandler::handleGetPendingEdits);
                         routerFactory.addHandlerByOperationId("adminModerationSummary",             moderationHandler::handleSummary);

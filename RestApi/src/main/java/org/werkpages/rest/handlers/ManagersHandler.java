@@ -1046,6 +1046,51 @@ public class ManagersHandler {
             .onFailure(err -> handleError(ctx, err));
     }
 
+    // ── GET /api/managers/:id/employments ─────────────────────────────────────
+
+    /**
+     * The manager's employments, each with the id the career editor identifies it by.
+     *
+     * <p>No authentication, deliberately. A logged-out visitor has to be able to open the editor
+     * and fill it in - they are asked to sign in at submit and never before - so this read cannot
+     * require an account. It publishes nothing the profile does not.
+     */
+    public void handleGetEmployments(RoutingContext ctx) {
+        long managerId;
+        try {
+            managerId = Long.parseLong(ctx.pathParam("id"));
+        } catch (NumberFormatException e) {
+            respond(ctx, 400, new JsonObject().put("error", "Invalid manager ID")); return;
+        }
+        service.getEmploymentsForEditing(managerId)
+            .onSuccess(list -> respond(ctx, 200, new JsonObject().put("data", list)))
+            .onFailure(err -> handleError(ctx, err));
+    }
+
+    // ── POST /api/managers/:id/career-edit ────────────────────────────────────
+
+    /**
+     * One contribution correcting any number of a manager's employments, plus their name.
+     *
+     * <p>401 when nobody is signed in, which the form handles by sending them to sign in with a
+     * returnTo back to the editor. The fields are never hidden behind that: the person fills the
+     * whole thing in first and is asked for an account only when they submit.
+     */
+    public void handleCareerEdit(RoutingContext ctx) {
+        String auth0Id = ctx.get("auth0Id");
+        if (auth0Id == null) { respond(ctx, 401, new JsonObject().put("error", "Unauthorized")); return; }
+        long managerId;
+        try {
+            managerId = Long.parseLong(ctx.pathParam("id"));
+        } catch (NumberFormatException e) {
+            respond(ctx, 400, new JsonObject().put("error", "Invalid manager ID")); return;
+        }
+        service.createCareerEditRequest(auth0Id, managerId, ctx.getBodyAsJson())
+            .onSuccess(json -> ctx.response().setStatusCode(201)
+                .putHeader("Content-Type", "application/json").end(json.encode()))
+            .onFailure(err -> handleError(ctx, err));
+    }
+
     // ── GET /api/managers/:id/pending-edits ───────────────────────────────────
 
     public void handleGetPendingEditsForManager(RoutingContext ctx) {

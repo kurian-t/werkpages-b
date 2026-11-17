@@ -127,7 +127,26 @@ class V108PlaceholderClassificationIntegrationTest {
             .load()
             .migrate();
 
-        assertEquals("108", headVersion(), "V108 must have applied");
+        /*
+          V108 APPLIED, which is not the same question as V108 being the newest.
+
+          This asserted that 108 was the HEAD, which is a proxy that fails the moment any migration
+          is added after it - V109 did exactly that - while saying nothing more about whether V108
+          itself ran. The message was always about application, so the assertion now is too.
+        */
+        assertTrue(appliedVersions().contains("108"), "V108 must have applied");
+    }
+
+    /** Every migration version recorded as successfully applied. */
+    private java.util.List<String> appliedVersions() throws Exception {
+        return await(pool.query("""
+                SELECT version FROM flyway_schema_history
+                 WHERE success AND version IS NOT NULL
+                """).execute().map(rs -> {
+                    java.util.List<String> out = new java.util.ArrayList<>();
+                    rs.forEach(r -> out.add(r.getString("version")));
+                    return out;
+                }));
     }
 
     @AfterAll

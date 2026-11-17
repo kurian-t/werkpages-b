@@ -3328,6 +3328,292 @@ paths:
                   error:
                     type: string
 
+  /api/managers/{id}/employments:
+    get:
+      operationId: getManagerEmployments
+      summary: The manager's employments, each with the id the career editor identifies it by
+      # Opts out of the global bearerAuth requirement, which is what makes it public. Without this
+      # the spec enforces a token and a logged-out visitor opening the editor gets a 401 - the
+      # fields would be hidden behind sign-in, which is the one thing a contribution form must
+      # never do.
+      security: []
+      description: >
+        Unauthenticated on purpose. A logged-out visitor must be able to open the career editor and
+        fill it in, being asked to sign in only at submit, so this read cannot require an account.
+        It publishes nothing the public profile does not.
+
+
+        Distinct from the profile's trajectory, which groups two spells at one employer into a
+        single tile for display. An editor has to address each employment on its own, and needs the
+        employment status and per-employment location the trajectory does not carry.
+      tags:
+        - Managers
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: The employments a contributor may correct
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id:
+                          type: integer
+                          format: int64
+                          nullable: true
+                          description: career_history.id, the only identifier that distinguishes
+                            two spells at one employer. NULL for the position the manager record
+                            asserts with no employment row written for it yet.
+                        fromManagerRecord:
+                          type: boolean
+                          description: This entry comes from the manager's own title and company
+                            rather than from an employment row. The profile already displays it, so
+                            the editor shows it first and the row is written on submit.
+                        title:
+                          type: string
+                        company:
+                          type: string
+                        companyId:
+                          type: integer
+                          format: int64
+                          nullable: true
+                        companyDomain:
+                          type: string
+                          nullable: true
+                        companyLogoUrl:
+                          type: string
+                          nullable: true
+                        startDate:
+                          type: string
+                          nullable: true
+                          description: Year and month, never a fabricated day. Null when unknown.
+                        endDate:
+                          type: string
+                          nullable: true
+                        periodKnown:
+                          type: boolean
+                        employmentStatus:
+                          type: string
+                          description: ongoing, ended, unknown or disputed. No enum here because an
+                            OpenAPI 3.0 enum combined with nullable rejects an explicit null.
+                        state:
+                          type: string
+                        isCurrent:
+                          type: boolean
+                        claimCount:
+                          type: integer
+                          format: int64
+                          description: Contributors with a resolved claim on this employment.
+                            Shown beside a company correction, because superseding moves their
+                            claims with it.
+                        declaredCountry:
+                          type: string
+                          nullable: true
+                        declaredState:
+                          type: string
+                          nullable: true
+                        declaredCity:
+                          type: string
+                          nullable: true
+                        declaredPrecision:
+                          type: string
+                          nullable: true
+                        companyLocationId:
+                          type: integer
+                          format: int64
+                          nullable: true
+                        declaredSource:
+                          type: string
+                          nullable: true
+                        declaredText:
+                          type: string
+                          nullable: true
+        '400':
+          description: Invalid manager ID
+
+  /api/managers/{id}/career-edit:
+    post:
+      operationId: submitCareerEdit
+      summary: One contribution correcting any number of a manager's employments, and their name
+      description: >
+        The whole submission is one coherent contribution: one explanation, one pending proposal per
+        contributor per manager, one moderator decision. Nothing is applied until it is approved.
+
+
+        A position either corrects an existing employment, adds a distinct one, or supersedes one
+        whose employer was wrong. Correcting and adding are deliberately different operations:
+        adding a current role never ends another, so somebody holding two jobs at once is recorded
+        as holding two jobs at once.
+      tags:
+        - Managers
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - explanation
+              properties:
+                name:
+                  type: string
+                  nullable: true
+                  description: A corrected name for the manager. A submission may change only the
+                    name and no employment at all.
+                explanation:
+                  type: string
+                  description: One explanation for the whole submission, collected during Review
+                    Changes. Reused as the reason on every field correction it produces, so nobody
+                    retypes the same sentence per field.
+                positions:
+                  type: array
+                  description: May be empty when only the name is being corrected.
+                  items:
+                    type: object
+                    required:
+                      - intent
+                      - changedFields
+                    properties:
+                      intent:
+                        type: string
+                        enum: [correct, add, supersede]
+                      roleId:
+                        type: integer
+                        format: int64
+                        nullable: true
+                        description: career_history.id of the employment being changed. Required for
+                          correct and supersede, and must be absent for add. Never identified by
+                          company name, which cannot tell two spells at one employer apart.
+                      fromManagerRecord:
+                        type: boolean
+                        nullable: true
+                        description: >
+                          This position is the one the MANAGER RECORD asserts, with no employment
+                          row behind it yet. Sent as an `add` with no roleId, because that is all
+                          the client can honestly say.
+
+
+                          On submit the server writes the row from the manager record and applies
+                          the change to it as a correction, so the audit trail, the rating snapshot
+                          sync and the staleness check all work on it as on any other employment.
+                          Without this marker the same submission would record a second, duplicate
+                          employment beside the one the profile is already displaying.
+                      changedFields:
+                        type: array
+                        description: Which of the values below this position actually proposes.
+                          Without it a null endDate is ambiguous between "leave it alone" and "this
+                          role has no end date after all", which are opposite instructions.
+                        items:
+                          type: string
+                      title:
+                        type: string
+                        nullable: true
+                      company:
+                        type: string
+                        nullable: true
+                        description: An audit snapshot of what the contributor typed. Identity comes
+                          from companyId, never from re-resolving this name.
+                      companyId:
+                        type: integer
+                        format: int64
+                        nullable: true
+                      startDate:
+                        type: string
+                        nullable: true
+                        description: Year and month. Omitted rather than invented when unknown.
+                      endDate:
+                        type: string
+                        nullable: true
+                      periodKnown:
+                        type: boolean
+                        nullable: true
+                      employmentStatus:
+                        type: string
+                        nullable: true
+                        description: ongoing, ended or unknown. disputed is a moderation outcome and
+                          is refused here and by the database. No enum, because an OpenAPI 3.0 enum
+                          with nullable rejects an explicit null.
+                      declaredCountry:
+                        type: string
+                        nullable: true
+                      declaredState:
+                        type: string
+                        nullable: true
+                      declaredCity:
+                        type: string
+                        nullable: true
+                      declaredPrecision:
+                        type: string
+                        nullable: true
+                      companyLocationId:
+                        type: integer
+                        format: int64
+                        nullable: true
+                      declaredSource:
+                        type: string
+                        nullable: true
+                      declaredText:
+                        type: string
+                        nullable: true
+                      corpusPlace:
+                        type: object
+                        nullable: true
+                        description: A building chosen from the search corpus, which has no id until
+                          somebody picks it. Promoted to a real location on submit.
+                        additionalProperties: true
+      responses:
+        '201':
+          description: Contribution recorded and pending moderation
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id:
+                    type: string
+                  managerId:
+                    type: integer
+                    format: int64
+                  newName:
+                    type: string
+                    nullable: true
+                  explanation:
+                    type: string
+                  positions:
+                    type: integer
+                  changeFormat:
+                    type: string
+                  status:
+                    type: string
+                  createdAt:
+                    type: string
+        '400':
+          description: The submission contradicts itself, or a position is incomplete
+        '401':
+          description: Not signed in. The form is never hidden behind this; it is asked at submit.
+        '403':
+          description: Account suspended
+        '404':
+          description: Manager or employment not found
+        '409':
+          description: An employment in the submission is no longer correctable
+
   /api/managers/{id}/edit-requests:
     post:
       operationId: createManagerEditRequest
@@ -3456,6 +3742,106 @@ paths:
                       type: object
         '403':
           description: Forbidden
+
+  /api/admin/pending-edits/{editId}/change-set:
+    get:
+      operationId: getEditChangeSet
+      summary: The complete set of changes behind one edit request
+      description: >
+        For a career-editor contribution, the legacy summary columns are all null and the substance
+        is in the change set, so the admin screen reads it here.
+
+
+        Each position carries three accounts of the same employment: what it said when the
+        contribution was written, what the contributor proposes, and what it says now. A moderator
+        needs all three to tell a correction from a revert, and comparing the first with the last is
+        what reveals that somebody else has changed the employment since it was submitted. That
+        comparison is reported as `stale`, and it is the same one approval enforces, so a conflict
+        is visible while reading rather than discovered when the approval is refused.
+      tags:
+        - Admin
+      parameters:
+        - in: path
+          name: editId
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: The contribution and its positions
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id:
+                    type: string
+                  managerId:
+                    type: integer
+                    format: int64
+                  managerName:
+                    type: string
+                  changeFormat:
+                    type: string
+                    description: legacy or career_editor. Read from the row, never inferred from
+                      whether a change set exists, because a name-only correction has none.
+                  status:
+                    type: string
+                  explanation:
+                    type: string
+                    nullable: true
+                  currentName:
+                    type: string
+                  proposedName:
+                    type: string
+                    nullable: true
+                  positions:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id:
+                          type: integer
+                          format: int64
+                        intent:
+                          type: string
+                        roleId:
+                          type: integer
+                          format: int64
+                          nullable: true
+                        changedFields:
+                          type: array
+                          items:
+                            type: string
+                        position:
+                          type: integer
+                        was:
+                          type: object
+                          description: The employment at submission time.
+                          additionalProperties: true
+                        proposed:
+                          type: object
+                          additionalProperties: true
+                        current:
+                          type: object
+                          description: The employment now.
+                          additionalProperties: true
+                        stale:
+                          type: boolean
+                          description: Somebody changed this employment after the contribution was
+                            submitted, in a field the contribution proposes. Approving would undo
+                            their change, so it is refused until reviewed.
+                        needsCompanyResolution:
+                          type: boolean
+                          description: An add or supersede naming a company with no record yet. The
+                            moderator resolves it through the picker before approving.
+        '401':
+          description: Unauthorized
+        '403':
+          description: Not an administrator
+        '404':
+          description: Edit request not found
 
   /api/admin/pending-edits/{editId}/approve:
     post:

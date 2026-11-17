@@ -381,8 +381,13 @@ public class AuthHandler {
      * must agree: a different default here would send somebody somewhere the frontend never sends
      * them, and only on the path where nothing else specified a destination, which is the path
      * least likely to be noticed.
+     *
+     * <p>{@code /search} is the canonical search URL in both brands. {@code /explore} and
+     * {@code /find} still resolve - they redirect, so old links keep working - but nothing points
+     * at them deliberately any more, because defaulting to an alias spent a redirect on every
+     * sign-in that fell through to it.
      */
-    private static final String DEFAULT_RETURN_TO = "/explore";
+    private static final String DEFAULT_RETURN_TO = "/search";
 
     /**
      * URL-encodes one query parameter value for the authorize URL.

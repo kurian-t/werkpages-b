@@ -140,7 +140,28 @@ class Phase2FreshInstallIntegrationTest {
         // stale deployment writing one again has it classified rather than refused. Refusing would
         // have broken ghost creation on the older build, which is the one thing worse than the
         // defect.
-        assertEquals("108", await(pool.query("""
+        //
+        // V109 (per-employment location, and a proposed change set) moved it to 109 on 2026-11-17.
+        // Acknowledged, and this one IS structural: it gives career_history its own eight declared
+        // location columns so an employment can say where it was held without moving the manager's
+        // present-day location, adds manager_edits.new_name and .explanation, adds the
+        // manager_edit_employments change set, and widens role_corrections.field by 'location'.
+        // Every column is nullable, the one new table is new, and both CHECK changes are
+        // widenings, so RateMyManagers keeps working unchanged against it. NOTHING is backfilled:
+        // an employment nobody has located stays unlocated rather than inheriting a location
+        // nobody stated.
+        //
+        // V110 (a contributor's status is binary) moved it to 110 on 2026-11-17.
+        // Acknowledged, and it is the one shape that can fail on existing rows: a NARROWING
+        // CHECK, on manager_edit_employments.new_employment_status. Safe because that column is
+        // new in V109, V109 is not deployed anywhere, and the migration proves no offending row
+        // exists rather than assuming it. career_history.employment_status is deliberately
+        // untouched and still admits unknown and disputed.
+        //
+        // It exists as its own version rather than as an edit to V109 because V109 had already
+        // been applied to a development database, and changing it produced exactly the checksum
+        // mismatch that rule prevents.
+        assertEquals("110", await(pool.query("""
                 SELECT version FROM flyway_schema_history
                  WHERE success AND version IS NOT NULL
                  ORDER BY installed_rank DESC LIMIT 1

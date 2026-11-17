@@ -3,6 +3,8 @@ package org.werkpages.service;
 import io.vertx.core.Future;
 import org.werkpages.repository.ManagerSearchRequestRepository;
 import io.vertx.core.json.JsonArray;
+import io.vertx.sqlclient.Pool;
+import io.vertx.sqlclient.SqlConnection;
 import io.vertx.core.json.JsonObject;
 import io.vertx.sqlclient.Row;
 import io.vertx.sqlclient.RowSet;
@@ -22,6 +24,7 @@ import org.werkpages.repository.UserRepository;
 
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
+import java.util.Objects;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
@@ -35,6 +38,8 @@ public class AdminService {
 
     /* Stateless, and constructed in place like the other collaborators here. */
     private final ReviewDisposition reviewDisposition = new ReviewDisposition();
+    /** One implementation of applying a change set, shared with the self-edit path. */
+    private final CareerChangeSetApplier careerApplier;
     private final CapturedDraftRepository capturedDrafts;
     /**
      * The two services that own the tables a captured draft can become.
@@ -111,6 +116,12 @@ public class AdminService {
         this.managerRepo          = managerRepo;
         this.reviewRepo           = reviewRepo;
         this.editRepo             = editRepo;
+        /*
+          Built here rather than injected, because it is this class's own use of a shared routine
+          and has exactly one dependency. A null editRepo is tolerated: several test constructors
+          pass one, and they never reach the career-editor path.
+        */
+        this.careerApplier        = new CareerChangeSetApplier(editRepo);
         this.notifRepo            = notifRepo;
         this.companyRepo          = companyRepo;
         // Guarded like challengeRepo below: several constructors are used by unit tests with no
@@ -781,6 +792,13 @@ public class AdminService {
                         .put("newCity", row.getString("new_declared_city"))
                         .put("newLinkedinUrl", row.getString("new_linkedin_url"))
                         .put("status", row.getString("status"))
+                        // A career-editor contribution cannot be summarised by the legacy
+                        // columns above, which are all null for one. The queue shows the format
+                        // and how many positions it carries, and the row is opened to read them.
+                        .put("changeFormat", row.getString("change_format"))
+                        .put("newName", row.getString("new_name"))
+                        .put("explanation", row.getString("explanation"))
+                        .put("positionCount", row.getLong("position_count"))
                         .put("createdAt", row.getOffsetDateTime("created_at").toString())
                     );
                 }
@@ -835,6 +853,22 @@ public class AdminService {
                     if (opt.isEmpty()) return Future.failedFuture(ServiceException.notFound("Edit request not found"));
                     Row row = opt.get();
                     if (!"pending".equals(row.getString("status"))) return Future.failedFuture(ServiceException.conflict("Edit request is not pending"));
+
+                    /*
+                      WHICH SHAPE THIS CONTRIBUTION IS.
+
+                      Read from change_format, never inferred from whether a change set exists: a
+                      contributor who corrects only the manager's NAME touches no employment, so
+                      their change set is legitimately empty, and routing by the presence of rows
+                      would send that submission down the legacy path to be "approved" by applying
+                      nothing at all.
+
+                      Everything below this line is the legacy path, unchanged. Proposals written
+                      through the old form are still pending and still approve exactly as they did.
+                    */
+                    if ("career_editor".equals(row.getString("change_format"))) {
+                        return approveCareerEdit(adminId, editId, row, fix);
+                    }
 
                     long   managerId           = row.getLong("manager_id");
                     String currentCompany      = row.getString("current_company");
@@ -1103,7 +1137,20 @@ public class AdminService {
                     UUID proposedBy  = fetchRow.getUUID("proposed_by");
                     String managerName = fetchRow.getString("manager_name");
                     OffsetDateTime now = OffsetDateTime.now(ZoneOffset.UTC);
-                    return editRepo.reject(editId, adminId, now)
+                    /*
+                      A CAREER-EDITOR rejection needs a transaction and the format marker, because
+                      manager_edits_format_guard refuses that decision from code which cannot read
+                      the change set. A LEGACY rejection is left exactly as it was: the guard never
+                      consults the marker for those rows, and routing them through a transaction
+                      they never needed would change a path this work has no business touching.
+                    */
+                    boolean careerEditor =
+                        "career_editor".equals(fetchRow.getString("change_format"));
+                    Future<Optional<Row>> rejected = careerEditor
+                        ? ((Pool) db).withTransaction(tx -> editRepo.markCareerEditApply(tx)
+                              .compose(v -> editRepo.reject(tx, editId, adminId, now)))
+                        : editRepo.reject(editId, adminId, now);
+                    return rejected
                         .compose(rowOpt -> {
                             if (rowOpt.isEmpty()) return Future.failedFuture(ServiceException.notFound("Pending edit not found"));
                             if (proposedBy != null) {
@@ -2783,5 +2830,157 @@ public class AdminService {
             .put("seenSinceReview", r.getInteger("seen_since_review"))
             .put("firstSeenAt", String.valueOf(r.getOffsetDateTime("first_seen_at")))
             .put("lastSeenAt", String.valueOf(r.getOffsetDateTime("last_seen_at")));
+    }
+
+    // ── APPROVING A CAREER-EDITOR CONTRIBUTION ──────────────────────────────
+
+    /**
+     * Apply a whole change set, in ONE transaction.
+     *
+     * <p>The applying itself lives in {@link CareerChangeSetApplier}, because a contributor editing
+     * their own not-yet-published manager applies a change set too, and two copies of that logic
+     * would drift. This method is the moderator's half: the authorization, the corrections they
+     * supply, and the transaction.
+     */
+    private Future<JsonObject> approveCareerEdit(UUID adminId, UUID editId, Row parent,
+                                                 JsonObject fix) {
+        long   managerId   = parent.getLong("manager_id");
+        String explanation = parent.getString("explanation");
+        UUID   proposedBy  = parent.getUUID("proposed_by");
+
+        // An administrator may correct the name during approval, exactly as they may correct a
+        // legacy request's fields. An absent key leaves the contributor's value alone.
+        String effectiveName = fix.containsKey("name")
+            ? toNullIfBlank(fix.getString("name"))
+            : parent.getString("new_name");
+
+        return ((Pool) db).withTransaction(tx ->
+                careerApplier.applyAndApprove(tx, managerId, editId, explanation, proposedBy,
+                                              adminId, effectiveName, fix))
+            .map(result -> new JsonObject()
+                .put("id", editId.toString())
+                .put("managerId", managerId)
+                .put("changeFormat", "career_editor")
+                .put("status", "approved")
+                .put("applied", result.getJsonArray("positions"))
+                .put("nameChanged", result.getBoolean("renamed")));
+    }
+
+    /**
+     * The complete change set behind one edit request, for a moderator to read before deciding.
+     *
+     * <h2>Why all three versions of every field travel together</h2>
+     *
+     * <p>Each position reports what the employment said when the contribution was written
+     * ({@code was}), what the contributor proposes ({@code proposed}), and what it says now
+     * ({@code current}). A moderator looking at only the proposal cannot tell a correction from a
+     * revert, and cannot see that somebody else has already fixed it.
+     *
+     * <p>{@code stale} is computed from {@code was} against {@code current}, for the changed fields
+     * only, and is the same comparison approval enforces. Showing it here means the moderator
+     * learns about a conflict while reading rather than by having their approval refused.
+     */
+    public Future<JsonObject> editChangeSet(String auth0Id, UUID editId) {
+        return requireAdmin(auth0Id)
+            .compose(adminId -> editRepo.findByIdWithManager(editId)
+                .compose(opt -> {
+                    if (opt.isEmpty()) {
+                        return Future.failedFuture(ServiceException.notFound("Edit request not found"));
+                    }
+                    Row parent = opt.get();
+                    return editRepo.findChangeSet(editId).map(rows -> {
+                        JsonArray positions = new JsonArray();
+                        rows.forEach(p -> positions.add(changeSetPosition(p)));
+                        return new JsonObject()
+                            .put("id", editId.toString())
+                            .put("managerId", parent.getLong("manager_id"))
+                            .put("managerName", parent.getString("manager_name"))
+                            .put("changeFormat", parent.getString("change_format"))
+                            .put("status", parent.getString("status"))
+                            .put("explanation", parent.getString("explanation"))
+                            .put("currentName", parent.getString("manager_name"))
+                            .put("proposedName", parent.getString("new_name"))
+                            .put("positions", positions);
+                    });
+                }));
+    }
+
+    private JsonObject changeSetPosition(Row p) {
+        JsonArray fields = new JsonArray();
+        String[] changed = p.getArrayOfStrings("changed_fields");
+        if (changed != null) for (String f : changed) fields.add(f);
+
+        JsonObject was = new JsonObject()
+            .put("title",            p.getString("was_title"))
+            .put("company",          p.getString("was_company_name"))
+            .put("companyId",        p.getLong("was_company_id"))
+            .put("startDate",        CareerChangeSetApplier.text(p.getOffsetDateTime("was_start_date")))
+            .put("endDate",          CareerChangeSetApplier.text(p.getOffsetDateTime("was_end_date")))
+            .put("periodKnown",      p.getBoolean("was_period_known"))
+            .put("employmentStatus", p.getString("was_employment_status"))
+            .put("location",         CareerChangeSetApplier.locationText(p, "was_"))
+            .put("state",            p.getString("was_state"));
+
+        JsonObject proposed = new JsonObject()
+            .put("title",            p.getString("new_title"))
+            .put("company",          CareerChangeSetApplier.displayCompany(p))
+            .put("companyId",        p.getLong("new_company_id"))
+            .put("startDate",        CareerChangeSetApplier.text(p.getOffsetDateTime("new_start_date")))
+            .put("endDate",          CareerChangeSetApplier.text(p.getOffsetDateTime("new_end_date")))
+            .put("periodKnown",      p.getBoolean("new_period_known"))
+            .put("employmentStatus", p.getString("new_employment_status"))
+            .put("location",         CareerChangeSetApplier.locationText(p, "new_"));
+
+        JsonObject current = new JsonObject()
+            .put("title",            p.getString("current_title"))
+            .put("company",          p.getString("current_company"))
+            .put("companyId",        p.getLong("current_company_id"))
+            .put("startDate",        CareerChangeSetApplier.text(p.getOffsetDateTime("current_start_date")))
+            .put("endDate",          CareerChangeSetApplier.text(p.getOffsetDateTime("current_end_date")))
+            .put("periodKnown",      p.getBoolean("current_period_known"))
+            .put("employmentStatus", p.getString("current_employment_status"))
+            .put("location",         CareerChangeSetApplier.locationText(p, "current_"))
+            .put("state",            p.getString("current_state"));
+
+        // An unresolved company is the one thing a moderator must fix before approving, so it is
+        // reported rather than discovered when the approval is refused.
+        boolean needsCompany =
+            (EditRepository.EmploymentChange.ADD.equals(p.getString("intent"))
+             || EditRepository.EmploymentChange.SUPERSEDE.equals(p.getString("intent")))
+            && p.getLong("new_company_id") == null;
+
+        return new JsonObject()
+            .put("id", p.getLong("id"))
+            .put("intent", p.getString("intent"))
+            .put("roleId", p.getLong("role_id"))
+            .put("changedFields", fields)
+            .put("position", p.getInteger("position"))
+            .put("was", was)
+            .put("proposed", proposed)
+            .put("current", current)
+            .put("stale", positionIsStale(p))
+            .put("needsCompanyResolution", needsCompany);
+    }
+
+    /** The same comparison {@link #firstStalePosition} enforces, for one position. */
+    private boolean positionIsStale(Row p) {
+        if (p.getLong("role_id") == null) return false;
+        if (p.getString("current_state") == null) return true;
+        if (!Objects.equals(p.getString("was_state"), p.getString("current_state"))) return true;
+        String[][] watched = {
+            {"title",             "was_title",             "current_title"},
+            {"start_date",        "was_start_date",        "current_start_date"},
+            {"end_date",          "was_end_date",          "current_end_date"},
+            {"period_known",      "was_period_known",      "current_period_known"},
+            {"employment_status", "was_employment_status", "current_employment_status"},
+        };
+        for (String[] w : watched) {
+            if (CareerChangeSetApplier.changes(p, w[0]) && !Objects.equals(p.getValue(w[1]), p.getValue(w[2]))) return true;
+        }
+        return CareerChangeSetApplier.changes(p, "location") && CareerChangeSetApplier.locationMoved(p);
+    }
+
+    private static String toNullIfBlank(String s) {
+        return s == null || s.isBlank() ? null : s.trim();
     }
 }

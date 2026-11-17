@@ -6,6 +6,7 @@ import io.vertx.sqlclient.RowSet;
 import io.vertx.sqlclient.SqlClient;
 import io.vertx.sqlclient.Tuple;
 import org.werkpages.service.DeclaredLocation;
+import org.werkpages.service.LocationStatsProjector;
 
 import java.time.LocalDate;
 import java.time.LocalDateTime;
@@ -183,7 +184,24 @@ public class ReviewRepository {
                        MIN(title)           AS title,
                        MIN(start_date)::date AS start_date,
                        MAX(end_date)::date   AS end_date,
-                       BOOL_OR(end_date IS NULL) AS is_current,
+                       /*
+                         CURRENT MEANS WHAT THE RECORD SAYS, not "has no end date".
+
+                         This was BOOL_OR(end_date IS NULL), which is the same question only while
+                         dates are the sole evidence. Rev 268 separated employment_status from the
+                         dates precisely so somebody can say "they have left" without knowing when -
+                         and under the old test such a role came back as current and the timeline
+                         rendered it "- Present". A contributor who explicitly chose "No longer in
+                         this role" had that answer overridden by the absence of a date.
+
+                         'unknown' still falls back to the date, which is all there is to go on, so
+                         every row written before this behaves exactly as it did.
+
+                         The same predicate appears in ManagerService.getEmploymentsForEditing;
+                         keep the two identical.
+                       */
+                       BOOL_OR(employment_status = 'ongoing'
+                               OR (end_date IS NULL AND employment_status <> 'ended')) AS is_current,
                        MIN(company_id)      AS company_id,
                        /*
                          WHICH ROWS THIS TILE IS, so nobody has to work it out from the name.
@@ -919,14 +937,16 @@ public class ReviewRepository {
                         """)
                     .execute())
                 .compose(restored -> {
+                    java.util.List<UUID> all       = new java.util.ArrayList<>();
                     java.util.List<UUID> withdrawn = new java.util.ArrayList<>();
                     for (Row row : restored) {
+                        all.add(row.getUUID("id"));
                         if ("withdrawn".equals(row.getString("role_basis"))) {
                             withdrawn.add(row.getUUID("id"));
                         }
                     }
                     int n = restored.rowCount();
-                    if (withdrawn.isEmpty()) return Future.succeededFuture(n);
+                    if (withdrawn.isEmpty()) return resyncLocations(tx, all).map(n);
                     /*
                       A RESTORED RATING MUST NOT BECOME PUBLICLY ELIGIBLE BECAUSE IT WAS RESTORED.
 
@@ -957,8 +977,46 @@ public class ReviewRepository {
                                AND NOT rating_role_is_publishable(id)
                             """)
                         .execute(Tuple.of(withdrawn.toArray(new UUID[0])))
-                        .map(held -> n);
+                        /*
+                          THE LOCATION PROJECTION, AFTER the hold-back and not before it.
+
+                          A rating held back above is not public, so it must not count, and
+                          contributionOf only gives the right answer once the row has reached its
+                          final state. Resyncing first would have added every restored rating and
+                          then left the held ones in the figures.
+                        */
+                        .compose(held -> resyncLocations(tx, all))
+                        .map(v -> n);
                 }));
+    }
+
+    /**
+     * Puts restored ratings back into the manager location read model.
+     *
+     * <p><b>This is the half the sweep was missing.</b> A withdrawal hides the rating and removes
+     * its contribution from {@code manager_location_stats_live}; the restore brought the rating
+     * back to publication three days later and never added the contribution back. Nothing else
+     * recomputes that table on a schedule, so the figures stayed permanently short, silently, for
+     * every rating anybody ever withdrew and left alone.
+     *
+     * <p>It was not noticed because a SECOND, dead implementation of this sweep did do the resync,
+     * and the only test covering the behaviour called that one. Deleting the duplicate is what
+     * exposed it.
+     *
+     * <p>{@code Optional.empty()} as the "before" state is correct rather than convenient: the
+     * rating was out of the projection while it was hidden, so it contributes nothing to subtract
+     * and is added back at whatever it now is. Same transaction as the restore, because a
+     * projection updated outside the mutation's transaction is a projection that drifts.
+     */
+    private static Future<Void> resyncLocations(io.vertx.sqlclient.SqlClient tx,
+                                                java.util.List<UUID> reviewIds) {
+        if (reviewIds.isEmpty()) return Future.succeededFuture();
+        LocationStatsProjector projector = new LocationStatsProjector();
+        Future<Void> chain = Future.succeededFuture();
+        for (UUID id : reviewIds) {
+            chain = chain.compose(v -> projector.resyncManagerReview(tx, id, Optional.empty()));
+        }
+        return chain;
     }
 
     /**

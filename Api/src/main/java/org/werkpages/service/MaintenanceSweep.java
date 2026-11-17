@@ -67,6 +67,25 @@ public class MaintenanceSweep {
     /** Optional: absent when no Brandfetch client id is configured. */
     private final BrandfetchClient brandfetch;
 
+    /**
+     * One run at a time, however long a run takes.
+     *
+     * <p>{@code setPeriodic} does not wait: if a sweep outlives its own period - a slow logo
+     * provider and a few thousand companies is all it takes - the timer fires again on top of it.
+     * Most steps here are idempotent, but the resolution steps are metered calls to Brandfetch
+     * and logo.dev, and paying twice for the same work is the cheapest of the possible outcomes.
+     *
+     * <p>In-process, deliberately, NOT a session-level advisory lock. There is exactly one
+     * scheduler for this sweep now - see the comment in RestApi's MainVerticle and section 1 of
+     * the shared platform rules - so cross-process overlap is not the risk being guarded against.
+     * A session lock held across a long multi-statement job introduces a worse failure than the
+     * one it prevents: a connection that dies mid-sweep leaves the lock held, and the sweep then
+     * never runs again until somebody notices. {@code CompanyStatsRebuilder} can use an advisory
+     * lock safely because its work is one transaction; this is not.
+     */
+    private final java.util.concurrent.atomic.AtomicBoolean running =
+        new java.util.concurrent.atomic.AtomicBoolean(false);
+
     /** Optional: identity resolution by agreement. Absent means no identities are written. */
     private DomainResolver resolver;
 
@@ -126,7 +145,15 @@ public class MaintenanceSweep {
      * makes the regression detectable at all.
      */
     public void schedule(Vertx vertx, long initialDelayMs, long periodMs) {
-        vertx.setPeriodic(initialDelayMs, periodMs, timerId -> runOnce());
+        vertx.setPeriodic(initialDelayMs, periodMs, timerId -> {
+            // See `running`: a sweep that outlives its period must not be started on top of
+            // itself. runOnce() stays unguarded, because a direct caller means to run it.
+            if (!running.compareAndSet(false, true)) {
+                System.out.println("\u00b7 maintenance sweep still running, skipping this tick");
+                return;
+            }
+            runOnce().onComplete(ignored -> running.set(false));
+        });
     }
 
     /**
