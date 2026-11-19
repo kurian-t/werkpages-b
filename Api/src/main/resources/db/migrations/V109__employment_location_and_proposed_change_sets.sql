@@ -185,15 +185,10 @@ CREATE TABLE IF NOT EXISTS manager_edit_employments (
   new_end_date            TIMESTAMPTZ,
   new_period_known        BOOLEAN,
 
-  -- 'ongoing' | 'ended' | 'unknown' here. NARROWED TO TWO BY V110.
-  --
-  -- Left as it was applied. Editing a migration that a database has already run
-  -- changes its checksum and the next start refuses with "Migration checksum
-  -- mismatch", which is exactly why the narrowing is its own version instead.
-  --
-  -- `disputed` was never admitted here: it is a moderation outcome reached when
-  -- accounts contradict each other, never something one contributor may assert
-  -- about somebody else's job.
+  -- 'ongoing' | 'ended' | 'unknown' only. `disputed` is a moderation outcome
+  -- reached when accounts contradict each other, never something a contributor
+  -- may assert about somebody else's job, so it is refused here rather than
+  -- merely hidden by the form.
   new_employment_status   TEXT,
 
   -- The same eight declared-location fields, minus location_source, which is

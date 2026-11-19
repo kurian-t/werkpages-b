@@ -81,6 +81,17 @@ class ManagerServiceValidationTest {
 
         when(userRepo.findByAuth0IdWithBan(AUTH0_ID))
             .thenReturn(Future.succeededFuture(Optional.of(defaultUser)));
+        /*
+            The default user HAS contributed. Correcting a career history is gated on having rated
+            a manager, so without this the edit tests below would fail on the gate rather than on
+            the validation each one is actually asserting - and they would fail having proved
+            nothing about either.
+
+            The gate itself is deliberately NOT proved here. A mock can be told any answer, so
+            agreeing with a wrong one costs nothing; it is proved against a real database in
+            CareerEditorIntegrationTest.
+        */
+        when(userRepo.hasContributed(USER_ID)).thenReturn(Future.succeededFuture(true));
         when(reviewRepo.countSubmittedTodayByUser(USER_ID))
             .thenReturn(Future.succeededFuture(0L));
         when(reviewRepo.findRecentDeletion(USER_ID, MANAGER_ID))

@@ -305,7 +305,36 @@ class EditRequestLocationIntegrationTest {
         await(pool.preparedQuery(
             "INSERT INTO users(auth0_id,email,username,first_name,last_name,role) VALUES ($1,$2,$3,$4,$5,$6)")
             .execute(Tuple.of(auth0Id, username + "@test.com", username, "Test", "User", role)));
+        /*
+          GRANTED TO EVERY USER THIS CLASS MAKES, because every test in it submits an edit request
+          and submitting one is now gated on having rated a manager. Doing it here rather than at
+          each of the eight call sites keeps the fixture in one place; no test in this class asserts
+          anything about a non-contributor, so there is nothing for it to mask.
+        */
+        makeContributor(auth0Id);
         return auth0Id;
+    }
+
+    /**
+     * Records that this account has rated a manager, which is what the career-edit gate asks for.
+     *
+     * <p>Submitting a correction now requires having contributed, so a fixture that only creates
+     * an account no longer gets past the gate.
+     *
+     * <p>Written as PARTICIPATION rather than as a rating on purpose: a {@code reviews} row would
+     * change manager rating counts, averages and the queries under test here, so a fixture meant
+     * to unlock a gate would quietly be altering the measurements too. Participation is the source
+     * the gate reads for a contributor whose rating was later unlinked, so it is a real mechanism.
+     * The gate itself is proved in CareerEditorIntegrationTest.
+     *
+     * <p>{@code subject_id} is arbitrary: the gate asks only whether this person has contributed
+     * at all, the column has no foreign key, and nothing here joins on it.
+     */
+    private void makeContributor(String auth0Id) throws Exception {
+        await(pool.preparedQuery(
+                "INSERT INTO rating_participation (user_id, subject_type, subject_id, "
+                + "gate_eligible) SELECT id, 'manager', 0, TRUE FROM users WHERE auth0_id = $1")
+            .execute(Tuple.of(auth0Id)));
     }
 
     private static <T> T await(Future<T> future) throws Exception {

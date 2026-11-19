@@ -1,0 +1,143 @@
+# FLYWAY CHECKSUMS FOR EVERY MIGRATION THAT HAS EVER BEEN RELEASED.
+#
+# WHAT THIS FILE IS FOR
+#
+# A migration that has run against any database must never change again. Flyway
+# records its checksum when it applies it, and compares on every later start - so
+# editing an applied file does not produce a wrong schema, it produces a backend
+# that REFUSES TO BOOT:
+#
+#     Migration checksum mismatch for migration version 109
+#
+# That happened on 2026-11-17. A narrowing CHECK was folded into V109 after a
+# development database had already applied it, and the backend would not start for
+# the rest of the afternoon. Every sign-in returned HTTP 500 because the backend
+# behind the proxy was simply not there.
+#
+# No test could see it. Every migration test builds a database from scratch, and a
+# fresh database has no history to contradict - so the whole suite stayed green
+# while the application could not start.
+#
+# This file is that missing history. MigrationChecksumsTest compares it against
+# the files on disk and fails when a released migration's content has moved.
+#
+# WHEN THE TEST FAILS
+#
+# If you changed an existing migration: DO NOT update the line here. Put the change
+# in a NEW migration instead. Editing the file breaks every database that has
+# already run it, including production, where there is no rollback.
+#
+# If you ADDED a migration: append its line. Run the test to be told the value, or
+# regenerate with the command the test prints.
+#
+# Checksums are Flyway's own: CRC32 over each line with line terminators stripped.
+V1__init.sql  800024954
+V2__schema_additions.sql  -1778674575
+V3__company_logo.sql  95626604
+V4__backfill_company_logos.sql  -1789640768
+V5__backfill_company_logos.sql  -885096303
+V6__review_per_role.sql  1192381904
+V7__review_role_dates_and_uniqueness.sql  612012963
+V8__review_deletion_cooldown.sql  539390601
+V9__notification_manager_id.sql  1543326182
+V10__ensure_review_deletions.sql  1676913589
+V11__manager_sources.sql  -233460361
+V12__nullable_review_user_id.sql  227773549
+V13__add_country.sql  -1968677114
+V14__auto_create_tracking.sql  1505557241
+V15__ghost_status.sql  -1006164524
+V16__add_state_city.sql  922217195
+V17__companies_table.sql  1452121185
+V18__career_history_company_id.sql  1607931392
+V19__backfill_career_history_company_id.sql  1423400324
+V20__company_stats_matview.sql  -932765088
+V21__fix_company_logo_priority.sql  -1084207898
+V22__search_created_by_user_id.sql  509693966
+V23__reviews_draft_token.sql  70856004
+V24__weight_column.sql  818905687
+V25__encrypt_user_pii.sql  -218569088
+V26__merge_suggestions.sql  1141458842
+V27__fix_sickkids_logo.sql  -1180149493
+V28__fix_search_created_by_user_fk.sql  1996533603
+V29__soft_delete_reviews.sql  1804727741
+V30__manager_slugs.sql  178337689
+V31__company_slugs.sql  182079483
+V32__manager_url_history.sql  -1524416933
+V33__backfill_seed_reviews.sql  -1151640364
+V34__fix_cron_soft_delete_filter.sql  1832072237
+V35__add_notification_manager_id.sql  -223085846
+V36__one_seed_per_manager.sql  243399492
+V37__one_real_review_per_user_per_manager.sql  1274779094
+V38__fix_company_stats_matview.sql  -530552534
+V39__company_stats_live_table.sql  1438633213
+V40__drop_company_stats_matview.sql  832067281
+V41__edit_company_logo_url.sql  -1443009380
+V42__fix_dotcom_logo_urls.sql  -684415581
+V43__refresh_company_stats_logos.sql  873663271
+V44__create_user_resumes.sql  869144062
+V45__add_resume_design.sql  2019021862
+V46__company_industry.sql  -1196947912
+V47__company_stats_triggers.sql  -1792763939
+V48__interview_reviews.sql  -2112555029
+V49__role_normalization.sql  476353782
+V50__interview_rounds.sql  -2097506886
+V51__interview_country.sql  -1369309929
+V52__interview_soft_delete.sql  1260517746
+V53__interview_city.sql  -1949753375
+V54__company_aliases.sql  -405957189
+V55__company_search_index.sql  -1033368031
+V56__edit_request_company_identity.sql  -1649854444
+V57__company_merges.sql  -2088003794
+V58__company_relationships.sql  -607070722
+V59__company_reviews.sql  -1192555524
+V60__proof_of_work.sql  -391080590
+V61__proof_relationship_other.sql  -1000647260
+V62__manager_merge_keeps_rows.sql  -45497056
+V63__company_review_author.sql  -1582193439
+V64__seed_high_profile_figures.sql  -212661083
+V65__interview_review_author.sql  -1244146073
+V66__interview_job_relevance.sql  -1206851634
+V67__geo_observations.sql  1748501758
+V68__company_locations.sql  -1460364769
+V69__backfill_declared_country.sql  1877621110
+V70__editable_location_and_state_backfill.sql  1770143056
+V71__published_reviews_declared_location.sql  214211799
+V72__location_provenance.sql  558345980
+V73__location_stats_read_model.sql  521537783
+V74__drop_published_reviews.sql  -1618825374
+V75__anonymous_ghost_quota.sql  1014545896
+V76__captured_drafts.sql  1579117342
+V77__interview_date_range.sql  -1769538421
+V78__review_manager_status.sql  2036057314
+V79__company_stats_live_all_datasets.sql  1693801897
+V80__reclaim_manager_base_slugs.sql  2099952694
+V81__ghost_creation_rate_index.sql  -565596710
+V82__pending_slug_namespace.sql  1347787947
+V83__rejected_slug_namespace.sql  612452493
+V84__review_moderation_deletion.sql  -1115433454
+V85__company_domain_resolution.sql  -1741672832
+V86__review_dates_hidden.sql  2135898186
+V87__company_review_dates_hidden.sql  1119299452
+V88__company_review_withdrawal.sql  828229169
+V89__company_stats_single_writer.sql  707699902
+V90__company_stats_lifecycle.sql  1158004836
+V91__company_stats_maintenance_runs.sql  1745853977
+V92__company_creation_quota.sql  -178569030
+V93__company_interview_stats_lifecycle.sql  -1406895069
+V94__manager_search_requests.sql  -319033948
+V95__manual_declared_location.sql  -1524543722
+V96__draft_publication.sql  2130679682
+V97__rev268_manager_identity_redesign.sql  1233933680
+V98__oauth_login_transactions.sql  -1914317979
+V99__username_identity.sql  -1834708880
+V100__app_sessions.sql  228594360
+V101__employment_attributed_company_stats.sql  1481566148
+V102__legacy_employment_attribution.sql  -276251237
+V103__account_recovery_requests.sql  548440239
+V104__attribution_corrections.sql  -870923838
+V105__s4_post_cutover_enforcement.sql  -633462318
+V106__unlink_and_example_ratings.sql  -1125469964
+V107__retire_stranded_examples_and_erased_bylines.sql  865155162
+V108__classify_placeholder_ratings_in_the_database.sql  949191458
+V109__employment_location_and_proposed_change_sets.sql  1991302054
+V110__contributor_status_is_binary.sql  -1543532371

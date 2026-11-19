@@ -324,6 +324,7 @@ class ManagerServiceCoverage2IntegrationTest {
     @Test
     void createEditRequest_dailyLimitExceeded_returnsTooManyRequests() throws Exception {
         String auth0Id = insertUser("auth0|edit-limit");
+        makeContributor(auth0Id);
         // One edit per manager, filling today's allowance (the upsert is per manager+user).
         /*
           Bound to the constant, not to a literal. These loops each said `i < 6`, so raising the
@@ -351,6 +352,7 @@ class ManagerServiceCoverage2IntegrationTest {
     @Test
     void createEditRequest_success_returnsEditWithExpectedFields() throws Exception {
         String auth0Id = insertUser("auth0|edit-success");
+        makeContributor(auth0Id);
         long managerId = insertManager("Edit Success Mgr", "EditCorp", "Engineer", "approved");
 
         JsonObject result = await(service.createEditRequest(auth0Id, managerId,
@@ -382,6 +384,7 @@ class ManagerServiceCoverage2IntegrationTest {
     @Test
     void getPendingEditsForManager_withPendingEdits_returnsData() throws Exception {
         String auth0Id = insertUser("auth0|get-pending-edits");
+        makeContributor(auth0Id);
         long managerId = insertManager("Pending Edit Mgr", "PendCorp", "Lead", "approved");
 
         // Create an edit request first
@@ -663,6 +666,31 @@ class ManagerServiceCoverage2IntegrationTest {
                 "INSERT INTO companies(name, status, created_at, updated_at) VALUES ($1,$2,now(),now())")
             .execute(Tuple.of(name, status))
             .toCompletionStage().toCompletableFuture().get(5, TimeUnit.SECONDS);
+    }
+
+    /**
+     * Records that this account has rated a manager, which is what the career-edit gate asks for.
+     *
+     * <p>Submitting a correction now requires having contributed, so a fixture that only creates
+     * an account no longer gets past the gate.
+     *
+     * <p>Written as PARTICIPATION rather than as a rating on purpose: a {@code reviews} row would
+     * change the rating counts and averages several tests in this class assert on, so a fixture
+     * meant only to unlock a gate would quietly be altering the measurements too. Participation is
+     * the source the gate reads for a contributor whose rating was later unlinked, so it is a real
+     * mechanism and not a trick. The gate itself is proved in CareerEditorIntegrationTest.
+     *
+     * <p>Called only by the tests that get PAST input validation and actually reach the gate. The
+     * validation tests reach it with no account at all and must keep doing so.
+     *
+     * <p>{@code subject_id} is arbitrary: the gate asks only whether this person has contributed
+     * at all, the column has no foreign key, and nothing here joins on it.
+     */
+    private void makeContributor(String auth0Id) throws Exception {
+        await(pool.preparedQuery(
+                "INSERT INTO rating_participation (user_id, subject_type, subject_id, "
+                + "gate_eligible) SELECT id, 'manager', 0, TRUE FROM users WHERE auth0_id = $1")
+            .execute(Tuple.of(auth0Id)));
     }
 
     private String insertUser(String auth0Id) throws Exception {

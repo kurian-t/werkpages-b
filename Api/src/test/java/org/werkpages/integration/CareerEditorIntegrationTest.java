@@ -69,10 +69,12 @@ class CareerEditorIntegrationTest {
         .withUsername("test")
         .withPassword("test");
 
-    static Pool           pool;
-    static ManagerService managerService;
-    static AdminService   adminService;
-    static EditRepository editRepo;
+    static Pool             pool;
+    static ManagerService   managerService;
+    static AdminService     adminService;
+    static EditRepository   editRepo;
+    /* Held as a field so the gate tests can drive a real unlink rather than imitating one. */
+    static ReviewRepository reviewRepo;
 
     long  companyId;
     long  otherCompanyId;
@@ -96,8 +98,8 @@ class CareerEditorIntegrationTest {
             new PoolOptions().setMaxSize(8));
 
         ManagerRepository managerRepo = new ManagerRepository(pool);
-        ReviewRepository  reviewRepo  = new ReviewRepository(pool);
         UserRepository    userRepo    = new UserRepository(pool);
+        reviewRepo = new ReviewRepository(pool);
         editRepo = new EditRepository(pool);
 
         managerService = new ManagerService(managerRepo, reviewRepo, userRepo, editRepo,
@@ -126,6 +128,23 @@ class CareerEditorIntegrationTest {
         otherCompanyId = insertCompany("Marlowe Freight", "marlowe");
         managerId      = insertManager("Priya Raghunathan", "priya-r");
         contributorId  = insertUser(contributor, "user");
+        /*
+          THE CONTRIBUTION THAT OPENS THE EDITING GATE.
+
+          Correcting a career history now requires having rated a manager, so the fixture that has
+          always been called `contributor` has to actually be one.
+
+          RECORDED AS PARTICIPATION RATHER THAN AS A RATING, because a rating is not inert here. A
+          `reviews` row would change the things most of these tests measure - reviews_count, the
+          segment matching in SEGMENTS_SQL, the rating-date inference that reads MIN(worked_from),
+          and the two tests that assert the whole table holds exactly one row. Participation is the
+          column the gate reads for a contributor whose rating was later unlinked, so it is a real
+          mechanism and not a trick; `aRealPublishedRatingAlsoOpensTheGate` covers the other branch.
+
+          WHICH subject does not matter: the gate asks whether somebody has contributed to this
+          corpus at all, not whether they contributed to the page they are looking at.
+        */
+        insertGateParticipation(contributorId);
         insertUser(adminAuth0, "admin");
     }
 
@@ -885,6 +904,130 @@ class CareerEditorIntegrationTest {
 
 
     // ══════════════════════════════════════════════════════════════════════════
+    // Dates nobody recorded, taken from the ratings
+    // ══════════════════════════════════════════════════════════════════════════
+
+    /**
+     * AN EMPLOYMENT NOBODY HAS DATED STILL HAS DATES TO SHOW, AND SAYS WHERE THEY CAME FROM.
+     *
+     * <p>The editor opened with empty date fields for a position whose dates the profile was
+     * displaying directly above it. The profile gets them from the ratings, because every rating
+     * asks when the person worked with this manager, and {@code SEGMENTS_SQL} already does
+     * {@code COALESCE(ch.start_date, MIN(worked_from))}. The form read the raw column and showed
+     * nothing, so the same employment had dates on one surface and none on the other.
+     *
+     * <p>This asserts the span is the OUTER bound across every rating - earliest start, latest end
+     * - and that both values are reported as inferred. That flag is the whole difference between
+     * offering a derivation for correction and presenting it as something somebody stated.
+     */
+    @Test
+    void anUndatedEmploymentTakesItsDatesFromTheRatingsAndSaysTheyAreEstimated() throws Exception {
+        long role = insertRole("Lead", "2019-01-01", companyId, "unknown");
+        // What a role recorded before anybody asked for dates looks like: a title, a company and
+        // no period at all.
+        await(pool.preparedQuery("UPDATE career_history SET start_date=NULL, end_date=NULL, "
+                + "period_known=FALSE WHERE id=$1").execute(Tuple.of(role)));
+        // Two overlapping spells, so the assertion is about the OUTER bound rather than about
+        // whichever rating happens to be read first.
+        insertRatingSpanning("Halverson Logistics", "Lead", "2012-05-01", "2013-06-01");
+        insertRatingSpanning("Halverson Logistics", "Lead", "2013-01-01", "2014-02-01");
+
+        JsonObject only = await(managerService.getEmploymentsForEditing(managerId)).getJsonObject(0);
+
+        assertEquals("2012-05", only.getString("startDate"),
+            "the earliest point anybody reported working with them in this role");
+        assertEquals("2014-02", only.getString("endDate"), "and the latest");
+        assertTrue(only.getBoolean("startDateInferred"), "it is a bound, not a record");
+        assertTrue(only.getBoolean("endDateInferred"));
+        /*
+          AND THE INFERRED END DATE MARKS THE ROLE PREVIOUS.
+
+          Deliberate product decision, 2026-11-17: a role nobody has reported working in since
+          2014 is more likely finished than current. It is the better guess rather than a certain
+          one, which is why it arrives labelled and editable instead of silently applied.
+        */
+        assertFalse(only.getBoolean("isCurrent"),
+            "an end date, even an inferred one, means the role is not still held");
+    }
+
+    /**
+     * A RECORDED DATE IS NEVER OVERWRITTEN BY AN INFERRED ONE, NOR LABELLED AS INFERRED.
+     *
+     * <p>The ratings here imply a completely different span from the one the employment records.
+     * Somebody stated those dates, so they win outright: the inference exists to fill a gap, not
+     * to correct a contribution. Getting this backwards would quietly rewrite dated history out of
+     * rating snapshots.
+     */
+    @Test
+    void anEmploymentWithItsOwnDatesIsNeverLabelledEstimated() throws Exception {
+        long role = insertRole("Lead", "2019-01-01", companyId, "ended");
+        await(pool.preparedQuery(
+                "UPDATE career_history SET end_date='2021-03-01'::timestamptz WHERE id=$1")
+            .execute(Tuple.of(role)));
+        insertRatingSpanning("Halverson Logistics", "Lead", "2012-05-01", "2014-02-01");
+
+        JsonObject only = await(managerService.getEmploymentsForEditing(managerId)).getJsonObject(0);
+
+        assertEquals("2019-01", only.getString("startDate"), "what somebody actually recorded");
+        assertEquals("2021-03", only.getString("endDate"));
+        assertFalse(only.getBoolean("startDateInferred"));
+        assertFalse(only.getBoolean("endDateInferred"));
+    }
+
+    /**
+     * THE MANAGER RECORD'S OWN POSITION GETS THE SAME TREATMENT, WHICH IS THE CASE THAT MATTERS
+     * MOST.
+     *
+     * <p>A manager created by somebody searching has a title and company on its own row and
+     * nothing in {@code career_history} at all, so the ratings are the only dates in existence.
+     * This is the shape the empty date fields were actually reported on.
+     */
+    @Test
+    void theManagersOwnPositionTakesItsDatesFromTheRatingsToo() throws Exception {
+        assertEquals(0, countCareerRows(), "precondition: nothing recorded");
+        insertRatingSpanning("Halverson Logistics", "Lead", "2016-04-01", "2018-09-01");
+
+        JsonObject first = await(managerService.getEmploymentsForEditing(managerId)).getJsonObject(0);
+
+        assertTrue(first.getBoolean("fromManagerRecord"));
+        assertEquals("2016-04", first.getString("startDate"));
+        assertEquals("2018-09", first.getString("endDate"));
+        assertTrue(first.getBoolean("startDateInferred"));
+        assertTrue(first.getBoolean("endDateInferred"));
+        // Still a read. A GET that writes rows lets anybody fill the table by loading pages.
+        assertEquals(0, countCareerRows());
+    }
+
+    /**
+     * A RATING FOR A DIFFERENT JOB CONTRIBUTES NO DATES TO THIS ONE.
+     *
+     * <p>The match is on the company and title each rating snapshotted, which is how
+     * {@code SEGMENTS_SQL} does it. Matching on the manager alone would pool every rating the
+     * person has ever received and hand each employment the same span, making the span of a
+     * long career look like the span of one job.
+     */
+    @Test
+    void ratingsForAnotherEmploymentDoNotDateThisOne() throws Exception {
+        long role = insertRole("Lead", "2019-01-01", companyId, "unknown");
+        await(pool.preparedQuery("UPDATE career_history SET start_date=NULL, end_date=NULL, "
+                + "period_known=FALSE WHERE id=$1").execute(Tuple.of(role)));
+        // Right manager, wrong job: a different title at the same employer.
+        insertRatingSpanning("Halverson Logistics", "Night Lead", "2005-01-01", "2007-01-01");
+        // And the right title at a different employer.
+        insertRatingSpanning("Marlowe Freight", "Lead", "2001-01-01", "2003-01-01");
+
+        JsonObject only = await(managerService.getEmploymentsForEditing(managerId)).getJsonObject(0);
+
+        assertNull(only.getString("startDate"), "no evidence about THIS employment");
+        assertNull(only.getString("endDate"));
+        assertFalse(only.getBoolean("startDateInferred"));
+        assertFalse(only.getBoolean("endDateInferred"));
+        // With no end date and a status that is not 'ended', it is still treated as held.
+        assertTrue(only.getBoolean("isCurrent"));
+    }
+
+
+    // ══════════════════════════════════════════════════════════════════════════
     // The position the manager record asserts
     // ══════════════════════════════════════════════════════════════════════════
 
@@ -1230,6 +1373,266 @@ class CareerEditorIntegrationTest {
         assertEquals("Sherwood Park", first.getString("declaredCity"));
     }
 
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Who is allowed to correct somebody else's career history
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /**
+     * THE CONTRIBUTION GATE ON EDITING, which nothing enforced until this.
+     *
+     * <p><b>What was wrong.</b> Correcting a career history required only an account. Anybody who
+     * had signed in once, and contributed nothing, could rewrite the employment record of a
+     * manager they had never worked with: titles, employers, dates, and whether a role is still
+     * held. The whole of {@code manager_edits} was open to any token holder.
+     *
+     * <p><b>Why an account alone is not enough.</b> An account costs one social sign-in. A rating
+     * is the thing that cannot be mass-produced cheaply and the thing that identifies somebody as
+     * a participant in this corpus rather than a passer-by, which is precisely why reading the
+     * numbers is already gated on it. Writing to the record was the weaker gate of the two, which
+     * is the wrong way round.
+     *
+     * <p><b>Why the test asserts a REFUSAL rather than a 403.</b> This is the service, and the
+     * service's contract is a failed Future carrying the reason. The HTTP status is the handler's
+     * business, and {@code AdminModerationJourneyIntegrationTest} is where the status is proved.
+     */
+    @Test
+    void somebodyWhoHasNeverRatedAManagerCannotCorrectACareerHistory() throws Exception {
+        String freeloader = "auth0|career-freeloader";
+        insertUser(freeloader, "user");
+        long role = insertRole("Depot Supervisor", "2019-01-01", companyId, "ongoing");
+
+        Exception e = assertThrows(Exception.class, () ->
+            await(managerService.createCareerEditRequest(freeloader, managerId, new JsonObject()
+                .put("explanation", "I read it somewhere")
+                .put("positions", new JsonArray()
+                    .add(correction(role, new JsonArray().add("title")).put("title", "Lead"))))));
+        assertTrue(message(e).contains("contribution_required"), message(e));
+
+        // AND NOTHING WAS WRITTEN. A gate that refuses the response but leaves the proposal in
+        // the moderation queue has not refused anything: a moderator would still see it and could
+        // still approve it.
+        assertEquals(0L, countRows("manager_edits"));
+        assertEquals(0L, countRows("manager_edit_employments"));
+    }
+
+    /**
+     * THE SAME RULE ON THE OLD FORM, because a rule enforced on one of two doors is decoration.
+     *
+     * <p>{@code POST /api/managers/:id/edit-requests} is the single-position form the career
+     * editor replaced. The client stopped calling it, which is exactly why it is worth a test:
+     * it is still mounted, still in the published OpenAPI document, and still writes to
+     * {@code manager_edits}. Gating only the new path would leave the rule bypassable by anybody
+     * who read the spec, and "the frontend does not call it" is the kind of protection section 24
+     * of CLAUDE.md exists to forbid.
+     */
+    @Test
+    void theLegacySinglePositionFormIsGatedToo() throws Exception {
+        String freeloader = "auth0|legacy-freeloader";
+        insertUser(freeloader, "user");
+
+        Exception e = assertThrows(Exception.class, () ->
+            await(managerService.createEditRequest(freeloader, managerId, new JsonObject()
+                .put("title", "Regional Director")
+                .put("company", "Halverson Logistics"))));
+        assertTrue(message(e).contains("contribution_required"), message(e));
+        assertEquals(0L, countRows("manager_edits"));
+    }
+
+    /**
+     * The gate opens on a rating, and keeps working for the ordinary contributor.
+     *
+     * <p>Stated as its own test rather than left implicit in the other forty: if the gate were
+     * accidentally inverted, or keyed on the wrong column, every one of those would fail with a
+     * refusal and the cause would not be obvious from any of them. This one names it.
+     */
+    @Test
+    void aContributorMayCorrectACareerHistory() throws Exception {
+        long role = insertRole("Depot Supervisor", "2019-01-01", companyId, "ongoing");
+
+        JsonObject res = await(managerService.createCareerEditRequest(contributor, managerId,
+            new JsonObject()
+                .put("explanation", "I reported to them, and the title is wrong.")
+                .put("positions", new JsonArray()
+                    .add(correction(role, new JsonArray().add("title")).put("title", "Lead")))));
+
+        assertEquals("pending", res.getString("status"));
+    }
+
+    /**
+     * The other branch of the gate: an ordinary live rating, with no participation row at all.
+     *
+     * <p>{@code hasContributed} reads two sources, and the shared fixture above exercises only
+     * one of them. Without this test the gate could be keyed solely on {@code
+     * rating_participation} - which is backfilled, and empty for anybody who rated before it
+     * existed - and every test in this class would still pass while real contributors were
+     * refused.
+     */
+    @Test
+    void aRealPublishedRatingAlsoOpensTheGate() throws Exception {
+        String rater = "auth0|career-real-rater";
+        UUID   raterId = insertUser(rater, "user");
+        long   elsewhere = insertManager("Someone Else", "someone-else");
+        await(pool.preparedQuery(
+                "INSERT INTO reviews (manager_id, user_id, author, overall_rating, "
+                + "manager_company, manager_title, origin) "
+                + "VALUES ($1, $2, 'real-rater', 4, 'Halverson Logistics', 'Lead', 'contributor')")
+            .execute(Tuple.of(elsewhere, raterId)));
+
+        long role = insertRole("Depot Supervisor", "2019-01-01", companyId, "ongoing");
+        JsonObject res = await(managerService.createCareerEditRequest(rater, managerId,
+            new JsonObject()
+                .put("explanation", "I worked under them for two years.")
+                .put("positions", new JsonArray()
+                    .add(correction(role, new JsonArray().add("title")).put("title", "Lead")))));
+
+        assertEquals("pending", res.getString("status"));
+    }
+
+    /**
+     * AN ADMIN IS NOT ASKED FOR A RATING FIRST.
+     *
+     * <p>They may already approve, reject and rewrite every one of these fields through the
+     * moderation tools, so the gate would protect nothing while building a moderation dead end -
+     * the same reasoning that lets an admin see a pending profile at all.
+     */
+    @Test
+    void anAdminMayCorrectACareerHistoryWithoutHavingRated() throws Exception {
+        long role = insertRole("Depot Supervisor", "2019-01-01", companyId, "ongoing");
+
+        // adminAuth0 has no rating and no participation row: the @BeforeEach gives those to the
+        // contributor only.
+        JsonObject res = await(managerService.createCareerEditRequest(adminAuth0, managerId,
+            new JsonObject()
+                .put("explanation", "Corrected from the employment letter attached to the report.")
+                .put("positions", new JsonArray()
+                    .add(correction(role, new JsonArray().add("title")).put("title", "Lead")))));
+
+        assertEquals("pending", res.getString("status"));
+    }
+
+    /**
+     * THE PERSON WHO SUBMITTED AN UNPUBLISHED PROFILE MAY FIX IT, HAVING RATED NOBODY.
+     *
+     * <p>This is the case that would have turned the gate into a trap, and it is not a rare one.
+     * The rating somebody leaves when they ADD a manager is HELD until that manager is approved,
+     * and {@code hasContributed} counts only live ratings - so whoever submitted a profile sixty
+     * seconds ago is precisely the account the gate reads as having contributed nothing. The career
+     * editor is now the only form offered for a pending manager, so refusing them would leave a
+     * typo in their own submission with nothing anywhere that could correct it.
+     *
+     * <p>It is not somebody else's record either: the profile is not published, and the submitter
+     * match is the same flag that makes the change apply immediately rather than queueing - which
+     * is why this asserts {@code applied} and not {@code pending}.
+     */
+    @Test
+    void theSubmitterOfAnUnpublishedManagerMayFixItWithoutHavingRated() throws Exception {
+        String newcomer = "auth0|career-newcomer";
+        UUID   newcomerId = insertUser(newcomer, "user");
+        long   draftId = await(pool.preparedQuery(
+                "INSERT INTO managers (name, company, title, status, approval_status, company_id, "
+                + "slug, overall_rating, reviews_count, category_averages, submitted_by) "
+                + "VALUES ('Unpublished Draft','Halverson Logistics','Lead','active',"
+                + "'pending_approval',$1,'unpublished-draft',0,0,'{}'::jsonb,$2) RETURNING id")
+            .execute(Tuple.of(companyId, newcomerId))
+            .map(rs -> rs.iterator().next().getLong("id")));
+
+        JsonObject res = await(managerService.createCareerEditRequest(newcomer, draftId,
+            new JsonObject()
+                .put("explanation", "I mistyped the start date when I added them.")
+                .put("positions", new JsonArray()
+                    .add(addition("Depot Supervisor", companyId)
+                        .put("startDate", "2021-05").put("employmentStatus", "ongoing")))));
+
+        assertEquals("applied", res.getString("status"),
+            "their own unpublished draft writes through rather than queueing");
+    }
+
+    /**
+     * And the exemption is NARROW: it is the submitter's own draft, not anybody's draft.
+     *
+     * <p>Without this, "pending_approval" on its own would read as a hole: an unrated stranger
+     * could rewrite a submission they did not make. They cannot see such a profile - a pending row
+     * is served only to its submitter and to admins - but visibility is not the authorization
+     * boundary and must not be the only thing standing here.
+     */
+    @Test
+    void aStrangerCannotUseSomebodyElsesUnpublishedDraftToGetRoundTheGate() throws Exception {
+        UUID ownerId = insertUser("auth0|draft-owner", "user");
+        long draftId = await(pool.preparedQuery(
+                "INSERT INTO managers (name, company, title, status, approval_status, company_id, "
+                + "slug, overall_rating, reviews_count, category_averages, submitted_by) "
+                + "VALUES ('Somebody Elses Draft','Halverson Logistics','Lead','active',"
+                + "'pending_approval',$1,'somebody-elses-draft',0,0,'{}'::jsonb,$2) RETURNING id")
+            .execute(Tuple.of(companyId, ownerId))
+            .map(rs -> rs.iterator().next().getLong("id")));
+
+        String stranger = "auth0|draft-stranger";
+        insertUser(stranger, "user");
+
+        Exception e = assertThrows(Exception.class, () ->
+            await(managerService.createCareerEditRequest(stranger, draftId, new JsonObject()
+                .put("explanation", "Changing somebody else's unpublished submission")
+                .put("positions", new JsonArray()
+                    .add(addition("Invented Role", companyId)
+                        .put("startDate", "2021-05").put("employmentStatus", "ongoing"))))));
+        assertTrue(message(e).contains("contribution_required"), message(e));
+        assertEquals(0L, countRows("manager_edits"));
+    }
+
+    /**
+     * UNLINKING A RATING MUST NOT CLOSE THIS GATE.
+     *
+     * <p>Unlinking severs {@code reviews.user_id} - that severance IS the unlinking - so the
+     * live-rating half of {@code hasContributed} goes blind the moment somebody uses it. The
+     * rating stays published and keeps counting toward the manager's average throughout, so
+     * closing the editing gate would take the contribution and the access both.
+     *
+     * <p>What carries the eligibility across is the participation record, which
+     * {@code unlinkByOwner} writes in the same transaction as the severance and before it.
+     * {@code UnlinkRatingIntegrationTest} already proves profile access survives; this proves the
+     * career-editing gate does, which is a separate caller and the newer of the two.
+     *
+     * <p>Driven through the real severance on purpose. Inserting a participation row by hand would
+     * prove the gate reads the table and nothing whatever about whether the unlink path fills it
+     * in, which is the half that would actually break.
+     */
+    @Test
+    void unlinkingARatingLeavesTheContributorAbleToCorrectACareerHistory() throws Exception {
+        String unlinker   = "auth0|career-unlinker";
+        UUID   unlinkerId = insertUser(unlinker, "user");
+        long   elsewhere  = insertManager("Rated Then Released", "rated-then-released");
+
+        UUID ratingId = await(pool.preparedQuery(
+                "INSERT INTO reviews (manager_id, user_id, author, overall_rating, "
+                + "manager_company, manager_title, gate_eligible, origin) "
+                + "VALUES ($1, $2, 'unlinker', 4, 'Halverson Logistics', 'Lead', TRUE, "
+                + "'contributor') RETURNING id")
+            .execute(Tuple.of(elsewhere, unlinkerId))
+            .map(rs -> rs.iterator().next().getUUID("id")));
+
+        assertTrue(await(reviewRepo.unlinkByOwner(pool, ratingId, elsewhere, unlinkerId)),
+            "the unlink should have happened");
+
+        /*
+          The ownership really is gone. Without this, a regression that left user_id in place would
+          leave the test passing on the live-rating branch while proving nothing about the gate.
+        */
+        long stillOwned = await(pool.preparedQuery(
+                "SELECT count(*) AS n FROM reviews WHERE user_id = $1")
+            .execute(Tuple.of(unlinkerId))
+            .map(rs -> rs.iterator().next().getLong("n")));
+        assertEquals(0L, stillOwned, "unlinking is the severance of ownership");
+
+        long role = insertRole("Depot Supervisor", "2019-01-01", companyId, "ongoing");
+        JsonObject res = await(managerService.createCareerEditRequest(unlinker, managerId,
+            new JsonObject()
+                .put("explanation", "I reported to them before I let my rating go.")
+                .put("positions", new JsonArray()
+                    .add(correction(role, new JsonArray().add("title")).put("title", "Lead")))));
+
+        assertEquals("pending", res.getString("status"));
+    }
+
     // ── fixtures ────────────────────────────────────────────────────────────
 
     private JsonObject correction(long roleId, JsonArray fields) {
@@ -1267,11 +1670,51 @@ class CareerEditorIntegrationTest {
             .map(rs -> rs.iterator().next().getLong("id")));
     }
 
+    /**
+     * Records that this person has rated a manager, which is what the editing gate asks for.
+     *
+     * <p>{@code gate_eligible} is FALSE by default on this table, so it has to be said explicitly:
+     * a held or rejected contribution is recorded too, and does not buy access.
+     */
+    private void insertGateParticipation(UUID userId) throws Exception {
+        await(pool.preparedQuery(
+                "INSERT INTO rating_participation (user_id, subject_type, subject_id, "
+                + "gate_eligible) VALUES ($1, 'manager', $2, TRUE)")
+            .execute(Tuple.of(userId, managerId)));
+    }
+
     private UUID insertUser(String auth0Id, String role) throws Exception {
         return await(pool.preparedQuery(
                 "INSERT INTO users (auth0_id, username, role) VALUES ($1,$2,$3) RETURNING id")
             .execute(Tuple.of(auth0Id, "u" + Math.abs(auth0Id.hashCode()), role))
             .map(rs -> rs.iterator().next().getUUID("id")));
+    }
+
+    /**
+     * A rating recording WHEN somebody worked with this manager, which is the only evidence the
+     * editor has about an employment nobody has dated.
+     *
+     * <p>Matched to an employment on the COMPANY AND TITLE the rating snapshotted, the way
+     * SEGMENTS_SQL matches it, rather than through a foreign key: a snapshot is all a rating
+     * carries.
+     */
+    private void insertRatingSpanning(String company, String title, String fromIso, String untilIso)
+            throws Exception {
+        /*
+          A FRESH AUTHOR FOR EACH RATING, because one is not allowed to rate the same role twice:
+          idx_reviews_user_manager_role_legacy enforces it by account and
+          idx_reviews_author_manager_role_legacy by display name, so both have to differ. Two
+          spells of overlapping evidence come from two different people in reality, which is also
+          the only way they come from here.
+        */
+        String who  = "rater-" + UUID.randomUUID().toString().substring(0, 8);
+        UUID   rater = insertUser(who, "user");
+        await(pool.preparedQuery(
+                "INSERT INTO reviews (manager_id, user_id, author, overall_rating, "
+                + "manager_company, manager_title, worked_from, worked_until, origin) "
+                + "VALUES ($1, $2, $3, 4, $4, $5, $6::date, $7::date, 'contributor')")
+            .execute(Tuple.of(managerId, rater, who, company, title,
+                              LocalDate.parse(fromIso), LocalDate.parse(untilIso))));
     }
 
     private long insertRole(String title, String startIso, long company, String status)

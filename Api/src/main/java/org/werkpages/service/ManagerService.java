@@ -4826,6 +4826,58 @@ public class ManagerService {
 
     // ── Edit requests ─────────────────────────────────────────────────────────
 
+    /**
+     * CORRECTING SOMEBODY'S CAREER HISTORY REQUIRES HAVING RATED A MANAGER.
+     *
+     * <p>Two conditions, and an account is only the first. Being signed in is already enforced
+     * before this is reached: the route carries the global bearer requirement and the handler
+     * refuses a request arriving without an identity. This is the second condition - the person
+     * must have contributed to the corpus they are proposing to rewrite.
+     *
+     * <h2>Why an account on its own is not enough</h2>
+     *
+     * <p>An account costs one social sign-in, so "logged in" is close to no barrier at all for
+     * somebody rewriting the employment record of a manager they have never met: the title, the
+     * employer, the dates, and whether a role is still held. A rating is the thing that cannot be
+     * mass-produced cheaply, and it is already what this product asks for before it will SHOW
+     * anybody these same numbers. Reading the record was gated and writing to it was not, which
+     * was the wrong way round.
+     *
+     * <h2>The same rule on both forms</h2>
+     *
+     * <p>Applied by the career editor and by the legacy single-position form. The client calls
+     * only the first, which is precisely why the second needs it: it is still mounted and still
+     * published in the OpenAPI document, so a rule enforced on one of two doors is decoration. An
+     * endpoint the frontend happens not to call is not an authorization boundary.
+     *
+     * <h2>The admin exemption</h2>
+     *
+     * <p>An admin may already approve, reject and rewrite every one of these fields through the
+     * moderation tools, so requiring a rating of them first protects nothing and would only build
+     * a dead end. This is the same reasoning {@link #enforceSubmitterAccess} uses to let an admin
+     * see a pending profile at all.
+     *
+     * <p>The career editor carries ONE FURTHER exemption that this helper deliberately does not:
+     * the submitter's own unpublished draft. It needs the manager row to establish, so it lives at
+     * the point in {@code submitCareerEdit} where that row is locked.
+     *
+     * <h2>What this deliberately does not gate</h2>
+     *
+     * <p>Reading the employments the editor renders. That endpoint publishes nothing the public
+     * profile does not, and every correction is refused at submit regardless.
+     *
+     * @return a failed Future carrying {@code contribution_required}, kept distinct from
+     *         {@code account_suspended} and from the daily limit so the client can say which of
+     *         the three happened
+     */
+    private Future<Void> requireContributor(UUID userId, String role) {
+        if ("admin".equals(role)) return Future.succeededFuture();
+        return userRepo.hasContributed(userId)
+            .compose(contributed -> contributed
+                ? Future.<Void>succeededFuture()
+                : Future.<Void>failedFuture(ServiceException.forbidden("contribution_required")));
+    }
+
     public Future<JsonObject> createEditRequest(String auth0Id, long managerId, JsonObject body) {
         if (body == null) return Future.failedFuture(ServiceException.badRequest("Missing request body"));
         String newCompany        = body.getString("company");
@@ -4895,7 +4947,8 @@ public class ManagerService {
                 Row userRow = opt.get();
                 if (userRow.getBoolean("is_banned")) return Future.failedFuture(ServiceException.forbidden("account_suspended"));
                 UUID userId = userRow.getUUID("id");
-                return editRepo.countSubmittedTodayByUser(userId)
+                return requireContributor(userId, userRow.getString("role"))
+                    .compose(gate -> editRepo.countSubmittedTodayByUser(userId))
                     .compose(todayEdits -> SubmissionLimits.checkDailyLimit(todayEdits, SubmissionLimits.DAILY_EDITS))
                     .compose(v -> managerRepo.findById(managerId)
                             .compose(mgrOpt -> {
@@ -5192,11 +5245,24 @@ public class ManagerService {
                     return Future.failedFuture(ServiceException.forbidden("account_suspended"));
                 }
                 UUID userId = userRow.getUUID("id");
-                return editRepo.countSubmittedTodayByUser(userId)
-                    .compose(today -> SubmissionLimits.checkDailyLimit(today, SubmissionLimits.DAILY_EDITS))
-                    .compose(v -> ((Pool) db).withTransaction(tx ->
-                        submitCareerEdit(tx, managerId, userId, newName, explanation.trim(),
-                                         changes, places, fromRecord)));
+                /*
+                  THE CONTRIBUTION GATE IS DECIDED HERE AND ENFORCED INSIDE THE TRANSACTION.
+
+                  Not composed in front like the legacy form's, because this path has one more
+                  exemption and it cannot be settled yet: the submitter's own unpublished draft is
+                  allowed through, and establishing that needs the manager row, which is read
+                  under FOR UPDATE a few lines into submitCareerEdit. So the answer travels in and
+                  the refusal happens where both facts are known. Nothing is written before it:
+                  the transaction rolls back.
+                */
+                boolean isAdmin = "admin".equals(userRow.getString("role"));
+                return userRepo.hasContributed(userId)
+                    .compose(contributed -> editRepo.countSubmittedTodayByUser(userId)
+                        .compose(today -> SubmissionLimits.checkDailyLimit(today, SubmissionLimits.DAILY_EDITS))
+                        .compose(v -> ((Pool) db).withTransaction(tx ->
+                            submitCareerEdit(tx, managerId, userId, newName, explanation.trim(),
+                                             changes, places, fromRecord,
+                                             contributed || isAdmin))));
             });
     }
 
@@ -5211,7 +5277,8 @@ public class ManagerService {
                                                 String newName, String explanation,
                                                 List<EditRepository.EmploymentChange> changes,
                                                 List<CorpusPlace> places,
-                                                List<Boolean> fromRecord) {
+                                                List<Boolean> fromRecord,
+                                                boolean gateSatisfied) {
         // Set while the manager row is locked and read after the change set is written, so the
         // decision is made from the state the transaction actually holds.
         final boolean[] selfApplies = { false };
@@ -5237,6 +5304,28 @@ public class ManagerService {
                 */
                 selfApplies[0] = "pending_approval".equals(m.getString("approval_status"))
                     && userId.equals(m.getUUID("submitted_by"));
+                /*
+                  THE CONTRIBUTION GATE. See requireContributor for why it exists at all.
+
+                  THE EXEMPTION FOR SOMEBODY'S OWN UNPUBLISHED DRAFT, which is not a loosening but
+                  the thing that stops the rule becoming a trap.
+
+                  The rating somebody leaves when they ADD a manager is held until that manager is
+                  approved, and hasContributed counts only live ratings. So the person most likely
+                  to want this form - whoever submitted the profile sixty seconds ago and spotted a
+                  typo in it - is exactly the person the gate would refuse, and since the career
+                  editor is now the only form offered for a pending manager, they would have no way
+                  to correct their own work at all.
+
+                  It is also not somebody else's record: a pending profile is not published, and
+                  selfApplies already means this contributor is its submitter, which is why that
+                  same flag lets the change apply immediately rather than queueing for review. The
+                  identical confusion once blurred a contributor's own rating back at them on the
+                  profile page, for the same reason.
+                */
+                if (!gateSatisfied && !selfApplies[0]) {
+                    return Future.failedFuture(ServiceException.forbidden("contribution_required"));
+                }
                 return snapshotAll(tx, managerId, changes, places, fromRecord, 0, new ArrayList<>());
             })
             .compose(snapshotted -> editRepo.markCareerEditApply(tx)
@@ -5553,6 +5642,29 @@ public class ManagerService {
                          difference: a value somebody can see, change and submit unchanged is a
                          declaration, where one attached behind their back is an inference.
                        */
+                       /*
+                         DATES FROM THE RATINGS, WHEN THE EMPLOYMENT HAS NONE OF ITS OWN.
+
+                         The editor showed empty date fields for a position whose dates the profile
+                         was displaying directly above it. The profile gets them from the ratings:
+                         SEGMENTS_SQL does COALESCE(ch.start_date, rv.start_date) where rv is
+                         MIN(worked_from) / MAX(worked_until) over the ratings for that company and
+                         title. Every rating asks when the person worked with the manager, so for a
+                         manager nobody has dated explicitly that span is the only evidence there is.
+
+                         Reusing that rule rather than inventing one, so the form and the profile
+                         cannot disagree about the same employment.
+
+                         It is a BOUND, not a fact: the role began no later than the earliest
+                         overlap and ended no earlier than the latest. So it is reported as inferred
+                         and the form says so, rather than presenting a derivation as a record.
+                       */
+                       COALESCE(ch.start_date, rated.rated_from) AS effective_start_date,
+                       COALESCE(ch.end_date,   rated.rated_until) AS effective_end_date,
+                       (ch.start_date IS NULL AND rated.rated_from IS NOT NULL)
+                         AS start_date_inferred,
+                       (ch.end_date IS NULL AND rated.rated_until IS NOT NULL)
+                         AS end_date_inferred,
                        COALESCE(ch.declared_country,   mgr.inherit_country)   AS declared_country,
                        COALESCE(ch.declared_state,     mgr.inherit_state)     AS declared_state,
                        COALESCE(ch.declared_city,      mgr.inherit_city)      AS declared_city,
@@ -5573,6 +5685,22 @@ public class ManagerService {
                   The manager's own location, offered ONLY to a current role that has none. The
                   CASE is what scopes it: a previous role joins to all-nulls and inherits nothing.
                 */
+                /*
+                  The ratings for THIS employment, matched the way SEGMENTS_SQL matches them: on
+                  the company and title each rating recorded. A snapshot is all a rating carries,
+                  so two spells at one employer with one title share their ratings' span - which is
+                  a limitation of the evidence rather than of this query, and the inferred flag is
+                  what keeps it honest.
+                */
+                LEFT JOIN LATERAL (
+                    SELECT MIN(r.worked_from)::timestamptz  AS rated_from,
+                           MAX(r.worked_until)::timestamptz AS rated_until
+                      FROM reviews r
+                     WHERE r.manager_id = ch.manager_id
+                       AND r.deleted_at IS NULL
+                       AND LOWER(TRIM(r.manager_company)) = LOWER(TRIM(ch.company))
+                       AND LOWER(TRIM(r.manager_title))   = LOWER(TRIM(ch.title))
+                ) rated ON TRUE
                 LEFT JOIN LATERAL (
                     SELECT CASE WHEN cur.is_current THEN loc.loc_country     END AS inherit_country,
                            CASE WHEN cur.is_current THEN loc.loc_state       END AS inherit_state,
@@ -5597,8 +5725,11 @@ public class ManagerService {
                   -- the editor lists them in. An employment with no end date and a status that is
                   -- not 'ended' is current; one with neither dates nor a stated status sorts with
                   -- the past rather than claiming to be current.
+                  -- The same rule the badge uses, including the inferred end date, or a position
+                  -- labelled "previous" would still sort among the current ones.
                   (ch.employment_status = 'ongoing'
-                     OR (ch.end_date IS NULL AND ch.employment_status <> 'ended')) DESC,
+                     OR (COALESCE(ch.end_date, rated.rated_until) IS NULL
+                         AND ch.employment_status <> 'ended')) DESC,
                   /*
                      NULLS LAST on both, so an undated position sorts to the END of its group.
                      This read NULLS FIRST on the end date, which put "they left, date unknown"
@@ -5608,7 +5739,7 @@ public class ManagerService {
                      The same convention now applies to the trajectory and the manager detail, so
                      the three surfaces agree instead of each answering differently.
                   */
-                  ch.end_date DESC NULLS LAST,
+                  COALESCE(ch.end_date, rated.rated_until) DESC NULLS LAST,
                   ch.start_date DESC NULLS LAST,
                   ch.id DESC
                 """)
@@ -5617,7 +5748,17 @@ public class ManagerService {
                 JsonArray out = new JsonArray();
                 for (Row r : rows) {
                     String status = r.getString("employment_status");
-                    OffsetDateTime end = r.getOffsetDateTime("end_date");
+                    OffsetDateTime end = r.getOffsetDateTime("effective_end_date");
+                    /*
+                      AN INFERRED END DATE MARKS THE ROLE AS PREVIOUS.
+
+                      The inference is a bound - the latest point anyone said they were still
+                      working with this manager - so treating it as the end of the role is a guess.
+                      It is the better guess though: a role nobody has been working in for two
+                      years is more likely finished than current, and it is shown as inferred with
+                      the dates editable, so anybody who knows otherwise can say so in the form.
+                      Deliberate product decision, 2026-11-17.
+                    */
                     boolean current = "ongoing".equals(status)
                         || (end == null && !"ended".equals(status));
                     out.add(new JsonObject()
@@ -5627,8 +5768,12 @@ public class ManagerService {
                         .put("companyId",        r.getLong("company_id"))
                         .put("companyDomain",    r.getString("company_domain"))
                         .put("companyLogoUrl",   r.getString("company_logo_url"))
-                        .put("startDate",        yearMonth(r.getOffsetDateTime("start_date")))
+                        .put("startDate",        yearMonth(r.getOffsetDateTime("effective_start_date")))
                         .put("endDate",          yearMonth(end))
+                        // So the form can say where a date came from instead of presenting an
+                        // inference as something somebody stated.
+                        .put("startDateInferred", Boolean.TRUE.equals(r.getBoolean("start_date_inferred")))
+                        .put("endDateInferred",   Boolean.TRUE.equals(r.getBoolean("end_date_inferred")))
                         .put("periodKnown",      r.getBoolean("period_known"))
                         .put("employmentStatus", status)
                         .put("state",            r.getString("state"))
@@ -5683,6 +5828,21 @@ public class ManagerService {
                 SELECT m.title, m.company, m.company_id, m.status,
                        """ + MANAGER_LOCATION_SQL + """
                        , c.domain AS company_domain, c.logo_url AS company_logo_url,
+                       /*
+                         The same inference for the position the manager record asserts, which is
+                         the case where it matters most: a manager created by somebody searching
+                         has no employment row at all, so the ratings are the only dates in
+                         existence. Matched on the manager's own company and title, which is what
+                         that position is.
+                       */
+                       (SELECT MIN(r.worked_from)::timestamptz FROM reviews r
+                         WHERE r.manager_id = m.id AND r.deleted_at IS NULL
+                           AND LOWER(TRIM(r.manager_company)) = LOWER(TRIM(m.company))
+                           AND LOWER(TRIM(r.manager_title))   = LOWER(TRIM(m.title))) AS rated_from,
+                       (SELECT MAX(r.worked_until)::timestamptz FROM reviews r
+                         WHERE r.manager_id = m.id AND r.deleted_at IS NULL
+                           AND LOWER(TRIM(r.manager_company)) = LOWER(TRIM(m.company))
+                           AND LOWER(TRIM(r.manager_title))   = LOWER(TRIM(m.title))) AS rated_until,
                        EXISTS (SELECT 1 FROM career_history ch
                                 WHERE ch.manager_id = m.id
                                   AND ch.state IN ('accepted', 'proposed')
@@ -5714,8 +5874,10 @@ public class ManagerService {
                         .put("companyId",        m.getLong("company_id"))
                         .put("companyDomain",    m.getString("company_domain"))
                         .put("companyLogoUrl",   m.getString("company_logo_url"))
-                        .put("startDate",        (String) null)
-                        .put("endDate",          (String) null)
+                        .put("startDate",        yearMonth(m.getOffsetDateTime("rated_from")))
+                        .put("endDate",          yearMonth(m.getOffsetDateTime("rated_until")))
+                        .put("startDateInferred", m.getOffsetDateTime("rated_from") != null)
+                        .put("endDateInferred",   m.getOffsetDateTime("rated_until") != null)
                         .put("periodKnown",      false)
                         .put("employmentStatus", active ? "ongoing" : "ended")
                         .put("state",            "accepted")

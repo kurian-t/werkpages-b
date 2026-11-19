@@ -232,6 +232,31 @@ public class ManagerServiceCoverage5IntegrationTest {
             .execute(Tuple.of(managerId)).map(rs -> rs.iterator().next().getString("slug")));
     }
 
+    /**
+     * Records that this account has rated a manager, which is what the career-edit gate asks for.
+     *
+     * <p>Submitting a correction now requires having contributed, so a fixture that only creates
+     * an account no longer gets past the gate.
+     *
+     * <p>Written as PARTICIPATION rather than as a rating on purpose: a {@code reviews} row would
+     * change the rating counts and averages several tests in this class assert on, so a fixture
+     * meant only to unlock a gate would quietly be altering the measurements too. Participation is
+     * the source the gate reads for a contributor whose rating was later unlinked, so it is a real
+     * mechanism and not a trick. The gate itself is proved in CareerEditorIntegrationTest.
+     *
+     * <p>Called only by the tests that get PAST input validation and actually reach the gate. The
+     * validation tests reach it with no account at all and must keep doing so.
+     *
+     * <p>{@code subject_id} is arbitrary: the gate asks only whether this person has contributed
+     * at all, the column has no foreign key, and nothing here joins on it.
+     */
+    private void makeContributor(String auth0Id) throws Exception {
+        await(pool.preparedQuery(
+                "INSERT INTO rating_participation (user_id, subject_type, subject_id, "
+                + "gate_eligible) SELECT id, 'manager', 0, TRUE FROM users WHERE auth0_id = $1")
+            .execute(Tuple.of(auth0Id)));
+    }
+
     private String insertUser(String auth0Id) throws Exception {
         pool.preparedQuery("INSERT INTO users(auth0_id, email, username, first_name, last_name, role) VALUES ($1,$2,$3,$4,$5,'user')")
                 .execute(Tuple.of(auth0Id, auth0Id + "@test.com", "u_" + auth0Id.replace("|", ""), "Test", "User"))
@@ -795,6 +820,7 @@ public class ManagerServiceCoverage5IntegrationTest {
     @Test
     void createEditRequest_success() throws Exception {
         String auth0Id = insertUser("auth0|er-success");
+        makeContributor(auth0Id);
         long managerId = insertManager("EditReq Mgr", "ERCorp", "Dev", "approved");
         JsonObject body = new JsonObject().put("company", "NewCorp").put("title", "New Lead");
         JsonObject result = await(service.createEditRequest(auth0Id, managerId, body));
@@ -903,6 +929,7 @@ public class ManagerServiceCoverage5IntegrationTest {
     @Test
     void createEditRequest_managerNotFound_returnsNotFound() throws Exception {
         String auth0Id = insertUser("auth0|er-nomgr");
+        makeContributor(auth0Id);
         try {
             await(service.createEditRequest(auth0Id, 99999L, new JsonObject().put("company", "NewCo")));
             fail("expected not found");
