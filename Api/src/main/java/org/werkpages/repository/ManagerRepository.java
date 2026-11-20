@@ -137,7 +137,9 @@ public class ManagerRepository {
                             'overall_working_experience', overall_working_experience
                         ),
                         'managerCompany', manager_company, 'managerTitle', manager_title,
-                        'text', text, 'verified', verified, 'helpfulCount', helpful_count,
+                        /* No 'text': free-form review text was removed on 2026-11-18. A rating
+                           is scores, nothing writes the column and nothing may serve it. */
+                        'verified', verified, 'helpfulCount', helpful_count,
                         'createdAt', created_at, 'workedFrom', worked_from, 'workedUntil', worked_until,
                         /*
                           Whether this one is public yet, so the page can say so and put it first.

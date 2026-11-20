@@ -334,9 +334,14 @@ public final class CareerChangeSetApplier {
     /**
      * Write the append-only record of what this correction changed.
      *
-     * <p>One row per field, which is the shape {@code role_corrections} already has. The
-     * submission's single explanation is reused as every row's reason: the contributor was asked
-     * once, during Review Changes, rather than made to retype the same sentence for each field.
+     * <p>One row per field, which is the shape {@code role_corrections} already has.
+     *
+     * <p>THE REASON IS NORMALLY NULL, and V112 made the column nullable to say so. The career
+     * editor stopped asking "How do you know?" on 2026-11-18, so a submission from it carries no
+     * explanation and there is nothing to record as the reason. A placeholder was deliberately not
+     * invented: the moderation history renders this column as the contributor's own words, and a
+     * sentence no human wrote would read there like evidence. The LEGACY single-position form still
+     * collects an explanation and still writes it here, which is why the parameter stays.
      *
      * <p>A field whose value did not actually move writes nothing, because
      * {@code role_correction_changed_something} requires {@code was IS DISTINCT FROM now_is} and

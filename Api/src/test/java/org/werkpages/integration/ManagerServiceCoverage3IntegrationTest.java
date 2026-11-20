@@ -198,6 +198,39 @@ class ManagerServiceCoverage3IntegrationTest {
         }
     }
 
+    /**
+     * THE PROFILE ENDPOINT MUST NOT SERVE REVIEW TEXT, EVEN WHEN A ROW HAS SOME.
+     *
+     * <p>Free-form review text was removed on 2026-11-18. Closing the four write paths and the two
+     * {@code ManagerService} serialisations was NOT enough, and this test exists because that gap
+     * reached a running server: the profile payload is assembled by a SQL
+     * {@code json_build_object} in {@code ManagerRepository}, which carried {@code 'text', text}
+     * of its own and kept serving the field after everything else had stopped.
+     *
+     * <p>Asserted against a row written DIRECTLY, bypassing the service, because that is the only
+     * shape that can still exist: the column is staying (production has 1257 ratings and has never
+     * held a character of text) and nothing in the application writes it any more. If a legacy row
+     * ever did carry prose, the API must still not hand it out.
+     */
+    @Test
+    void getManagerById_neverServesReviewText() throws Exception {
+        long managerId = insertManager("Text Leak Check", "Corp", "Dev", "approved");
+        await(pool.preparedQuery(
+                "INSERT INTO reviews (manager_id, user_id, author, overall_rating, "
+                + "manager_company, manager_title, text, origin) "
+                + "VALUES ($1, NULL, 'legacy', 4, 'Corp', 'Dev', "
+                + "'prose that must never be served', 'contributor')")
+            .execute(io.vertx.sqlclient.Tuple.of(managerId)));
+
+        io.vertx.sqlclient.Row row = await(service.getManagerById(managerId, null));
+        String payload = row.toJson().encode();
+
+        assertFalse(payload.contains("prose that must never be served"),
+            "the profile endpoint served review text: " + payload);
+        assertFalse(payload.contains("\"text\""),
+            "the profile payload still carries a text key: " + payload);
+    }
+
     @Test
     void getManagerById_rejectedManager_returnsNotFound() throws Exception {
         long managerId = insertManager("Rejected Person", "Corp", "Dev", "rejected");

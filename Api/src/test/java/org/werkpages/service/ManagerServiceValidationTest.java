@@ -228,13 +228,17 @@ class ManagerServiceValidationTest {
         assertTrue(ex.getMessage().toLowerCase().contains("title"));
     }
 
-    @Test
-    void reviewTextTooLong_returns400() {
-        JsonObject body = validBody().put("text", "A".repeat(2001));
-        ServiceException ex = assertServiceFails(service.createReview(AUTH0_ID, MANAGER_ID, body, null));
-        assertEquals(400, ex.getStatusCode());
-        assertTrue(ex.getMessage().contains("2000"));
-    }
+    /*
+     * REMOVED 2026-11-18: "reviewTextTooLong_returns400".
+     *
+     * It asserted a 400 for a review body over 2000 characters. Free-form review text was removed
+     * that day: the service no longer reads `text` from the request, so the length check it
+     * asserted no longer exists and could not fire.
+     *
+     * The replacement is an INTEGRATION test, deliberately, in ManagerServiceCoverage4 and 5:
+     * "a posted text is ignored" is a claim about what reaches the database, and a mock cannot
+     * see that. Asserting it here would only prove the service does not throw.
+     */
 
     // ── Date validation ───────────────────────────────────────────────────────
 

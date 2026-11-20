@@ -141,3 +141,5 @@ V107__retire_stranded_examples_and_erased_bylines.sql  865155162
 V108__classify_placeholder_ratings_in_the_database.sql  949191458
 V109__employment_location_and_proposed_change_sets.sql  1991302054
 V110__contributor_status_is_binary.sql  -1543532371
+V111__career_editor_asks_no_explanation.sql  407196005
+V112__a_correction_needs_no_reason.sql  -503021439

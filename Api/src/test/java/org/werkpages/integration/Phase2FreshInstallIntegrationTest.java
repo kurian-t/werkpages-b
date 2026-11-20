@@ -161,7 +161,31 @@ class Phase2FreshInstallIntegrationTest {
         // It exists as its own version rather than as an edit to V109 because V109 had already
         // been applied to a development database, and changing it produced exactly the checksum
         // mismatch that rule prevents.
-        assertEquals("110", await(pool.query("""
+        //
+        // V111 (the career editor asks no explanation) moved it to 111 on 2026-11-18.
+        // Acknowledged: it DROPS manager_edits_career_editor_explains, the CHECK V109 added to
+        // make an explanation mandatory on a career-editor row. The "How do you know?" question
+        // was removed from the form on request, so the constraint would have refused every row
+        // the form now produces. Dropping a CHECK cannot invalidate stored data - every row that
+        // satisfied the stricter rule satisfies its absence - and the column, the legacy form's
+        // explanation and every explanation already recorded are untouched.
+        //
+        // Its own version for the third time running, and for the same reason as V110: V109 is
+        // already applied to development databases.
+        //
+        // V112 (a correction needs no reason) moved it to 112 on 2026-11-19.
+        // Acknowledged, and it is the other half of V111. V111 stopped the form collecting an
+        // explanation; role_corrections.reason was still NOT NULL, and that column is written one
+        // row per corrected field at approval. So approving an ADDITION kept working while
+        // approving a CORRECTION of a title, location or dates raised 23502 and applied nothing.
+        // Found by the test that approves all three in one submission. This DROPS the NOT NULL
+        // and restates the non-blank CHECK as `reason IS NULL OR btrim(reason) <> ''`, which is
+        // the same rule a NULL always satisfied, now said out loud.
+        //
+        // Relaxing, not narrowing: no stored row can be invalidated by dropping NOT NULL, nothing
+        // is backfilled, and an RMM build from before today still sends a reason and is
+        // unaffected. The moderator's own correction tool still requires one.
+        assertEquals("112", await(pool.query("""
                 SELECT version FROM flyway_schema_history
                  WHERE success AND version IS NOT NULL
                  ORDER BY installed_rank DESC LIMIT 1

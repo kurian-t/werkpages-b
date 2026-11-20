@@ -760,18 +760,35 @@ public class ManagerServiceCoverage5IntegrationTest {
         }
     }
 
+    /**
+     * A POSTED `text` IS IGNORED: NOT STORED, NOT SERVED, AND NOT REFUSED EITHER.
+     *
+     * <p>This asserted that an over-long review body was rejected at 2000 characters. Free-form
+     * review text was removed on 2026-11-18 - a rating is scores, not prose - so the field is no
+     * longer read from the request, no longer serialised into the response and no longer rendered
+     * anywhere. There is no length left to violate, and the 2000-character check it asserted is
+     * gone with it.
+     *
+     * <p>INVERTED RATHER THAN DELETED, because the field can still be POSTED by anything that
+     * chooses to: the column exists and the endpoint accepts unknown keys. The requirement now is
+     * that sending one changes nothing at all. Production has 1257 ratings and has never held a
+     * single character of review text; this is what keeps it that way.
+     */
     @Test
-    void replaceReview_validateBodySync_textTooLong_returnsBadRequest() throws Exception {
+    void replaceReview_postedTextIsIgnored() throws Exception {
         String auth0Id = insertUser("auth0|rr-sync-text");
         long managerId = insertManager("RR SyncText Mgr", "RRSyncTextCo", "Dev", "approved");
         UUID reviewId = insertReviewForUser(managerId, auth0Id, "RRSyncTextCo", "Dev");
         JsonObject body = validReplaceReviewBody("RRSyncTextCo", "Dev").put("text", "A".repeat(2001));
-        try {
-            await(service.replaceReview(auth0Id, managerId, reviewId, body, null));
-            fail("expected bad request");
-        } catch (Exception e) {
-            assertTrue(e.getMessage().toLowerCase().contains("2000") || e.getMessage().toLowerCase().contains("text"));
-        }
+
+        await(service.replaceReview(auth0Id, managerId, reviewId, body, null));
+
+        Long stored = await(pool.preparedQuery(
+                "SELECT count(*) AS n FROM reviews WHERE manager_id = $1 "
+                + "AND btrim(coalesce(text,'')) <> ''")
+            .execute(Tuple.of(managerId))
+            .map(rs -> rs.iterator().next().getLong("n")));
+        assertEquals(0L, stored.longValue(), "free-form text must never be stored");
     }
 
     @Test
@@ -1450,17 +1467,20 @@ public class ManagerServiceCoverage5IntegrationTest {
         }
     }
 
+    /** The same rule on the create-manager path: a posted review body is ignored, never stored. */
     @Test
-    void createManager_reviewTextTooLong_returnsBadRequest() throws Exception {
+    void createManager_postedReviewTextIsIgnored() throws Exception {
         String auth0Id = insertUser("auth0|cm-text-long");
         JsonObject body = buildValidCreateBody("CM Text Long", "TextLCorp", "Dev");
         body.getJsonObject("review").put("text", "A".repeat(2001));
-        try {
-            await(service.createManager(auth0Id, body, null));
-            fail("expected bad request");
-        } catch (Exception e) {
-            assertTrue(e.getMessage().toLowerCase().contains("2000") || e.getMessage().toLowerCase().contains("text"));
-        }
+
+        await(service.createManager(auth0Id, body, null));
+
+        Long stored = await(pool.preparedQuery(
+                "SELECT count(*) AS n FROM reviews WHERE btrim(coalesce(text,'')) <> ''")
+            .execute()
+            .map(rs -> rs.iterator().next().getLong("n")));
+        assertEquals(0L, stored.longValue(), "free-form text must never be stored");
     }
 
     @Test

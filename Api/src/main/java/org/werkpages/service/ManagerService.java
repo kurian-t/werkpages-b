@@ -2658,7 +2658,8 @@ public class ManagerService {
         JsonObject ratings   = reviewBody.getJsonObject("ratings");
         String managerCompany = reviewBody.getString("managerCompany");
         String managerTitle   = reviewBody.getString("managerTitle");
-        String reviewText     = reviewBody.getString("text");
+        // FREE-FORM TEXT IS NOT ACCEPTED: a rating is scores, not prose. See updateReview.
+        String reviewText     = null;
         LocalDate workedFrom  = parseYearMonth(reviewBody.getString("workedFrom"));
         LocalDate workedUntil = parseYearMonth(reviewBody.getString("workedUntil"));
         /*
@@ -2685,7 +2686,6 @@ public class ManagerService {
         }
         if (managerCompany.length() > 100) return Future.failedFuture(ServiceException.badRequest("Manager company must be at most 100 characters"));
         if (managerTitle.length() > 100)   return Future.failedFuture(ServiceException.badRequest("Manager title must be at most 100 characters"));
-        if (reviewText != null && reviewText.length() > 2000) return Future.failedFuture(ServiceException.badRequest("Review text must be at most 2000 characters"));
         if (!isValidRating(overallRating)) return Future.failedFuture(ServiceException.badRequest("Overall rating must be between 1 and 5"));
         for (int i = 0; i < RATING_KEYS.length; i++) {
             Double v = getRating(ratings, i);
@@ -3599,7 +3599,7 @@ public class ManagerService {
         JsonObject ratings        = body.getJsonObject("ratings");
         String managerCompany     = body.getString("managerCompany") != null ? body.getString("managerCompany").trim() : null;
         String managerTitle       = body.getString("managerTitle")   != null ? body.getString("managerTitle").trim()   : null;
-        String text               = body.getString("text")           != null ? body.getString("text").trim()           : null;
+        String text               = null;  // free-form text is not accepted; see updateReview
         LocalDate workedFrom      = parseYearMonth(body.getString("workedFrom"));
         LocalDate workedUntil     = parseYearMonth(body.getString("workedUntil"));
         // Opt-in: absent means show, exactly as every rating written before this existed does.
@@ -3652,7 +3652,6 @@ public class ManagerService {
         if (managerCompany != null && managerCompany.length() < 2 && !allowIncomplete)   return Future.failedFuture(ServiceException.badRequest("Company name must be at least 2 characters"));
         if (managerCompany != null && managerCompany.length() > 100) return Future.failedFuture(ServiceException.badRequest("Manager company must be at most 100 characters"));
         if (managerTitle != null && managerTitle.length()   > 100) return Future.failedFuture(ServiceException.badRequest("Manager title must be at most 100 characters"));
-        if (text != null && text.length() > 2000) return Future.failedFuture(ServiceException.badRequest("Review text must be at most 2000 characters"));
         if (overallRating != null && !isValidRating(overallRating)) return Future.failedFuture(ServiceException.badRequest("Overall rating must be between 1 and 5"));
         for (int i = 0; i < RATING_KEYS.length; i++) {
             Double v = getRating(ratings, i);
@@ -4354,7 +4353,18 @@ public class ManagerService {
         JsonObject ratings         = body.getJsonObject("ratings");
         String managerCompany      = body.getString("managerCompany") != null ? body.getString("managerCompany").trim() : null;
         String managerTitle        = body.getString("managerTitle")   != null ? body.getString("managerTitle").trim()   : null;
-        String text                = body.getString("text")           != null ? body.getString("text").trim()           : null;
+        /*
+          FREE-FORM TEXT IS NOT ACCEPTED.
+
+          A rating is scores. No form collects a review body - the add form posts `text: null`
+          explicitly - and nothing may arrive carrying one, so this is read as null rather than
+          from the request. A client that posts `text` has it ignored, not stored.
+
+          The COLUMN still exists and still holds whatever older rows wrote, which is why the
+          field is no longer SERVED either: storing it unseen and serving it are both ways for
+          prose to reappear. Dropping the column is a separate, destructive decision.
+        */
+        String text                = null;
         String authorType          = body.getString("authorType", "username");
         String clientAuthor        = toProperNameCase(body.getString("author", ""));
         LocalDate workedFrom       = parseYearMonth(body.getString("workedFrom"));
@@ -4392,7 +4402,6 @@ public class ManagerService {
         if (!isValidRating(overallRating)) return Future.failedFuture(ServiceException.badRequest("Overall rating must be between 1 and 5"));
         if (managerCompany.length() > 100) return Future.failedFuture(ServiceException.badRequest("Manager company must be at most 100 characters"));
         if (managerTitle.length()   > 100) return Future.failedFuture(ServiceException.badRequest("Manager title must be at most 100 characters"));
-        if (text != null && text.length() > 2000) return Future.failedFuture(ServiceException.badRequest("Review text must be at most 2000 characters"));
         for (String key : RATING_KEYS) {
             if (!isValidRating(ratings.getDouble(key))) return Future.failedFuture(ServiceException.badRequest("Rating for '" + key + "' must be between 1 and 5"));
         }
@@ -4743,7 +4752,7 @@ public class ManagerService {
         JsonObject ratings    = body.getJsonObject("ratings");
         String managerCompany = body.getString("managerCompany");
         String managerTitle   = body.getString("managerTitle");
-        String text           = body.getString("text");
+        String text           = null;  // free-form text is not accepted; see updateReview
         LocalDate workedFrom  = parseYearMonth(body.getString("workedFrom"));
         LocalDate workedUntil = parseYearMonth(body.getString("workedUntil"));
         LocalDate managerRoleStart = parseYearMonth(body.getString("managerRoleStart"));
@@ -4770,7 +4779,6 @@ public class ManagerService {
         if (missingSync != null) return ServiceException.badRequest(missingSync);
         if (managerCompany.length() > 100) return ServiceException.badRequest("Manager company must be at most 100 characters");
         if (managerTitle.length()   > 100) return ServiceException.badRequest("Manager title must be at most 100 characters");
-        if (text != null && text.length() > 2000) return ServiceException.badRequest("Review text must be at most 2000 characters");
         if (!isValidRating(overallRating)) return ServiceException.badRequest("Overall rating must be between 1 and 5");
         for (int i = 0; i < RATING_KEYS.length; i++) {
             Double v = getRating(ratings, i);
@@ -5035,14 +5043,19 @@ public class ManagerService {
         if (body == null) return Future.failedFuture(ServiceException.badRequest("Missing request body"));
 
         String newName     = toNullIfBlank(body.getString("name"));
-        String explanation = body.getString("explanation");
+        /*
+          NO EXPLANATION IS ASKED FOR, AND NONE IS REQUIRED.
 
-        if (explanation == null || explanation.isBlank()) {
-            return Future.failedFuture(ServiceException.badRequest(
-                "Say what you are correcting and how you know. One explanation covers the whole "
-                + "submission."));
-        }
-        if (explanation.length() > 2000) {
+          The career editor used to demand one: a "How do you know?" box that had to be filled in
+          before Submit would enable. It was removed from the form on request, so this path accepts
+          a submission without one and writes NULL.
+
+          Still accepted if a client sends it, trimmed and length-capped, because the column exists
+          and the LEGACY single-position form (createEditRequest) still collects one. Removing the
+          field from this path does not remove it from that one.
+        */
+        String explanation = toNullIfBlank(body.getString("explanation"));
+        if (explanation != null && explanation.length() > 2000) {
             return Future.failedFuture(ServiceException.badRequest(
                 "Explanation must be at most 2000 characters"));
         }
@@ -5260,7 +5273,7 @@ public class ManagerService {
                     .compose(contributed -> editRepo.countSubmittedTodayByUser(userId)
                         .compose(today -> SubmissionLimits.checkDailyLimit(today, SubmissionLimits.DAILY_EDITS))
                         .compose(v -> ((Pool) db).withTransaction(tx ->
-                            submitCareerEdit(tx, managerId, userId, newName, explanation.trim(),
+                            submitCareerEdit(tx, managerId, userId, newName, explanation,
                                              changes, places, fromRecord,
                                              contributed || isAdmin))));
             });
@@ -6026,7 +6039,6 @@ public class ManagerService {
             .put("ratings",       ratings)
             .put("managerCompany", row.getString("manager_company"))
             .put("managerTitle",  row.getString("manager_title"))
-            .put("text",          row.getString("text"))
             .put("verified",      row.getBoolean("verified"))
             .put("helpfulCount",  row.getInteger("helpful_count"))
             .put("createdAt",     row.getOffsetDateTime("created_at").toString())
@@ -6150,7 +6162,6 @@ public class ManagerService {
             .put("ratings",       ratings)
             .put("managerCompany", row.getString("manager_company"))
             .put("managerTitle",  row.getString("manager_title"))
-            .put("text",          row.getString("text"))
             .put("verified",      row.getBoolean("verified"))
             .put("helpfulCount",  row.getInteger("helpful_count"))
             .put("createdAt",     row.getOffsetDateTime("created_at").toString())

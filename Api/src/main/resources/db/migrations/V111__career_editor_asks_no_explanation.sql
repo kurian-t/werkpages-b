@@ -1,0 +1,39 @@
+-- ─────────────────────────────────────────────────────────────────────────────
+-- V111  THE CAREER EDITOR NO LONGER ASKS "HOW DO YOU KNOW?"
+--
+-- Requested 2026-11-18. The question was removed from the form in both products,
+-- so a career-editor submission now arrives carrying no explanation at all and
+-- the column is written NULL.
+--
+-- WHY THIS IS NOT AN EDIT TO V109.
+--
+-- V109 added `manager_edits_career_editor_explains`, which refuses exactly the
+-- row this change now produces. V109 is undeployed to production but has already
+-- been applied to development databases, and editing an applied migration changes
+-- its checksum, after which the next backend start refuses:
+--
+--     Migration checksum mismatch for migration version 109
+--
+-- That happened on 2026-11-17 and cost an afternoon. Same reasoning as V110, same
+-- answer: the correction is its own version. See migration-checksums.txt.
+--
+-- WHAT THIS DOES NOT DO.
+--
+-- The column stays. The LEGACY single-position form (createEditRequest) still
+-- collects an explanation and still writes it, the moderation screens still show
+-- one where it exists, and every explanation recorded before today is untouched.
+-- Only the constraint that made it MANDATORY for a career-editor row is dropped,
+-- because the form that would have supplied it no longer asks.
+--
+-- SAFE AGAINST EXISTING DATA. Dropping a CHECK cannot invalidate a stored row:
+-- every row that satisfied the stricter rule satisfies its absence.
+--
+-- RMM COMPATIBILITY. `manager_edits` is shared and RMM writes it through the same
+-- career-editor path. RMM's service was changed in lockstep and no longer sends
+-- an explanation either, so neither backend depends on the constraint. An RMM
+-- build from before today sends one and is unaffected: this relaxes a rule, it
+-- does not impose one.
+-- ─────────────────────────────────────────────────────────────────────────────
+
+ALTER TABLE manager_edits
+  DROP CONSTRAINT IF EXISTS manager_edits_career_editor_explains;

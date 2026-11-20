@@ -729,6 +729,52 @@ public class CompanyRepository {
             .compose(row -> withPickedBrand(row, domain, logoUrl));
     }
 
+    /**
+     * As {@link #findOrCreate(String, String, String, String)}, but on a caller's CONNECTION, so
+     * the company is created inside the caller's transaction and disappears if it rolls back.
+     *
+     * <p>Added for career-edit approval: a moderator approving an employment at a company nobody
+     * has recorded creates that company, and a half-applied approval must not leave one behind.
+     *
+     * <h2>SELECT first, deliberately, and only inside a transaction</h2>
+     *
+     * <p>The pool version leans on {@code ON CONFLICT} and recovers from a unique violation with a
+     * second SELECT. That recovery CANNOT work inside a transaction: in PostgreSQL a 23505 aborts
+     * the surrounding transaction, so the recovering SELECT would fail too and take the caller's
+     * work with it. So this looks first and inserts only when nothing is there, with
+     * {@code ON CONFLICT (slug)} still covering a racing insert from another transaction.
+     *
+     * <p>What remains uncovered is a different transaction inserting the same NAME under a
+     * different slug in the window between the select and the insert. That raises, the approval
+     * rolls back, and the moderator sees an error and can retry onto the now-existing row. Rare,
+     * loud, and it corrupts nothing - which is the right failure for this to have.
+     */
+    public Future<Row> findOrCreate(SqlClient conn, String name, String domain, String logoUrl,
+                                    String status) {
+        return conn.preparedQuery("""
+                SELECT * FROM companies
+                 WHERE LOWER(TRIM(name)) = LOWER(TRIM($1))
+                    OR slug = lower(regexp_replace(regexp_replace(lower(trim($1)), '[^a-z0-9\\s-]', '', 'g'), '\\s+', '-', 'g'))
+                 ORDER BY (LOWER(TRIM(name)) = LOWER(TRIM($1))) DESC
+                 LIMIT 1
+                """)
+            .execute(Tuple.of(name.trim()))
+            .compose(found -> {
+                if (found.iterator().hasNext()) return Future.succeededFuture(found.iterator().next());
+                return conn.preparedQuery("""
+                        INSERT INTO companies (name, domain, logo_url, status, slug, created_at, updated_at)
+                        VALUES ($1, $2, $3, $4,
+                            lower(regexp_replace(regexp_replace(lower(trim($1)), '[^a-z0-9\\s-]', '', 'g'), '\\s+', '-', 'g')),
+                            now(), now())
+                        ON CONFLICT (slug) DO UPDATE SET updated_at = now()
+                        RETURNING *
+                        """)
+                    .execute(Tuple.of(name.trim(), domain, logoUrl, status))
+                    .map(rows -> rows.iterator().next());
+            })
+            .map(this::classifyIfNeeded);
+    }
+
     public Future<Row> findOrCreate(String name, String domain, String logoUrl, String status) {
         // Primary conflict target is the slug index. Two names that produce the same slug
         // (e.g. "Acme Corp" and "Acme Corp.") are treated as the same company.

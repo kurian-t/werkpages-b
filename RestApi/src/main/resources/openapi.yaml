@@ -3468,8 +3468,6 @@ paths:
           application/json:
             schema:
               type: object
-              required:
-                - explanation
               properties:
                 name:
                   type: string
@@ -3478,9 +3476,11 @@ paths:
                     name and no employment at all.
                 explanation:
                   type: string
-                  description: One explanation for the whole submission, collected during Review
-                    Changes. Reused as the reason on every field correction it produces, so nobody
-                    retypes the same sentence per field.
+                  nullable: true
+                  description: Optional, and the form no longer asks for it. The "How do you know?"
+                    question was removed from the career editor, so a submission carries none and
+                    the column is written NULL. Still accepted, and still capped at 2000
+                    characters, because the legacy single-position form collects one.
                 positions:
                   type: array
                   description: May be empty when only the name is being corrected.
@@ -7073,9 +7073,6 @@ components:
             that somebody retired.
         managerTitle:
           type: string
-        text:
-          type: string
-          nullable: true
         declaredCountry:
           type: string
           nullable: true
@@ -7154,9 +7151,6 @@ components:
           type: string
         managerTitle:
           type: string
-        text:
-          type: string
-          nullable: true
         datesHidden:
           type: boolean
           default: false
@@ -7241,9 +7235,6 @@ components:
           type: string
         managerTitle:
           type: string
-        text:
-          type: string
-          nullable: true
         datesHidden:
           type: boolean
           default: false

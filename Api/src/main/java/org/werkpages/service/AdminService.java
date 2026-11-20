@@ -2855,8 +2855,10 @@ public class AdminService {
             : parent.getString("new_name");
 
         return ((Pool) db).withTransaction(tx ->
-                careerApplier.applyAndApprove(tx, managerId, editId, explanation, proposedBy,
-                                              adminId, effectiveName, fix))
+                resolveProposedCompanies(tx, editId, fix)
+                    .compose(resolved -> careerApplier.applyAndApprove(tx, managerId, editId,
+                                              explanation, proposedBy, adminId, effectiveName,
+                                              resolved)))
             .map(result -> new JsonObject()
                 .put("id", editId.toString())
                 .put("managerId", managerId)
@@ -2864,6 +2866,78 @@ public class AdminService {
                 .put("status", "approved")
                 .put("applied", result.getJsonArray("positions"))
                 .put("nameChanged", result.getBoolean("renamed")));
+    }
+
+    /**
+     * GIVE EVERY PROPOSED COMPANY A RECORD, SO APPROVING IS APPROVING.
+     *
+     * <p>A contributor types an employer the picker has never heard of, accepts its "add this one"
+     * entry, and submits. Nothing creates a company at that moment, deliberately: companies are
+     * not created from unreviewed contributor input, which is what the daily creation cap exists
+     * to enforce. So the proposal carries {@code new_company_name} and no {@code new_company_id}.
+     *
+     * <p>The applier then refused to approve it, telling the moderator to "resolve the company
+     * through the picker" - asking an administrator to re-answer a question the contributor had
+     * already answered, on a form that offered no way to say "yes, that company, make it". The
+     * refusal was reported as a bug and it was one: <b>approval IS the review</b>. An
+     * administrator pressing Approve on an employment at a named company has decided that company
+     * is real, and section 19's rule is that every company comes into existence through
+     * {@code companyRepo.findOrCreate}. So it is created here, as a ghost, publicly visible, the
+     * same way every other auto-created company is.
+     *
+     * <h2>INSIDE the approval transaction</h2>
+     *
+     * <p>It takes the caller's {@code tx}, so a company created here is created by the same
+     * transaction that applies the change set. If the apply fails for any reason, the rollback
+     * takes the company with it and no orphan is left behind. An earlier version of this ran on
+     * the pool first, which was simpler and wrong: a failed approval left a ghost company nobody
+     * had agreed to.
+     *
+     * <h2>SEQUENTIALLY, not in parallel</h2>
+     *
+     * <p>Two positions can name the SAME unknown employer. Resolved concurrently they would both
+     * look, both find nothing and both insert, and the second insert's unique violation would
+     * abort the whole transaction - taking the approval with it. Folded one after another, the
+     * second position simply finds what the first created.
+     *
+     * <h2>What it does not override</h2>
+     *
+     * <p>A company the moderator resolved by hand wins, and so does one the contributor picked:
+     * this only fills in positions where nothing has answered. Resolution stays PER POSITION,
+     * because a change set can name two unknown employers and one flat id cannot answer for both.
+     */
+    private Future<JsonObject> resolveProposedCompanies(SqlConnection tx, UUID editId,
+                                                        JsonObject fix) {
+        return editRepo.findChangeSet(tx, editId).compose(rows -> {
+            JsonObject positions = fix.getJsonObject("positions") != null
+                ? fix.getJsonObject("positions")
+                : new JsonObject();
+
+            List<Row> unresolved = new ArrayList<>();
+            for (Row p : rows) {
+                JsonObject mine = positions.getJsonObject(String.valueOf(p.getLong("id")));
+                boolean answered = (mine != null && mine.getLong("companyId") != null)
+                    || fix.getLong("companyId") != null
+                    || p.getLong("new_company_id") != null;
+                String typed = p.getString("new_company_name");
+                if (!answered && typed != null && !typed.isBlank()) unresolved.add(p);
+            }
+            if (unresolved.isEmpty()) return Future.succeededFuture(fix);
+
+            Future<Void> chain = Future.succeededFuture();
+            for (Row p : unresolved) {
+                final String key   = String.valueOf(p.getLong("id"));
+                final String typed = p.getString("new_company_name").trim();
+                chain = chain.compose(v -> companyRepo.findOrCreate(tx, typed, null, null, "ghost")
+                    .map(company -> {
+                        JsonObject mine = positions.getJsonObject(key);
+                        positions.put(key, (mine != null ? mine : new JsonObject())
+                            .put("companyId", company.getLong("id")));
+                        return null;
+                    }));
+            }
+            return chain.map(v -> fix.copy().put("positions", positions));
+        });
     }
 
     /**

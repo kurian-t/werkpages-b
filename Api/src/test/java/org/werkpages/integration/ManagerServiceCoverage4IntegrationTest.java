@@ -456,18 +456,34 @@ class ManagerServiceCoverage4IntegrationTest {
         }
     }
 
+    /**
+     * A POSTED `text` IS IGNORED: NOT STORED, NOT SERVED, AND NOT REFUSED EITHER.
+     *
+     * <p>This asserted that an over-long review body was rejected at 2000 characters. Free-form
+     * review text was removed on 2026-11-18 - a rating is scores, not prose - so the field is no
+     * longer read from the request, no longer serialised into the response and no longer rendered
+     * anywhere. There is no length left to violate, and the 2000-character check it asserted is
+     * gone with it.
+     *
+     * <p>INVERTED RATHER THAN DELETED, because the field can still be POSTED by anything that
+     * chooses to: the column exists and the endpoint accepts unknown keys. The requirement now is
+     * that sending one changes nothing at all. Production has 1257 ratings and has never held a
+     * single character of review text; this is what keeps it that way.
+     */
     @Test
-    void createReview_reviewTextTooLong_returnsBadRequest() throws Exception {
+    void createReview_postedTextIsIgnored() throws Exception {
         String auth0Id = insertUser("auth0|var-text-long");
         long managerId = insertManager("Text Long Mgr", "TLC", "Dev", "approved");
         JsonObject body = validReviewBody().put("text", "X".repeat(2001));
-        try {
-            await(service.createReview(auth0Id, managerId, body, null));
-            fail("expected bad request");
-        } catch (Exception e) {
-            assertTrue(e.getMessage() != null && e.getMessage().toLowerCase().contains("2000"),
-                "Expected 2000 chars limit but got: " + e.getMessage());
-        }
+
+        await(service.createReview(auth0Id, managerId, body, null));
+
+        Long stored = await(pool.preparedQuery(
+                "SELECT count(*) AS n FROM reviews WHERE manager_id = $1 "
+                + "AND btrim(coalesce(text,'')) <> ''")
+            .execute(io.vertx.sqlclient.Tuple.of(managerId))
+            .map(rs -> rs.iterator().next().getLong("n")));
+        assertEquals(0L, stored.longValue(), "free-form text must never be stored");
     }
 
     @Test

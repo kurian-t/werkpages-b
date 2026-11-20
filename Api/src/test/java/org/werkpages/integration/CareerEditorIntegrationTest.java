@@ -253,16 +253,18 @@ class CareerEditorIntegrationTest {
         assertTrue(message(e).contains("nothing to submit"), message(e));
     }
 
-    @Test
-    void anExplanationIsRequired() throws Exception {
-        long role = insertRole("Depot Supervisor", "2019-01-01", companyId, "ongoing");
-        Exception e = assertThrows(Exception.class, () ->
-            await(managerService.createCareerEditRequest(contributor, managerId, new JsonObject()
-                .put("positions", new JsonArray()
-                    .add(correction(role, new JsonArray().add("title")).put("title", "Lead"))))));
-        assertTrue(message(e).contains("explanation") || message(e).contains("how you know"),
-            message(e));
-    }
+    /*
+     * REMOVED 2026-11-18: "anExplanationIsRequired".
+     *
+     * It asserted that a submission with no explanation is refused. The "How do you know?"
+     * question was removed from the career editor on request, so that refusal is gone from the
+     * form, from this service and from the database, where V111 dropped
+     * `manager_edits_career_editor_explains`.
+     *
+     * Recorded rather than quietly deleted, because its inverse now exists and is the thing to
+     * read instead: `aSubmissionCarryingNoExplanationIsAccepted`, below. The LEGACY
+     * single-position form still collects an explanation and is unaffected.
+     */
 
     // ══════════════════════════════════════════════════════════════════════════
     // Identifying the employment
@@ -1631,6 +1633,293 @@ class CareerEditorIntegrationTest {
                     .add(correction(role, new JsonArray().add("title")).put("title", "Lead")))));
 
         assertEquals("pending", res.getString("status"));
+    }
+
+    /**
+     * NO EXPLANATION IS ASKED FOR, SO A SUBMISSION WITHOUT ONE MUST BE ACCEPTED.
+     *
+     * <p>The career editor used to demand a "How do you know?" before Submit would enable, and the
+     * requirement was enforced in three places: the form, this service, and
+     * {@code manager_edits_career_editor_explains}, a CHECK that V109 installed. The question was
+     * removed from the form on 2026-11-18, so all three had to go or the form would collect
+     * nothing and the database would refuse every row it produced.
+     *
+     * <p>This test is the one that would have caught stopping halfway. A service that still
+     * refuses, or a database constraint left in place, fails here with the submission that the
+     * real client now sends.
+     */
+    @Test
+    void aSubmissionCarryingNoExplanationIsAccepted() throws Exception {
+        long role = insertRole("Depot Supervisor", "2019-01-01", companyId, "ongoing");
+
+        JsonObject res = await(managerService.createCareerEditRequest(contributor, managerId,
+            new JsonObject()
+                .put("positions", new JsonArray()
+                    .add(correction(role, new JsonArray().add("title")).put("title", "Lead")))));
+
+        assertEquals("pending", res.getString("status"));
+        // Written as NULL rather than as an empty string, so nothing downstream has to tell the
+        // difference between "said nothing" and "said nothing in particular".
+        assertNull(editRow(res).getString("explanation"));
+    }
+
+    /**
+     * APPROVING AN EMPLOYMENT AT A COMPANY NOBODY HAS RECORDED YET MUST JUST WORK.
+     *
+     * <p>Reported by an administrator on 2026-11-18, in these words: "AS THE ADMIN IT SHOULD JUST
+     * BE ADDED". They had typed an employer the picker did not know, accepted its "add this one"
+     * entry, submitted, and then on the moderation screen got:
+     *
+     * <pre>
+     *   This request adds an employment at "ville.levis.qc.ca", which has no company record yet,
+     *   so approving it cannot tell which company is meant. Resolve the company through the
+     *   picker, then approve.
+     * </pre>
+     *
+     * <p>Two things were wrong with that. It asked an administrator to re-answer a question the
+     * contributor had already answered, and the screen it pointed them at offered no way to say
+     * "yes, that one, make it" - so the contribution could not be approved at all.
+     *
+     * <p>Approval IS the review. The company is created at approval through
+     * {@code companyRepo.findOrCreate}, as a ghost, which is how every other auto-created company
+     * in this product comes into existence (section 19).
+     *
+     * <p>Deliberately NOT fixed by creating the company at SUBMIT time: companies are not created
+     * from unreviewed contributor input, which is what the daily creation cap exists to enforce.
+     */
+    @Test
+    void approvingAnEmploymentAtAnUnknownCompanyCreatesThatCompany() throws Exception {
+        String typed = "ville.levis.qc.ca";
+        assertEquals(0L, companiesNamed(typed), "the company must not exist before this");
+
+        JsonObject res = await(managerService.createCareerEditRequest(contributor, managerId,
+            new JsonObject().put("positions", new JsonArray()
+                .add(new JsonObject()
+                    .put("intent", "add")
+                    .put("roleId", (Long) null)
+                    .put("changedFields", new JsonArray().add("title").add("company")
+                        .add("employment_status").add("start_date"))
+                    .put("title", "Conseiller")
+                    .put("company", typed)
+                    .put("companyId", (Long) null)
+                    .put("startDate", "2021-05")
+                    .put("employmentStatus", "ongoing")))));
+
+        // No picker, no override, no second form: the administrator simply approves.
+        JsonObject applied = await(adminService.approveEdit(adminAuth0,
+            UUID.fromString(res.getString("id"))));
+        assertEquals("approved", applied.getString("status"));
+
+        assertEquals(1L, companiesNamed(typed),
+            "approving an employment at a named company must bring that company into existence");
+
+        // And the employment points AT the record, rather than carrying loose text that no
+        // company page will ever match.
+        Row role = newestRole();
+        assertNotNull(role.getLong("company_id"), "the new employment must reference the company");
+        assertEquals(typed, role.getString("company"));
+    }
+
+    /**
+     * A COMPANY THE MODERATOR RESOLVED BY HAND STILL WINS.
+     *
+     * <p>Auto-creation at approval fills in what nothing has answered. It must never overwrite an
+     * answer, or a moderator who carefully picked the right existing employer would watch approval
+     * file the employment under a brand-new company named after whatever the contributor typed,
+     * which is the exact mistake the original refusal was written to prevent.
+     */
+    @Test
+    void aCompanyTheModeratorResolvedIsNotOverwrittenByAutoCreation() throws Exception {
+        String typed = "ville.levis.qc.ca";
+
+        JsonObject res = await(managerService.createCareerEditRequest(contributor, managerId,
+            new JsonObject().put("positions", new JsonArray()
+                .add(unknownCompanyAddition("Conseiller", typed)))));
+
+        // The moderator says: that is Marlowe Freight, which already exists.
+        long rowId = await(pool.preparedQuery(
+                "SELECT id FROM manager_edit_employments WHERE edit_id = $1")
+            .execute(Tuple.of(UUID.fromString(res.getString("id"))))
+            .map(rs -> rs.iterator().next().getLong("id")));
+
+        await(adminService.approveEdit(adminAuth0, UUID.fromString(res.getString("id")),
+            new JsonObject().put("positions", new JsonObject()
+                .put(String.valueOf(rowId), new JsonObject().put("companyId", otherCompanyId)))));
+
+        assertEquals(otherCompanyId, newestRole().getLong("company_id"),
+            "the moderator's choice must be the employer, not a company invented from the text");
+        assertEquals(0L, companiesNamed(typed),
+            "nothing may be created when the moderator has already answered");
+    }
+
+    /**
+     * TWO UNKNOWN EMPLOYERS IN ONE SUBMISSION GET TWO COMPANIES.
+     *
+     * <p>Resolution is per position for a reason: one flat company id cannot answer for two, and
+     * applied to both it would file one employment under the wrong employer. The auto-creation has
+     * to keep that property rather than resolving the first name it finds and reusing it.
+     */
+    @Test
+    void twoUnknownEmployersInOneSubmissionEachGetTheirOwnCompany() throws Exception {
+        JsonObject res = await(managerService.createCareerEditRequest(contributor, managerId,
+            new JsonObject().put("positions", new JsonArray()
+                .add(unknownCompanyAddition("Conseiller", "ville.levis.qc.ca"))
+                .add(unknownCompanyAddition("Agent", "ville.quebec.qc.ca")))));
+
+        await(adminService.approveEdit(adminAuth0, UUID.fromString(res.getString("id"))));
+
+        assertEquals(1L, companiesNamed("ville.levis.qc.ca"));
+        assertEquals(1L, companiesNamed("ville.quebec.qc.ca"));
+        assertEquals(2L, await(pool.preparedQuery(
+                "SELECT count(DISTINCT company_id) AS n FROM career_history WHERE manager_id = $1")
+            .execute(Tuple.of(managerId))
+            .map(rs -> rs.iterator().next().getLong("n"))).longValue(),
+            "each employment must point at its own employer");
+    }
+
+    /**
+     * ONE COMPANY, EVEN WHEN TWO POSITIONS NAME IT, AND EVEN THOUGH THEY RESOLVE CONCURRENTLY.
+     *
+     * <p>Resolution is per position, so a change set naming the same unknown employer twice issues
+     * two {@code findOrCreate} calls for one name, and they run together under {@code Future.all}.
+     * That is a genuine race on the companies table, and the thing it must not do is produce two
+     * companies with the same name or fail the approval outright.
+     *
+     * <p>It holds because {@code findOrCreate} is idempotent on the company slug and recovers from
+     * a 23505 raised by the other half of the race. This test is what says so out loud, because
+     * the resolution deliberately runs OUTSIDE the approval transaction: a duplicate created here
+     * would not be rolled back by anything.
+     */
+    @Test
+    void twoPositionsNamingTheSameUnknownCompanyShareOneRecord() throws Exception {
+        String typed = "ville.levis.qc.ca";
+
+        JsonObject res = await(managerService.createCareerEditRequest(contributor, managerId,
+            new JsonObject().put("positions", new JsonArray()
+                .add(unknownCompanyAddition("Conseiller", typed))
+                .add(unknownCompanyAddition("Agent", typed)))));
+
+        await(adminService.approveEdit(adminAuth0, UUID.fromString(res.getString("id"))));
+
+        assertEquals(1L, companiesNamed(typed), "one employer named twice is still one employer");
+        assertEquals(1L, await(pool.preparedQuery(
+                "SELECT count(DISTINCT company_id) AS n FROM career_history WHERE manager_id = $1")
+            .execute(Tuple.of(managerId))
+            .map(rs -> rs.iterator().next().getLong("n"))).longValue(),
+            "both employments must point at the same company row");
+    }
+
+    /**
+     * TITLE, LOCATION AND DATES CORRECTED AND APPROVED, WITH NO EXPLANATION ANYWHERE.
+     *
+     * <p>The other explanation-free tests cover a submission being accepted and an ADDITION being
+     * approved. Neither demonstrates the case that actually matters day to day: correcting an
+     * employment that already exists - its title, where it was held, and when - and a moderator
+     * approving that correction, with no explanation collected at any point.
+     *
+     * <p>All three field kinds in ONE submission on purpose. They take different paths through the
+     * applier: a title correction carries across to the ratings that snapshotted it, a location
+     * writes the declared columns, and dates go through the period logic. An explanation
+     * requirement surviving in any one of them would have been missed by testing only the others.
+     */
+    @Test
+    void titleLocationAndDateCorrectionsAreApprovedWithNoExplanation() throws Exception {
+        long role = insertRole("Depot Supervisor", "2019-01-01", companyId, "ongoing");
+        await(pool.preparedQuery("UPDATE career_history SET declared_country='Canada', "
+                + "declared_state='Ontario', declared_city='Toronto', declared_precision='city', "
+                + "declared_source='corpus' WHERE id=$1")
+            .execute(Tuple.of(role)));
+
+        JsonObject res = await(managerService.createCareerEditRequest(contributor, managerId,
+            new JsonObject()   // NO "explanation" key at all
+                .put("positions", new JsonArray()
+                    .add(correction(role, new JsonArray()
+                            .add("title").add("location").add("start_date").add("end_date"))
+                        .put("title", "Senior Depot Supervisor")
+                        .put("declaredCountry", "Canada").put("declaredState", "Ontario")
+                        .put("declaredCity", "Kitchener").put("declaredPrecision", "city")
+                        .put("declaredSource", "corpus")
+                        .put("startDate", "2018-04").put("endDate", "2023-09")
+                        .put("periodKnown", true)
+                        .put("employmentStatus", "ended")))));
+        assertEquals("pending", res.getString("status"));
+        assertNull(editRow(res).getString("explanation"));
+
+        JsonObject applied = await(adminService.approveEdit(adminAuth0,
+            UUID.fromString(res.getString("id"))));
+        assertEquals("approved", applied.getString("status"));
+
+        Row after = roleRow(role);
+        assertEquals("Senior Depot Supervisor", after.getString("title"), "title not corrected");
+        assertEquals("Kitchener", after.getString("declared_city"), "location not corrected");
+        assertEquals(LocalDate.parse("2018-04-01"),
+            after.getOffsetDateTime("start_date").toLocalDate(), "start date not corrected");
+        assertEquals(LocalDate.parse("2023-09-01"),
+            after.getOffsetDateTime("end_date").toLocalDate(), "end date not corrected");
+    }
+
+    /**
+     * A FAILED APPROVAL LEAVES NO COMPANY BEHIND.
+     *
+     * <p>This is the test for company creation being INSIDE the approval transaction, and it is
+     * the one that distinguishes that from the earlier arrangement. Resolution used to run on the
+     * pool before the transaction opened, so an approval that then failed left a ghost company
+     * nobody had agreed to - invisible until somebody searched for it.
+     *
+     * <p>The failure is forced the way reality forces it: somebody else corrects the same
+     * employment's title between submission and approval, so {@code firstStalePosition} refuses
+     * the whole change set. That refusal happens AFTER the company has been created inside the
+     * transaction, which is exactly the window being tested. If the creation were still on the
+     * pool this test fails, because the company would survive the rollback.
+     *
+     * <p>NOT BY DELETING THE EMPLOYMENT, which was the first attempt here and cannot work:
+     * {@code employment_status_events_role_id_fkey} and {@code role_corrections_role_id_fkey} are
+     * ON DELETE RESTRICT, so the DELETE is refused in the test's own setup and the approval under
+     * test is never reached. The test passed nothing and proved nothing.
+     */
+    @Test
+    void anApprovalThatFailsCreatesNoCompany() throws Exception {
+        String typed = "ville.levis.qc.ca";
+        long   role  = insertRole("Depot Supervisor", "2019-01-01", companyId, "ongoing");
+
+        JsonObject res = await(managerService.createCareerEditRequest(contributor, managerId,
+            new JsonObject().put("positions", new JsonArray()
+                .add(unknownCompanyAddition("Conseiller", typed))
+                .add(correction(role, new JsonArray().add("title")).put("title", "Lead")))));
+
+        // Somebody else corrects the same employment after this submission snapshotted it, which
+        // is what makes the apply refuse. Nothing about the company changes.
+        await(pool.preparedQuery(
+                "UPDATE career_history SET title = $2, updated_at = now() WHERE id = $1")
+            .execute(Tuple.of(role, "Depot Supervisor, Nights")));
+
+        Exception e = assertThrows(Exception.class, () ->
+            await(adminService.approveEdit(adminAuth0, UUID.fromString(res.getString("id")))));
+        assertTrue(message(e).toLowerCase().contains("changed by somebody else"), message(e));
+
+        assertEquals(0L, companiesNamed(typed),
+            "the approval rolled back, so the company it created must be gone with it");
+    }
+
+    /** An added position naming a company that has no record, which is what the picker sends. */
+    private JsonObject unknownCompanyAddition(String title, String company) {
+        return new JsonObject()
+            .put("intent", "add")
+            .put("roleId", (Long) null)
+            .put("changedFields", new JsonArray().add("title").add("company")
+                .add("employment_status").add("start_date"))
+            .put("title", title)
+            .put("company", company)
+            .put("companyId", (Long) null)
+            .put("startDate", "2021-05")
+            .put("employmentStatus", "ongoing");
+    }
+
+    private long companiesNamed(String name) throws Exception {
+        return await(pool.preparedQuery(
+                "SELECT count(*) AS n FROM companies WHERE lower(btrim(name)) = lower(btrim($1))")
+            .execute(Tuple.of(name))
+            .map(rs -> rs.iterator().next().getLong("n")));
     }
 
     // ── fixtures ────────────────────────────────────────────────────────────
