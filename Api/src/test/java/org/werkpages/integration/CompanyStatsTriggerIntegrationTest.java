@@ -192,6 +192,44 @@ class CompanyStatsTriggerIntegrationTest {
     }
 
     // ══════════════════════════════════════════════════════════════════════════
+    // What the average actually averages
+    // ══════════════════════════════════════════════════════════════════════════
+
+    /**
+     * EVERY RATING COUNTS ONCE, NOT EVERY MANAGER.
+     *
+     * <p>Reported from production: a company whose ratings were 1s and 5s showed 1. The figure was
+     * {@code AVG(m.overall_rating)} - the unweighted mean of each manager's own mean - so a manager
+     * with one rating carried the same weight as a manager with forty. Reproduced on a V112
+     * database before V113 was written: twelve ratings at one company, one 1.0, one 5.0 and ten
+     * 5.0, reported <b>3.7</b> where the average of the twelve is 4.67.
+     *
+     * <p>Here the same shape in miniature: eleven ratings, one 1.0 and ten 5.0. The old formula
+     * answers 3.0, which is a score nobody gave and which no reader could reconcile with the
+     * opinions on the page. The weighted figure is 4.6.
+     *
+     * <p>The third manager has no ratings at all and must change nothing. The FILTER that excludes
+     * them was rewritten by V113 along with the average, and without it an unrated row drags the
+     * company toward whatever default it carries - which is how a company with one 5.0 rating used
+     * to be able to report less than 5.0.
+     */
+    @Test
+    void theAverageWeightsEachManagerByHowManyRatingsTheyHave() throws Exception {
+        long companyId = insertCompany("Denominator Holdings");
+        insertManager("One Rating",  companyId, "approved", null, 1,  1.0);
+        insertManager("Ten Ratings", companyId, "approved", null, 10, 5.0);
+        insertManager("No Ratings",  companyId, "approved", null, 0,  0.0);
+
+        Row row = stats(companyId).orElseThrow();
+
+        assertEquals(11L, row.getLong("total_reviews"),
+            "the count already described every rating; only the average disagreed with it");
+        assertEquals(4.6, row.getBigDecimal("avg_rating").doubleValue(),
+            "51 points across 11 ratings. The mean of the two managers' means is 3.0, which is "
+            + "what this reported before V113");
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
     // Helpers
     // ══════════════════════════════════════════════════════════════════════════
 

@@ -265,6 +265,37 @@ class CompanyListingIntegrationTest {
         assertEquals(2, managers.size());
     }
 
+    /**
+     * EVERY RATING COUNTS ONCE, NOT EVERY MANAGER.
+     *
+     * <p>Reported from production: a company whose ratings were 1s and 5s showed 1. This figure is
+     * accumulated in Java, over the company's manager rows, and it summed each manager's AVERAGE
+     * and divided by the number of MANAGERS - so one rating of 1.0 weighed as much as ten of 5.0.
+     *
+     * <p>Three managers here, eleven ratings. 51 points across 11 is 4.6. The mean of the three
+     * managers' means is 3.0, which is what this returned before and which no reader could
+     * reconcile with the opinions listed underneath it.
+     *
+     * <p>The third manager has no ratings at all and must change nothing: an unrated row carries
+     * whatever default it was created with, and counting it would drag the company toward it.
+     *
+     * <p>V113 made the same correction to company_stats_expected, which feeds the directory and
+     * the company cards. This is the company PAGE, which computes its own figure.
+     */
+    @Test
+    void getCompanyProfile_averagesTheRatingsAndNotTheManagers() throws Exception {
+        insertManager("One Rating",  "Denominator Ltd", "Manager",  "approved", 1.0,  1);
+        insertManager("Ten Ratings", "Denominator Ltd", "Director", "approved", 5.0,  10);
+        insertManager("No Ratings",  "Denominator Ltd", "Lead",     "approved", null, 0);
+
+        JsonObject profile = await(service.getCompanyProfile("Denominator Ltd"));
+
+        assertEquals(11L, profile.getLong("totalReviews"),
+            "the count already described every rating; only the average disagreed with it");
+        assertEquals(4.6, profile.getDouble("avgRating"), 0.001,
+            "51 points across 11 ratings. The mean of the managers' means is 3.0");
+    }
+
     @Test
     void getCompanyProfile_caseInsensitiveCompanyMatch() throws Exception {
         insertManager("Alice A", "Acme Corp", "Manager", "approved", 4.0, 1);
@@ -603,7 +634,9 @@ class CompanyListingIntegrationTest {
         assertEquals(2L, tech.getLong("companyCount"));
         assertEquals(2L, tech.getLong("managerCount"));
         assertEquals(4L, tech.getLong("totalReviews"));            // 3 + 1
-        assertEquals(3.0, tech.getDouble("avgRating"), 0.05); // (4.0 + 2.0) / 2
+        // (4.0 x 3 + 2.0 x 1) / 4, weighted. 3.0 was the mean of the two managers' means,
+        // which gave a manager with one rating the same say as a manager with three.
+        assertEquals(3.5, tech.getDouble("avgRating"), 0.05);
         assertEquals("technology", tech.getString("slug"));
 
         JsonObject retail = findIndustry(data, "Retail");

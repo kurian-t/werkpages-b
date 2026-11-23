@@ -368,7 +368,14 @@ class Phase2UpgradeIntegrationTest {
         assertEquals("legacy", r.getString("role_basis"),
             "the defaults have to describe what a pre-cutover rating IS, or the old write path "
             + "cannot satisfy reviews_basis_matches_claim and its siblings");
-        assertEquals("none", r.getString("attribution_basis"));
+        /*
+          'inferred' since V113, and this is the statement that proves the attribution reaches a
+          backend that knows nothing about it. The column list above is verbatim what a pre-phase-2
+          backend sends: it names no attribution column at all, and the rating is attributed anyway,
+          because V113 does it in a BEFORE INSERT trigger rather than in either application.
+        */
+        assertEquals("inferred", r.getString("attribution_basis"));
+        assertNotNull(r.getLong("attributed_company_id"));
         assertFalse(r.getBoolean("role_required"));
         assertEquals("live", r.getString("disposition"),
             "and the five publication triggers let it through, because a legacy rating needs no "

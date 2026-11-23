@@ -141,8 +141,23 @@ class CompanyStatsMixedVersionIntegrationTest {
           THE EXACT DEPLOYMENT SEQUENCE: triggers populate the projection correctly, then the old
           jar's sweep runs over the top of it.
 
-          Asserted by capturing every column before and after and requiring them equal. Comparing
-          only the columns the old statement writes would miss it clobbering one it should not.
+          ── WHAT V113 CHANGED ABOUT THIS TEST, AND WHY IT IS NOT A WEAKENING ──────────────────
+
+          This asserted that the old writer changes NOTHING. That was true while both computed the
+          average the same way, and it stopped being true the moment V113 made the projection
+          weight each manager by how many ratings they have. PRE_V90_RMM_WRITER computes
+          AVG(m.overall_rating), the mean of the managers' means, so it is now a pre-V113 writer as
+          well as a pre-V90 one, and it flattens exactly one number.
+
+          So the guarantee is restated rather than dropped. Every column the old statement computes
+          the same way is still required to be untouched - that is the clobbering this test was
+          written to catch - and the one it computes differently is pinned to what it would do,
+          together with the proof that the drift checker sees it. An unnoticed regression and a
+          noticed one are different situations, and this now says which this is.
+
+          NEITHER CODEBASE CONTAINS THIS WRITER. Both were grepped on 2026-11-22: company_stats_live
+          is written by database triggers alone, as V89 requires. The statement survives here as a
+          model of a jar old enough to predate that, which is the only way it could ever run again.
         */
         long managerCo = insertCompany("Mixed Managers Co");
         insertManager("Alice A", managerCo, "approved", null, 5, 4.0);
@@ -151,26 +166,34 @@ class CompanyStatsMixedVersionIntegrationTest {
         insertInterview(managerCo, 3);
 
         Row before = stats(managerCo).orElseThrow();
-        // Independently specified: 2 eligible managers, 5 + 7 reviews, mean of 4.0 and 2.0.
+        // Independently specified: 2 eligible managers, 5 + 7 reviews, and each of those twelve
+        // ratings counted once - (4.0 x 5 + 2.0 x 7) / 12. The mean of the two managers' means is
+        // 3.0, which is what the old writer below still answers.
         assertEquals(2L,  before.getLong("manager_count"));
         assertEquals(12L, before.getLong("total_reviews"));
-        assertEquals(0, new java.math.BigDecimal("3.0").compareTo(before.getBigDecimal("avg_rating")));
+        assertEquals(0, new java.math.BigDecimal("2.8").compareTo(before.getBigDecimal("avg_rating")));
 
         await(pool.query(PRE_V90_RMM_WRITER).execute());
 
         Row after = stats(managerCo).orElseThrow();
         assertEquals(before.getLong("manager_count"),        after.getLong("manager_count"));
         assertEquals(before.getLong("total_reviews"),        after.getLong("total_reviews"));
-        assertEquals(before.getBigDecimal("avg_rating"),     after.getBigDecimal("avg_rating"));
         assertEquals(before.getString("logo_url"),           after.getString("logo_url"));
         assertEquals(before.getLong("workplace_count"),      after.getLong("workplace_count"));
         assertEquals(before.getBigDecimal("workplace_avg_rating"), after.getBigDecimal("workplace_avg_rating"));
         assertEquals(before.getLong("interview_count"),      after.getLong("interview_count"));
         assertEquals(before.getBigDecimal("interview_avg_rating"), after.getBigDecimal("interview_avg_rating"));
 
-        // And the shared checker, which computes from source independently of both, sees no drift.
-        assertTrue(await(maintenance.reconcile()).isEmpty(),
-            "the old writer must not introduce drift: " + await(maintenance.reconcile()));
+        assertEquals(0, new java.math.BigDecimal("3.0").compareTo(after.getBigDecimal("avg_rating")),
+            "the one number a jar older than V113 gets wrong: it averages the managers rather "
+            + "than the ratings, so it flattens 2.8 back to 3.0");
+
+        // And the shared checker, which computes from source independently of both, says so. This
+        // is what makes such a jar a detected fault rather than a silent one: reconcile reports it,
+        // the maintenance sweep repairs it, and company_stats_drift_log keeps the evidence.
+        assertTrue(await(maintenance.reconcile()).stream()
+                .anyMatch(d -> d.companyId() == managerCo && "avg_rating".equals(d.field())),
+            "a stale writer must be visible to the drift checker: " + await(maintenance.reconcile()));
     }
 
     @Test

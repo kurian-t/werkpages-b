@@ -135,7 +135,23 @@ class Phase2SchemaCompatibilityIntegrationTest {
         assertEquals("legacy", rating.getString("role_basis"),
             "a rating written by the pre-cutover path is legacy provenance, and the column default "
             + "has to say so or reviews_basis_matches_claim refuses the insert outright");
-        assertEquals("none", rating.getString("attribution_basis"));
+        /*
+          'inferred', not 'none', since V113.
+
+          attribution_basis defaulted to 'none' and nothing in this path ever set it, so every
+          rating the website wrote counted toward its manager and toward no company - which is
+          what made a company profile average whichever subset V102's one-off backfill had
+          reached. V113 attributes a legacy rating as it is written, by the employment evidence
+          V102 used: this submission creates the career entry at the company in the same
+          transaction, so the manager has exactly one employer and that settles it.
+
+          Nothing else about the pre-cutover shape moved. The rating is still legacy, still
+          carries no claim, and is still live.
+        */
+        assertEquals("inferred", rating.getString("attribution_basis"));
+        assertNotNull(rating.getLong("attributed_company_id"),
+            "an inferred basis that names no company would assert an employer is known while "
+            + "counting toward nothing, which reviews_inferred_names_a_company refuses outright");
         assertFalse(rating.getBoolean("role_required"));
         assertNull(rating.getLong("claim_id"), "nothing is inferred into a claim");
         assertEquals("live", rating.getString("disposition"),

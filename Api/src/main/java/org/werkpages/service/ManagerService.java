@@ -487,7 +487,18 @@ public class ManagerService {
                             totalReviews += (reviews != null ? reviews : 0);
                             BigDecimal rating = row.getBigDecimal("overall_rating");
                             boolean hasRating = rating != null && (reviews != null && reviews > 0);
-                            if (hasRating) { ratingSum += rating.doubleValue(); ratingCount++; }
+                            /*
+                              WEIGHTED, so every rating counts once.
+
+                              This summed the managers' AVERAGES and divided by the number of MANAGERS, so a
+                              manager with one rating of 1.0 weighed as much as a manager with ten of 5.0 and
+                              the company came out at 3.0. Reported from production as "1s and 5s and the
+                              average turned out to be 1". V113 made the same correction to the projection.
+                            */
+                            if (hasRating) {
+                                ratingSum   += rating.doubleValue() * reviews;
+                                ratingCount += reviews;
+                            }
                             Object catObj = row.getValue("category_averages");
                             if (catObj != null) {
                                 JsonObject cats = catObj instanceof JsonObject
@@ -811,7 +822,18 @@ public class ManagerService {
             totalReviews += (reviews != null ? reviews : 0);
             BigDecimal rating = row.getBigDecimal("overall_rating");
             boolean hasRating = rating != null && (reviews != null && reviews > 0);
-            if (hasRating) { ratingSum += rating.doubleValue(); ratingCount++; }
+            /*
+              WEIGHTED, so every rating counts once.
+
+              This summed the managers' AVERAGES and divided by the number of MANAGERS, so a
+              manager with one rating of 1.0 weighed as much as a manager with ten of 5.0 and
+              the company came out at 3.0. Reported from production as "1s and 5s and the
+              average turned out to be 1". V113 made the same correction to the projection.
+            */
+            if (hasRating) {
+                ratingSum   += rating.doubleValue() * reviews;
+                ratingCount += reviews;
+            }
             Object catObj = row.getValue("category_averages");
             if (catObj != null) {
                 JsonObject cats = catObj instanceof JsonObject

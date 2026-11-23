@@ -185,7 +185,25 @@ class Phase2FreshInstallIntegrationTest {
         // Relaxing, not narrowing: no stored row can be invalidated by dropping NOT NULL, nothing
         // is backfilled, and an RMM build from before today still sends a reason and is
         // unaffected. The moderator's own correction tool still requires one.
-        assertEquals("112", await(pool.query("""
+        //
+        // V113 (company averages count every rating) moved it to 113 on 2026-11-22.
+        // Acknowledged, and it is the only one of these that writes to existing rows. Two
+        // corrections, both to figures that were wrong on screen:
+        //
+        //   - a BEFORE INSERT trigger attributes a legacy rating to an employer as it is written.
+        //     attribution_basis defaulted to 'none' and only V102's one-off backfill ever set
+        //     anything, so every rating submitted since counted toward no company and the
+        //     company profile's "Manager opinions" average was computed from whatever subset
+        //     V102 had reached;
+        //   - company_stats_expected.avg_rating was AVG(m.overall_rating), the mean of each
+        //     manager's mean, and is now weighted by reviews_count. Twelve ratings at one
+        //     company - one 1.0, one 5.0 and ten 5.0 - reported 3.7 against a true 4.67.
+        //
+        // It re-runs V102's two rules for the ratings that arrived after it, and rebuilds both
+        // projections so the stored figures are corrected rather than only future ones. No column
+        // is added, dropped or narrowed, and no constraint becomes stricter, so an RMM build from
+        // before today writes ratings exactly as it did and simply gets them attributed.
+        assertEquals("113", await(pool.query("""
                 SELECT version FROM flyway_schema_history
                  WHERE success AND version IS NOT NULL
                  ORDER BY installed_rank DESC LIMIT 1

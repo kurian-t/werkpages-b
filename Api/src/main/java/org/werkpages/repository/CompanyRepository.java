@@ -880,8 +880,15 @@ public class CompanyRepository {
                        COUNT(DISTINCT c.id)                    AS company_count,
                        COUNT(DISTINCT m.id)                    AS manager_count,
                        COALESCE(SUM(m.reviews_count), 0)       AS total_reviews,
-                       ROUND(AVG(m.overall_rating) FILTER (WHERE m.overall_rating IS NOT NULL
-                             AND m.reviews_count > 0)::NUMERIC, 1) AS avg_rating
+                       -- WEIGHTED BY HOW MANY RATINGS EACH MANAGER HAS, so every rating counts
+                       -- once. This was AVG(m.overall_rating), which averaged the MANAGERS: one
+                       -- rating of 1.0 outweighed ten of 5.0 at the same employer. V113 made the
+                       -- same correction to company_stats_expected.
+                       ROUND((SUM(m.overall_rating * m.reviews_count) FILTER (
+                                  WHERE m.overall_rating IS NOT NULL AND m.reviews_count > 0)
+                              / NULLIF(SUM(m.reviews_count) FILTER (
+                                  WHERE m.overall_rating IS NOT NULL AND m.reviews_count > 0), 0)
+                             )::NUMERIC, 1) AS avg_rating
                 FROM companies c
                 JOIN managers m ON m.company_id = c.id
                 WHERE c.industry IS NOT NULL
@@ -909,8 +916,15 @@ public class CompanyRepository {
                        COUNT(DISTINCT c.id)                    AS company_count,
                        COUNT(DISTINCT m.id)                    AS manager_count,
                        COALESCE(SUM(m.reviews_count), 0)       AS total_reviews,
-                       ROUND(AVG(m.overall_rating) FILTER (WHERE m.overall_rating IS NOT NULL
-                             AND m.reviews_count > 0)::NUMERIC, 1) AS avg_rating,
+                       -- WEIGHTED BY HOW MANY RATINGS EACH MANAGER HAS, so every rating counts
+                       -- once. This was AVG(m.overall_rating), which averaged the MANAGERS: one
+                       -- rating of 1.0 outweighed ten of 5.0 at the same employer. V113 made the
+                       -- same correction to company_stats_expected.
+                       ROUND((SUM(m.overall_rating * m.reviews_count) FILTER (
+                                  WHERE m.overall_rating IS NOT NULL AND m.reviews_count > 0)
+                              / NULLIF(SUM(m.reviews_count) FILTER (
+                                  WHERE m.overall_rating IS NOT NULL AND m.reviews_count > 0), 0)
+                             )::NUMERIC, 1) AS avg_rating,
                        /*
                           The industry's other two averages, computed independently of the
                           managers join above.
@@ -1424,9 +1438,15 @@ public class CompanyRepository {
                 SELECT COUNT(DISTINCT c.id)              AS company_count,
                        COUNT(DISTINCT m.id)              AS manager_count,
                        COALESCE(SUM(m.reviews_count), 0) AS total_reviews,
-                       ROUND(AVG(m.overall_rating) FILTER (
-                           WHERE m.overall_rating IS NOT NULL AND m.reviews_count > 0
-                       )::NUMERIC, 1)                    AS avg_rating
+                       -- WEIGHTED BY HOW MANY RATINGS EACH MANAGER HAS, so every rating counts
+                       -- once. This was AVG(m.overall_rating), which averaged the MANAGERS: one
+                       -- rating of 1.0 outweighed ten of 5.0 at the same employer. V113 made the
+                       -- same correction to company_stats_expected.
+                       ROUND((SUM(m.overall_rating * m.reviews_count) FILTER (
+                                  WHERE m.overall_rating IS NOT NULL AND m.reviews_count > 0)
+                              / NULLIF(SUM(m.reviews_count) FILTER (
+                                  WHERE m.overall_rating IS NOT NULL AND m.reviews_count > 0), 0)
+                             )::NUMERIC, 1) AS avg_rating
                 FROM tree
                 JOIN companies c ON c.id = tree.id AND c.status <> 'merged'
                 LEFT JOIN managers m

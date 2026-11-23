@@ -87,7 +87,9 @@ class IndustryServiceIntegrationTest {
         assertEquals(2L, tech.getLong("companyCount"));
         assertEquals(2L, tech.getLong("managerCount"));
         assertEquals(4L, tech.getLong("totalReviews"));               // 3 + 1
-        assertEquals(3.0, tech.getDouble("avgRating"), 0.05);         // (4.0 + 2.0) / 2
+        // (4.0 x 3 + 2.0 x 1) / 4, weighted so every rating counts once. 3.0 was the mean of
+        // the two managers' means, which gave Bob's single rating the same say as Alice's three.
+        assertEquals(3.5, tech.getDouble("avgRating"), 0.05);
 
         JsonObject retail = find(data, "Retail");
         assertEquals(1L, retail.getLong("companyCount"));

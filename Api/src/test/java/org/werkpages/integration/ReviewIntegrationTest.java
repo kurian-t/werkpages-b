@@ -115,6 +115,69 @@ class ReviewIntegrationTest {
         assertEquals("Senior Manager", manager.getString("title"));
     }
 
+    /**
+     * A RATING SUBMITTED THE ORDINARY WAY BELONGS TO AN EMPLOYER.
+     *
+     * <p>{@code reviews.attribution_basis} defaults to {@code 'none'}, and the only code that ever
+     * set anything else is {@code RoleAwareSubmissionService}, which is behind a flag that is off.
+     * V102 attributed the ratings that existed when it ran and was a one-off, so every rating
+     * submitted afterwards counted toward its manager and toward no company:
+     * {@code rating_employment_company} answers NULL for basis 'none', correctly, because nothing
+     * had told it an employer.
+     *
+     * <p>The company profile's "Manager opinions" section reads exactly those employment-attributed
+     * figures. So its average was computed from whichever subset of a company's ratings V102 had
+     * reached, which is how a company whose ratings were 1s and 5s came to show 1.
+     *
+     * <p><b>Why the existing employment-stats tests did not catch it.</b> Every fixture in
+     * {@code CompanyEmploymentStatsIntegrationTest} writes {@code attribution_basis = 'submitted'}
+     * by hand. They assert what the projection does with an attributed rating, which was never
+     * wrong. Nothing asserted that the application produces one. This test goes through
+     * {@code createReview}, the path the website uses.
+     */
+    @Test
+    void aSubmittedRatingIsAttributedToAnEmployer() throws Exception {
+        long companyId = await(pool.preparedQuery(
+                "INSERT INTO companies(name, status) VALUES ('Attribution Co', 'approved') RETURNING id")
+            .execute()
+            .map(rs -> rs.iterator().next().getLong("id")));
+        long managerId = await(pool.preparedQuery("""
+                INSERT INTO managers(name, company, company_id, title, image, status,
+                                     approval_status, overall_rating, reviews_count, category_averages)
+                VALUES ('Attributed Boss', 'Attribution Co', $1, 'Lead', 'img', 'active',
+                        'approved', 0, 0, '{}')
+                RETURNING id
+                """)
+            .execute(Tuple.of(companyId))
+            .map(rs -> rs.iterator().next().getLong("id")));
+        String auth0Id = insertUser("auth0|attribution", "AttribUser11");
+
+        await(service.createReview(auth0Id, managerId,
+            validBody("Attribution Co", "Lead", "2022-01", null), null));
+
+        Row rating = await(pool.preparedQuery(
+                "SELECT attribution_basis, attributed_company_id FROM reviews WHERE manager_id = $1")
+            .execute(Tuple.of(managerId))
+            .map(rs -> rs.iterator().next()));
+
+        assertNotEquals("none", rating.getString("attribution_basis"),
+            "a rating nobody can attribute counts toward no company, and until V113 that was "
+            + "every rating the website wrote");
+        assertEquals(companyId, rating.getLong("attributed_company_id"),
+            "the employer is the one the contributor named, or the employment their work period "
+            + "falls inside - both of which are this company here");
+
+        Row stats = await(pool.preparedQuery(
+                "SELECT employment_reviews, employment_avg_rating FROM company_stats_live "
+                + "WHERE company_id = $1")
+            .execute(Tuple.of(companyId))
+            .map(rs -> rs.iterator().next()));
+
+        assertEquals(1L, stats.getLong("employment_reviews"),
+            "and it reaches the figures the company page prints, in the same transaction");
+        assertEquals(4.0, stats.getBigDecimal("employment_avg_rating").doubleValue());
+    }
+
     @Test
     void olderReview_doesNotUpdateManagerProfile() throws Exception {
         long managerId  = insertManager("Bob Jones", "OriginalCorp", "Director");

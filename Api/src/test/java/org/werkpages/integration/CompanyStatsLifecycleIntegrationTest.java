@@ -110,10 +110,13 @@ class CompanyStatsLifecycleIntegrationTest {
         insertManager("Bob B",   c, "ghost",    null, 1, 2.0);
 
         Row s = stats(c).orElseThrow();
-        // Worked out by hand: two eligible managers, 3 + 1 reviews, mean of 4.0 and 2.0.
+        // Worked out by hand: two eligible managers, 3 + 1 reviews, and every one of those four
+        // ratings counts once - (4.0 x 3 + 2.0 x 1) / 4. The mean of the two managers' means is
+        // 3.0, which is what this reported until V113 and which no reader could reconcile with
+        // the ratings on the page.
         assertEquals(2L, s.getLong("manager_count"));
         assertEquals(4L, s.getLong("total_reviews"));
-        assertEquals(0, new java.math.BigDecimal("3.0").compareTo(s.getBigDecimal("avg_rating")));
+        assertEquals(0, new java.math.BigDecimal("3.5").compareTo(s.getBigDecimal("avg_rating")));
         assertEquals(0L, s.getLong("workplace_count"));
         assertEquals(0L, s.getLong("interview_count"));
     }
@@ -176,7 +179,8 @@ class CompanyStatsLifecycleIntegrationTest {
         assertEquals(12L, s.getLong("total_reviews"),   "5 + 7, not multiplied by the other datasets");
         assertEquals(3L,  s.getLong("workplace_count"), "3 workplace ratings, not 3 x 2 managers");
         assertEquals(2L,  s.getLong("interview_count"), "2 interviews, not 2 x 2 managers");
-        assertEquals(0, new java.math.BigDecimal("3.0").compareTo(s.getBigDecimal("avg_rating")));
+        // (4.0 x 5 + 2.0 x 7) / 12, weighted since V113. 3.0 was the mean of the managers' means.
+        assertEquals(0, new java.math.BigDecimal("2.8").compareTo(s.getBigDecimal("avg_rating")));
         assertEquals(0, new java.math.BigDecimal("4.0").compareTo(s.getBigDecimal("workplace_avg_rating")));
         assertEquals(0, new java.math.BigDecimal("3.0").compareTo(s.getBigDecimal("interview_avg_rating")));
     }

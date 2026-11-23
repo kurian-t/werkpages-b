@@ -222,9 +222,11 @@ class CompanyRelationshipsIntegrationTest {
         assertEquals(3L, stats.get().getLong("company_count"), "the parent counts as part of its own group");
         assertEquals(3L, stats.get().getLong("manager_count"));
         assertEquals(10L, stats.get().getLong("total_reviews"));
-        assertEquals(0, new java.math.BigDecimal("3.0").compareTo(stats.get().getBigDecimal("avg_rating")),
-            "an unweighted mean of manager ratings, the same way a single company's is computed, "
-            + "so the two numbers on screen are comparable");
+        // 4.0 x 2 + 2.0 x 3 + 3.0 x 5 = 29 points across 10 ratings.
+        assertEquals(0, new java.math.BigDecimal("2.9").compareTo(stats.get().getBigDecimal("avg_rating")),
+            "weighted by how many ratings each manager has, the same way a single company's is "
+            + "computed, so the two numbers on screen stay comparable. Both were the unweighted "
+            + "mean of the managers' means until the company average was corrected");
     }
 
     @Test
