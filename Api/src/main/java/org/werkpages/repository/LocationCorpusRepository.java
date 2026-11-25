@@ -1221,6 +1221,22 @@ public class LocationCorpusRepository {
                 .put("street", rs.getString("street"))
                 .put("city", rs.getString("city"))
                 .put("stateCode", rs.getString("state_code"))
+                /*
+                  THE COUNTRY OF THE PARTITION THIS ROW CAME FROM.
+
+                  Free: `iso` is the country whose parquet partition this query read, so it is
+                  known without selecting a column. It is deliberately NOT added to the SELECT -
+                  the comment above records that dropping country_code and the other unused
+                  columns took the query from 1.105s to 0.202s.
+
+                  Carried because a place suggestion is SELECTABLE: the client sends it back as
+                  corpusPlace on submit, and CorpusPlace.validate() refuses a workplace with no
+                  country. A suggestion offered from a worldwide search was stamped with the
+                  REQUEST's country, which is null, so the rating could not be published at all:
+                  "A workplace must have a country", on a form that had been filled in completely.
+                */
+                .put("countryCode", iso)
+                .put("country", country)
                 .put("postalCode", rs.getString("postal_code")))));
     }
 

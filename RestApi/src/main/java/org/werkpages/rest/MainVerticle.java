@@ -227,7 +227,10 @@ public class MainVerticle extends AbstractVerticle {
                         managerService.startLocationCorpus();
                         AdminService        adminService   = new AdminService(userRepo, managerRepo, reviewRepo, editRepo, notifRepo, companyRepo, mergeSuggestionsRepo, Database.getClient());
                         NotificationService notifService   = new NotificationService(userRepo, notifRepo);
-                        ReportService       reportService  = new ReportService(userRepo, reportRepo);
+                        // adminService, because the report QUEUE is admin-only. Built without it
+                        // the submit path still works and every queue call answers 403, which is
+                        // a wiring mistake that looks exactly like a permissions bug.
+                        ReportService       reportService  = new ReportService(userRepo, reportRepo, adminService);
                         ResumeService       resumeService  = new ResumeService(userRepo, resumeRepo, companyRepo);
                         IndustryService     industryService = new IndustryService(companyRepo, CompanyLogoUtils::resolveLogoUrl);
                         InterviewService    interviewService = new InterviewService(interviewRepo, companyRepo, userRepo);
@@ -469,6 +472,8 @@ public class MainVerticle extends AbstractVerticle {
                         routerFactory.addHandlerByOperationId("getMyDraft",             draftsHandler::handleGetDraft);
                         routerFactory.addHandlerByOperationId("discardMyDraft",         draftsHandler::handleDiscardDraft);
                         routerFactory.addHandlerByOperationId("reportManager",         reportsHandler::handleReportManager);
+                        routerFactory.addHandlerByOperationId("adminListReports",      reportsHandler::handleListReports);
+                        routerFactory.addHandlerByOperationId("adminResolveReport",    reportsHandler::handleResolveReport);
                         routerFactory.addHandlerByOperationId("getStats",               managersHandler::handleGetStats);
                         routerFactory.addHandlerByOperationId("getCompanyListing",      managersHandler::handleGetCompanyListing);
                         routerFactory.addHandlerByOperationId("getCompanyProfile",      managersHandler::handleGetCompanyProfile);

@@ -26,7 +26,13 @@ import java.util.UUID;
  */
 public class CompanyReviewRepository {
 
-    /** The ten, in display order. Overall is asked separately and is not one of them. */
+    /**
+     * The ten category questions, in display order.
+     *
+     * <p>The author's own "Overall, how was working here?" is NOT one of them: it is its own
+     * column, asked and stored separately. The rating itself is the average of all eleven scores,
+     * derived by the database as {@code rating_average} (V115).
+     */
     public static final List<String> CATEGORIES = List.of(
         "work_life_balance", "compensation_benefits", "career_growth", "job_security",
         "workload_sustainability", "senior_leadership", "company_communication",
@@ -54,7 +60,9 @@ public class CompanyReviewRepository {
       field that comes back empty over a stored answer reads as data loss.
     */
     private static final String COLUMNS =
-        "id, company_id, user_id, overall_rating, " + String.join(", ", CATEGORIES)
+        // rating_average is the figure every reader sees; overall_rating is its author's own
+        // eleventh answer, which the form reopens on. Both are selected, deliberately.
+        "id, company_id, user_id, overall_rating, rating_average, " + String.join(", ", CATEGORIES)
         + ", worked_from, worked_until, dates_hidden, author, created_at, updated_at, "
         + "declared_country, declared_state, declared_city, declared_precision, company_location_id, "
         + "declared_source, declared_text";
@@ -65,6 +73,12 @@ public class CompanyReviewRepository {
      * <p>Upsert rather than insert: one rating per person per company is the rule, and someone
      * revisiting the form means to change their answer, not to be told they already answered.
      * The unique index is partial on {@code deleted_at}, so this targets it explicitly.
+     *
+     * <p>{@code overall} is the author's answer to the eleventh question, written as given. What
+     * it is NOT, since V115, is the company's rating: that is {@code rating_average}, a generated
+     * column holding the average of all eleven scores. Nothing here computes or writes it, and
+     * nothing should - a derived number with an application writer drifts from what it derives
+     * from, which is how a card came to print 1.0 over a breakdown averaging 3.2.
      */
     public Future<Row> upsert(long companyId, UUID userId, double overall, List<Double> categories,
                               LocalDate workedFrom, LocalDate workedUntil, String author,
@@ -231,6 +245,11 @@ public class CompanyReviewRepository {
      * <p>Returns a single row of averages plus the count. Every category is NOT NULL so all ten
      * averages share one denominator, which is what lets the page print a single "based on N"
      * rather than a count per bar.
+     *
+     * <p>The company's rating is {@code AVG(rating_average)}: the average of what each rating
+     * averaged, and since every rating carries all eleven scores that is the average of every
+     * score given. The authors' own overalls are averaged separately and returned beside it, as
+     * data rather than as the headline.
      */
     public Future<Optional<Row>> findCompanyAggregate(long companyId) {
         StringBuilder avgs = new StringBuilder();
@@ -239,7 +258,8 @@ public class CompanyReviewRepository {
         }
         return db.preparedQuery("""
                 SELECT COUNT(*) AS rating_count,
-                       ROUND(AVG(overall_rating), 1) AS overall_rating%s
+                       ROUND(AVG(rating_average), 1) AS overall_rating,
+                       ROUND(AVG(overall_rating), 1) AS authors_overall_rating%s
                 FROM company_reviews
                 WHERE company_id = $1 AND deleted_at IS NULL
                 """.formatted(avgs))

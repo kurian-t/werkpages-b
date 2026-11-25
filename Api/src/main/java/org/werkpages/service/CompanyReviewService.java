@@ -346,10 +346,27 @@ public class CompanyReviewService {
      */
     public static Optional<String> publicationBlocker(JsonObject payload) {
         Future<RatingInput> parsed = parseRating(payload);
-        if (parsed.succeeded()) return Optional.empty();
-        Throwable cause = parsed.cause();
-        return Optional.of(cause instanceof ServiceException se ? se.getMessage()
-                                                                : "This draft is incomplete.");
+        if (!parsed.succeeded()) {
+            Throwable cause = parsed.cause();
+            return Optional.of(cause instanceof ServiceException se ? se.getMessage()
+                                                                    : "This draft is incomplete.");
+        }
+        /*
+          THE LOCATION TOO, because the write validates it and this did not.
+
+          parseRating covers the ten categories, the overall, the period and the handle. The
+          workplace itself is validated one layer deeper, inside DeclaredLocationResolver, so a
+          draft carrying a corpus place with no country passed this check, had its Publish button
+          rendered, and failed the write with "A workplace must have a country" when an admin
+          pressed it. The panel's promise is that it refuses an unpublishable draft and names what
+          is missing; that was true of every answer except this one.
+        */
+        CorpusPlace place = CorpusPlace.fromBody(payload);
+        if (place != null) {
+            String problem = place.validate();
+            if (problem != null) return Optional.of(problem);
+        }
+        return Optional.empty();
     }
 
     /** This person's own rating of a company, for pre-filling the form and showing the done state. */
@@ -481,7 +498,16 @@ public class CompanyReviewService {
             }
             return new JsonObject()
                 .put("ratingCount",   row.getLong("rating_count"))
+                /*
+                  THE COMPANY'S RATING: the average of every score its raters gave, which the
+                  query computes as AVG(rating_average). It used to be the average of their
+                  separate overall answers alone, which is how a company with one rating of five
+                  5s, four 1s and a 3 read 1.0.
+                */
                 .put("overallRating", numberOrNull(row, "overall_rating"))
+                // Kept and served, never the headline: what people answered when asked to sum it
+                // up themselves. Data, for whoever wants to look at it.
+                .put("authorsOverallRating", numberOrNull(row, "authors_overall_rating"))
                 .put("categories",    categories);
         });
     }
@@ -539,7 +565,12 @@ public class CompanyReviewService {
                         UUID author = row.getUUID("user_id");
                         data.add(new JsonObject()
                             .put("id",            row.getUUID("id").toString())
-                            .put("overallRating", withholdScores ? null : numberOrNull(row, "overall_rating"))
+                            // This rating's own figure: the average of its eleven scores.
+                            .put("overallRating", withholdScores ? null : numberOrNull(row, "rating_average"))
+                            // Its author's eleventh answer, which the card shows as the last row
+                            // of the breakdown so the headline is visibly the average of what is
+                            // listed under it. Withheld with the rest when the reader is gated.
+                            .put("authorsOverallRating", withholdScores ? null : numberOrNull(row, "overall_rating"))
                             .put("categories",    categories)
                             /*
                               Withheld together when the author asked for it. "current" goes with
@@ -697,7 +728,13 @@ public class CompanyReviewService {
         JsonObject json = new JsonObject()
             .put("id",            row.getUUID("id").toString())
             .put("companyId",     row.getLong("company_id"))
-            .put("overallRating", numberOrNull(row, "overall_rating"))
+            /*
+              overallRating means the same thing on every endpoint: the rating's own figure, the
+              average of its eleven scores. The form reopens on authorsOverallRating instead,
+              because that is the question it asks and the answer this person gave.
+            */
+            .put("overallRating", numberOrNull(row, "rating_average"))
+            .put("authorsOverallRating", numberOrNull(row, "overall_rating"))
             .put("ratings",       ratings)
             /*
               NOT masked here, unlike the list above: this is the author's own rating and the form

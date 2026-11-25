@@ -203,7 +203,27 @@ class Phase2FreshInstallIntegrationTest {
         // projections so the stored figures are corrected rather than only future ones. No column
         // is added, dropped or narrowed, and no constraint becomes stricter, so an RMM build from
         // before today writes ratings exactly as it did and simply gets them attributed.
-        assertEquals("113", await(pool.query("""
+        //
+        // V114 (a report can be read, and decided) moved it to 114 on 2026-11-23.
+        // Acknowledged. Found while verifying that the Report button works as intended: it does
+        // not. The button validated its reason, refused a duplicate and wrote to `reports`, and
+        // the only SELECT against that table in either backend was the duplicate check, so no
+        // admin had ever seen a report while the profile page promised each reporter a review.
+        // It is the correction route the Terms and the Privacy Policy point a rated person at.
+        //
+        // This adds the state that lets a queue drain: status with a default of 'open',
+        // resolved_at, resolved_by and resolution_note, two CHECKs keeping the state coherent
+        // with the decision, a partial index for the open queue and the index the manager_id FK
+        // never had. Purely additive, and the one NOT NULL column carries a DEFAULT, which is the
+        // single form of NOT NULL an existing writer survives: RMM's INSERT names four columns
+        // and omits status, so a report filed by a pre-V114 build arrives 'open' and shows up in
+        // the queue. No row is updated, moved or deleted.
+        //
+        // No unique index on (manager_id, user_id), deliberately: production already holds
+        // reports, a unique index would fail to build if any duplicate pair exists, and clearing
+        // one first means deleting user-submitted rows. Raised separately rather than decided
+        // inside a migration.
+        assertEquals("114", await(pool.query("""
                 SELECT version FROM flyway_schema_history
                  WHERE success AND version IS NOT NULL
                  ORDER BY installed_rank DESC LIMIT 1

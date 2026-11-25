@@ -95,16 +95,127 @@ class CompanyReviewIntegrationTest {
         assertTrue(e.getMessage().contains("every category"), "got: " + e.getMessage());
     }
 
+    /**
+     * A RATING IS THE AVERAGE OF EVERY SCORE ITS AUTHOR GAVE. All eleven of them.
+     *
+     * <p>Reported from production on Compulsion Games: one workplace rating scoring five 5s, four
+     * 1s and a 3 across the ten categories, with its author's own overall answered as 1, displayed
+     * a headline of <b>1.0</b> directly above the breakdown printing those ten numbers. The
+     * company's rating was the average of the eleventh answer and nothing else, so one person's
+     * summary judgement WAS the figure. Sixteen of the twenty workplace ratings in production
+     * showed a number that was not an average of their own scores.
+     *
+     * <p>A manager rating has never worked that way: it asks ten questions, one of which is
+     * "overall working experience", and averages all ten.
+     *
+     * <p>Here the eleven are 5+5+1+1+5+1+1+5+5+3 = 32 for the categories, plus an overall of 1,
+     * so 33/11 = <b>3.0</b>.
+     *
+     * <p>Asserted everywhere the figure surfaces, because they are four different code paths: the
+     * submit response, the public list behind the cards, the company aggregate on the Company tab,
+     * and {@code company_stats_live}, which is what the directory card reads.
+     */
     @Test
-    void theOverallRatingIsRequiredSeparately() throws Exception {
-        // It is not the mean of the ten - someone can rate the parts poorly and the whole well.
+    void theRatingIsTheAverageOfEveryScoreItsAuthorGave() throws Exception {
+        insertCompany("Red Hat", "red-hat");
+        String auth = insertUser("auth0|cr-avg", "CrAvg");
+
+        JsonObject result = await(service.submit(auth, "red-hat", mixedBody().put("overallRating", 1.0)));
+
+        assertEquals(3.0, result.getDouble("overallRating"), 0.0001,
+            "33 points over eleven scores is 3.0, not the 1.0 its author answered to one of them");
+
+        JsonObject listed = await(service.listFor(auth, "red-hat", 20, 0))
+            .getJsonArray("data").getJsonObject(0);
+        assertEquals(3.0, listed.getDouble("overallRating"), 0.0001, "the card's headline");
+
+        JsonObject agg = await(service.aggregateFor(companyId("red-hat")));
+        assertEquals(3.0, agg.getDouble("overallRating"), 0.0001, "the Company tab");
+
+        java.math.BigDecimal projected = await(pool.preparedQuery(
+                "SELECT workplace_avg_rating AS r FROM company_stats_live WHERE company_id = $1")
+            .execute(Tuple.of(companyId("red-hat")))
+            .map(rs -> rs.iterator().next().getBigDecimal("r")));
+        assertNotNull(projected, "the projection has a row for a company somebody rated");
+        assertEquals(3.0, projected.doubleValue(), 0.0001,
+            "the directory card reads the projection, not the row");
+    }
+
+    /**
+     * THE AUTHOR'S OWN OVERALL IS KEPT. It is their answer, it is data, and it is not deleted.
+     *
+     * <p>Stated as its own test because the fix above could have been had by overwriting the
+     * column with the average, and that would have destroyed twenty people's answers to a
+     * question they were asked. What changed is which number the site calls the company's
+     * rating, not what it remembers being told.
+     */
+    @Test
+    void theAuthorsOwnOverallIsStillStoredAndStillServed() throws Exception {
+        insertCompany("Red Hat", "red-hat");
+        String auth = insertUser("auth0|cr-kept", "CrKept");
+
+        JsonObject result = await(service.submit(auth, "red-hat", mixedBody().put("overallRating", 1.0)));
+
+        assertEquals(1.0, result.getDouble("authorsOverallRating"), 0.0001,
+            "their answer comes back beside the average, not instead of it");
+
+        java.math.BigDecimal stored = await(pool.query(
+                "SELECT overall_rating FROM company_reviews WHERE deleted_at IS NULL")
+            .execute().map(rs -> rs.iterator().next().getBigDecimal("overall_rating")));
+        assertEquals(1.0, stored.doubleValue(), 0.0001, "and the column still holds it verbatim");
+
+        JsonObject listed = await(service.listFor(auth, "red-hat", 20, 0))
+            .getJsonArray("data").getJsonObject(0);
+        assertEquals(1.0, listed.getDouble("authorsOverallRating"), 0.0001,
+            "the card shows it as the eleventh row of the breakdown, so the headline above it is "
+            + "visibly the average of the rows underneath");
+
+        JsonObject agg = await(service.aggregateFor(companyId("red-hat")));
+        assertEquals(1.0, agg.getDouble("authorsOverallRating"), 0.0001);
+
+        /*
+          And the form reopens on their answer rather than on the average. Without this the box
+          asking "Overall, how was working here?" would come back prefilled with 3.0, a number
+          nobody typed, and the next save would turn it into their answer.
+        */
+        JsonObject mine = await(service.findMine(auth, "red-hat")).getJsonObject("review");
+        assertEquals(1.0, mine.getDouble("authorsOverallRating"), 0.0001);
+        assertEquals(3.0, mine.getDouble("overallRating"), 0.0001);
+    }
+
+    @Test
+    void theOverallRatingIsStillRequired() throws Exception {
+        /*
+          Still asked, still mandatory. It is no longer the company's rating by itself, which is a
+          different thing from not collecting it: a rating missing it would be an average over ten
+          scores sitting beside averages over eleven.
+        */
         insertCompany("Red Hat", "red-hat");
         String auth = insertUser("auth0|cr-3", "CrUser3");
 
         JsonObject body = validBody(4.0);
         body.remove("overallRating");
 
-        assertThrows(Exception.class, () -> await(service.submit(auth, "red-hat", body)));
+        Exception e = assertThrows(Exception.class, () -> await(service.submit(auth, "red-hat", body)));
+        assertTrue(e.getMessage().contains("overall rating"), "got: " + e.getMessage());
+    }
+
+    @Test
+    void editingARatingRecomputesTheAverage() throws Exception {
+        /*
+          The upsert takes the DO UPDATE branch, which is a different write from the insert. A
+          generated column covers both by construction - that is most of why the average is one,
+          and the database's rather than the application's.
+        */
+        insertCompany("Red Hat", "red-hat");
+        String auth = insertUser("auth0|cr-avg-2", "CrAvg2");
+
+        await(service.submit(auth, "red-hat", mixedBody().put("overallRating", 1.0)));
+        JsonObject edited = await(service.submit(auth, "red-hat", validBody(5.0)));
+
+        assertEquals(5.0, edited.getDouble("overallRating"), 0.0001,
+            "eleven 5s average 5.0, and the edit recomputed rather than keeping 3.0");
+        assertEquals(5.0, edited.getDouble("authorsOverallRating"), 0.0001);
     }
 
     @Test
@@ -763,6 +874,24 @@ class CompanyReviewIntegrationTest {
         assertEquals("manual",      row.getString("declared_source"));
         assertEquals("Second Mill", row.getString("declared_text"),
             "the edited location must replace the old one, not be discarded as 'declared nothing'");
+    }
+
+    /**
+     * The ten scores from the production rating that exposed the bug: mean 3.2.
+     *
+     * <p>Deliberately NOT ten of the same number. A body where every category matches the overall
+     * passes whether the overall is derived or merely echoed back, which is why the suite had ten
+     * tests over this table and none of them could see the defect.
+     */
+    private static JsonObject mixedBody() {
+        double[] ten = { 5, 5, 1, 1, 5, 1, 1, 5, 5, 3 };
+        JsonObject ratings = new JsonObject();
+        int i = 0;
+        for (String c : CompanyReviewRepository.CATEGORIES) ratings.put(c, ten[i++]);
+        return new JsonObject()
+            .put("ratings", ratings)
+            .put("workedFrom", "2021-04")
+            .putNull("workedUntil");
     }
 
     private static JsonObject validBody(double overall) {

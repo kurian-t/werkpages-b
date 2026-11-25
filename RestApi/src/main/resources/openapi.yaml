@@ -1321,8 +1321,14 @@ paths:
       summary: Rate a company as a workplace
       description: >-
         What the employer is like to work for, as distinct from what its managers are like. All ten
-        categories are required and the overall rating is asked separately rather than derived from
-        them, because somebody's summary judgement is not the mean of its parts.
+        categories are required, and so is the author's own overall.
+
+
+        THE RATING ITSELF IS THE AVERAGE OF ALL ELEVEN SCORES, computed by the database, the same
+        way a manager rating averages its ten (one of which is "overall working experience"). The
+        overall answer below is kept as data and counted as one of the eleven; it is not the
+        company's rating on its own, which is what made a card read 1.0 over a breakdown of five
+        5s, four 1s and a 3.
 
 
         One rating per person per company. Submitting again replaces the previous answer rather
@@ -3309,6 +3315,12 @@ paths:
       responses:
         '201':
           description: Report submitted successfully
+        '401':
+          # Reporting requires an account. The profile page keeps a half-written report in
+          # sessionStorage, sends the visitor to sign up and posts it on the way back, so a guest
+          # never loses the report - but the endpoint itself is closed to one, and the contract
+          # said nothing about that until V114's queue made the whole path worth stating.
+          description: Not signed in
         '400':
           description: Missing or invalid reason
           content:
@@ -5150,6 +5162,112 @@ paths:
         '403':
           description: Forbidden
 
+  /api/admin/reports:
+    get:
+      operationId: adminListReports
+      summary: Reports filed against manager profiles, oldest open first (admin only)
+      description: >-
+        The read side of the Report button. Reports were written to the database from the day the
+        button shipped and never read by anything but the duplicate check, so nobody could see one;
+        this is the queue that makes them actionable. Open reports come oldest first, because the
+        age is what matters.
+      tags:
+        - Admin
+      parameters:
+        - name: status
+          in: query
+          required: false
+          schema: { type: string, enum: [open, resolved, dismissed], default: open }
+        - name: limit
+          in: query
+          required: false
+          schema: { type: integer, default: 50 }
+        - name: offset
+          in: query
+          required: false
+          schema: { type: integer, default: 0 }
+      responses:
+        '200':
+          description: One page of reports in the requested state
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  total:  { type: integer }
+                  status: { type: string }
+                  data:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id:          { type: string, format: uuid }
+                        managerId:   { type: integer, format: int64 }
+                        managerName: { type: string }
+                        managerSlug: { type: string }
+                        reason:
+                          type: string
+                          enum: [incorrect_person, never_worked_here, duplicate_profile, incorrect_information, other]
+                        comment:     { type: string, nullable: true }
+                        status:      { type: string, enum: [open, resolved, dismissed] }
+                        createdAt:   { type: string, format: date-time }
+                        reporter:
+                          type: string
+                          nullable: true
+                          description: >-
+                            The reporter's handle, or null when no account stands behind the report
+                            any more. reports.user_id is ON DELETE SET NULL, so deleting an account
+                            leaves its reports in the queue without a reporter.
+                        reporterKnown:  { type: boolean }
+                        resolvedAt:     { type: string, format: date-time, nullable: true }
+                        resolvedBy:     { type: string, nullable: true }
+                        resolutionNote: { type: string, nullable: true }
+        '400':
+          description: Unknown status
+        '401':
+          description: Unauthorized
+        '403':
+          description: Not an admin
+
+  /api/admin/reports/{reportId}/resolve:
+    post:
+      operationId: adminResolveReport
+      summary: Decide one report and take it out of the queue (admin only)
+      description: >-
+        Neither action deletes the report: it is evidence about a profile and about the account that
+        filed it, and both outlive the decision. `resolved` means it was acted on, `dismissed` means
+        no action was needed.
+      tags:
+        - Admin
+      parameters:
+        - name: reportId
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                action: { type: string, enum: [resolved, dismissed] }
+                note:   { type: string, nullable: true, maxLength: 500 }
+              required: [action]
+      responses:
+        '200':
+          description: The report was decided by this call
+        '400':
+          description: Missing or unknown action
+        '401':
+          description: Unauthorized
+        '403':
+          description: Not an admin
+        '404':
+          description: No such report
+        '409':
+          description: Already decided, by this admin or another one
+
   /api/admin/companies/pending:
     get:
       operationId: adminPendingCompanies
@@ -6462,8 +6580,10 @@ components:
           minimum: 0
           maximum: 5
           description: >-
-            Asked explicitly, never derived. "The pay was poor and it was chaotic, but I loved
-            working there" is a real position that averaging the ten below would erase.
+            Asked explicitly and stored as given: "the pay was poor and it was chaotic, but I
+            loved working there" is a real position, and it is kept. It is averaged WITH the ten
+            below rather than replacing them, so a summary judgement counts once among eleven
+            instead of being the whole figure.
         ratings:
           type: object
           description: All ten are required. There is no N/A - see the migration for why.
@@ -6570,7 +6690,18 @@ components:
           description: Name of that same company, so a follow-up prompt can name it.
         id:            { type: string, format: uuid }
         companyId:     { type: integer, format: int64 }
-        overallRating: { type: number }
+        overallRating:
+          type: number
+          description: >-
+            THE RATING: the average of all eleven scores its author gave. Derived by the database;
+            never sent by a client. Every endpoint means this by the name.
+        authorsOverallRating:
+          type: number
+          nullable: true
+          description: >-
+            What its author answered when asked to sum it up themselves. One of the eleven
+            averaged above, kept as data, and the value the rating form reopens on. Null when the
+            reader is gated, with every other score.
         ratings:       { type: object }
         workedFrom:    { type: string, nullable: true }
         workedUntil:   { type: string, nullable: true }

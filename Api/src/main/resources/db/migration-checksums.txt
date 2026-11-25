@@ -144,3 +144,5 @@ V110__contributor_status_is_binary.sql  -1543532371
 V111__career_editor_asks_no_explanation.sql  407196005
 V112__a_correction_needs_no_reason.sql  -503021439
 V113__company_averages_count_every_rating.sql  -870972834
+V114__report_queue_resolution.sql  1071863063
+V115__company_rating_averages_every_score.sql  807786403

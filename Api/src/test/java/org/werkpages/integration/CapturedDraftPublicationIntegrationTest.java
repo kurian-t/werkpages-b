@@ -376,6 +376,82 @@ class CapturedDraftPublicationIntegrationTest {
     }
 
     @Test
+    void aDraftWhoseWorkplaceHasNoCountryIsNotOfferedAsPublishable() throws Exception {
+        insertCompany("Logic-ology", "logic-ology");
+        String adminAuth = insertUser("auth0|dp-admin-geo", "DpAdminGeo", "admin");
+        /*
+          REPORTED FROM PRODUCTION, on this exact payload.
+
+          A place picked from the corpus during a worldwide search was stamped with the REQUEST's
+          country rather than its own, so the captured draft held a corpusPlace with city
+          "Richmond", stateCode "BC" and country null. The suggestion path no longer loses it.
+
+          This holds the other half: the PANEL's question. getCapturedDrafts computed publishable
+          from parseRating alone, which looks at the categories, the overall, the period and the
+          handle, while the workplace itself is validated one layer deeper inside the write. So
+          the queue reported this draft as publishable, the button rendered enabled, and pressing
+          it failed with "A workplace must have a country" - on a form somebody had filled in
+          completely.
+
+          The panel already does the right thing with the answer: it disables Publish on
+          !publishable and prints blockedReason. It was simply being told the wrong thing.
+        */
+        JsonObject body = ratingBody(4.0)
+            .put("declaredSource", "corpus")
+            .put("declaredPrecision", "exact")
+            .put("corpusPlace", new JsonObject()
+                .put("sourcePlaceId", "3cbc9d90-7a62-4063-bb04-40070e60a4dd")
+                .put("name", "Logic-ology")
+                .put("street", "7271 Nelson Rd")
+                .put("city", "Richmond")
+                .put("stateCode", "BC")
+                .put("postalCode", "V6V 1B1")
+                .putNull("country")
+                .putNull("countryCode"));
+        await(companyRatings.captureDraft("logic-ology", body));
+
+        JsonObject queued = await(admin.getCapturedDrafts(adminAuth, 20, 0))
+            .getJsonArray("data").getJsonObject(0);
+
+        assertNotNull(queued.getJsonObject("payload").getJsonObject("corpusPlace"),
+            "the capture keeps the place it was given");
+        assertFalse(queued.getBoolean("publishable"),
+            "the queue must not offer a Publish button for a draft the write will refuse");
+        assertEquals("A workplace must have a country", queued.getString("blockedReason"),
+            "and it names the missing answer, which is the whole promise of this screen");
+    }
+
+    @Test
+    void aDraftWithACompleteWorkplaceIsStillPublishable() throws Exception {
+        insertCompany("Logic-ology", "logic-ology");
+        String adminAuth = insertUser("auth0|dp-admin-geo-2", "DpAdminGeo2", "admin");
+        /*
+          The other side of the check above: tightening the gate must not start refusing drafts
+          that are perfectly publishable. Same payload, with the country the suggestion path now
+          carries.
+        */
+        JsonObject body = ratingBody(4.0)
+            .put("declaredSource", "corpus")
+            .put("declaredPrecision", "exact")
+            .put("corpusPlace", new JsonObject()
+                .put("sourcePlaceId", "3cbc9d90-7a62-4063-bb04-40070e60a4dd")
+                .put("name", "Logic-ology")
+                .put("street", "7271 Nelson Rd")
+                .put("city", "Richmond")
+                .put("stateCode", "BC")
+                .put("postalCode", "V6V 1B1")
+                .put("country", "Canada")
+                .put("countryCode", "CA"));
+        await(companyRatings.captureDraft("logic-ology", body));
+
+        JsonObject queued = await(admin.getCapturedDrafts(adminAuth, 20, 0))
+            .getJsonArray("data").getJsonObject(0);
+
+        assertTrue(queued.getBoolean("publishable"));
+        assertNull(queued.getString("blockedReason"));
+    }
+
+    @Test
     void aDraftWithNoCompanyCannotBePublished() throws Exception {
         String adminAuth = insertUser("auth0|dp-admin-5", "DpAdmin5", "admin");
         /*

@@ -1956,6 +1956,14 @@ public class ManagerService {
                     .put("street", h.street())
                     .put("city", h.city())
                     .put("stateCode", h.stateCode())
+                    /*
+                      The country this index was searched for, carried for the same reason the
+                      remote path carries its partition's: the suggestion is selectable, and a
+                      corpusPlace with no country cannot be published.
+                    */
+                    .put("countryCode",
+                         org.werkpages.repository.LocationCorpusRepository.iso(country))
+                    .put("country", country)
                     .put("postalCode", h.postalCode()));
             }
             /*
@@ -2359,10 +2367,24 @@ public class ManagerService {
                   The DISPLAY name, for the same reason the geography tier uses it: a row saying
                   "US" while every other row says "United States" does not match either.
                 */
+                /*
+                  THE ROW'S OWN COUNTRY WINS, exactly as it does for the display field above and
+                  for every geography row below.
+
+                  This stamped the REQUEST's country unconditionally. A request that names no
+                  country - a worldwide search - made that null, so the selectable payload was
+                  born with country and countryCode both null, and the submit was refused with "A
+                  workplace must have a country" on a completely filled-in form. The row always
+                  knows: a place search reads one country's partition, and placesFor refuses to
+                  run without one.
+                */
                 .put("corpusPlace", place.copy()
-                        .put("country", country)
+                        .put("country", place.getString("country") != null
+                                        ? place.getString("country") : country)
                         .put("countryCode",
-                             org.werkpages.repository.LocationCorpusRepository.iso(country))));
+                             place.getString("countryCode") != null
+                             ? place.getString("countryCode")
+                             : org.werkpages.repository.LocationCorpusRepository.iso(country))));
         }
     }
 
@@ -2503,7 +2525,16 @@ public class ManagerService {
     public Future<JsonObject> getStats() {
         Future<Long> userSubmittedFuture = db.query("SELECT COUNT(*) FROM managers WHERE approval_status IN ('approved','ghost') AND external_id IS NULL")
             .execute().map(rows -> rows.iterator().next().getLong(0));
-        Future<Long> realReviewsFuture = db.query("SELECT COUNT(*) FROM reviews r JOIN managers m ON r.manager_id = m.id WHERE m.approval_status IN ('approved','ghost') AND m.external_id IS NULL AND r.origin = 'contributor'")
+        /*
+          GENUINE RATINGS, WHEREVER THEY WERE LEFT.
+
+          Two faults, both removed. It filtered m.external_id IS NULL, so every rating on an
+          imported profile was missing from a tile headed "Opinions Shared" while two thirds of
+          live profiles are imported; a person wrote those ratings whatever created the profile
+          they sit on. And it retyped the countable-rating predicate as origin = 'contributor'
+          alone, with no disposition and no deleted_at, so held and withdrawn ratings counted.
+        */
+        Future<Long> realReviewsFuture = db.query("SELECT COUNT(*) FROM reviews r JOIN managers m ON r.manager_id = m.id WHERE m.approval_status IN ('approved','ghost') AND " + ReviewSql.genuine("r"))
             .execute().map(rows -> rows.iterator().next().getLong(0));
         /*
           WEIGHTED OPINIONS NO LONGER COUNTS EXAMPLES.

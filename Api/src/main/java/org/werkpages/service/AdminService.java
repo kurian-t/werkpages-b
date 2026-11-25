@@ -16,6 +16,7 @@ import org.werkpages.repository.PickedBrand;
 import org.werkpages.repository.ConfidenceRepository;
 import org.werkpages.repository.EditRepository;
 import org.werkpages.repository.ManagerRepository;
+import org.werkpages.repository.ReviewSql;
 import org.werkpages.repository.MergeSuggestionsRepository;
 import org.werkpages.repository.NotificationRepository;
 import org.werkpages.repository.ProofChallengeRepository;
@@ -2612,6 +2613,21 @@ public class AdminService {
                 })));
     }
 
+    /*
+      EVERY LIVE MANAGER, AND ONLY GENUINE RATINGS.
+
+      Both halves of this used to filter external_id IS NULL, which answered "how many profiles
+      did people add" under headings that say "Managers by Country" and "Ratings by Country". With
+      4,727 of 7,090 live managers imported, the table read 878 American managers while 5,605
+      American profiles were live and reachable from search. countApproved() and every search
+      query select on approval_status alone, so this was the one surface in the product that
+      disagreed with what a visitor can open. The scraped against people-added split is still
+      reported, by getStats, which is where that question belongs.
+
+      The ratings half also retyped its own idea of a countable rating as weight = FALSE, which
+      counts held and rejected ones. ReviewSql.genuine owns that predicate: live, not deleted,
+      written by a person.
+    */
     public Future<JsonObject> getCountryStats(String auth0Id) {
         if (db == null) return Future.failedFuture(ServiceException.forbidden("DB not configured"));
         return requireAdmin(auth0Id)
@@ -2620,7 +2636,6 @@ public class AdminService {
                     SELECT COALESCE(country, 'Unknown') AS country, COUNT(*) AS count
                     FROM managers
                     WHERE approval_status IN ('approved', 'ghost')
-                      AND external_id IS NULL
                     GROUP BY country
                     ORDER BY count DESC
                     """).execute(),
@@ -2628,10 +2643,9 @@ public class AdminService {
                     SELECT COALESCE(m.country, 'Unknown') AS country, COUNT(*) AS count
                     FROM reviews r
                     JOIN managers m ON r.manager_id = m.id
-                    WHERE r.weight = FALSE
-                      AND r.deleted_at IS NULL
+                    WHERE
+                    """ + ReviewSql.genuine("r") + """
                       AND m.approval_status IN ('approved', 'ghost')
-                      AND m.external_id IS NULL
                     GROUP BY m.country
                     ORDER BY count DESC
                     """).execute()

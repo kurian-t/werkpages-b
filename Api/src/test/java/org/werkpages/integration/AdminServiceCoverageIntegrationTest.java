@@ -368,14 +368,45 @@ class AdminServiceCoverageIntegrationTest {
     }
 
     // ══════════════════════════════════════════════════════════════════════════
-    // getCountryStats — bot filter
+    // getCountryStats: every live manager, and only genuine ratings
     // ══════════════════════════════════════════════════════════════════════════
 
+    /*
+      THE COUNTRY BREAKDOWN COUNTS MANAGERS, NOT PROVENANCE.
+
+      These tests asserted the opposite until 2026-11-24, under a banner reading "bot filter": a
+      manager carrying an external_id was dropped from "Managers by Country" so that the table
+      agreed with the "User Submitted" tile.
+
+      What that cost in production: the table read 878 American managers while 5,605 American
+      profiles were live, public and reachable from search. 4,727 of 7,090 live managers carry an
+      external_id, and nothing a visitor touches filters on it. countApproved() and every search
+      query select on approval_status alone, so the only country breakdown in the product
+      disagreed with every page anybody can open, by a factor of six.
+
+      The scraped against people-added split is still wanted, and getStats still reports it
+      through realManagers and scrapedManagers. It is simply not the question a country chart
+      answers.
+
+      The ratings half changed for a different reason. It hand-rolled its own idea of a countable
+      rating as "weight = FALSE AND deleted_at IS NULL", which counts held and rejected ones.
+      ReviewSql.genuine exists so that predicate is written once; this query now uses it.
+    */
+
+    /** The count for one country out of one of the two arrays, or 0 when absent. */
+    private static long countryCount(JsonObject stats, String arrayKey, String country) {
+        return stats.getJsonArray(arrayKey).stream()
+            .map(o -> (JsonObject) o)
+            .filter(e -> country.equals(e.getString("country")))
+            .mapToLong(e -> e.getLong("count"))
+            .findFirst().orElse(0L);
+    }
+
     @Test
-    void getCountryStats_excludesScrapedManagers() throws Exception {
+    void getCountryStats_countsEveryLiveManagerWhateverItsOrigin() throws Exception {
         String adminAuth = insertUser("auth0|cs-admin01", "CsAdmin01", "admin");
 
-        // 3 scraped managers: external_id set to a non-seed value
+        // Three from the import. The public directory serves these like any other profile.
         for (int i = 0; i < 3; i++) {
             await(pool.preparedQuery("""
                     INSERT INTO managers(name,company,title,image,status,approval_status,
@@ -385,7 +416,7 @@ class AdminServiceCoverageIntegrationTest {
                 .execute(Tuple.of("Scraped " + i, "ScrapedCo", "Role", "scraper_" + i)));
         }
 
-        // 1 organic manager: external_id IS NULL
+        // One a person added.
         await(pool.preparedQuery("""
                 INSERT INTO managers(name,company,title,image,status,approval_status,
                                      overall_rating,reviews_count,category_averages,country)
@@ -393,22 +424,15 @@ class AdminServiceCoverageIntegrationTest {
                 """)
             .execute(Tuple.of("Real Manager", "RealCo", "Director")));
 
-        JsonObject result = await(service.getCountryStats(adminAuth));
-        JsonArray managers = result.getJsonArray("managers");
-
-        long usCount = managers.stream()
-            .map(o -> (JsonObject) o)
-            .filter(e -> "United States".equals(e.getString("country")))
-            .mapToLong(e -> e.getLong("count"))
-            .findFirst().orElse(0L);
-        assertEquals(1L, usCount, "scraped managers (external_id set) must not appear in country stats");
+        assertEquals(4L, countryCount(await(service.getCountryStats(adminAuth)), "managers", "United States"),
+            "every live manager belongs in the breakdown: an external_id is provenance, not visibility");
     }
 
     @Test
-    void getCountryStats_excludesSeedAndScrapedManagers() throws Exception {
+    void getCountryStats_countsGhostAndSeededManagersToo() throws Exception {
         String adminAuth = insertUser("auth0|cs-admin02", "CsAdmin02", "admin");
 
-        // Seed manager (external_id LIKE 'seed_%') — must NOT appear; aligns with User Submitted stat
+        // A seeded profile. None exist in production, but the filter that hid them was the same one.
         await(pool.preparedQuery("""
                 INSERT INTO managers(name,company,title,image,status,approval_status,
                                      overall_rating,reviews_count,category_averages,country,external_id)
@@ -416,15 +440,13 @@ class AdminServiceCoverageIntegrationTest {
                 """)
             .execute(Tuple.of("Ghost Manager", "GhostCo", "Manager")));
 
-        // Scraped manager — must NOT appear
         await(pool.preparedQuery("""
                 INSERT INTO managers(name,company,title,image,status,approval_status,
                                      overall_rating,reviews_count,category_averages,country,external_id)
                 VALUES ($1,$2,$3,'img','active','approved',0,0,'{}','Canada','scraper_x')
                 """)
-            .execute(Tuple.of("Scraped Manager", "ScrapedCo", "Bot")));
+            .execute(Tuple.of("Scraped Manager", "ScrapedCo", "Analyst")));
 
-        // Organic manager — must appear
         await(pool.preparedQuery("""
                 INSERT INTO managers(name,company,title,image,status,approval_status,
                                      overall_rating,reviews_count,category_averages,country)
@@ -432,114 +454,89 @@ class AdminServiceCoverageIntegrationTest {
                 """)
             .execute(Tuple.of("Organic Manager", "OrganicCo", "Manager")));
 
-        JsonObject result = await(service.getCountryStats(adminAuth));
-        JsonArray managers = result.getJsonArray("managers");
-
-        long caCount = managers.stream()
-            .map(o -> (JsonObject) o)
-            .filter(e -> "Canada".equals(e.getString("country")))
-            .mapToLong(e -> e.getLong("count"))
-            .findFirst().orElse(0L);
-        assertEquals(1L, caCount, "only organic managers (external_id IS NULL) must appear in managers by country");
+        // Ghost is live and publicly visible, which is the whole point of the status.
+        assertEquals(3L, countryCount(await(service.getCountryStats(adminAuth)), "managers", "Canada"),
+            "approved and ghost are both live, whatever created them");
     }
 
     @Test
-    void getCountryStats_ratingsExcludesReviewsOnScrapedManagers() throws Exception {
+    void getCountryStats_ratingsCountGenuineRatingsOnAnyLiveManager() throws Exception {
         String adminAuth = insertUser("auth0|cs-admin03", "CsAdmin03", "admin");
 
-        // Scraped manager with a real review — review must NOT appear in ratings by country
-        long scrapedId = await(pool.preparedQuery("""
-                INSERT INTO managers(name,company,title,image,status,approval_status,
-                                     overall_rating,reviews_count,category_averages,country,external_id)
-                VALUES ($1,$2,$3,'img','active','approved',3.0,1,'{}','United States','scraper_y')
-                RETURNING id
-                """)
-            .execute(Tuple.of("Scraped With Review", "ScrapedCo", "Manager"))
-            .map(rs -> rs.iterator().next().getLong("id")));
-        await(pool.preparedQuery("""
-                INSERT INTO reviews(manager_id,user_id,author,overall_rating,manager_company,manager_title,weight)
-                VALUES ($1,NULL,'Anon',3.0,$2,$3,FALSE)
-                """)
-            .execute(Tuple.of(scrapedId, "ScrapedCo", "Manager")));
+        long scrapedId = insertLiveManager("Scraped With Rating", "ScrapedCo", "United States", "scraper_y");
+        insertRating(scrapedId, "ScrapedCo", 3.0);
 
-        // Organic manager with a real review — must appear
-        long organicId = await(pool.preparedQuery("""
-                INSERT INTO managers(name,company,title,image,status,approval_status,
-                                     overall_rating,reviews_count,category_averages,country)
-                VALUES ($1,$2,$3,'img','active','approved',4.0,1,'{}','United States')
-                RETURNING id
-                """)
-            .execute(Tuple.of("Organic Manager", "OrganicCo", "Manager"))
-            .map(rs -> rs.iterator().next().getLong("id")));
-        await(pool.preparedQuery("""
-                INSERT INTO reviews(manager_id,user_id,author,overall_rating,manager_company,manager_title,weight)
-                VALUES ($1,NULL,'Anon',4.0,$2,$3,FALSE)
-                """)
-            .execute(Tuple.of(organicId, "OrganicCo", "Manager")));
+        long organicId = insertLiveManager("Organic With Rating", "OrganicCo", "United States", null);
+        insertRating(organicId, "OrganicCo", 4.0);
 
-        JsonObject result = await(service.getCountryStats(adminAuth));
-        JsonArray reviews = result.getJsonArray("reviews");
-
-        long usCount = reviews.stream()
-            .map(o -> (JsonObject) o)
-            .filter(e -> "United States".equals(e.getString("country")))
-            .mapToLong(e -> e.getLong("count"))
-            .findFirst().orElse(0L);
-        assertEquals(1L, usCount, "ratings on scraped managers must not appear in ratings by country");
+        /*
+          A rating left on an imported profile was written by a person about their manager. The
+          profile's origin says nothing about the rating's, and excluding it understated every
+          genuine opinion the product had collected on two thirds of its profiles.
+        */
+        assertEquals(2L, countryCount(await(service.getCountryStats(adminAuth)), "reviews", "United States"),
+            "a genuine rating counts wherever it was left");
     }
 
     @Test
-    void getCountryStats_ratingsExcludesSeedManagerReviews() throws Exception {
+    void getCountryStats_ratingsExcludeExamplesHeldAndDeleted() throws Exception {
         String adminAuth = insertUser("auth0|cs-admin04", "CsAdmin04", "admin");
 
-        // Seed manager with a real review — review must NOT appear in ratings by country
-        long seedId = await(pool.preparedQuery("""
+        long id = insertLiveManager("Mixed Bag", "MixedCo", "Malta", null);
+
+        insertRating(id, "MixedCo", 4.0);                       // the only one that counts
+
+        // A platform example. Shown on the profile as a demonstration, counted nowhere.
+        await(pool.preparedQuery("""
+                INSERT INTO reviews(manager_id,user_id,author,overall_rating,manager_company,manager_title,
+                                    weight,origin)
+                VALUES ($1,NULL,'Example',5.0,$2,'Manager',TRUE,'platform_example')
+                """)
+            .execute(Tuple.of(id, "MixedCo")));
+
+        /*
+          Held: the rating left when somebody adds a manager, withheld until the profile is
+          approved. gate_eligible and live_since move with disposition, enforced by a CHECK.
+        */
+        await(pool.preparedQuery("""
+                INSERT INTO reviews(manager_id,user_id,author,overall_rating,manager_company,manager_title,
+                                    weight,origin,disposition,gate_eligible,live_since)
+                VALUES ($1,NULL,'Pending',2.0,$2,'Manager',FALSE,'contributor','held',FALSE,NULL)
+                """)
+            .execute(Tuple.of(id, "MixedCo")));
+
+        // Withdrawn by its author. Gone as far as every reader is concerned.
+        await(pool.preparedQuery("""
+                INSERT INTO reviews(manager_id,user_id,author,overall_rating,manager_company,manager_title,
+                                    weight,origin,deleted_at)
+                VALUES ($1,NULL,'Withdrawn',1.0,$2,'Manager',FALSE,'contributor',now())
+                """)
+            .execute(Tuple.of(id, "MixedCo")));
+
+        assertEquals(1L, countryCount(await(service.getCountryStats(adminAuth)), "reviews", "Malta"),
+            "only live, undeleted, person-written ratings count: ReviewSql.genuine, not a retyped predicate");
+    }
+
+    /** A live manager in one country, with {@code externalId} null for one a person added. */
+    private long insertLiveManager(String name, String company, String country, String externalId)
+            throws Exception {
+        return await(pool.preparedQuery("""
                 INSERT INTO managers(name,company,title,image,status,approval_status,
                                      overall_rating,reviews_count,category_averages,country,external_id)
-                VALUES ($1,$2,$3,'img','active','ghost',4.0,1,'{}','Canada','seed_xyz')
+                VALUES ($1,$2,'Manager','img','active','approved',0,0,'{}',$3,$4)
                 RETURNING id
                 """)
-            .execute(Tuple.of("Seed Manager", "SeedCo", "Manager"))
+            .execute(Tuple.of(name, company, country, externalId))
             .map(rs -> rs.iterator().next().getLong("id")));
+    }
+
+    /** A genuine, live, person-written rating. Authorless but unweighted, so it stays a contributor row. */
+    private void insertRating(long managerId, String company, double overall) throws Exception {
         await(pool.preparedQuery("""
                 INSERT INTO reviews(manager_id,user_id,author,overall_rating,manager_company,manager_title,weight)
-                VALUES ($1,NULL,'Anon',4.0,$2,$3,FALSE)
+                VALUES ($1,NULL,'Anon',$2,$3,'Manager',FALSE)
                 """)
-            .execute(Tuple.of(seedId, "SeedCo", "Manager")));
-
-        // Organic manager with a real review — must appear
-        long organicId = await(pool.preparedQuery("""
-                INSERT INTO managers(name,company,title,image,status,approval_status,
-                                     overall_rating,reviews_count,category_averages,country)
-                VALUES ($1,$2,$3,'img','active','approved',5.0,1,'{}','Canada')
-                RETURNING id
-                """)
-            .execute(Tuple.of("Organic Manager", "OrganicCo", "Manager"))
-            .map(rs -> rs.iterator().next().getLong("id")));
-        await(pool.preparedQuery("""
-                INSERT INTO reviews(manager_id,user_id,author,overall_rating,manager_company,manager_title,weight)
-                VALUES ($1,NULL,'Anon',5.0,$2,$3,FALSE)
-                """)
-            .execute(Tuple.of(organicId, "OrganicCo", "Manager")));
-
-        JsonObject result = await(service.getCountryStats(adminAuth));
-        JsonArray reviews = result.getJsonArray("reviews");
-        JsonArray managers = result.getJsonArray("managers");
-
-        long caReviewCount = reviews.stream()
-            .map(o -> (JsonObject) o)
-            .filter(e -> "Canada".equals(e.getString("country")))
-            .mapToLong(e -> e.getLong("count"))
-            .findFirst().orElse(0L);
-        assertEquals(1L, caReviewCount, "ratings on seed managers must not appear in ratings by country");
-
-        // Seed manager does NOT appear in the managers array (managers query is organic only)
-        long caManagerCount = managers.stream()
-            .map(o -> (JsonObject) o)
-            .filter(e -> "Canada".equals(e.getString("country")))
-            .mapToLong(e -> e.getLong("count"))
-            .findFirst().orElse(0L);
-        assertEquals(1L, caManagerCount, "only organic managers must appear in managers by country");
+            .execute(Tuple.of(managerId, overall, company)));
     }
 
     // ══════════════════════════════════════════════════════════════════════════
