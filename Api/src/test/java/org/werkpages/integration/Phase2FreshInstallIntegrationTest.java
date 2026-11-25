@@ -223,7 +223,20 @@ class Phase2FreshInstallIntegrationTest {
         // reports, a unique index would fail to build if any duplicate pair exists, and clearing
         // one first means deleting user-submitted rows. Raised separately rather than decided
         // inside a migration.
-        assertEquals("114", await(pool.query("""
+        //
+        // V115 (the company rating is the average of every score) moved it to 115 on 2026-11-24.
+        // Acknowledged. A workplace rating showed a headline of 1.0 above ten category scores of
+        // 5, 5, 1, 1, 5, 1, 1, 5, 5 and 3, because the headline was the author's answer to
+        // "Overall, how was working here?" rather than an average of anything. Manager ratings
+        // have always been the mean of their category scores, and these are now the same: the
+        // rating is the average of all eleven answers, derived by the database as
+        // company_reviews.rating_average, a GENERATED ... STORED column that no writer can set.
+        //
+        // The author's own overall answer is kept, still NOT NULL, still required by the API and
+        // now served as authorsOverallRating, so nothing is lost and no row is rewritten. Purely
+        // additive: one generated column, one trigger function replaced and one recomputation of
+        // the projections through company_stats_apply.
+        assertEquals("115", await(pool.query("""
                 SELECT version FROM flyway_schema_history
                  WHERE success AND version IS NOT NULL
                  ORDER BY installed_rank DESC LIMIT 1
