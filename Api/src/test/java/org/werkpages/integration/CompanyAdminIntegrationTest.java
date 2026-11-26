@@ -115,6 +115,45 @@ class CompanyAdminIntegrationTest {
         assertEquals(2L, co.getLong("managerCount"));
     }
 
+    /*
+      THE ADMIN COMPANY COUNT COUNTS WHAT PEOPLE ADDED.
+
+      An import counts toward the scraped counter and nowhere else (2026-11-25,
+      ManagerSql.contributed). This figure previously excluded platform seeds but included
+      imports, so a company's number on the admin tab was mostly the size of the scrape.
+
+      The public company and industry counts deliberately still include imports, because an
+      imported profile is live, listed and openable. Section 22 of CLAUDE.md owns that, and
+      nothing here touches it.
+    */
+    @Test
+    void adminListCompanies_managerCountExcludesImportedProfiles() throws Exception {
+        String adminAuth = insertUser("auth0|co-admin-imp", "CoAdminImp", "admin");
+        long companyId = insertCompany("Provenance Corp");
+
+        // One a person added.
+        insertManagerForCompany("Organic O", "Provenance Corp", "Manager", "approved", companyId);
+
+        // Two from the import, at the same company, both live and both publicly openable.
+        for (int i = 0; i < 2; i++) {
+            await(pool.preparedQuery("""
+                    INSERT INTO managers(name,company,title,image,status,approval_status,
+                                         overall_rating,reviews_count,category_averages,company_id,external_id)
+                    VALUES ($1,'Provenance Corp','Director','img','active','approved',0,0,'{}',$2,$3)
+                    """)
+                .execute(Tuple.of("Imported " + i, companyId, "scraper_co_" + i)));
+        }
+
+        JsonObject result = await(service.adminListCompanies(adminAuth));
+        JsonObject co = result.getJsonArray("data").stream()
+            .map(o -> (JsonObject) o)
+            .filter(e -> "Provenance Corp".equals(e.getString("name")))
+            .findFirst().orElseThrow();
+
+        assertEquals(1L, co.getLong("managerCount").longValue(),
+            "three live managers at this company, one of which anybody added: the count is 1");
+    }
+
     @Test
     void adminListCompanies_returnsEmptyWhenNoCompanies() throws Exception {
         String adminAuth = insertUser("auth0|co-admin02", "CoAdmin02", "admin");

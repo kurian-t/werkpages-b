@@ -20,6 +20,7 @@ import org.werkpages.repository.GeoObservationRepository;
 import org.werkpages.repository.ManagerRepository;
 import org.werkpages.repository.ReportRepository;
 import org.werkpages.repository.ReviewRepository;
+import org.werkpages.repository.ManagerSql;
 import org.werkpages.repository.ReviewSql;
 import org.werkpages.repository.UserRepository;
 
@@ -2523,26 +2524,36 @@ public class ManagerService {
     // ── GET stats ─────────────────────────────────────────────────────────────
 
     public Future<JsonObject> getStats() {
-        Future<Long> userSubmittedFuture = db.query("SELECT COUNT(*) FROM managers WHERE approval_status IN ('approved','ghost') AND external_id IS NULL")
+        Future<Long> userSubmittedFuture = db.query("SELECT COUNT(*) FROM managers m WHERE " + ManagerSql.contributed("m"))
             .execute().map(rows -> rows.iterator().next().getLong(0));
         /*
-          GENUINE RATINGS, WHEREVER THEY WERE LEFT.
+          GENUINE RATINGS, ON THE PROFILES PEOPLE ADDED.
 
-          Two faults, both removed. It filtered m.external_id IS NULL, so every rating on an
-          imported profile was missing from a tile headed "Opinions Shared" while two thirds of
-          live profiles are imported; a person wrote those ratings whatever created the profile
-          they sit on. And it retyped the countable-rating predicate as origin = 'contributor'
-          alone, with no disposition and no deleted_at, so held and withdrawn ratings counted.
+          Two predicates, one from each correction this figure has had.
+
+          ReviewSql.genuine, because the countable-rating predicate had been retyped here as
+          origin = 'contributor' alone, with no disposition and no deleted_at, so held and
+          withdrawn ratings counted.
+
+          ManagerSql.contributed, because an import counts toward the scraped counter and nowhere
+          else (2026-11-25). That reverses the intermediate position that a rating on an imported
+          profile belongs under "Opinions Shared" because a person wrote it. True of the rating,
+          but with two thirds of profiles imported the tile stopped reporting what the product is
+          receiving, which is the only reason it is on the page.
         */
-        Future<Long> realReviewsFuture = db.query("SELECT COUNT(*) FROM reviews r JOIN managers m ON r.manager_id = m.id WHERE m.approval_status IN ('approved','ghost') AND " + ReviewSql.genuine("r"))
+        Future<Long> realReviewsFuture = db.query("SELECT COUNT(*) FROM reviews r JOIN managers m ON r.manager_id = m.id WHERE " + ManagerSql.contributed("m") + " AND " + ReviewSql.genuine("r"))
             .execute().map(rows -> rows.iterator().next().getLong(0));
         /*
-          WEIGHTED OPINIONS NO LONGER COUNTS EXAMPLES.
+          WEIGHTED OPINIONS NO LONGER COUNTS EXAMPLES, OR IMPORTS.
           It counted exactly the platform seeds - weight = TRUE inside its window - so the figure
           was a count of demonstrations presented as opinions. Examples contribute to no genuine
           figure, and this is a public one.
+
+          It now joins managers for the reason the tile above does: an import counts toward the
+          scraped counter and nowhere else. The join also drops a weighted rating whose manager is
+          not live, which the bare count over reviews included.
         */
-        Future<Long> weightedOpinionsFuture = db.query("SELECT COUNT(*) FROM reviews WHERE origin = 'contributor' AND weight = TRUE AND (weight_expires_on IS NULL OR weight_expires_on > CURRENT_DATE)")
+        Future<Long> weightedOpinionsFuture = db.query("SELECT COUNT(*) FROM reviews r JOIN managers m ON r.manager_id = m.id WHERE " + ManagerSql.contributed("m") + " AND r.origin = 'contributor' AND r.weight = TRUE AND (r.weight_expires_on IS NULL OR r.weight_expires_on > CURRENT_DATE)")
             .execute().map(rows -> rows.iterator().next().getLong(0));
         Future<Long> seededManagersFuture = db.query("SELECT COUNT(*) FROM managers WHERE approval_status IN ('approved','ghost') AND external_id LIKE 'seed_%'")
             .execute().map(rows -> rows.iterator().next().getLong(0));

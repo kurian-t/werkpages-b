@@ -73,6 +73,16 @@ class RoleNormalizationIntegrationTest {
     void cleanDb() throws Exception {
         await(pool.query("TRUNCATE role_aliases").execute());
         await(pool.query("TRUNCATE managers, users, companies CASCADE").execute());
+        /*
+          THE CATALOGUE IS A FIXTURE HERE, NOT A GIVEN.
+
+          V116 ships 405 curated titles, so without this every suggestion test in this class would
+          see catalogue rows alongside the ones it inserted, and the assertions on exact result
+          counts would fail for a reason that has nothing to do with what they test. Emptying it
+          keeps those tests measuring what they were written to measure, and the catalogue tests
+          below insert exactly the rows they need.
+        */
+        await(pool.query("TRUNCATE job_titles").execute());
     }
 
     @AfterAll
@@ -283,6 +293,121 @@ class RoleNormalizationIntegrationTest {
 
         assertEquals(1, results.size());
         assertEquals("Staff Designer", results.getJsonObject(0).getString("title"));
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // The curated catalogue (V116) — suggesting a title before anybody has used it
+    // ══════════════════════════════════════════════════════════════════════════
+
+    /*
+      WHY THE CATALOGUE EXISTS. Suggestions used to come only from titles already attached to a
+      live manager, which works for a title 636 managers share and is useless for a sector with no
+      rows yet: nobody was offered "Head Nurse" until somebody had already typed "Head Nurse", and
+      the second nurse then inherited whatever spelling the first one invented.
+
+      WHAT WAS OBSERVED. Typing a title nobody held produced no dropdown at all, because the list
+      opened only when it had something to suggest and the "Not listed? Add ..." row lives inside
+      that list. So the one affordance for an unknown title was reachable only when the title was
+      already known.
+    */
+
+    /** One catalogue row, as V116 writes them: display title, optional acronym, derived key. */
+    private void insertCatalogueTitle(String title, String acronym) throws Exception {
+        await(pool.preparedQuery(
+                "INSERT INTO job_titles (title, acronym, match_key) "
+              + "VALUES ($1, $2, normalize_role_title($1))")
+            .execute(Tuple.of(title, acronym)));
+    }
+
+    @Test
+    void offersACatalogueTitleNoManagerHolds() throws Exception {
+        insertCatalogueTitle("Head Nurse", null);
+
+        JsonArray results = await(service.suggestTitles("head nur"));
+
+        assertEquals(1, results.size(), "the catalogue must answer for a sector with no rows yet");
+        assertEquals("Head Nurse", results.getJsonObject(0).getString("title"));
+        assertEquals(0, results.getJsonObject(0).getInteger("usageCount"),
+            "nobody holds it, and the count must say so rather than invent usage");
+    }
+
+    @Test
+    void typingAnAcronymFindsTheTitleItStandsFor() throws Exception {
+        insertCatalogueTitle("Chief Executive Officer", "CEO");
+
+        JsonArray results = await(service.suggestTitles("ceo"));
+
+        assertEquals(1, results.size());
+        assertEquals("Chief Executive Officer", results.getJsonObject(0).getString("title"),
+            "the row carries the extended form, which is what gets stored on selection");
+        assertEquals("CEO", results.getJsonObject(0).getString("acronym"),
+            "and the short form, which the picker shows as \"CEO (Chief Executive Officer)\"");
+    }
+
+    /*
+      AN AMBIGUOUS ACRONYM RETURNS EVERY READING, AND THAT IS THE DESIGN.
+
+      V49's normalizer resolves "avp" to "assistant vice president", silently merging Assistant
+      and Associate Vice President, which are different jobs. The replacement does not guess: both
+      readings come back and the person says which they meant. If this test ever reads 1, something
+      has started choosing on their behalf again.
+    */
+    @Test
+    void anAmbiguousAcronymOffersEveryReadingRatherThanPickingOne() throws Exception {
+        insertCatalogueTitle("Assistant Vice President", "AVP");
+        insertCatalogueTitle("Associate Vice President", "AVP");
+
+        JsonArray results = await(service.suggestTitles("avp"));
+
+        assertEquals(2, results.size(), "two readings, no guess");
+        java.util.List<String> titles = new java.util.ArrayList<>();
+        for (int i = 0; i < results.size(); i++) titles.add(results.getJsonObject(i).getString("title"));
+        assertTrue(titles.contains("Assistant Vice President"), titles.toString());
+        assertTrue(titles.contains("Associate Vice President"), titles.toString());
+    }
+
+    @Test
+    void aSpellingPeopleHereUseOutranksTheCatalogueAndIsNotDuplicatedByIt() throws Exception {
+        // The catalogue holds the canonical form; two people here wrote it differently.
+        insertCatalogueTitle("Store Manager", null);
+        insertManager("A", "Store manager", "approved", null);
+        insertManager("B", "Store manager", "approved", null);
+
+        JsonArray results = await(service.suggestTitles("store"));
+
+        assertEquals(1, results.size(),
+            "the catalogue entry keys the same as the live spelling, so it must not appear twice");
+        assertEquals("Store manager", results.getJsonObject(0).getString("title"),
+            "what people here actually wrote wins over the catalogue's spelling");
+        assertEquals(2, results.getJsonObject(0).getInteger("usageCount"));
+    }
+
+    @Test
+    void aTitleInNobodysVocabularyReturnsNothingSoTheFormCanOfferToAddIt() throws Exception {
+        insertCatalogueTitle("Head Nurse", null);
+        insertManager("A", "Store Manager", "approved", null);
+
+        assertEquals(0, await(service.suggestTitles("quantum flux wrangler")).size(),
+            "an empty result is what makes the picker show \"Not listed? Add ...\" rather than a list");
+    }
+
+    /*
+      A TYPO MUST STILL FIND THE TITLE IT MEANT.
+
+      Reported: typing "Managett" offered only "Not listed? Add Managett", so the only route to
+      "Manager" was noticing your own mistake. Substring matching cannot answer a misspelling, and
+      a picker that cannot answer one is how a one-off typo becomes a permanent entry in the
+      vocabulary. Trigram similarity closes it.
+    */
+    @Test
+    void aMisspelledTitleStillFindsTheRealOne() throws Exception {
+        insertCatalogueTitle("Manager", null);
+
+        JsonArray results = await(service.suggestTitles("Managett"));
+
+        assertTrue(results.size() >= 1, "a typo must still reach the title it meant");
+        assertEquals("Manager", results.getJsonObject(0).getString("title"),
+            "and the nearest real spelling must be first, not buried");
     }
 
     @Test

@@ -1184,16 +1184,26 @@ public class CompanyRepository {
     }
 
     /** All companies ordered by name, for the admin panel. */
+    /*
+      ADMIN COUNT, SO IT COUNTS WHAT PEOPLE ADDED.
+
+      An import counts toward the scraped counter and nowhere else (2026-11-25,
+      ManagerSql.contributed). This figure used to exclude platform seeds but include imports,
+      which on the admin company tab meant a company's number was mostly the size of the scrape.
+
+      The public company and industry counts in this same file deliberately still include imports,
+      because an imported profile is live, openable and listed, and section 22 of CLAUDE.md owns
+      that. Two different questions, which is why they are now two different predicates rather
+      than one spelled out twice.
+    */
     public Future<RowSet<Row>> findAllForAdmin() {
-        return db.query("""
-                SELECT c.id, c.name, c.status,
-                       COUNT(m.id) FILTER (WHERE m.approval_status IN ('approved','ghost')
-                                             AND (m.external_id IS NULL OR m.external_id NOT LIKE 'seed_%')) AS manager_count
-                FROM companies c
-                LEFT JOIN managers m ON m.company_id = c.id
-                GROUP BY c.id, c.name, c.status
-                ORDER BY c.name ASC
-                """)
+        return db.query(
+                "SELECT c.id, c.name, c.status, "
+              + "COUNT(m.id) FILTER (WHERE " + ManagerSql.contributed("m") + ") AS manager_count "
+              + "FROM companies c "
+              + "LEFT JOIN managers m ON m.company_id = c.id "
+              + "GROUP BY c.id, c.name, c.status "
+              + "ORDER BY c.name ASC")
             .execute();
     }
 

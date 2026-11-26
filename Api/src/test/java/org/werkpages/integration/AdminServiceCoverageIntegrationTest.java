@@ -372,25 +372,32 @@ class AdminServiceCoverageIntegrationTest {
     // ══════════════════════════════════════════════════════════════════════════
 
     /*
-      THE COUNTRY BREAKDOWN COUNTS MANAGERS, NOT PROVENANCE.
+      THE COUNTRY BREAKDOWN COUNTS WHAT PEOPLE ADDED.
 
-      These tests asserted the opposite until 2026-11-24, under a banner reading "bot filter": a
-      manager carrying an external_id was dropped from "Managers by Country" so that the table
-      agreed with the "User Submitted" tile.
+      An import counts toward the scraped counter and nowhere else. Product decision, 2026-11-25.
 
-      What that cost in production: the table read 878 American managers while 5,605 American
-      profiles were live, public and reachable from search. 4,727 of 7,090 live managers carry an
-      external_id, and nothing a visitor touches filters on it. countApproved() and every search
-      query select on approval_status alone, so the only country breakdown in the product
-      disagreed with every page anybody can open, by a factor of six.
+      These assertions have now been written three ways, and the history matters because each
+      version was a reasonable answer to a different question:
 
-      The scraped against people-added split is still wanted, and getStats still reports it
-      through realManagers and scrapedManagers. It is simply not the question a country chart
-      answers.
+        1. Until 2026-11-24 an external_id dropped a manager from the table, under a banner
+           reading "bot filter", so the table agreed with the "User Submitted" tile.
+        2. On 2026-11-24 that filter was removed, because the table read 878 American managers
+           while 5,605 American profiles were live and openable from search, and nothing a
+           visitor touches filters on external_id.
+        3. From 2026-11-25 the filter is back, deliberately, because the question this panel
+           answers is what the product is receiving. With 4,727 of 7,090 profiles arriving in one
+           import, including them means the table reports the size of a one-off scrape forever.
+           "United States 5,608" was the number that settled it.
 
-      The ratings half changed for a different reason. It hand-rolled its own idea of a countable
-      rating as "weight = FALSE AND deleted_at IS NULL", which counts held and rejected ones.
-      ReviewSql.genuine exists so that predicate is written once; this query now uses it.
+      Version 2 was right that the public directory shows imported profiles and must keep doing
+      so. That is why nothing here touches visibility: countApproved(), search and every manager
+      and company figure still select on approval_status alone, and ratings on imported profiles
+      are still published and still count toward every public average. This is the admin panel's
+      own accounting and nothing else.
+
+      The ratings half also keeps the correction made in version 2. It had hand-rolled its own
+      idea of a countable rating as "weight = FALSE AND deleted_at IS NULL", which counts held and
+      rejected ones. ReviewSql.genuine exists so that predicate is written once.
     */
 
     /** The count for one country out of one of the two arrays, or 0 when absent. */
@@ -403,10 +410,10 @@ class AdminServiceCoverageIntegrationTest {
     }
 
     @Test
-    void getCountryStats_countsEveryLiveManagerWhateverItsOrigin() throws Exception {
+    void getCountryStats_countsOnlyTheProfilesPeopleAdded() throws Exception {
         String adminAuth = insertUser("auth0|cs-admin01", "CsAdmin01", "admin");
 
-        // Three from the import. The public directory serves these like any other profile.
+        // Three from the import. The public directory still serves these like any other profile.
         for (int i = 0; i < 3; i++) {
             await(pool.preparedQuery("""
                     INSERT INTO managers(name,company,title,image,status,approval_status,
@@ -424,21 +431,33 @@ class AdminServiceCoverageIntegrationTest {
                 """)
             .execute(Tuple.of("Real Manager", "RealCo", "Director")));
 
-        assertEquals(4L, countryCount(await(service.getCountryStats(adminAuth)), "managers", "United States"),
-            "every live manager belongs in the breakdown: an external_id is provenance, not visibility");
+        assertEquals(1L, countryCount(await(service.getCountryStats(adminAuth)), "managers", "United States"),
+            "the breakdown reports what people added, so three imports contribute nothing to it");
     }
 
     @Test
-    void getCountryStats_countsGhostAndSeededManagersToo() throws Exception {
+    void getCountryStats_countsGhostButNotSeededOrScraped() throws Exception {
         String adminAuth = insertUser("auth0|cs-admin02", "CsAdmin02", "admin");
 
-        // A seeded profile. None exist in production, but the filter that hid them was the same one.
+        /*
+          A ghost somebody created by searching. Ghost is live and publicly visible, and it is a
+          profile a person caused to exist, so it counts. This is the row that stops the new
+          filter being read as "approved only".
+        */
+        await(pool.preparedQuery("""
+                INSERT INTO managers(name,company,title,image,status,approval_status,
+                                     overall_rating,reviews_count,category_averages,country)
+                VALUES ($1,$2,$3,'img','active','ghost',0,0,'{}','Canada')
+                """)
+            .execute(Tuple.of("Ghost Manager", "GhostCo", "Manager")));
+
+        // A platform seed. None exist in production, and it has a counter of its own.
         await(pool.preparedQuery("""
                 INSERT INTO managers(name,company,title,image,status,approval_status,
                                      overall_rating,reviews_count,category_averages,country,external_id)
                 VALUES ($1,$2,$3,'img','active','ghost',0,0,'{}','Canada','seed_abc')
                 """)
-            .execute(Tuple.of("Ghost Manager", "GhostCo", "Manager")));
+            .execute(Tuple.of("Seeded Manager", "SeedCo", "Manager")));
 
         await(pool.preparedQuery("""
                 INSERT INTO managers(name,company,title,image,status,approval_status,
@@ -454,13 +473,12 @@ class AdminServiceCoverageIntegrationTest {
                 """)
             .execute(Tuple.of("Organic Manager", "OrganicCo", "Manager")));
 
-        // Ghost is live and publicly visible, which is the whole point of the status.
-        assertEquals(3L, countryCount(await(service.getCountryStats(adminAuth)), "managers", "Canada"),
-            "approved and ghost are both live, whatever created them");
+        assertEquals(2L, countryCount(await(service.getCountryStats(adminAuth)), "managers", "Canada"),
+            "the organic ghost and the organic approved profile, and neither the seed nor the import");
     }
 
     @Test
-    void getCountryStats_ratingsCountGenuineRatingsOnAnyLiveManager() throws Exception {
+    void getCountryStats_ratingsOnImportedProfilesDoNotCount() throws Exception {
         String adminAuth = insertUser("auth0|cs-admin03", "CsAdmin03", "admin");
 
         long scrapedId = insertLiveManager("Scraped With Rating", "ScrapedCo", "United States", "scraper_y");
@@ -470,12 +488,13 @@ class AdminServiceCoverageIntegrationTest {
         insertRating(organicId, "OrganicCo", 4.0);
 
         /*
-          A rating left on an imported profile was written by a person about their manager. The
-          profile's origin says nothing about the rating's, and excluding it understated every
-          genuine opinion the product had collected on two thirds of its profiles.
+          The rating on the imported profile is genuine, is published and still counts toward that
+          manager's average and toward every company and industry figure. It does not count here,
+          because this table reports what the product received rather than what it holds. If that
+          distinction is ever dropped again, this assertion reads 2.
         */
-        assertEquals(2L, countryCount(await(service.getCountryStats(adminAuth)), "reviews", "United States"),
-            "a genuine rating counts wherever it was left");
+        assertEquals(1L, countryCount(await(service.getCountryStats(adminAuth)), "reviews", "United States"),
+            "a genuine rating on an imported profile stays published and counts nowhere in the admin panel");
     }
 
     @Test

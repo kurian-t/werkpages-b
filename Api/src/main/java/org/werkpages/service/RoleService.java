@@ -139,6 +139,14 @@ public class RoleService {
                 out.add(new JsonObject()
                     .put("title",        row.getString("display_title"))
                     .put("normalized",   row.getString("title_normalized"))
+                    /*
+                      The short form, for the picker's label only. The row reads
+                      "CEO (Chief Executive Officer)" so that an acronym is never lost and the
+                      expansion is never a surprise, while the value stored on selection stays
+                      the extended title. Null for every title that has no acronym, which is
+                      most of them.
+                    */
+                    .put("acronym",      row.getString("acronym"))
                     .put("usageCount",   row.getLong("usage_count").intValue()));
             }
             return out;

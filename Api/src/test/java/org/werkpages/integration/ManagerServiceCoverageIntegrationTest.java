@@ -384,6 +384,99 @@ class ManagerServiceCoverageIntegrationTest {
             "a withdrawn rating must stop being counted - it is invisible everywhere else");
     }
 
+    /*
+      AN IMPORT COUNTS TOWARD THE SCRAPED COUNTER AND NOWHERE ELSE.
+
+      Product decision of 2026-11-25, recorded in full on ManagerSql.contributed. These tiles are
+      read to see what the product is receiving, and 4,727 of 7,090 live profiles arrived in a
+      single import, so counting them makes every figure report the size of a one-off scrape.
+      "Managers by Country" reading "United States 5,608" is what settled it.
+
+      The ratings below are genuine: written by a person, live, undeleted. They still count toward
+      that manager's average, the company projection and every industry figure, and the profile is
+      still public and openable. They are simply absent from the admin panel.
+
+      WRITTEN WITH A CONTROL, AND THAT IS THE POINT. The first half inserts the rows on a profile
+      a person added and asserts the counters DO move. Without it, an assertion that the counters
+      do not move for an import would also pass if the rows were never counted at all, for example
+      if V108's classification trigger had reclassified the weighted one. Identical rows, one
+      difference, opposite outcomes.
+
+      Deltas rather than absolutes because these counters are site-wide and other tests in this
+      class leave rows behind.
+    */
+    @Test
+    void getStats_anImportAndItsRatingsCountTowardTheScrapedCounterOnly() throws Exception {
+        JsonObject start = await(service.getStats());
+
+        liveManagerWithTwoRatings("Organic Prov", null,
+            userIdOf(insertUser("auth0|prov-organic-plain")),
+            userIdOf(insertUser("auth0|prov-organic-weight")));
+        JsonObject afterOrganic = await(service.getStats());
+
+        assertEquals(start.getLong("realManagers") + 1, afterOrganic.getLong("realManagers").longValue(),
+            "control: a profile a person added raises \"Added by People\"");
+        /*
+          BOTH ratings, because "Weighted Opinions" is a subset of "Opinions Shared" rather than a
+          separate population: a weighted opinion is still an opinion somebody shared. The thing
+          that keeps a row out of the first tile is origin = 'platform_example', not its weight.
+          getStats_realReviews_excludesWeightedReviews in ReviewIntegrationTest reads 1 for a
+          similar fixture only because its weighted row is authorless, which V108 classifies as an
+          example in the database.
+        */
+        assertEquals(start.getLong("realReviews") + 2, afterOrganic.getLong("realReviews").longValue(),
+            "control: both ratings raise \"Opinions Shared\", the weighted one included");
+        assertEquals(start.getLong("weightedOpinions") + 1, afterOrganic.getLong("weightedOpinions").longValue(),
+            "control: its weighted rating raises \"Weighted Opinions\"");
+
+        liveManagerWithTwoRatings("Imported Prov", "scraper_prov_1",
+            userIdOf(insertUser("auth0|prov-import-plain")),
+            userIdOf(insertUser("auth0|prov-import-weight")));
+        JsonObject afterImport = await(service.getStats());
+
+        assertEquals(afterOrganic.getLong("scrapedManagers") + 1, afterImport.getLong("scrapedManagers").longValue(),
+            "the scraped counter is the one place an import appears");
+        assertEquals(afterOrganic.getLong("realManagers").longValue(), afterImport.getLong("realManagers").longValue(),
+            "\"Added by People\" has always excluded imports and still does");
+        assertEquals(afterOrganic.getLong("realReviews").longValue(), afterImport.getLong("realReviews").longValue(),
+            "a genuine rating on an imported profile stays published and counts nowhere in the panel");
+        assertEquals(afterOrganic.getLong("weightedOpinions").longValue(), afterImport.getLong("weightedOpinions").longValue(),
+            "the weighted tile joins managers for the same reason the one beside it does");
+    }
+
+    /** The {@code users} row id behind an auth0 id. */
+    private java.util.UUID userIdOf(String auth0Id) throws Exception {
+        return await(pool.preparedQuery("SELECT id FROM users WHERE auth0_id = $1")
+            .execute(Tuple.of(auth0Id)).map(rs -> rs.iterator().next().getUUID("id")));
+    }
+
+    /**
+     * One live manager, {@code externalId} null for a profile a person added, carrying one plain
+     * and one weighted genuine rating by two different contributors.
+     *
+     * <p>Two users because a rating is one per person per manager, and both carry a real
+     * {@code user_id} so neither can be mistaken for a platform placeholder.
+     */
+    private void liveManagerWithTwoRatings(String name, String externalId,
+                                           java.util.UUID plainBy, java.util.UUID weightedBy) throws Exception {
+        long id = await(pool.preparedQuery(
+                "INSERT INTO managers(name,company,title,image,status,approval_status,"
+              + "overall_rating,reviews_count,category_averages,external_id) "
+              + "VALUES ($1,'ProvCo','Director','img','active','approved',0,0,'{}',$2) RETURNING id")
+            .execute(Tuple.of(name, externalId))
+            .map(rs -> rs.iterator().next().getLong("id")));
+        await(pool.preparedQuery(
+                "INSERT INTO reviews(manager_id,user_id,author,overall_rating,manager_company,"
+              + "manager_title,weight,origin) "
+              + "VALUES ($1,$2,'Plain',4.0,'ProvCo','Director',FALSE,'contributor')")
+            .execute(Tuple.of(id, plainBy)));
+        await(pool.preparedQuery(
+                "INSERT INTO reviews(manager_id,user_id,author,overall_rating,manager_company,"
+              + "manager_title,weight,origin) "
+              + "VALUES ($1,$2,'Weighted',5.0,'ProvCo','Director',TRUE,'contributor')")
+            .execute(Tuple.of(id, weightedBy)));
+    }
+
     // ── getMySubmittedManagers ────────────────────────────────────────────────
 
     @Test

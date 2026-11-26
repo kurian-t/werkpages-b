@@ -16,6 +16,7 @@ import org.werkpages.repository.PickedBrand;
 import org.werkpages.repository.ConfidenceRepository;
 import org.werkpages.repository.EditRepository;
 import org.werkpages.repository.ManagerRepository;
+import org.werkpages.repository.ManagerSql;
 import org.werkpages.repository.ReviewSql;
 import org.werkpages.repository.MergeSuggestionsRepository;
 import org.werkpages.repository.NotificationRepository;
@@ -2614,41 +2615,37 @@ public class AdminService {
     }
 
     /*
-      EVERY LIVE MANAGER, AND ONLY GENUINE RATINGS.
+      CONTRIBUTED MANAGERS, AND ONLY GENUINE RATINGS.
 
-      Both halves of this used to filter external_id IS NULL, which answered "how many profiles
-      did people add" under headings that say "Managers by Country" and "Ratings by Country". With
-      4,727 of 7,090 live managers imported, the table read 878 American managers while 5,605
-      American profiles were live and reachable from search. countApproved() and every search
-      query select on approval_status alone, so this was the one surface in the product that
-      disagreed with what a visitor can open. The scraped against people-added split is still
-      reported, by getStats, which is where that question belongs.
+      Both halves count what people added, and nothing else. An import counts toward the scraped
+      counter and nowhere else, which is the product decision of 2026-11-25 recorded in full on
+      ManagerSql.contributed.
 
-      The ratings half also retyped its own idea of a countable rating as weight = FALSE, which
-      counts held and rejected ones. ReviewSql.genuine owns that predicate: live, not deleted,
-      written by a person.
+      This reverses the position written here before, and that position is worth keeping because
+      it was half right. It argued that a table headed "Managers by Country" must agree with what
+      a visitor can open, dropped the external_id filter, and the United States went from 878 to
+      5,608. Right about public visibility, wrong about what this panel is for: these figures are
+      read to see what the product is receiving, and with 4,727 of 7,090 profiles arriving in one
+      import, the import drowns the signal. What a visitor can open is answered by the directory
+      and by countApproved(), neither of which this touches.
+
+      The ratings half keeps the other correction from that change. It had retyped its own idea of
+      a countable rating as weight = FALSE, which counts held and rejected ones. ReviewSql.genuine
+      owns that predicate: live, not deleted, written by a person.
     */
     public Future<JsonObject> getCountryStats(String auth0Id) {
         if (db == null) return Future.failedFuture(ServiceException.forbidden("DB not configured"));
         return requireAdmin(auth0Id)
             .compose(adminId -> Future.all(
-                db.preparedQuery("""
-                    SELECT COALESCE(country, 'Unknown') AS country, COUNT(*) AS count
-                    FROM managers
-                    WHERE approval_status IN ('approved', 'ghost')
-                    GROUP BY country
-                    ORDER BY count DESC
-                    """).execute(),
-                db.preparedQuery("""
-                    SELECT COALESCE(m.country, 'Unknown') AS country, COUNT(*) AS count
-                    FROM reviews r
-                    JOIN managers m ON r.manager_id = m.id
-                    WHERE
-                    """ + ReviewSql.genuine("r") + """
-                      AND m.approval_status IN ('approved', 'ghost')
-                    GROUP BY m.country
-                    ORDER BY count DESC
-                    """).execute()
+                db.preparedQuery(
+                    "SELECT COALESCE(m.country, 'Unknown') AS country, COUNT(*) AS count "
+                  + "FROM managers m WHERE " + ManagerSql.contributed("m") + " "
+                  + "GROUP BY m.country ORDER BY count DESC").execute(),
+                db.preparedQuery(
+                    "SELECT COALESCE(m.country, 'Unknown') AS country, COUNT(*) AS count "
+                  + "FROM reviews r JOIN managers m ON r.manager_id = m.id "
+                  + "WHERE " + ReviewSql.genuine("r") + " AND " + ManagerSql.contributed("m") + " "
+                  + "GROUP BY m.country ORDER BY count DESC").execute()
             ))
             .map(cf -> {
                 JsonArray managers = new JsonArray();

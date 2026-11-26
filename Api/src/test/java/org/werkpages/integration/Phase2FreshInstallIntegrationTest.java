@@ -236,7 +236,22 @@ class Phase2FreshInstallIntegrationTest {
         // now served as authorsOverallRating, so nothing is lost and no row is rewritten. Purely
         // additive: one generated column, one trigger function replaced and one recomputation of
         // the projections through company_stats_apply.
-        assertEquals("115", await(pool.query("""
+        //
+        // V116 (a catalogue of job titles) moved it to 116 on 2026-11-25.
+        // Acknowledged, and it is the mildest shape there is: ONE BRAND-NEW TABLE, job_titles,
+        // with 405 rows and three indexes. No existing table is touched, no column is added,
+        // dropped or narrowed, no constraint becomes stricter and nothing is backfilled.
+        //
+        // RateMyManagers reads it through the title suggestion endpoint and never writes it, so a
+        // build from before today is unaffected either way: the table is simply not in any query
+        // it issues. The rows carry normalize_role_title(title) as their match key, computed by
+        // V49's function, so the catalogue keys titles exactly as managers.title_normalized does.
+        //
+        // The acronym column is deliberately NOT unique. A repeated acronym - AVP, BA, CCO, CIO,
+        // CMO, CPO, GM, PE, PM - is the ambiguity the picker resolves by offering every reading
+        // instead of guessing one, and a unique index would force exactly the guess V49's
+        // normalizer already makes wrongly when it resolves "avp" to assistant vice president.
+        assertEquals("116", await(pool.query("""
                 SELECT version FROM flyway_schema_history
                  WHERE success AND version IS NOT NULL
                  ORDER BY installed_rank DESC LIMIT 1

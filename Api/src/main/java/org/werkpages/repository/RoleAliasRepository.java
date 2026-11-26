@@ -158,23 +158,83 @@ public class RoleAliasRepository {
                     FROM interview_reviews ir
                     WHERE ir.role_category IS NOT NULL
                       AND ir.deleted_at IS NULL
+                ),
+                -- What this product's own people actually wrote. Ranked first, always.
+                used AS (
+                    SELECT t.norm                                   AS title_normalized,
+                           MODE() WITHIN GROUP (ORDER BY t.display) AS display_title,
+                           NULL::TEXT                               AS acronym,
+                           COUNT(*)::BIGINT                         AS usage_count,
+                           0                                        AS tier
+                    FROM used_titles t, q
+                    WHERE t.norm IS NOT NULL
+                      AND (
+                            (q.loose  <> '' AND t.norm LIKE '%' || q.loose  || '%')
+                         OR (q.strict IS NOT NULL AND t.norm LIKE '%' || q.strict || '%')
+                         -- A typo must find a spelling people here already use, too.
+                         OR (q.loose <> '' AND similarity(t.norm, q.loose) > 0.4)
+                      )
+                    GROUP BY t.norm, q.loose, q.strict
+                ),
+                /*
+                  The curated vocabulary (V116), so a sector with no rows yet can still be
+                  offered its own words. A nurse must be able to pick "Head Nurse" before any
+                  nurse has ever been added, and a directory that only suggests what it already
+                  holds can never bootstrap a sector.
+
+                  Matched three ways, because people reach a title by three different routes:
+                  the normalized form, the acronym (typing CEO must resolve), and the literal
+                  words. An acronym repeated across rows is an ambiguity, and both rows come
+                  back on purpose so the person can say which they meant.
+                */
+                cat AS (
+                    SELECT jt.match_key AS title_normalized,
+                           jt.title     AS display_title,
+                           jt.acronym   AS acronym,
+                           0::BIGINT    AS usage_count,
+                           1            AS tier
+                    FROM job_titles jt, q
+                    WHERE (q.loose  <> '' AND jt.match_key LIKE '%' || q.loose || '%')
+                       OR (q.strict IS NOT NULL AND jt.match_key LIKE '%' || q.strict || '%')
+                       OR (jt.acronym IS NOT NULL AND upper(jt.acronym) LIKE upper(btrim($1)) || '%')
+                       OR lower(jt.title) LIKE '%' || lower(btrim($1)) || '%'
+                       /*
+                         A TYPO MUST STILL FIND THE TITLE IT MEANT.
+
+                         Substring matching answers nothing for "Managett", so the picker showed
+                         only "Not listed? Add Managett" and the person had no way to reach
+                         "Manager" except by noticing their own mistake. That is how a one-off
+                         misspelling becomes a permanent entry in the vocabulary, which is the
+                         thing this whole design exists to stop.
+
+                         pg_trgm is installed (V55) and V116 puts a GIN trigram index on
+                         match_key. 0.4 is deliberately loose for a picker: a wrong suggestion
+                         costs a glance, a missing one costs a new bad spelling.
+                       */
+                       OR (q.loose <> '' AND similarity(jt.match_key, q.loose) > 0.4)
                 )
-                SELECT t.norm                             AS title_normalized,
-                       MODE() WITHIN GROUP (ORDER BY t.display) AS display_title,
-                       COUNT(*)                           AS usage_count
-                FROM used_titles t, q
-                WHERE t.norm IS NOT NULL
-                  AND (
-                        (q.loose  <> '' AND t.norm LIKE '%' || q.loose  || '%')
-                     OR (q.strict IS NOT NULL AND t.norm LIKE '%' || q.strict || '%')
-                  )
-                GROUP BY t.norm, q.loose, q.strict
-                -- Prefix matches first: someone typing "eng" means titles that start that way
-                -- before ones that merely contain it. Then by how many people use the spelling.
-                ORDER BY (t.norm LIKE COALESCE(q.strict, q.loose) || '%'
-                          OR t.norm LIKE q.loose || '%') DESC,
-                         COUNT(*) DESC,
-                         t.norm ASC
+                SELECT s.title_normalized, s.display_title, s.acronym, s.usage_count
+                FROM (
+                    SELECT * FROM used
+                    UNION ALL
+                    -- A catalogue entry whose key somebody here already uses would be a
+                    -- duplicate row saying the same thing, so the live spelling wins.
+                    SELECT c.* FROM cat c
+                    WHERE NOT EXISTS (SELECT 1 FROM used u
+                                      WHERE u.title_normalized = c.title_normalized)
+                ) s, q
+                -- Real usage above catalogue; then prefix matches, because someone typing
+                -- "eng" means titles that start that way before ones that merely contain it;
+                -- then how many people use the spelling.
+                ORDER BY s.tier ASC,
+                         (s.title_normalized LIKE COALESCE(q.strict, q.loose) || '%'
+                          OR s.title_normalized LIKE q.loose || '%'
+                          OR upper(COALESCE(s.acronym, '')) = upper(btrim($1))) DESC,
+                         -- Then an exact-ish spelling ahead of a loose one, so a typo lands on
+                         -- its nearest real title rather than on whatever merely contains it.
+                         similarity(s.title_normalized, q.loose) DESC,
+                         s.usage_count DESC,
+                         s.title_normalized ASC
                 LIMIT $2
                 """)
             .execute(Tuple.of(query, limit));
