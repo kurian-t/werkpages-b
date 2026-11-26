@@ -316,7 +316,12 @@ public class ManagerService {
 
     /** Looks up a manager by slug. Same access rules as getManagerById. */
     public Future<Row> getManagerBySlug(String slug, String auth0Id) {
-        return managerRepo.findBySlugFollowingMerges(slug)
+        /*
+          Through the URL history on a miss, so a link shared before a rename still opens the
+          profile instead of "Manager Not Found". The history rows were already being written and
+          nothing read them.
+        */
+        return managerRepo.findBySlugFollowingMergesOrHistory(slug, null)
             .compose(opt -> {
                 if (opt.isEmpty()) return Future.failedFuture(ServiceException.notFound("Manager not found"));
                 Row row = opt.get();

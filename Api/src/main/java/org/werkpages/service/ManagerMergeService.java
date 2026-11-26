@@ -194,6 +194,9 @@ public final class ManagerMergeService {
             .compose(v -> reconcileConflicts(conn, survivor, absorbed, adminId, n))
             .compose(v -> openDuplicateRatingTasks(conn, survivor, adminId, n))
             .compose(v -> resolveMergedEmployment(conn))
+            // 9b. THE HEADLINE FOLLOWS THE MOST RECENT EMPLOYMENT, now that both profiles'
+            //     employments belong to the survivor.
+            .compose(v -> adoptMostRecentRole(conn, survivor, n))
             // Identity. Kept, never deleted: reviews.manager_id cascades, and deleting the row is
             // what used to destroy everything that could not move.
             .compose(v -> conn.preparedQuery("""
@@ -215,6 +218,65 @@ public final class ManagerMergeService {
                                           n.claimsMoved, n.claimsRedirected, n.ratingsMoved,
                                           n.ratingsHeld)))
             .map(v -> n.toJson());
+    }
+
+    /**
+     * Points the survivor's headline at whichever employment is now the most recent.
+     *
+     * <p>A merge can bring across a job more recent than anything the survivor had. The two
+     * profiles are one person, so after the move the survivor's own {@code title} and
+     * {@code company} - the name and role at the top of the profile - must describe that person's
+     * latest known job, not whichever of the two rows happened to survive. Without this the
+     * trajectory showed the newer employment while the headline above it still named the older
+     * one, on the same page, about the same person.
+     *
+     * <p><b>An undated employment never wins.</b> {@code period_known} is required, so a row
+     * nobody has dated cannot displace a dated one - the same assumption the trajectory orders by,
+     * and for the same reason: an employment is undated precisely when nobody rated it, and
+     * promoting it to the headline would overstate what is known about where somebody works now.
+     * Among dated rows the latest {@code start_day} wins, an ongoing row breaks a tie, and the
+     * highest id breaks that.
+     *
+     * <p>Superseded rows are excluded: a row the merge retired as a duplicate is history, not a
+     * current post.
+     *
+     * <p>Writes nothing when the survivor's headline already names that employment, so a merge
+     * that changes nothing about the current job touches no column and fires no trigger.
+     *
+     * <p>The logo travels with the employer. Leaving {@code company_logo_url} behind would put the
+     * previous employer's mark beside the new employer's name in the header, which is the exact
+     * class of defect the career tiles already carry comments about. The companies row is the
+     * authority and the stored snapshot is only a fallback, so it is replaced only when the
+     * company has one.
+     *
+     * <p>No slug concern: {@code managers_auto_slug_trg} is BEFORE INSERT only, so changing the
+     * company here cannot rewrite the slug and cannot break an existing URL.
+     */
+    private Future<Void> adoptMostRecentRole(SqlConnection conn, long survivor, Counts n) {
+        return conn.preparedQuery("""
+                UPDATE managers m
+                   SET title            = r.title,
+                       company          = r.company,
+                       company_id       = r.company_id,
+                       company_logo_url = COALESCE(r.logo_url, m.company_logo_url),
+                       updated_at       = now()
+                  FROM (
+                        SELECT ch.title, ch.company, ch.company_id, c.logo_url
+                          FROM career_history ch
+                          LEFT JOIN companies c ON c.id = ch.company_id
+                         WHERE ch.manager_id = $1
+                           AND ch.period_known
+                           AND ch.state IN ('proposed','accepted')
+                         ORDER BY ch.start_day DESC,
+                                  (ch.end_day IS NULL) DESC,
+                                  ch.id DESC
+                         LIMIT 1
+                       ) r
+                 WHERE m.id = $1
+                   AND (m.title <> r.title
+                        OR m.company_id IS DISTINCT FROM r.company_id)
+                """).execute(Tuple.of(survivor))
+            .map(updated -> { n.headlineUpdated = updated.rowCount() == 1; return null; });
     }
 
     /**
@@ -1099,6 +1161,8 @@ public final class ManagerMergeService {
         int conflictsFolded, conflictsMoved, conflictsOpened;
         int opportunitiesMoved, opportunitiesRetired;
         int seedsRetired;
+        /** Whether the survivor's own title and company moved to a newer employment. */
+        boolean headlineUpdated;
 
         JsonObject toJson() {
             return new JsonObject()
@@ -1108,6 +1172,7 @@ public final class ManagerMergeService {
                 // of ratings held and marked, every one of which is still there.
                 .put("moved",             ratingsMoved)
                 .put("parked",            ratingsHeld)
+                .put("headlineUpdated",   headlineUpdated)
                 .put("rolesMoved",        rolesMoved)
                 .put("rolesSuperseded",   rolesSuperseded)
                 .put("claimsMoved",       claimsMoved)

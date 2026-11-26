@@ -151,7 +151,22 @@ public class ReviewRepository {
     public Future<RowSet<Row>> findCareerSegmentsByManager(long managerId, int limit, int offset,
                                                            UUID viewerId, boolean isAdmin) {
         return db.preparedQuery(SEGMENTS_SQL + """
-                ORDER BY start_date ASC NULLS LAST
+                /*
+                  NULLS FIRST, not NULLS LAST.
+
+                  The list is ascending, oldest first, so NULLS LAST put an employment nobody has
+                  dated in the NEWEST position. A merge is where that shows: it brings the
+                  absorbed profile's employments across, and an employment is undated precisely
+                  because nobody rated it, so every merged-in job arrived at the end of the
+                  trajectory as though it were the person's current post. One real case had
+                  Thornbury Logistics drawn twice, once at each end, with AccuWeather between
+                  them, because the grouping runs over this order and groups only ADJACENT
+                  segments of one employer.
+
+                  No date now means older, which matches the trajectory's own comparator in
+                  client/lib/careerRoles.ts and the headline rule in ManagerMergeService.
+                */
+                ORDER BY start_date ASC NULLS FIRST
                 LIMIT $2 OFFSET $3
                 """)
             .execute(Tuple.of(managerId, limit, offset, isAdmin, viewerId));

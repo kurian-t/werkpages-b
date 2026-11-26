@@ -980,6 +980,139 @@ class AdminServiceIntegrationTest {
         assertEquals(403, ex.getStatusCode());
     }
 
+    /*
+      REPORTED: "right now i can fix title, company, name, on a manager profile, but if i fix the
+      name, the url remains wrong. Can you make it so it acts like the merge and moves the profile
+      over to the correct url?"
+
+      A slug is assigned once, at INSERT - managers_auto_slug_trg is BEFORE INSERT only - and
+      nothing recomputed it. So correcting a misspelled name fixed the name, the title, the company
+      and every snapshot of them, and left the URL still spelling the mistake for ever.
+    */
+    @Test
+    void adminEditManager_correctingTheNameMovesTheUrl() throws Exception {
+        String adminAuth = insertUser("auth0|reslug-admin01", "ReslugAdmin01", "admin");
+        long managerId   = insertManagerWithSlug("Jonathon Smyth", "Smythe Haulage",
+                                                 "jonathon-smyth");
+
+        await(service.adminEditManager(adminAuth, managerId, "Jonathan Smith", null, null, null));
+
+        assertEquals("jonathan-smith", slugOfManager(managerId),
+            "the URL follows the corrected name");
+    }
+
+    /*
+      The half that makes this safe to do at all. A slug is a public URL and may be indexed, so the
+      old one has to keep resolving - which is why this reuses the merge's reslug() rather than
+      issuing its own UPDATE.
+    */
+    @Test
+    void adminEditManager_theOldUrlStillResolves() throws Exception {
+        String adminAuth = insertUser("auth0|reslug-admin02", "ReslugAdmin02", "admin");
+        long managerId   = insertManagerWithSlug("Jonathon Smyth", "Smythe Haulage",
+                                                 "jonathon-smyth");
+
+        await(service.adminEditManager(adminAuth, managerId, "Jonathan Smith", null, null, null));
+
+        Long remembered = await(pool.preparedQuery(
+                "SELECT manager_id FROM manager_url_history WHERE manager_slug = $1")
+            .execute(Tuple.of("jonathon-smyth"))
+            .map(rs -> rs.iterator().hasNext()
+                ? rs.iterator().next().getLong("manager_id") : null));
+        assertEquals(managerId, remembered,
+            "the outgoing URL is remembered, so a shared link redirects rather than 404ing");
+    }
+
+    /*
+      An edit that does not touch the name must not move a public URL. Re-slugging on every edit
+      would also drag a manager legitimately wearing "<name>-<company>" off it, because two people
+      share that name, the moment somebody corrected their job title.
+    */
+    @Test
+    void adminEditManager_editingOnlyTheTitleLeavesTheUrlAlone() throws Exception {
+        String adminAuth = insertUser("auth0|reslug-admin03", "ReslugAdmin03", "admin");
+        long managerId   = insertManagerWithSlug("Jonathon Smyth", "Smythe Haulage",
+                                                 "jonathon-smyth");
+
+        await(service.adminEditManager(adminAuth, managerId, null, "Depot Lead", null, null));
+
+        assertEquals("jonathon-smyth", slugOfManager(managerId));
+        Long remembered = await(pool.preparedQuery(
+                "SELECT count(*) AS c FROM manager_url_history WHERE manager_id = $1")
+            .execute(Tuple.of(managerId)).map(rs -> rs.iterator().next().getLong("c")));
+        assertEquals(0L, remembered, "nothing moved, so nothing is recorded");
+    }
+
+    /*
+      The plain name genuinely belongs to somebody else. The old slug is wrong whatever happens -
+      it spells a name this person does not have - so keeping it is not an option, and the
+      company-suffixed form is where a correct name would have landed at creation.
+    */
+    @Test
+    void adminEditManager_aNameHeldByAnotherManagerFallsBackToTheCompanySuffix() throws Exception {
+        String adminAuth = insertUser("auth0|reslug-admin04", "ReslugAdmin04", "admin");
+        insertManagerWithSlug("Jane Doe", "Unrelated Co", "jane-doe");
+        long managerId = insertManagerWithSlug("Jayne Doh", "Smythe Haulage", "jayne-doh");
+
+        await(service.adminEditManager(adminAuth, managerId, "Jane Doe", null, null, null));
+
+        String slug = slugOfManager(managerId);
+        assertNotEquals("jane-doe", slug, "the other manager keeps the plain name");
+        assertNotEquals("jayne-doh", slug, "and this one does not keep a URL spelling the old name");
+        assertTrue(slug.startsWith("jane-doe-"), "it lands where creation would have put it: " + slug);
+    }
+
+    /*
+      REPORTED, after the rename shipped locally: "the url did update but the page said Manager Not
+      Found".
+
+      Two separate defects, and this is the server one. manager_url_history has been written on
+      every slug move for a long time - at approval, by the merge's reclaimBaseSlug, and now by an
+      admin correcting a name - and findByOldUrl existed to read it. It had NO CALLERS. The table
+      was a write-only log, so every retired URL answered 404 while two comments claimed shared
+      links kept resolving. One of those comments was mine.
+
+      The other defect was in the client, which refetched the OLD slug before navigating; that one
+      is covered by the Playwright suite.
+    */
+    @Test
+    void aRetiredUrlStillOpensTheProfile() throws Exception {
+        String adminAuth = insertUser("auth0|reslug-admin05", "ReslugAdmin05", "admin");
+        long managerId   = insertManagerWithSlug("Jamez Hays", "Northwind Logistics",
+                                                 "jamez-hays");
+
+        await(service.adminEditManager(adminAuth, managerId, "James Hayes", null, null, null));
+        assertEquals("james-hayes", slugOfManager(managerId));
+
+        // The address somebody bookmarked, or a search engine indexed, before the correction.
+        io.vertx.sqlclient.Row viaOldUrl = await(managerRepo.findBySlugFollowingMergesOrHistory("jamez-hays", null)
+            .map(opt -> opt.orElse(null)));
+        assertNotNull(viaOldUrl, "a retired URL must resolve, not 404");
+        assertEquals(managerId, viaOldUrl.getLong("id"));
+        assertEquals("James Hayes", viaOldUrl.getString("name"));
+    }
+
+    @Test
+    void aSlugThatNeverExistedStillAnswersNothing() throws Exception {
+        // The fallback must not turn every miss into a lookup that finds something.
+        assertTrue(await(managerRepo.findBySlugFollowingMergesOrHistory("nobody-at-all", null))
+            .isEmpty());
+    }
+
+    @Test
+    void theCurrentUrlIsUnaffectedByTheFallback() throws Exception {
+        String adminAuth = insertUser("auth0|reslug-admin06", "ReslugAdmin06", "admin");
+        long managerId   = insertManagerWithSlug("Jamez Hays", "Northwind Logistics",
+                                                 "jamez-hays2");
+
+        await(service.adminEditManager(adminAuth, managerId, "James Hayes", null, null, null));
+
+        io.vertx.sqlclient.Row direct = await(managerRepo.findBySlugFollowingMergesOrHistory(
+            slugOfManager(managerId), null).map(opt -> opt.orElse(null)));
+        assertNotNull(direct, "the new URL resolves directly, without touching the history");
+        assertEquals(managerId, direct.getLong("id"));
+    }
+
     @Test
     void adminEditManager_notFound_returns404() throws Exception {
         String adminAuth = insertUser("auth0|edit-admin01", "EditAdmin01", "admin");

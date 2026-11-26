@@ -99,6 +99,25 @@ public class ManagerRepository {
                         'id', ch2.id, 'company', ch2.company, 'title', ch2.title,
                         'startDate', ch2.start_date, 'endDate', ch2.end_date,
                         /*
+                          WHETHER THE PERIOD IS KNOWN AT ALL, and what the record says about the
+                          employment still running. Both were absent, and their absence is a
+                          defect the merge made visible.
+
+                          With only the two dates, a reader cannot tell "this employment has no
+                          stated period" from "this employment is still running", because both
+                          arrive as a null end date. So the trajectory called every undated row
+                          the person's CURRENT job - and a merge moves the absorbed profile's
+                          employments across, which are undated exactly when nobody rated them.
+                          Every merged-in job therefore drew as the most recent one.
+
+                          employment_status is the resolution of that question (V109 onward) and
+                          is believed where it states an answer; period_known says whether there
+                          is a period to reason about. Additive: no existing field changes, so a
+                          client that does not read them behaves exactly as before.
+                        */
+                        'periodKnown', ch2.period_known,
+                        'employmentStatus', ch2.employment_status,
+                        /*
                           The employer's identity, so the tile can draw its logo.
 
                           It carried the company NAME and nothing else, so the career trajectory
@@ -315,6 +334,48 @@ public class ManagerRepository {
     /** {@link #findBySlug}, but a slug that was merged away resolves to the surviving manager. */
     public Future<Optional<Row>> findBySlugFollowingMerges(String slug) {
         return findBySlugFollowingMerges(slug, null);
+    }
+
+    /**
+     * {@link #findBySlugFollowingMerges(String)}, falling back to a URL this manager has LEFT.
+     *
+     * <p><b>This is what makes moving a slug safe, and until now nothing did it.</b>
+     * {@code manager_url_history} has been written on every slug move for a long time - at
+     * approval, by the merge's {@code reclaimBaseSlug}, and now when an admin corrects a
+     * misspelled name - and {@link #findByOldUrl} exists to read it. But findByOldUrl had NO
+     * CALLERS in either backend, so the table was a write-only log and every retired URL answered
+     * 404. Two comments, including one of mine, claimed otherwise.
+     *
+     * <p>Keyed on the manager slug alone, because {@code /manager/:slug} carries no company slug -
+     * findByOldUrl needs both, which is why it only ever suited the nested company route. The most
+     * recent record wins: a slug can be left, taken by somebody else, and left again.
+     *
+     * <p>It resolves to the manager's CURRENT slug and re-enters the same query, so the row shape
+     * is identical to a direct hit and a profile that has since been merged away still follows the
+     * merge to its survivor.
+     */
+    public Future<Optional<Row>> findBySlugFollowingMergesOrHistory(String slug, UUID viewerId) {
+        return findBySlugFollowingMerges(slug, viewerId).compose(found -> found.isPresent()
+            ? Future.succeededFuture(found)
+            : db.preparedQuery("""
+                    SELECT m.slug
+                      FROM manager_url_history h
+                      JOIN managers m ON m.id = h.manager_id
+                     WHERE h.manager_slug = $1
+                     ORDER BY h.created_at DESC
+                     LIMIT 1
+                    """)
+                .execute(Tuple.of(slug))
+                .compose(rows -> {
+                    if (!rows.iterator().hasNext()) return Future.succeededFuture(Optional.empty());
+                    String current = rows.iterator().next().getString("slug");
+                    // Guard against a history row that points back at the slug being asked for,
+                    // which would recurse for ever.
+                    if (current == null || current.equals(slug)) {
+                        return Future.succeededFuture(Optional.empty());
+                    }
+                    return findBySlugFollowingMerges(current, viewerId);
+                }));
     }
 
     /** {@link #findBySlugFollowingMerges(String)}, with this viewer's own unpublished reviews. */
@@ -812,7 +873,13 @@ public class ManagerRepository {
     public Future<RowSet<Row>> getCareerHistory(long managerId) {
         return db.preparedQuery("""
                 SELECT company, title, start_date, end_date
-                FROM career_history WHERE manager_id = $1 ORDER BY start_date DESC
+                FROM career_history WHERE manager_id = $1
+                -- NULLS LAST, so an undated employment reads as the OLDEST in this
+                -- newest-first list rather than the newest. Without it PostgreSQL's
+                -- DESC default is NULLS FIRST, which put a row nobody has dated at the
+                -- top - disagreeing with the aggregate above, which has always said
+                -- NULLS LAST, about the same rows.
+                ORDER BY start_date DESC NULLS LAST
                 """)
             .execute(Tuple.of(managerId));
     }
@@ -2479,6 +2546,53 @@ public class ManagerRepository {
                         // Keeping the one we have is the correct outcome, not an error.
                         .recover(err -> Future.succeededFuture(false)));
                 });
+            });
+    }
+
+    /**
+     * Moves a manager onto the slug their CURRENT name implies, recording the URL being left.
+     *
+     * <p>A slug is decided once, at INSERT - {@code managers_auto_slug_trg} is BEFORE INSERT only -
+     * so an admin correcting a misspelled name fixed the name, the title, the company and every
+     * snapshot of them, and left the URL still spelling the mistake. The profile for "Jonathon
+     * Smyth", corrected to "Jonathan Smith", stayed at {@code /manager/jonathon-smyth} for ever.
+     *
+     * <p>This is the same operation {@link #reclaimBaseSlug} performs after a merge, with one
+     * difference: a merge only ever wants the PLAIN name and declines anything else, because its
+     * whole purpose is shedding a collision-breaker. Here the name itself changed, so the old slug
+     * is wrong whatever happens, and falling back to the company-suffixed form is better than
+     * keeping a URL that spells a different person's name. {@link #generateUniqueSlug} decides
+     * that, exactly as it does at creation, so a corrected name lands where a correct name would
+     * have landed in the first place.
+     *
+     * <p><b>The old URL keeps working.</b> {@link #reslug} writes the outgoing
+     * {@code (company_slug, manager_slug)} pair into {@code manager_url_history} before moving,
+     * and {@link #findByOldUrl} resolves it, so links already shared and anything a search engine
+     * indexed redirect rather than 404. That is the whole reason this reuses reslug instead of
+     * writing its own UPDATE.
+     *
+     * <p>Does nothing when the slug already matches the name, so an edit that leaves the name
+     * alone cannot move a URL.
+     *
+     * @return the slug after this call, whether or not it moved; null when no such manager
+     */
+    public Future<String> reslugForCurrentName(long managerId) {
+        return db.preparedQuery("SELECT name, company, slug FROM managers WHERE id = $1")
+            .execute(Tuple.of(managerId))
+            .compose(rows -> {
+                if (!rows.iterator().hasNext()) return Future.succeededFuture(null);
+                Row row = rows.iterator().next();
+                String name    = row.getString("name");
+                String company = row.getString("company");
+                String current = row.getString("slug");
+                if (name == null || current == null) return Future.succeededFuture(current);
+                // Already correct. Checked against the PLAIN form first so a manager legitimately
+                // wearing "<name>-<company>" is not dragged off it on an unrelated edit.
+                if (cleanSlugFor(name).equals(current)) return Future.succeededFuture(current);
+                return generateUniqueSlug(name, company).compose(candidate ->
+                    candidate.equals(current)
+                        ? Future.succeededFuture(current)
+                        : reslug(managerId, candidate).map(v -> candidate));
             });
     }
 

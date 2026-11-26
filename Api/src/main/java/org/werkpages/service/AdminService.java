@@ -1342,14 +1342,48 @@ public class AdminService {
                     .map(ignored -> row.getLong("id")))
             : Future.succeededFuture(null);
         return requireAdmin(auth0Id)
-            .compose(adminId -> companyIdFuture)
-            .compose(newCompanyId -> managerRepo.adminEdit(managerId, effName, effTitle, effCompany,
-                                                           effLinkedinUrl, newCompanyId,
-                                                           newCountry, newState, newCity,
-                                                           newCompanyLogoUrl, newCompanyLocationId))
-            .compose(opt -> opt.isPresent()
-                ? Future.succeededFuture(opt.get())
-                : Future.failedFuture(ServiceException.notFound("Manager not found")));
+            /*
+              THE NAME BEFORE THE EDIT, so the URL can follow a corrected name.
+
+              A slug is assigned once, at INSERT, and nothing recomputed it - so correcting a
+              misspelled name fixed the name, the title, the company and every snapshot of them,
+              and left the URL still spelling the mistake.
+
+              Read first rather than compared afterwards, because the only question that matters
+              is whether the NAME changed. Re-slugging on any edit would move a public URL when an
+              admin corrected a job title, and would drag a manager legitimately wearing
+              "<name>-<company>" off it for no reason.
+            */
+            .compose(adminId -> managerRepo.findById(managerId))
+            .compose(before -> {
+                if (before.isEmpty()) {
+                    return Future.failedFuture(ServiceException.notFound("Manager not found"));
+                }
+                String previousName = before.get().getString("name");
+                return companyIdFuture
+                    .compose(newCompanyId -> managerRepo.adminEdit(managerId, effName, effTitle, effCompany,
+                                                                   effLinkedinUrl, newCompanyId,
+                                                                   newCountry, newState, newCity,
+                                                                   newCompanyLogoUrl, newCompanyLocationId))
+                    .compose(opt -> opt.isPresent()
+                        ? Future.succeededFuture(opt.get())
+                        : Future.failedFuture(ServiceException.notFound("Manager not found")))
+                    .compose(edited -> {
+                        boolean nameChanged = effName != null
+                            && !effName.equalsIgnoreCase(
+                                previousName == null ? "" : previousName.trim());
+                        if (!nameChanged) return Future.succeededFuture(edited);
+                        /*
+                          The old URL is not broken by this: reslug records the outgoing pair in
+                          manager_url_history first, and findByOldUrl resolves it, so a shared
+                          link redirects rather than 404ing. The new slug is reported so the
+                          panel can move the address bar to it instead of leaving an admin on a
+                          URL that now only works by redirect.
+                        */
+                        return managerRepo.reslugForCurrentName(managerId)
+                            .map(slug -> slug == null ? edited : edited.put("slug", slug));
+                    });
+            });
     }
 
     // ── Merge managers ────────────────────────────────────────────────────────

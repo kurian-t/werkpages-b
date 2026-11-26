@@ -172,6 +172,103 @@ class ManagerMergeIntegrationTest {
         assertEquals(survivor, (long) roleRow(b).getLong("manager_id"));
     }
 
+    // ── the headline follows the most recent employment ──────────────────────
+
+    /*
+      REPORTED: "if the merging role is more recent than the one the manager currently has the
+      managers title and role need to also be updated on the profile to the most recent role".
+
+      Two profiles for one person. The merge already moved every employment across, so the
+      trajectory showed the newer job - while the headline at the top of the profile still named
+      the older one, about the same person, on the same page.
+    */
+    @Test
+    void theHeadlineMovesToTheAbsorbedProfilesMoreRecentRole() throws Exception {
+        insertRole(survivor, "Depot Lead",   "2015-01-01T00:00:00Z");
+        insertRole(absorbed, "Regional Head", "2023-06-01T00:00:00Z");
+
+        JsonObject m = merge();
+
+        assertTrue(m.getBoolean("headlineUpdated"), "the merge reports that it moved the headline");
+        assertEquals("Regional Head", managerRow(survivor).getString("title"));
+        // And the derived key follows, because managers_normalize_title fires on UPDATE OF title.
+        assertEquals("regional head", managerRow(survivor).getString("title_normalized"));
+    }
+
+    @Test
+    void theHeadlineStaysWhenTheSurvivorAlreadyHoldsTheLatestRole() throws Exception {
+        insertRole(survivor, "Regional Head", "2023-06-01T00:00:00Z");
+        insertRole(absorbed, "Depot Lead",    "2015-01-01T00:00:00Z");
+        // The fixture creates managers titled "Lead", which names no employment, so the headline
+        // has to be put in step first or this test proves only that the fixture was stale.
+        setManagerTitle(survivor, "Regional Head");
+
+        JsonObject m = merge();
+
+        assertFalse(m.getBoolean("headlineUpdated"),
+            "nothing to change, so no column is touched and no trigger fires");
+        assertEquals("Regional Head", managerRow(survivor).getString("title"));
+    }
+
+    /*
+      THE ASSUMPTION, PINNED. An employment is undated precisely when nobody rated it, so an
+      undated row is treated as older than any dated one - the same rule the trajectory orders by.
+      Promoting it to the headline would state that somebody's current job is the one we know
+      least about.
+    */
+    @Test
+    void anUndatedRoleNeverBecomesTheHeadline() throws Exception {
+        insertRole(survivor, "Depot Lead", "2015-01-01T00:00:00Z");
+        insertRoleWithUnknownPeriod(absorbed, "Mystery Post");
+
+        JsonObject m = merge();
+
+        /*
+          The headline DOES move here, from the fixture's "Lead" to the only dated employment
+          there is. What must not happen is the undated row winning, which is what this asserts.
+        */
+        assertEquals("Depot Lead", managerRow(survivor).getString("title"),
+            "an undated employment cannot displace a dated one");
+        assertNotEquals("Mystery Post", managerRow(survivor).getString("title"));
+        // It still MOVED, though. Not promoting it is not the same as losing it.
+        assertEquals(1, m.getInteger("rolesMoved"));
+    }
+
+    /*
+      The survivor's own headline is equally subject to the rule: if the only dated employment
+      arrives from the absorbed profile, it wins even though the survivor's row is the one that
+      survived.
+    */
+    @Test
+    void aDatedRoleBeatsTheSurvivorsOwnUndatedOne() throws Exception {
+        insertRoleWithUnknownPeriod(survivor, "Mystery Post");
+        insertRole(absorbed, "Regional Head", "2021-04-01T00:00:00Z");
+
+        JsonObject m = merge();
+
+        assertTrue(m.getBoolean("headlineUpdated"));
+        assertEquals("Regional Head", managerRow(survivor).getString("title"));
+    }
+
+    /*
+      A role the merge retired as a duplicate is history, not a current post, so it must not be
+      eligible for the headline even when its start date is the latest.
+    */
+    @Test
+    void aSupersededRoleIsNotEligibleForTheHeadline() throws Exception {
+        // Same employer, same title, same day on both profiles: the absorbed one is superseded.
+        insertRole(survivor, "Regional Head", "2023-06-01T00:00:00Z");
+        long dupe = insertRole(absorbed, "Regional Head", "2023-06-01T00:00:00Z");
+        // And an older role on the survivor, so there is something else to choose.
+        insertRole(survivor, "Depot Lead", "2015-01-01T00:00:00Z");
+
+        merge();
+
+        assertEquals("superseded", roleRow(dupe).getString("state"));
+        assertEquals("Regional Head", managerRow(survivor).getString("title"),
+            "the surviving copy of that employment, not the retired one");
+    }
+
     // ── claims ────────────────────────────────────────────────────────────────
 
     @Test
@@ -1689,6 +1786,12 @@ class ManagerMergeIntegrationTest {
     private Row claimRow(long id) throws Exception {
         return await(pool.preparedQuery("SELECT * FROM role_claims WHERE id = $1")
             .execute(Tuple.of(id)).map(rs -> rs.iterator().next()));
+    }
+
+    /** Puts the headline in step with an employment, which the fixture does not do. */
+    private void setManagerTitle(long managerId, String title) throws Exception {
+        await(pool.preparedQuery("UPDATE managers SET title = $2 WHERE id = $1")
+            .execute(Tuple.of(managerId, title)));
     }
 
     private Row managerRow(long id) throws Exception {
