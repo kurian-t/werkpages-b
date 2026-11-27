@@ -427,6 +427,82 @@ class CompanyEmploymentStatsIntegrationTest {
     }
 
 
+    /**
+     * REPORTED, 2026-11-26: IBM's profile read "Manager opinions / 0 managers" and "no reviews
+     * yet", with two managers listed beside it and a rating of 2.9 visible one tab away.
+     *
+     * <p>The block reads the employment-attributed population, and the rating was attributed to no
+     * company: {@code attribution_basis = 'none'}, {@code attributed_company_id = NULL}. It carried
+     * the employer the contributor typed, "IBM", and exactly one company row matches that name, so
+     * nothing about it was ambiguous. It had simply never been attributed, because V102's backfill
+     * predated it and V113's trigger postdated it. V118 attributes the rows in that gap and moves
+     * the three rules into {@code legacy_rating_employer()} so the backfill and the trigger cannot
+     * disagree again.
+     *
+     * <p>Asserted on the figures the page actually reads, not on the column: the complaint was a
+     * zero on screen, and a test that checked only {@code attribution_basis} would have passed
+     * while the page still said nothing.
+     */
+    @Test
+    void aRatingThatNamesItsEmployerIsCountedForThatCompany() throws Exception {
+        long acme    = givenCompany("Acme Industries");
+        long manager = givenManager("Bo Peep", acme);
+        givenRatingAttributedByNobody(manager, "Acme Industries", 4.0);
+
+        Row attribution = await(pool.preparedQuery(
+                "SELECT attribution_basis, attributed_company_id FROM reviews WHERE manager_id = $1")
+            .execute(Tuple.of(manager))).iterator().next();
+        assertEquals("submitted", attribution.getString("attribution_basis"),
+            "the employer the contributor named resolves to exactly one company, so it is not a guess");
+        assertEquals(acme, attribution.getLong("attributed_company_id"));
+
+        Row stats = await(pool.preparedQuery("""
+                SELECT employment_reviews, employment_manager_count, employment_avg_rating
+                  FROM company_stats_live WHERE company_id = $1
+                """).execute(Tuple.of(acme))).iterator().next();
+        assertEquals(1L, stats.getLong("employment_reviews").longValue(),
+            "the company page said \"no reviews yet\" about a company that had been rated");
+        assertEquals(1L, stats.getLong("employment_manager_count").longValue(),
+            "and \"0 managers\" while listing the manager the rating is about");
+    }
+
+    /**
+     * The rules the backfill and the trigger now share, read directly.
+     *
+     * <p>V102 wrote the backfill and V113 wrote the trigger, each with its own copy, and they had
+     * already drifted: the trigger grew the submitted-name rule and the backfill never had it,
+     * which is the whole reason a rating could sit unattributed next to a company row that matched
+     * its own text. One function, two callers, so a third copy cannot appear.
+     */
+    @Test
+    void theSharedRuleNamesACompanyOnlyWhenItIsNotAGuess() throws Exception {
+        long acme = givenCompany("Unique Co");
+
+        Row resolved = await(pool.preparedQuery(
+                "SELECT * FROM legacy_rating_employer(NULL::BIGINT, NULL::DATE, NULL::DATE, $1)")
+            .execute(Tuple.of("unique co   "))).iterator().next();
+        assertEquals("submitted", resolved.getString("out_basis"),
+            "matched on the same normalised key as companies_name_ci, so spacing and case do not matter");
+        assertEquals(acme, resolved.getLong("out_company_id"));
+
+        Row unknown = await(pool.preparedQuery(
+                "SELECT * FROM legacy_rating_employer(NULL::BIGINT, NULL::DATE, NULL::DATE, $1)")
+            .execute(Tuple.of("A Company Nobody Holds"))).iterator().next();
+        assertEquals("none", unknown.getString("out_basis"),
+            "an employer that cannot be identified is left unattributed rather than guessed");
+        assertNull(unknown.getLong("out_company_id"));
+    }
+
+    /** A legacy rating with no attribution of its own, as every pre-V113 row was. */
+    private void givenRatingAttributedByNobody(long managerId, String companyName, double overall)
+            throws Exception {
+        await(pool.preparedQuery("""
+                INSERT INTO reviews (manager_id, author, overall_rating, manager_company,
+                                     manager_title, role_basis, disposition)
+                VALUES ($1, 'rater-' || gen_random_uuid(), $2, $3, 'Lead', 'legacy', 'live')
+                """).execute(Tuple.of(managerId, overall, companyName)));
+    }
+
     private long givenCompany(String name) throws Exception {
         return await(pool.preparedQuery(
                 "INSERT INTO companies (name, slug, status) VALUES ($1, $2, 'approved') RETURNING id")

@@ -295,10 +295,19 @@ class AccountErasureIntegrationTest {
         assertEquals("live", dispositionOf(managerRating.reviewId()));
 
         // IDENTITY SEVERED on all three.
+        //
+        // The byline is MINTED, not nulled. These two read assertNull, which was the premise
+        // UserRepository stated - "no author name is ever selected for display" - and that premise
+        // was false: CompanyReviewService and InterviewService both put `author` in the response,
+        // and the cards render a null one as "Anonymous employee" / "Anonymous candidate". So the
+        // null was the same disclosure the manager path had already been fixed to avoid, and these
+        // assertions were holding it in place.
         assertNull(companyReviewRow(companyRating).getUUID("user_id"));
-        assertNull(companyReviewRow(companyRating).getString("author"));
+        ErasedByline.assertMinted(companyReviewRow(companyRating).getString("author"),
+            "the erased company rating");
         assertNull(interviewReviewRow(interviewRating).getUUID("user_id"));
-        assertNull(interviewReviewRow(interviewRating).getString("author"));
+        ErasedByline.assertMinted(interviewReviewRow(interviewRating).getString("author"),
+            "the erased interview experience");
         assertNull(reviewRow(managerRating.reviewId()).getUUID("user_id"));
 
         // STILL ATTRIBUTED TO THEIR SUBJECT, which is what makes them worth keeping.
@@ -311,6 +320,45 @@ class AccountErasureIntegrationTest {
         // their account quietly reduced the published figures for every company they had rated.
         assertEquals(managerReviewsBefore, (int) reviewsCountOf(managerId));
         assertEquals(0, driftCount(), "company_stats_live agrees with its source tables");
+    }
+
+    /**
+     * REPORTED, 2026-11-26: a company page showed "Former employee / Anonymous employee" beside
+     * ratings signed with ordinary handles, so a reader could tell at a glance which opinion had
+     * been written by somebody who deleted their account. That is the one fact the erasure exists
+     * to remove, and it was being announced on the card.
+     *
+     * <p>The cause was a false premise written into {@code UserRepository}: "a company rating is
+     * anonymous by construction and no author name is ever selected for display, so severing the
+     * identity is all that is needed". Both {@code CompanyReviewService} and
+     * {@code InterviewService} do select it, and both clients render a null one as the literal
+     * "Anonymous employee" / "Anonymous candidate" - strings worn by no live contribution.
+     *
+     * <p>So the manager path's fix (V107, {@code Pseudonyms.mint()}) never reached the other two
+     * tables, and nulling the column was exactly as disclosing as the 'Anonymous User' literal it
+     * had replaced on {@code reviews}.
+     *
+     * <p>Asserted here on its own, rather than only inside the three-contribution test, because
+     * what has to hold is a property of the byline and not a side effect of counting rows.
+     */
+    @Test
+    void anErasedCompanyRatingAndInterviewExperienceCarryPlausibleHandlesRatherThanNothing()
+            throws Exception {
+        UUID companyRating   = insertCompanyReview(contributor);
+        UUID interviewRating = insertInterviewReview(contributor);
+
+        await(users.deleteWithReviewAnonymization(contributor));
+
+        String companyByline   = companyReviewRow(companyRating).getString("author");
+        String interviewByline = interviewReviewRow(interviewRating).getString("author");
+
+        ErasedByline.assertMinted(companyByline, "the erased company rating");
+        ErasedByline.assertMinted(interviewByline, "the erased interview experience");
+
+        // And NOT the handle they wrote it under: the fixture signs both 'Ash B', and keeping it
+        // would leave the person's own name on a rating they asked to be disconnected from.
+        assertNotEquals("Ash B", companyByline);
+        assertNotEquals("Ash B", interviewByline);
     }
 
     @Test

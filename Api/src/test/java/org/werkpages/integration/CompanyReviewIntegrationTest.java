@@ -569,7 +569,24 @@ class CompanyReviewIntegrationTest {
         var row = await(service.listFor(auth, "red-hat", 20, 0)).getJsonArray("data")
             .getJsonObject(0);
 
-        assertNull(row.getString("author"));
+        /*
+          IT LISTS, which is this test's point and is unchanged.
+
+          BUT NOT WITHOUT A BYLINE, which is what it used to assert. A null byline is not rendered
+          as an absence: CompanyRatingList printed it as the literal "Anonymous employee", a label
+          no other rating on the page carries, so it marked out exactly the rows whose author was
+          unknown - every rating written by somebody who had deleted their account among them.
+          Reported from production on 2026-11-26.
+
+          So the public list substitutes a stable handle, derived from the row id so it is the same
+          name on every read. The COLUMN is still null, and the author's own view still reports
+          that truthfully; this is about what a stranger reading the page sees.
+        */
+        String byline = row.getString("author");
+        assertNotNull(byline, "a listed rating always has something to sign it");
+        assertTrue(byline.matches("[A-Z][a-z]+[A-Z][a-z]+[1-9][0-9]"),
+            "and it is shaped like any other handle rather than labelled: got '" + byline + "'");
+        assertFalse(byline.toLowerCase().contains("anon"), byline);
     }
 
     @Test

@@ -79,6 +79,8 @@ public class AdminService {
     private final SqlClient                   db;
     private final ProofChallengeRepository    challengeRepo;
     private final ConfidenceRepository        confidenceRepo;
+    /** The title vocabulary, for the catalogue's one write path. Built from db, guarded like the rest. */
+    private final org.werkpages.repository.RoleAliasRepository roleTitles;
 
     public AdminService(UserRepository userRepo, ManagerRepository managerRepo,
                         ReviewRepository reviewRepo, EditRepository editRepo,
@@ -134,6 +136,7 @@ public class AdminService {
         this.db                   = db;
         this.challengeRepo  = db == null ? null : new ProofChallengeRepository(db);
         this.confidenceRepo = db == null ? null : new ConfidenceRepository(db);
+        this.roleTitles     = db == null ? null : new org.werkpages.repository.RoleAliasRepository(db);
         // Guarded for the same reason as the two above.
         this.capturedDrafts = db == null ? null : new CapturedDraftRepository(db);
         boolean canPublish = db != null && companyRepo != null && userRepo != null;
@@ -189,6 +192,30 @@ public class AdminService {
                         .put("overallRating", row.getBigDecimal("overall_rating"))
                         .put("reviewsCount", row.getInteger("reviews_count"))
                         .put("createdAt",    row.getOffsetDateTime("created_at").toString())
+                        /*
+                          THE LOCATION, which this projection omitted entirely.
+
+                          REPORTED, 2026-11-26: the Live Profiles tab said "No location set" on
+                          every row. The panel prints that when the payload has no location, and
+                          this is where the payload lost it - the repository did not select the
+                          columns and this did not serialize them, so the message described the
+                          response rather than the manager.
+
+                          The same keys and the same shape the pending queue sends, because the
+                          panel renders both tabs through one adminLocationOf / formatLocation
+                          pair. A second spelling here would have the tab silently fall back to
+                          "No location set" again.
+                        */
+                        .put("country",            row.getString("country"))
+                        .put("state",              row.getString("state"))
+                        .put("city",               row.getString("city"))
+                        .put("companyLocationId",  row.getLong("company_location_id"))
+                        .put("locationName",       row.getString("location_name"))
+                        .put("locationStreet",     row.getString("location_street"))
+                        .put("locationSource",     row.getString("location_source"))
+                        // Whether the catalogue holds this title. Shown on the row so an admin
+                        // reviewing a profile can promote a title nobody has catalogued yet.
+                        .put("titleUnlisted",      row.getBoolean("title_unlisted"))
                     );
                 }
                 return new JsonObject().put("data", result).put("limit", limit).put("offset", offset);
@@ -247,6 +274,7 @@ public class AdminService {
                         .put("locationName", row.getString("location_name"))
                         .put("locationStreet", row.getString("location_street"))
                         .put("locationSource", row.getString("location_source"))
+                        .put("titleUnlisted", row.getBoolean("title_unlisted"))
                     );
                 }
                 return new JsonObject().put("data", result).put("limit", limit).put("offset", offset);
@@ -731,6 +759,65 @@ public class AdminService {
                 // Already decided, or never pending. Saying so beats reporting a success that
                 // changed nothing.
                 : Future.failedFuture(ServiceException.notFound("No pending company with that id")));
+    }
+
+    /**
+     * Job titles people have used that the curated catalogue does not hold.
+     *
+     * <p>The picker offers "Not listed? Add &lt;what you typed&gt;" for an unknown title. That row
+     * keeps the wording and tells nobody: the title reaches the site by being submitted, and
+     * {@code job_titles} could previously only change by writing a migration. V116 reserved
+     * {@code source = 'promoted'} for this and nothing ever wrote it.
+     *
+     * <p>Reported with counts so the decision is informed: a spelling fifty people use is a
+     * different proposition from one somebody typed once, and the count is the only thing that
+     * distinguishes them.
+     */
+    public Future<JsonObject> listUnlistedTitles(String auth0Id, int limit) {
+        return requireAdmin(auth0Id)
+            .compose(adminId -> roleTitles.findTitlesNotInCatalogue(limit))
+            .map(rows -> {
+                JsonArray out = new JsonArray();
+                for (io.vertx.sqlclient.Row r : rows) {
+                    out.add(new JsonObject()
+                        .put("title",        r.getString("title"))
+                        .put("matchKey",     r.getString("match_key"))
+                        .put("managerCount", r.getLong("manager_count"))
+                        .put("pendingCount", r.getLong("pending_count"))
+                        .put("lastUsed",     r.getOffsetDateTime("last_used") == null
+                                             ? null : r.getOffsetDateTime("last_used").toString()));
+                }
+                return new JsonObject().put("data", out);
+            });
+    }
+
+    /**
+     * Adds a title to the curated catalogue, which is the decision the Add row implies and could
+     * not previously reach.
+     *
+     * <p>Separate from approving the manager on purpose. A submission can be perfectly good while
+     * its title is a one-off nobody should be offered, and a title can be worth keeping from a
+     * submission that is rejected for something else entirely.
+     *
+     * <p>Answers {@code added:false} rather than failing when the catalogue already holds it: two
+     * admins reaching the same obvious title is not an error, and the second one does not need to
+     * be told off for it.
+     */
+    public Future<JsonObject> promoteTitle(String auth0Id, String title) {
+        if (title == null || title.isBlank()) {
+            return Future.failedFuture(ServiceException.badRequest("A title is required"));
+        }
+        if (title.strip().length() > 100) {
+            // The same ceiling the picker and managers.title accept, so nothing can be catalogued
+            // that could not have been typed.
+            return Future.failedFuture(ServiceException.badRequest("That title is too long"));
+        }
+        return requireAdmin(auth0Id)
+            .compose(adminId -> roleTitles.promoteTitle(title.strip()))
+            .map(added -> new JsonObject()
+                .put("success", true)
+                .put("added", added)
+                .put("title", title.strip()));
     }
 
     /** The figures list, editable without a deploy because an anti-abuse list churns. */

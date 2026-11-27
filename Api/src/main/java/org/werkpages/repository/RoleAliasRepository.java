@@ -241,6 +241,73 @@ public class RoleAliasRepository {
     }
 
     /** Normalized titles held by visible managers but not yet classified — the coverage gap. */
+    /**
+     * Titles people have used that the catalogue does not hold.
+     *
+     * <h2>Why this is a list rather than a flag on a submission</h2>
+     *
+     * <p>The picker offers "Not listed? Add &lt;what you typed&gt;" for a title it cannot find, and
+     * that row keeps the typed wording and sends nothing to anybody: the title reaches the site by
+     * being submitted, and nothing ever proposes it for the curated vocabulary. So the question
+     * "which titles are new?" cannot be answered from a record of who clicked what. It is answered
+     * from the titles that exist, which also catches the ones nobody clicked that row for.
+     *
+     * <p>Grouped by the normalised key rather than the text, because "Sr. Manager" and "Snr
+     * Manager" are one decision, not two. The spelling offered for promotion is the commonest one
+     * in use, not the first or the longest, so promoting it blesses what people actually type.
+     *
+     * <p>Seeded managers are excluded for the reason every other aggregate excludes them: a
+     * platform-created row is not somebody's answer.
+     */
+    public Future<RowSet<Row>> findTitlesNotInCatalogue(int limit) {
+        return db.preparedQuery("""
+                SELECT m.title_normalized                           AS match_key,
+                       mode() WITHIN GROUP (ORDER BY btrim(m.title)) AS title,
+                       count(*)                                     AS manager_count,
+                       count(*) FILTER (
+                           WHERE m.approval_status = 'pending_approval')  AS pending_count,
+                       max(m.created_at)                            AS last_used
+                  FROM managers m
+                 WHERE m.title_normalized IS NOT NULL
+                   AND btrim(COALESCE(m.title, '')) <> ''
+                   AND m.approval_status IN ('approved', 'ghost', 'pending_approval')
+                   AND (m.external_id IS NULL OR m.external_id NOT LIKE 'seed_%')
+                   AND NOT EXISTS (SELECT 1 FROM job_titles jt
+                                    WHERE jt.match_key = m.title_normalized)
+                 GROUP BY m.title_normalized
+                 ORDER BY count(*) DESC, max(m.created_at) DESC
+                 LIMIT $1
+                """)
+            .execute(Tuple.of(limit));
+    }
+
+    /**
+     * Adds a title to the curated vocabulary, as {@code source = 'promoted'}.
+     *
+     * <p>V116 reserved that value in {@code job_titles_source_set} and nothing has ever written it:
+     * the catalogue could only be changed by writing a migration. This is the path that was missing.
+     *
+     * <p>Refuses a duplicate on BOTH keys. {@code title} is unique in the schema, but
+     * {@code match_key} is not, and two rows normalising to the same key would offer the same job
+     * twice in one list - the picker dedupes a catalogue entry against live usage, not against
+     * another catalogue entry.
+     *
+     * @return true when a row was added, false when the catalogue already held it
+     */
+    public Future<Boolean> promoteTitle(String title) {
+        return db.preparedQuery("""
+                INSERT INTO job_titles (title, match_key, source)
+                SELECT btrim($1), normalize_role_title($1), 'promoted'
+                 WHERE normalize_role_title($1) IS NOT NULL
+                   AND NOT EXISTS (SELECT 1 FROM job_titles
+                                    WHERE match_key = normalize_role_title($1))
+                ON CONFLICT (title) DO NOTHING
+                RETURNING id
+                """)
+            .execute(Tuple.of(title))
+            .map(rows -> rows.iterator().hasNext());
+    }
+
     public Future<Row> findCoverage() {
         return db.preparedQuery("""
                 SELECT COUNT(DISTINCT m.title_normalized)                                AS distinct_titles,

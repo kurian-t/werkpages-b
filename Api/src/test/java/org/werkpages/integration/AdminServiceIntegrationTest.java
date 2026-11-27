@@ -1324,6 +1324,57 @@ class AdminServiceIntegrationTest {
     // Helpers
     // ══════════════════════════════════════════════════════════════════════════
 
+    /**
+     * REPORTED, 2026-11-26: every row in the admin Live Profiles tab read "No location set",
+     * including profiles that plainly have a location, and no profile can now go live without one.
+     *
+     * <p>The tab was not describing the managers. It was describing its own payload: the panel
+     * prints that line when the response carries no location, {@code findGhostForAdmin} selected
+     * none of the location columns and {@code getGhostManagers} serialized none of them. The
+     * pending queue has carried them since the day an admin could not see what they were about to
+     * publish; the live tab, where the row is ALREADY published, had never been given them.
+     *
+     * <p>Asserted on the response rather than on the row, because the row was never the problem.
+     * A test that read the database would have passed throughout.
+     */
+    @Test
+    void getGhostManagers_carriesTheLocationSoTheTabStopsSayingNoLocationSet() throws Exception {
+        String adminAuth0 = insertUser("auth0|wp-loc-1", "GhostLoc1", "admin");
+
+        long managerId = await(pool.preparedQuery(
+                "INSERT INTO managers(name,company,title,image,status,approval_status,"
+                + "overall_rating,reviews_count,category_averages,country,state,city,"
+                + "location_source) "
+                + "VALUES ('Lena Ortiz','Thornbury Rail','Operations Director','img','active',"
+                + "'ghost',0,0,'{}','Canada','Ontario','Kitchener','typed') RETURNING id")
+            .execute()
+            .map(rs -> rs.iterator().next().getLong("id")));
+
+        JsonObject result = await(service.getGhostManagers(adminAuth0, 10, 0));
+        JsonArray data = result.getJsonArray("data");
+
+        JsonObject row = null;
+        for (int i = 0; i < data.size(); i++) {
+            if (managerId == data.getJsonObject(i).getLong("id")) row = data.getJsonObject(i);
+        }
+        assertNotNull(row, "the ghost manager is in the live profiles tab");
+
+        // The keys the panel actually reads, spelled the way the pending tab spells them: both
+        // tabs render through one adminLocationOf / formatLocation pair, so a different spelling
+        // here would send the tab straight back to "No location set".
+        assertEquals("Canada",    row.getString("country"));
+        assertEquals("Ontario",   row.getString("state"));
+        assertEquals("Kitchener", row.getString("city"));
+
+        // And the provenance, which is why the pending tab carries it: a location inferred from
+        // some visitor's IP must not be indistinguishable from one somebody typed.
+        assertEquals("typed", row.getString("locationSource"));
+
+        // The keys exist even when empty, rather than being absent from the object.
+        assertTrue(row.containsKey("locationStreet"));
+        assertTrue(row.containsKey("companyLocationId"));
+    }
+
     private String insertUser(String auth0Id, String username, String role) throws Exception {
         await(pool.preparedQuery(
             "INSERT INTO users(auth0_id, email, username, first_name, last_name, role) " +
@@ -1409,6 +1460,94 @@ class AdminServiceIntegrationTest {
     }
 
     /** A manager with a known slug at a known company - the collision setup these tests need. */
+    /**
+     * The job-title catalogue's one write path, which did not exist until 2026-11-27.
+     *
+     * <p>The picker offers "Not listed? Add &lt;what you typed&gt;" for a title it cannot find.
+     * That row keeps the contributor's wording and records nothing anywhere: a title reached the
+     * site by being submitted, and {@code job_titles} could only change by writing a migration.
+     * V116 reserved {@code source = 'promoted'} for this and nothing ever wrote it.
+     */
+    @Test
+    void unlistedTitlesAreListedWithCountsAndCanBePromoted() throws Exception {
+        String adminAuth0 = insertUser("auth0|wp-title-1", "TitleAdmin1", "admin");
+
+        // Two managers carrying a title the catalogue has never held, and one carrying a title it
+        // does hold, so the list is proved to be a filter rather than a dump.
+        await(pool.query(
+                "INSERT INTO managers(name,company,title,status,approval_status,slug) VALUES "
+                + "('Ada One','Probe Co','Chief Vibes Officer','active','ghost','ada-one-ttl'),"
+                + "('Ada Two','Probe Co','Chief Vibes Officer','active','pending_approval','ada-two-ttl'),"
+                + "('Ada Three','Probe Co','Software Engineer','active','ghost','ada-three-ttl')")
+            .execute());
+
+        JsonArray listed = await(service.listUnlistedTitles(adminAuth0, 50)).getJsonArray("data");
+
+        JsonObject vibes = null;
+        for (int i = 0; i < listed.size(); i++) {
+            JsonObject r = listed.getJsonObject(i);
+            if ("Chief Vibes Officer".equals(r.getString("title"))) vibes = r;
+            assertNotEquals("Software Engineer", r.getString("title"),
+                "a title the catalogue already holds is not something to add to it");
+        }
+        assertNotNull(vibes, "a title nobody has catalogued is the whole point of the list");
+        assertEquals(2L, vibes.getLong("managerCount").longValue(),
+            "the count is what distinguishes a spelling fifty people use from a one-off");
+        assertEquals(1L, vibes.getLong("pendingCount").longValue());
+
+        JsonObject added = await(service.promoteTitle(adminAuth0, "Chief Vibes Officer"));
+        assertTrue(added.getBoolean("added"), "it was not in the catalogue, so it was added");
+
+        io.vertx.sqlclient.Row row = await(pool.preparedQuery(
+                "SELECT source, match_key FROM job_titles WHERE title = $1")
+            .execute(Tuple.of("Chief Vibes Officer"))).iterator().next();
+        assertEquals("promoted", row.getString("source"),
+            "the value V116 reserved for exactly this and nothing had ever written");
+        assertEquals("chief vibes officer", row.getString("match_key"),
+            "keyed with the same normalizer managers.title_normalized uses, or the picker would "
+            + "offer it beside the live spelling instead of instead of it");
+
+        // And it leaves the list, because the question it answered is now answered.
+        JsonArray after = await(service.listUnlistedTitles(adminAuth0, 50)).getJsonArray("data");
+        for (int i = 0; i < after.size(); i++) {
+            assertNotEquals("Chief Vibes Officer", after.getJsonObject(i).getString("title"));
+        }
+    }
+
+    /**
+     * Promoting the same title twice is not an error.
+     *
+     * <p>Two admins reaching the same obvious title is ordinary, and so is a second spelling that
+     * normalises onto one already held: {@code job_titles.title} is unique but {@code match_key}
+     * is not, and two rows with one key would offer the same job twice in one list.
+     */
+    @Test
+    void promotingATitleTheCatalogueAlreadyHoldsIsNotAnError() throws Exception {
+        String adminAuth0 = insertUser("auth0|wp-title-2", "TitleAdmin2", "admin");
+
+        assertTrue(await(service.promoteTitle(adminAuth0, "Chief Snack Officer")).getBoolean("added"));
+        assertFalse(await(service.promoteTitle(adminAuth0, "Chief Snack Officer")).getBoolean("added"),
+            "said so rather than failing: the second admin does not need telling off");
+        assertFalse(await(service.promoteTitle(adminAuth0, "chief   snack officer")).getBoolean("added"),
+            "a different spelling of a title already held normalises onto it, and a second row "
+            + "would offer the same job twice");
+
+        Long rows = await(pool.preparedQuery(
+                "SELECT count(*) AS c FROM job_titles WHERE match_key = 'chief snack officer'")
+            .execute()).iterator().next().getLong("c");
+        assertEquals(1L, rows.longValue());
+    }
+
+    /** A blank title is refused before it reaches the catalogue. */
+    @Test
+    void aBlankTitleIsRefused() throws Exception {
+        String adminAuth0 = insertUser("auth0|wp-title-3", "TitleAdmin3", "admin");
+        Exception e = assertThrows(Exception.class,
+            () -> await(service.promoteTitle(adminAuth0, "   ")));
+        assertTrue(e.getMessage() != null && e.getMessage().toLowerCase().contains("title"),
+            "the refusal names what was wrong: " + e.getMessage());
+    }
+
     private long insertManagerWithSlug(String name, String company, String slug) throws Exception {
         Long companyId = await(pool.preparedQuery(
                 "INSERT INTO companies(name,status,slug) VALUES ($1,'approved',$2) "

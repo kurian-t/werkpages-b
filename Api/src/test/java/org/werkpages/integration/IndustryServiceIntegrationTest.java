@@ -203,6 +203,72 @@ class IndustryServiceIntegrationTest {
 
     // ── helpers ──────────────────────────────────────────────────────────────────
 
+    /**
+     * REPORTED, 2026-11-26: an industry page read "3.0 managers avg / 41 reviews" beside "1.0
+     * company avg / 2 reviews", and the company figure did not match the figure the same
+     * companies showed on their own pages.
+     *
+     * <p>V115 made the workplace average the mean of each rating's ELEVEN scores, keeping the
+     * author's separate "overall, how was working here?" answer as one of the eleven rather than
+     * as the whole number. It changed {@code company_stats_expected}, which is what the company
+     * page reads. {@code findIndustryStats} computes its own figure live and was missed, so the
+     * industry page alone still averaged that single answer.
+     *
+     * <p>Two definitions of one published number. This fixture makes them disagree on purpose:
+     * every category is 5 and the author's own overall is 1, so averaging the eleven gives 4.6
+     * and averaging the author's answer alone gives 1.0. Before the fix this asserted 1.0.
+     */
+    @Test
+    void profile_workplaceAverage_isTheMeanOfElevenScoresNotTheAuthorsOwnAnswer() throws Exception {
+        long acme = insertCompanyWithIndustry("Acme Tech", "acme-tech", "Technology");
+        insertManager("Alice", "alice", "approved", acme, "Acme Tech", 4.0, 3, null);
+        insertWorkplaceRating(acme, 1.0, 5);
+        await(companyRepo.refreshCompanyStats());
+
+        JsonObject p = await(service.getIndustryProfile("technology"));
+
+        assertEquals(1L, p.getLong("workplaceCount"));
+        // (5 * 10 + 1) / 11 = 4.636..., rounded to one place.
+        assertEquals("4.6", p.getValue("workplaceRating").toString(),
+            "the industry page must publish the same definition of this number as the company "
+            + "page does, which V115 settled as the average of the eleven");
+
+        /*
+          AND THE COMPANY'S OWN PAGE AGREES, which is the comparison the report was built on: the
+          industry page and a company listed on it describing the same ratings.
+
+          The company page reads company_stats_live, written by the database from
+          company_stats_expected; the industry page computes its figure live in findIndustryStats.
+          Two implementations of one published number, which is exactly how they came to disagree,
+          so the test holds them to each other rather than to a literal.
+
+          NOT compared against the industry LISTING, although an earlier version of this test did:
+          findIndustryListing publishes the manager average alone, with no workplace or interview
+          figure in the row or in the tile, so there was nothing there to agree or disagree.
+        */
+        var live = await(pool.preparedQuery(
+                "SELECT workplace_avg_rating FROM company_stats_live WHERE company_id = $1")
+            .execute(Tuple.of(acme)));
+        assertEquals(1, live.size(), "the projection should hold a row for a company with a rating");
+        assertEquals(p.getValue("workplaceRating").toString(),
+            live.iterator().next().getBigDecimal("workplace_avg_rating").toString(),
+            "the industry page and the company page have to say the same thing about the same "
+            + "ratings, and V115 settled what that is: the average of the eleven");
+    }
+
+    /** One workplace rating: the author's own overall, and one value for all ten categories. */
+    private void insertWorkplaceRating(long companyId, double authorsOverall, int everyCategory)
+            throws Exception {
+        await(pool.preparedQuery("""
+                INSERT INTO company_reviews (company_id, author, overall_rating,
+                    work_life_balance, compensation_benefits, career_growth, job_security,
+                    workload_sustainability, senior_leadership, company_communication,
+                    flexibility, inclusion_belonging, tools_resources, worked_from)
+                VALUES ($1,'KeenOtter42',$2,$3,$3,$3,$3,$3,$3,$3,$3,$3,$3,'2024-01-01'::date)
+                """)
+            .execute(Tuple.of(companyId, authorsOverall, everyCategory)));
+    }
+
     private long insertCompanyWithIndustry(String name, String slug, String industry) throws Exception {
         return await(pool.preparedQuery("""
                 INSERT INTO companies (name, slug, status, industry, created_at, updated_at)

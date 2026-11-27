@@ -941,7 +941,26 @@ public class CompanyRepository {
                        (SELECT COUNT(*) FROM company_reviews cr
                           JOIN companies wc ON wc.id = cr.company_id
                          WHERE wc.industry = $1 AND cr.deleted_at IS NULL) AS workplace_count,
-                       (SELECT ROUND(AVG(cr.overall_rating)::NUMERIC, 1) FROM company_reviews cr
+                       -- rating_average, NOT overall_rating, and the difference is the whole of
+                       -- a reported defect.
+                       --
+                       -- REPORTED, 2026-11-26: an industry page read "3.0 managers avg / 41
+                       -- reviews" beside "1.0 company avg / 2 reviews", and the company figure did
+                       -- not match the same companies' own pages.
+                       --
+                       -- V115 made the workplace figure the average of each rating's ELEVEN
+                       -- scores, and kept the author's separate "overall, how was working here?"
+                       -- answer as one of those eleven rather than as the whole number.
+                       -- company_stats_expected was changed; this query was missed, so the
+                       -- industry page alone still averaged that single answer. Two definitions of
+                       -- one published number, which is the thing the company_stats notes warn
+                       -- about: a reader comparing the industry page with a company on it saw two
+                       -- different averages of the same ratings.
+                       --
+                       -- The interview average below is NOT the same case and is correct as it
+                       -- stands: interview_reviews has no derived average, overall_rating is its
+                       -- only figure, and the read model averages that same column.
+                       (SELECT ROUND(AVG(cr.rating_average)::NUMERIC, 1) FROM company_reviews cr
                           JOIN companies wc ON wc.id = cr.company_id
                          WHERE wc.industry = $1 AND cr.deleted_at IS NULL) AS workplace_avg_rating,
                        (SELECT COUNT(*) FROM interview_reviews ir

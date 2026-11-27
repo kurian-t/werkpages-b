@@ -300,27 +300,8 @@ public class UserRepository {
             //    rated the same manager under the same title and employer can both erase
             //    themselves. The flag does that, not the byline, so varying the byline costs
             //    nothing there.
-            tx.preparedQuery("SELECT id FROM reviews WHERE user_id = $1")
-                .execute(Tuple.of(userId))
-                .compose(idRows -> {
-                    java.util.List<Tuple> batch = new java.util.ArrayList<>();
-                    for (Row idRow : idRows) {
-                        // getValue, not getUUID or getLong: this id's type is not this method's
-                        // business, and naming it wrongly would break only on the erasure path.
-                        batch.add(Tuple.of(Pseudonyms.mint(), idRow.getValue("id")));
-                    }
-                    // An account with no ratings is ordinary, and executeBatch on an empty list
-                    // is not: the driver rejects it.
-                    if (batch.isEmpty()) return Future.succeededFuture();
-                    return tx.preparedQuery("""
-                            UPDATE reviews
-                            SET author = $1, user_id = NULL, dates_hidden = TRUE,
-                                author_erased = TRUE, updated_at = now()
-                            WHERE id = $2
-                            """)
-                        .executeBatch(batch)
-                        .mapEmpty();
-                })
+            mintBylines(tx, userId, "reviews",
+                    ", dates_hidden = TRUE, author_erased = TRUE, updated_at = now()")
                 // 2. COMPANY RATINGS. Were being DESTROYED: company_reviews.user_id was CASCADE and
                 //    nothing anonymised them, so deleting an account silently deleted every company
                 //    rating that person had written while their manager ratings survived. Worse, the
@@ -328,20 +309,40 @@ public class UserRepository {
                 //    company_stats_live, so the published figures for every company they had rated
                 //    fell as a side effect of somebody closing their account.
                 //
-                //    A company rating is anonymous by construction and no author name is ever
-                //    selected for display, so severing the identity is all that is needed.
-                //    dates_hidden here too: company_reviews carries the same column and the same
+                //    THE BYLINE IS MINTED HERE TOO, and this is where that was got wrong.
+                //
+                //    This code set author = NULL, on the premise written one line above it: "a
+                //    company rating is anonymous by construction and no author name is ever
+                //    selected for display, so severing the identity is all that is needed." The
+                //    premise is false. CompanyReviewService puts `author` in the response and
+                //    InterviewService does the same, and both cards render a null one as a
+                //    literal - "Anonymous employee" on a workplace rating, "Anonymous candidate"
+                //    on an interview experience.
+                //
+                //    No live contribution wears either string, so nulling the column disclosed
+                //    exactly what 'Anonymous User' used to disclose on `reviews`: which opinion
+                //    on the page was written by somebody who had deleted their account. Reported
+                //    from production on 2026-11-26, where a company profile showed one rating
+                //    signed with an ordinary handle and the one beside it signed "Anonymous
+                //    employee".
+                //
+                //    So all three tables now do the same thing, through the same helper: one
+                //    freshly minted handle per row, drawn from the vocabulary live accounts and
+                //    anonymous contributors already draw from. The fix that reached `reviews` in
+                //    V107 simply never reached the other two.
+                //
+                //    dates_hidden stays: company_reviews carries the same column and the same
                 //    worked_from / worked_until pair, and a period at one employer is no less
                 //    identifying than a period under one manager. The self-deletion path already
                 //    sets it, so this makes the two routes agree.
-                .compose(ignored -> tx.preparedQuery(
-                        "UPDATE company_reviews SET author = NULL, user_id = NULL, "
-                        + "dates_hidden = TRUE WHERE user_id = $1")
-                    .execute(Tuple.of(userId)))
-                // 3. INTERVIEW EXPERIENCES. Same defect, same fix.
-                .compose(ignored -> tx.preparedQuery(
-                        "UPDATE interview_reviews SET author = NULL, user_id = NULL WHERE user_id = $1")
-                    .execute(Tuple.of(userId)))
+                //    updated_at IS DELIBERATELY NOT TOUCHED, and the original statement did not
+                //    touch it either. The card renders "edited <n> days ago" from it, so bumping
+                //    it would announce that every one of this person's ratings was edited at the
+                //    same moment - which is the erasure, re-disclosed through a timestamp.
+                .compose(ignored -> mintBylines(tx, userId, "company_reviews",
+                    ", dates_hidden = TRUE"))
+                // 3. INTERVIEW EXPERIENCES. Same defect, same fix, same reason.
+                .compose(ignored -> mintBylines(tx, userId, "interview_reviews", ""))
                 .compose(ignored -> tx.preparedQuery(
                         "UPDATE managers SET search_created_by_user_id = NULL "
                         + "WHERE search_created_by_user_id = $1")
@@ -360,6 +361,54 @@ public class UserRepository {
                         "UPDATE rating_opportunity_retirements SET user_id = NULL WHERE user_id = $1")
                     .execute(Tuple.of(userId)))
                 .mapEmpty());
+    }
+
+    /**
+     * Severs one table's authorship: every row this account wrote gets a freshly minted handle
+     * and loses its {@code user_id}, in one batch.
+     *
+     * <p><b>One name per row, not one per account.</b> A handle shared across an erased account's
+     * contributions relinks them: a reader could see that one person rated these four managers,
+     * which is a fact the erasure removes everywhere else. A single {@code UPDATE ... SET author =
+     * $1} cannot do that, which is why this is a batch.
+     *
+     * <p><b>Minted, never nulled and never a literal.</b> Both alternatives disclose. A fixed
+     * string like {@code Anonymous User} is worn by no live account, and a null byline is rendered
+     * by the clients as {@code Anonymous employee} or {@code Anonymous candidate}, which is the
+     * same tell by a different route. {@link Pseudonyms#mint} produces {@code KindPanda11} -
+     * indistinguishable in form from the handles live accounts carry and from the ones the rating
+     * forms already hand to anonymous contributors - and it is drawn from nothing about the
+     * person, so it identifies nobody.
+     *
+     * <p>All three contribution tables go through here so that there is one definition of what an
+     * erased byline looks like. Three near-identical blocks is how one of them ends up different,
+     * and one of them being different is the defect this replaces.
+     *
+     * @param table            a literal from this class, never anything a caller supplies: it is
+     *                         interpolated into the statement because a table name cannot be a
+     *                         bind parameter
+     * @param extraAssignments further SET clauses for this table, beginning with a comma, or ""
+     */
+    private Future<Void> mintBylines(io.vertx.sqlclient.SqlConnection tx, UUID userId,
+                                     String table, String extraAssignments) {
+        return tx.preparedQuery("SELECT id FROM " + table + " WHERE user_id = $1")
+            .execute(Tuple.of(userId))
+            .compose(idRows -> {
+                java.util.List<Tuple> batch = new java.util.ArrayList<>();
+                for (Row idRow : idRows) {
+                    // getValue, not getUUID or getLong: reviews keys on a bigint and the other two
+                    // on a uuid, and naming either wrongly would break only on the erasure path.
+                    batch.add(Tuple.of(Pseudonyms.mint(), idRow.getValue("id")));
+                }
+                // An account with no contributions of this kind is ordinary, and executeBatch on
+                // an empty list is not: the driver rejects it.
+                if (batch.isEmpty()) return Future.succeededFuture();
+                return tx.preparedQuery(
+                        "UPDATE " + table + " SET author = $1, user_id = NULL"
+                        + extraAssignments + " WHERE id = $2")
+                    .executeBatch(batch)
+                    .mapEmpty();
+            });
     }
 
     // ── Admin user management ─────────────────────────────────────────────────

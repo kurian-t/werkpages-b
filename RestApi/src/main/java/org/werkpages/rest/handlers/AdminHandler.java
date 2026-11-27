@@ -188,6 +188,28 @@ public class AdminHandler {
             .onFailure(err -> ManagersHandler.handleError(ctx, err));
     }
 
+    // ── the curated job-title catalogue ──────────────────────────────────────
+    //
+    // The picker's "Not listed? Add <what you typed>" row keeps the wording and records nothing,
+    // so a title nobody catalogued only ever reached the site by being submitted. These two are
+    // the review and the write that were missing: job_titles could previously change only by
+    // writing a migration, and V116 reserved source = 'promoted' for this.
+
+    public void handleListUnlistedTitles(RoutingContext ctx) {
+        int limit = parseIntParam(ctx.request().getParam("limit"), 50, 1, 200);
+        service.listUnlistedTitles(ctx.get("auth0Id"), limit)
+            .onSuccess(json -> ok(ctx, json))
+            .onFailure(err -> ManagersHandler.handleError(ctx, err));
+    }
+
+    public void handlePromoteTitle(RoutingContext ctx) {
+        io.vertx.core.json.JsonObject body = ctx.body() == null ? null : ctx.body().asJsonObject();
+        if (body == null) { bad(ctx, "A title is required"); return; }
+        service.promoteTitle(ctx.get("auth0Id"), body.getString("title"))
+            .onSuccess(json -> ok(ctx, json))
+            .onFailure(err -> ManagersHandler.handleError(ctx, err));
+    }
+
     public void handleGetGhostManagers(RoutingContext ctx) {
         String auth0Id = ctx.get("auth0Id");
         int limit  = parseIntParam(ctx.request().getParam("limit"),  50, 1, 200);

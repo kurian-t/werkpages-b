@@ -588,8 +588,31 @@ public class ManagerRepository {
     public Future<RowSet<Row>> findGhostForAdmin(int limit, int offset) {
         return db.preparedQuery("""
                 SELECT m.id, m.name, m.company, m.title, m.image, m.overall_rating,
-                       m.reviews_count, m.created_at, m.company_logo_url, m.company_id
+                       m.reviews_count, m.created_at, m.company_logo_url, m.company_id,
+                       -- WHERE THE MANAGER WORKS, which this query did not select at all.
+                       --
+                       -- REPORTED, 2026-11-26: every row in the admin Live Profiles tab read
+                       -- "No location set", including profiles that plainly have one. The tab was
+                       -- not reporting the data, it was reporting the absence of these columns:
+                       -- the panel falls back to that line when the payload carries no location,
+                       -- and the payload could not carry one because nothing selected it.
+                       --
+                       -- findPendingForAdmin already carries exactly this set, for the reason its
+                       -- own comment gives: a location nobody can see is a location nobody can
+                       -- correct. A live profile is the one that is already published, so that
+                       -- argument is stronger here, not weaker.
+                       -- Whether the catalogue already holds this title. The admin reviewing a
+                       -- submission is the only person who can promote a new one, and they cannot
+                       -- do that if nothing tells them the title is new. Computed rather than
+                       -- stored: it answers for every row, including the ones submitted before
+                       -- anything recorded the question.
+                       (m.title_normalized IS NOT NULL
+                        AND NOT EXISTS (SELECT 1 FROM job_titles jt
+                                         WHERE jt.match_key = m.title_normalized)) AS title_unlisted,
+                       m.country, m.state, m.city, m.company_location_id, m.location_source,
+                       loc.display_name AS location_name, loc.street AS location_street
                 FROM managers m
+                LEFT JOIN company_locations loc ON loc.id = m.company_location_id
                 WHERE m.approval_status = 'ghost'
                 ORDER BY m.created_at DESC
                 LIMIT $1 OFFSET $2
@@ -622,7 +645,15 @@ public class ManagerRepository {
                        -- It was not selected at all, so a location nobody could see was also a
                        -- location nobody could correct before approving it into the directory.
                        m.country, m.state, m.city, m.company_location_id, m.location_source,
-                       loc.display_name AS location_name, loc.street AS location_street
+                       loc.display_name AS location_name, loc.street AS location_street,
+                       -- Whether the catalogue already holds this title. The admin reviewing a
+                       -- submission is the only person who can promote a new one, and they cannot
+                       -- do that if nothing tells them the title is new. Computed rather than
+                       -- stored: it answers for every row, including the ones submitted before
+                       -- anything recorded the question.
+                       (m.title_normalized IS NOT NULL
+                        AND NOT EXISTS (SELECT 1 FROM job_titles jt
+                                         WHERE jt.match_key = m.title_normalized)) AS title_unlisted
                 FROM managers m
                 LEFT JOIN users u ON u.id = m.submitted_by
                 LEFT JOIN company_locations loc ON loc.id = m.company_location_id

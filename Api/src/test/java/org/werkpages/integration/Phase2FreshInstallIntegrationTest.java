@@ -251,7 +251,72 @@ class Phase2FreshInstallIntegrationTest {
         // CMO, CPO, GM, PE, PM - is the ambiguity the picker resolves by offering every reading
         // instead of guessing one, and a unique index would force exactly the guess V49's
         // normalizer already makes wrongly when it resolves "avp" to assistant vice president.
-        assertEquals("116", await(pool.query("""
+        // V117 (plausible bylines on company and interview ratings) moved it to 117 on
+        // 2026-11-26. Acknowledged, and it is the third DATA correction rather than a structural
+        // change: no table, column, constraint or index is touched.
+        //
+        // It names the rows that had no byline. Account erasure set company_reviews.author and
+        // interview_reviews.author to NULL, on a premise written into UserRepository that no
+        // author name was ever selected for display. Both services do select it, and the clients
+        // render a null one as "Anonymous employee" / "Anonymous candidate" - strings worn by no
+        // live contribution, so a reader could tell which opinion was written by somebody who had
+        // deleted their account. That is the same disclosure V107 removed from `reviews`, reached
+        // by a different route.
+        //
+        // RateMyManagers is unaffected by a stale build: it reads these columns and its own
+        // CompanyReviewService now substitutes a stable handle for a null one anyway, so an older
+        // jar reading a migrated database shows a handle either way. Nothing it writes can
+        // violate anything here, because the migration adds no constraint.
+        //
+        // updated_at is deliberately left alone, which is where this differs from V107. The
+        // workplace card renders "edited <n> days ago" from it, so bumping it would announce that
+        // all of these ratings were edited at one instant.
+        // V118, 2026-11-26. Acknowledged, and it is the fourth DATA correction rather than a
+        // structural change: no table, column, constraint or index is touched. It also replaces two
+        // function bodies, which is why it is not purely data.
+        //
+        // REPORTED: IBM's company profile read "Manager opinions / 0 managers" with two managers
+        // listed beside it and a rating of 2.9 visible one tab away, and "no reviews yet" under a
+        // company that has been rated.
+        //
+        // The Manager opinions block reads the EMPLOYMENT-ATTRIBUTED population. V102 backfilled
+        // attribution once from career_history; V113 added the BEFORE INSERT trigger that also
+        // resolves the company name the contributor submitted. Nothing ever went back for the
+        // ratings written between the two, nor for the ones V102's career-history rules could not
+        // reach - a manager created by search or the add form has no career_history at all, so
+        // V102 attributed nothing for them while the rating itself carried the employer typed on
+        // it. Locally that was 19 of 25 live ratings, all 19 resolvable by their own name.
+        //
+        // The three rules now live in legacy_rating_employer(), read by both the trigger and this
+        // backfill, because V102's backfill and V113's trigger had ALREADY drifted: the trigger
+        // grew a third rule the backfill never had, which is exactly how these rows were missed.
+        //
+        // RateMyManagers is unaffected by a stale build: it reads these columns and writes none of
+        // them, and the migration adds no constraint.
+        // V119, 2026-11-27. Acknowledged. The first migration since V97 that REWRITES TEXT PEOPLE
+        // WROTE, so it is the one to be most careful about.
+        //
+        // REPORTED from production: typing "Vp" in the title picker offered "VP Sales" and "VP of
+        // Product" beside "Vice President of Sales" and "Vice President, Talent". The picker's
+        // first tier is the spellings this product's own people have used, so those rows are real
+        // stored titles and the inconsistency is in the data rather than the display. V116
+        // installed the catalogue and deliberately changed no existing row; this is the cleanup
+        // that was left for afterwards, approved on 2026-11-27.
+        //
+        // Expands an acronym ONLY where the catalogue gives it exactly one reading, so VP, SVP and
+        // CEO yes, and PM, AVP, GM and CPO never - expanding those would write a coin toss into a
+        // title real people read. Writes a department with "of" after a comma for any catalogue
+        // rank, and after a space only for President ranks, because a comma is a reliable signal
+        // and a space is not: a general rule would turn "Software Engineer Manager" into
+        // "Software Engineer of Manager".
+        //
+        // Every rewrite is recorded in job_title_cleanup_v119, which is what makes
+        // rollback_v119_job_title_cleanup.sql an exact undo rather than a second guess. A row
+        // edited after the migration is skipped by that rollback.
+        //
+        // RateMyManagers reads managers.title and writes it on submission; nothing it writes can
+        // violate anything here, because the migration adds no constraint.
+        assertEquals("119", await(pool.query("""
                 SELECT version FROM flyway_schema_history
                  WHERE success AND version IS NOT NULL
                  ORDER BY installed_rank DESC LIMIT 1

@@ -49,4 +49,34 @@ public final class Pseudonyms {
              + ANIMAL[RNG.nextInt(ANIMAL.length)]
              + (10 + RNG.nextInt(90));
     }
+
+    /**
+     * A stand-in byline derived from a row's own id: the same name on every read, for every
+     * reader, forever.
+     *
+     * <p><b>Why a read-time name exists at all.</b> {@link #mint} is written into the row, which
+     * is the right place for it, but it only covers rows this application writes. Contributions
+     * written before authors existed carry no byline, and the clients render a missing one as the
+     * literal "Anonymous employee" or "Anonymous candidate" - strings worn by no live
+     * contribution, and therefore a mark on precisely the rows whose authorship is unknown. The
+     * serializers call this so the response can never carry a null byline, whatever wrote the row
+     * and whichever migration has or has not run against the database behind it.
+     *
+     * <p><b>Derived from the id, so it is stable.</b> A freshly minted name on every read would
+     * give one rating a different handle each time the page loaded, which is worse than the
+     * problem: it would be obvious that the name is invented. The id is already public, already
+     * carried in the response, and reveals nothing about the author.
+     *
+     * <p>{@code String.hashCode} is specified by the language rather than left to the
+     * implementation, so the same id yields the same name in every JVM this ever runs in, and in
+     * both products.
+     */
+    public static String stableFor(String seed) {
+        int h = seed == null ? 0 : seed.hashCode();
+        // floorMod, not %: hashCode is signed and a negative index would throw on about half of
+        // all ids, which is the kind of failure that appears only for some rows.
+        return ADJ[Math.floorMod(h, ADJ.length)]
+             + ANIMAL[Math.floorMod(h / 31, ANIMAL.length)]
+             + (10 + Math.floorMod(h / 997, 90));
+    }
 }

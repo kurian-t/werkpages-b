@@ -10,6 +10,7 @@ import org.werkpages.repository.CompanyRepository;
 import org.werkpages.repository.CapturedDraftRepository;
 import org.werkpages.repository.CompanyReviewRepository;
 import org.werkpages.repository.UserRepository;
+import org.werkpages.repository.Pseudonyms;
 
 import java.time.LocalDate;
 import java.time.format.DateTimeParseException;
@@ -188,6 +189,20 @@ public class CompanyReviewService {
           The handle the author picked. Trimmed and capped, and blank means none - an
           empty string would put a nameless byline on the rating rather than leaving it
           anonymous, which is a different thing.
+
+          NULL IS STORED, AND MINTING HERE WAS TRIED AND REVERTED. Giving a blank handle a freshly
+          minted one looked like the fix for "Anonymous employee" and broke something else: the
+          upsert keeps the existing byline through COALESCE(EXCLUDED.author, company_reviews.author)
+          precisely so that revisiting the form to change a star does not rename the rating, and a
+          minted value is not null, so every edit that omitted the handle overwrote the name a
+          reader had already seen. Caught by
+          CompanyReviewIntegrationTest.editingWithoutSendingAHandleKeepsTheOneAReaderAlreadySaw.
+
+          The byline a reader sees is guaranteed at the READ path instead, by bylineOf, which
+          substitutes a stable handle for an absent one without writing anything. So "no handle"
+          stays a storable state, an edit cannot rename anybody, and no card can say
+          "Anonymous employee". The one path that does rewrite the column is account erasure,
+          which has to: that is the identity being severed.
         */
         String author = body.getString("author");
         if (author != null) {
@@ -589,9 +604,11 @@ public class CompanyReviewService {
                             // rating has said the same thing since the day it was written.
                             .put("updatedAt",     row.getOffsetDateTime("updated_at") == null
                                                   ? null : row.getOffsetDateTime("updated_at").toString())
-                            // Null for ratings written before authors existed; the page renders
-                            // those as "Anonymous employee", exactly as it always did.
-                            .put("author",        row.getString("author"))
+                            // NEVER NULL. A missing byline rendered as "Anonymous employee", a
+                            // string no live rating wears, so it marked the rows whose author was
+                            // unknown - erased accounts among them. bylineOf substitutes a stable
+                            // handle instead. See its javadoc.
+                            .put("author",        bylineOf(row))
                             .put("mine",          viewerId != null && viewerId.equals(author)));
                     }
                     return new JsonObject().put("data", data).put("gated", withholdScores)
@@ -746,6 +763,16 @@ public class CompanyReviewService {
                                     ? null : row.getLocalDate("worked_from").toString());
         LocalDate until = row.getLocalDate("worked_until");
         json.put("workedUntil", until == null ? null : until.toString());
+        /*
+          THE TRUTH HERE, not a substituted handle, and this is the one read path that differs.
+
+          reviewToJson answers the submit response and "your own rating" in Account Settings. Both
+          are the author looking at their own contribution, where the UI names the choice they made
+          about their byline. Substituting a stable handle would report a name they never picked
+          back to them as though they had, and it would make an edit that omits the handle look
+          like a rename. The public list is where a missing byline becomes "Anonymous employee",
+          so that is where bylineOf belongs.
+        */
         json.put("author", row.getString("author"));
         /*
           Handed back so the form opens on the location already filed, the same way it opens on the
@@ -764,5 +791,29 @@ public class CompanyReviewService {
     private static Double numberOrNull(Row row, String column) {
         java.math.BigDecimal v = row.getBigDecimal(column);
         return v == null ? null : v.doubleValue();
+    }
+
+    /**
+     * The byline a card shows, which is never nothing.
+     *
+     * <p>A missing byline is not a neutral absence. Both clients render it as the literal
+     * "Anonymous employee", and no live contribution wears that string, so it marks out exactly
+     * the rows whose author is unknown - including, until 2026-11-26, every rating written by
+     * somebody who had deleted their account. That was the same disclosure the manager path had
+     * already removed from {@code reviews}, arriving by a different route.
+     *
+     * <p>Rows are now written with a handle on every path, and a migration gave one to the rows
+     * that predate that. This is the belt to those braces: it guarantees the RESPONSE carries a
+     * handle whatever is in the column, so a row written by some path nobody has thought of yet,
+     * or read out of a database the migration has not reached, still cannot disclose anything.
+     *
+     * <p>Derived from the row's id, so it is the same name on every read rather than a new one
+     * each time the page loads, and the id reveals nothing about the author.
+     */
+    private static String bylineOf(io.vertx.sqlclient.Row row) {
+        String author = row.getString("author");
+        if (author != null && !author.isBlank()) return author;
+        Object id = row.getValue("id");
+        return Pseudonyms.stableFor(id == null ? "" : id.toString());
     }
 }

@@ -1084,6 +1084,68 @@ paths:
         '403':
           description: Forbidden
 
+  /api/admin/job-titles/unlisted:
+    get:
+      operationId: adminListUnlistedTitles
+      summary: Job titles in use that the catalogue does not hold
+      description: >-
+        The picker offers "Not listed? Add <what you typed>" for a title it cannot find, and that
+        row keeps the wording and records nothing: the title reaches the site by being submitted,
+        and job_titles could previously only change by writing a migration. This is the list that
+        makes promoting one possible. Grouped by normalised key, because "Sr. Manager" and "Snr
+        Manager" are one decision, and reported with counts, because a spelling fifty people use
+        is a different proposition from one somebody typed once.
+      tags:
+        - Admin
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 200
+            default: 50
+      responses:
+        '200':
+          description: The titles, commonest first
+        '401':
+          description: Unauthorized
+        '403':
+          description: Forbidden
+  /api/admin/job-titles/promote:
+    post:
+      operationId: adminPromoteTitle
+      summary: Add a title to the curated catalogue
+      description: >-
+        Writes the row with source = 'promoted', the value V116 reserved and nothing has ever
+        written. Deliberately separate from approving the manager: a submission can be good while
+        its title is a one-off nobody should be offered, and a title can be worth keeping from a
+        submission rejected for something else. Answers added=false rather than failing when the
+        catalogue already holds it, including when a different spelling normalises to the same key.
+      tags:
+        - Admin
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - title
+              properties:
+                title:
+                  type: string
+                  maxLength: 100
+      responses:
+        '200':
+          description: Added, or already present
+        '400':
+          description: Missing or unusable title
+        '401':
+          description: Unauthorized
+        '403':
+          description: Forbidden
   /api/admin/high-profile-figures:
     get:
       operationId: adminListHighProfileFigures

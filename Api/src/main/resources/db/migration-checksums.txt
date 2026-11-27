@@ -147,3 +147,6 @@ V113__company_averages_count_every_rating.sql  -870972834
 V114__report_queue_resolution.sql  1071863063
 V115__company_rating_averages_every_score.sql  807786403
 V116__job_title_catalogue.sql  633256289
+V117__plausible_bylines_on_company_and_interview_ratings.sql  1785157953
+V118__attribute_the_legacy_ratings_v113_never_reached.sql  1676127772
+V119__canonicalize_stored_job_titles.sql  -1454920177

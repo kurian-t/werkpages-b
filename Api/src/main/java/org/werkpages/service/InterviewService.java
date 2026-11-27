@@ -9,6 +9,7 @@ import org.werkpages.repository.CompanyRepository;
 import org.werkpages.repository.CapturedDraftRepository;
 import org.werkpages.repository.InterviewRepository;
 import org.werkpages.repository.UserRepository;
+import org.werkpages.repository.Pseudonyms;
 
 import java.math.BigDecimal;
 import java.math.RoundingMode;
@@ -436,8 +437,15 @@ public class InterviewService {
             parseYearMonth(body, "interviewedFrom"),
             parseYearMonth(body, "interviewedUntil"),
             parseRounds(body),
-            // The handle the author picked, the way a manager review is signed. Blank means none:
-            // an empty string would put a nameless byline on the card rather than leaving it bare.
+            /*
+              The handle the author picked, the way a manager review is signed. Blank means none:
+              an empty string would put a nameless byline on the card rather than leaving it bare.
+
+              NOT MINTED HERE, for the reason CompanyReviewService records at length: writing a
+              handle on submit renames a contribution whose author edits it later without
+              re-sending one. What a reader sees is guaranteed by bylineOf at the read path
+              instead, so "no handle" stays storable and no card can say "Anonymous candidate".
+            */
             optionalText(body, "author", 60));
     }
 
@@ -688,7 +696,7 @@ public class InterviewService {
                             .put("country",       row.getString("country"))
                             // Null on experiences written before authors existed; those render
                             // without a byline, exactly as they always did.
-                            .put("author",        row.getString("author"))
+                            .put("author",        bylineOf(row))
                             .put("createdAt",     row.getOffsetDateTime("created_at").toString())
                             .put("updatedAt",     row.getOffsetDateTime("updated_at") == null
                                                   ? null : row.getOffsetDateTime("updated_at").toString()));
@@ -961,5 +969,25 @@ public class InterviewService {
             throw ServiceException.badRequest("interviewYear must be between " + OLDEST_YEAR + " and " + currentYear);
         }
         return raw;
+    }
+
+    /**
+     * The byline a card shows, which is never nothing.
+     *
+     * <p>A missing byline is not a neutral absence: InterviewExperienceList renders it as
+     * "Anonymous candidate", a string no live experience wears, so it marked out exactly the rows
+     * whose author was unknown - every experience written by somebody who had deleted their
+     * account among them, because the erasure nulled this column until 2026-11-26.
+     *
+     * <p>Rows are now written with a handle on every path and a migration gave one to the rows
+     * that predate that. This guarantees the RESPONSE carries one whatever is in the column.
+     * Derived from the row's id, so it is the same name on every read, and the id reveals nothing
+     * about its author.
+     */
+    private static String bylineOf(io.vertx.sqlclient.Row row) {
+        String author = row.getString("author");
+        if (author != null && !author.isBlank()) return author;
+        Object id = row.getValue("id");
+        return Pseudonyms.stableFor(id == null ? "" : id.toString());
     }
 }

@@ -507,6 +507,8 @@ public class MainVerticle extends AbstractVerticle {
                         routerFactory.addHandlerByOperationId("adminResolveProofChallenge",   proofChallengesHandler::handleAdminResolve);
                         routerFactory.addHandlerByOperationId("adminListHighProfileFigures",  proofChallengesHandler::handleListFigures);
                         routerFactory.addHandlerByOperationId("adminGhostCreationStatus", adminHandler::handleGhostCreationStatus);
+                        routerFactory.addHandlerByOperationId("adminListUnlistedTitles",  adminHandler::handleListUnlistedTitles);
+                        routerFactory.addHandlerByOperationId("adminPromoteTitle",        adminHandler::handlePromoteTitle);
                         routerFactory.addHandlerByOperationId("adminAddHighProfileFigure",    proofChallengesHandler::handleAddFigure);
                         routerFactory.addHandlerByOperationId("adminRemoveHighProfileFigure", proofChallengesHandler::handleRemoveFigure);
                         routerFactory.addHandlerByOperationId("deleteCompanyRating", companyRatingsHandler::handleDelete);
